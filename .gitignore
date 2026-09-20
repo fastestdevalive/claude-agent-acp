@@ -1,0 +1,36 @@
+# OS / editors / IDEs
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.fleet/
+*.iml
+*.swp
+
+# Node / JS / TS
+node_modules/
+dist/
+build/
+coverage/
+.next/
+.turbo/
+.cache/
+*.log
+.env
+.env.*
+!.env.example
+
+# Gradle / JVM / Android / KMP
+.gradle/
+build/
+local.properties
+!gradle/wrapper/gradle-wrapper.jar
+*.apk
+*.aab
+*.dex
+captures/
+.cxx/
+.kotlin/
+kotlin-js-store/
+xcuserdata/
+DerivedData/
