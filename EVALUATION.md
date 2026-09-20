@@ -1,10 +1,18 @@
 # Feasibility: a native-Rust replacement for `@agentclientprotocol/claude-agent-acp`
 
-**Question.** Can a Rust-based ACP-driving tool (vibe-station, or anything shaped like it) drop
-Bun/Node/npm entirely for Claude support by reimplementing `claude-agent-acp` — and does
-`@anthropic-ai/claude-agent-sdk` have to come along for the ride?
+**Question:** can a Rust ACP-driving tool (vibe-station, or anything shaped like it) drop
+Bun/Node/npm entirely for Claude support — and does `@anthropic-ai/claude-agent-sdk` have to be
+ported too?
 
-**Method.** Everything below is read from the real artifacts on this machine, not from docs or memory:
+**Answer in one line:** yes — bypass the SDK (proven), port ~3.2k lines of the adapter's core
+(bounded), skip the rest (unnecessary). No technical wall found; three new behavioral constraints
+found.
+
+---
+
+## Sources read
+
+Everything below is read from real artifacts on this machine — not docs, not memory.
 
 | Artifact | Path |
 | --- | --- |
@@ -13,209 +21,297 @@ Bun/Node/npm entirely for Claude support by reimplementing `claude-agent-acp` �
 | Rust ACP SDK (crate source) | `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-2.1.0/` |
 | Consumer | `~/code/fastestdevalive/vibe-station/rust/vst-agents/` |
 
-Line/character citations into `sdk.mjs` are `file:line:col`, because that file is a 1.32 MB esbuild
-bundle whose 155 "lines" are each tens of thousands of characters wide — `wc -l` is meaningless there.
+> **Citation format.** `sdk.mjs` refs are `file:line:col` — that file is a 1.32 MB esbuild bundle
+> whose 155 "lines" are each tens of thousands of chars wide, so `wc -l` is meaningless there.
+> Adapter refs are plain `file:line`.
 
 ---
 
-## 1. Does `@anthropic-ai/claude-agent-sdk` need to be ported, or can it be bypassed?
+## The stack today
 
-**It can be bypassed, and the existing Rust spike is already on the right side of the line — but the
-"thin wrapper" framing is only two-thirds right, and the third that is wrong matters.** The layers
-that would have made porting mandatory genuinely are not there. `query()` itself is three statements
-(`sdk.mjs:152:477`). The exported `query` path never once calls the settings resolver: the full
-managed-policy machinery *is* bundled — per-OS managed paths at `sdk.mjs:151:20500`
-(`/Library/Application Support/ClaudeCode`, `C:\Program Files\ClaudeCode`, `/etc/claude-code`), macOS
-MDM plist reads at `sdk.mjs:151:57103`, Windows/WSL `reg.exe` HKLM/HKCU queries at
-`sdk.mjs:151:205007` parsed by `sdk.mjs:151:207005`, and a six-tier precedence merge at
-`sdk.mjs:151:197963` — but it is reachable only through the separately exported `resolveSettings`
-(`o5`, defined `sdk.mjs:151:209894`, wrapped `151:210662`), and neither the process transport
-(`class Rk`, `sdk.mjs:118:3022`) nor the query factory (`mO`, `sdk.mjs:151:213428`) references it.
-What `query()` actually does with settings is forward flags: `--setting-sources=…`,
-`--managed-settings`, and a `--settings` JSON blob (`sdk.mjs:118:~7300`, merged by `m1` at
-`sdk.mjs:118:213`). Every policy tier, MDM source and permission rule is resolved *inside* the
-`claude` binary. Likewise absent: there is **no retry, no respawn, no reconnect** anywhere in `Rk` or
-the query class `Gg` — a spawn error is latched once at `sdk.mjs:118:11120` and the iterator throws;
-the only backoff in the file (`[200,800]`) belongs to the transcript-mirror batcher and only runs if
-you pass `options.sessionStore`. And `query()` holds **no session state**: `class Gg`
-(`sdk.mjs:118:19873`) carries `pendingControlResponses`, `cancelControllers`, `hookCallbacks`,
-`sdkMcpTransports` and friends — pure protocol plumbing, no session id, no history, no compaction.
-Resume is flags (`--resume=`, `--fork-session`, `--session-id=`). Prompt injection is literally one
-line (`hO`, `sdk.mjs:151:219410`), and it writes `session_id:""` — the SDK does not even track the
-real id. Binary resolution is a fixed candidate list over the optional native packages
-(`b1`, `sdk.mjs:118:17481`) with glibc/musl ordering from `process.report.getReport().header
-.glibcVersionRuntime` (`sdk.mjs:118:17296`) — **no PATH search, no `which claude`.** Worth flagging
-as a correction to the prior investigation: `CLAUDE_CODE_EXECUTABLE` **does not exist in SDK
-0.3.232** — `grep -c` returns 0 across `sdk.mjs`, `sdk.d.ts` and `bridge.mjs`. vibe-station's
-override (`vst-agents/src/claude.rs:420`) works because *the adapter* reads that variable
-(`dist/acp-agent.js:233-236`, applied at `4908`) and passes it down as
-`options.pathToClaudeCodeExecutable`; the SDK only honors the option. **The third that is wrong:**
-the SDK's control-channel implementation (`class Gg`, `sdk.mjs:118:19873`–`124:452`, ~22 KB
-minified ≈ 800–1000 lines of source) is *not* thin, and a hand-rolled spawn+parse silently misses
-several load-bearing facts. First, the real argv is
-`["--output-format","stream-json","--verbose","--input-format","stream-json"]`
-(`sdk.mjs:118:4903`) — **`--print` is never passed** (`grep -o -- '"--print"' sdk.mjs` → 0 hits);
-non-interactive mode is inferred from stream-json IO plus `CLAUDE_CODE_ENTRYPOINT="sdk-ts"`. Second,
-and most consequentially: **`systemPrompt`, `agents`, `hooks`, `skills`, `toolAliases`,
-`forwardSubagentText` and `supportedDialogKinds` are sent in the `initialize` *control_request*, not
-as CLI flags** (`sdk.mjs:120:~4100`), and the response is what carries `commands`, `models`, `agents`
-and `account` back. Any Rust driver wanting a custom system prompt or hooks must therefore implement
-the control channel — it is not optional the moment you go past a bare prompt. Third, a deadlock
-trap: `hasBidirectionalNeeds()` (`sdk.mjs:118:20530`) suppresses the normal
-close-stdin-after-prompt behavior whenever a `canUseTool`, hook, SDK-MCP or elicitation callback is
-registered; close stdin early with a permission callback live and the CLI hangs. Beyond that sits a
-pile of individually-boring correctness details a reimplementation will rediscover the hard way: the
-`suppressControlResponse` sentinel meaning *deliberately never answer* (`sdk.mjs:118:19850`);
-`pending_permission_requests` / `pending_user_dialog_requests` replay carried on the `initialize`
-response; `keep_alive` frames consumed silently at `sdk.mjs:118:23865` (a naive parser leaks them to
-the caller); `control_cancel_request` for in-flight cancellation; the stderr-drain-before-exit race
-(`sdk.mjs:118:704`, `786`) plus the 2 KB stderr tail that turns "exit code 1" into an actionable
-message; the rule that a `result` with `is_error` *replaces* the raw process error
-(`sdk.mjs:118:~24200`); the SIGTERM→SIGKILL ladder (2 s / 5 s, `sdk.mjs:118:~14900`) driven by a
-*separate* forwarded abort controller (`sdk.mjs:118:3400`) so the user's signal cannot hard-kill; and
-a module-global `process.on("exit")` child reaper (`sdk.mjs:118:806`–`949`). **Verdict: bypass, not
-port** — nothing architectural is lost, the spike already proved the happy path, and reimplementing
-`Gg`'s subset (`initialize`, `can_use_tool`, `interrupt`, `set_permission_mode`, `hook_callback`) is
-a few hundred lines of Rust. The one piece with real design in it, and the only part worth porting
-*carefully* rather than reinventing, is the in-process MCP server multiplexed over the control
-channel (`class Ik` at `sdk.mjs:118:19590` + `connectSdkMcpServer` + `sendMcpServerMessageToCli` +
-`handleMcpControlRequest`, with bidirectional JSON-RPC id correlation and an outbound-id
-short-circuit) — and vibe-station does not use that today.
+```mermaid
+flowchart TD
+    VS["vibe-station (Rust)<br/>ACP <b>client</b>"]
+    ADP["@agentclientprotocol/claude-agent-acp<br/>11,266 lines JS · Zed"]
+    SDK["@anthropic-ai/claude-agent-sdk<br/>1.32 MB bundle · Anthropic"]
+    CLI["<b>claude</b> binary<br/>323 MB · closed source"]
 
-## 2. Is `claude-agent-acp` itself portable, and how much is actually needed?
+    VS -->|"ACP JSON-RPC over stdio<br/>(agent-client-protocol crate)"| ADP
+    ADP -->|"query() call<br/>in-process"| SDK
+    SDK -->|"stream-json + control_request<br/>over stdin/stdout"| CLI
 
-**Portable, with no technical wall — but the honest scope is not "7,100 lines"; it is roughly 3,150
-lines of core inside `acp-agent.js` plus ~630 lines of tool mapping, and for vibe-station
-specifically it is meaningfully less than that again.** The package is 11,266 lines of compiled JS,
-of which `dist/acp-agent.js` is 7,114 and `dist/tools.js` 1,111; the rest
-(`file-change-audit.js` 379, `session-failure-extension.js` 351, `elicitation.js` 304,
-`settings.js` 185, `index.js` 98, `utils.js` 81, `goal-extension.js` 50) is almost entirely
-skippable. A line-accounted read of `acp-agent.js` splits roughly **44% protocol-necessary / 44%
-optional-rich / 12% boilerplate**, and a large fraction of the "core" lines are prose comments — the
-turn-lifecycle region `1215–1845` is about half commentary. The protocol-necessary core is:
-capabilities in `initialize` (`693–746`, 54 lines); `newSession`/`loadSession` plus the non-optional
-slice of `createSession` (`747–759`, `788–798`, `4645–4695`, ~200 of `4696–5209`'s 514); `prompt`
-itself, which owns no loop and merely enqueues a `Turn` and awaits a deferred (`973–1037`, 65 lines);
-the turn activate/settle/orphan machinery (`1338–1682`, 345); the consumer loop with its abort/EOF
-race (`1683–1845`, 163); `result` → stop-reason mapping (`2532–2884`, 353); idle settle via
-`session_state_changed` (`2049–2163`, 115); the stream→ACP mappers `toAcpNotifications` (`6383–6759`),
-`streamEventToAcpNotifications` (`6760–6864`) and `toolCallNotification` (`6303–6382`), 562 combined;
-prompt content mapping (`6101–6193`, 93); permission translation — `canUseTool` (`4069–4275`),
-`requestPermissionFromClient`/`ensureToolCallEmitted` (`4017–4068`),
-`permissionMetadataForAlwaysAllow` (`447–541`) — 354 combined; `cancel` (`3443–3668` plus
-`6865–6892`, 254); fs passthrough (`4002–4016`, 15); and wiring (`542–572`, `6893–6929`, ~250).
-Everything else is genuinely optional: model resolution and allowlisting is its own ~560 lines
-(`5676–6045`, `6930–7114`); config options / modes / fast mode ~630 (`3724–3860`, `4388–4644`,
-`5479–5675`); elicitation ~540 (`elicitation.js` + `4276–4374` + refusal-fallback `2396–2481`);
-the JetBrains/AIR file-change-audit ~480 and session-failure ~450 (both negotiated as `_meta`
-capabilities at `acp-agent.js:734`, and together the single largest skippable chunk at ~930 lines);
-auth/gateway/providers ~390; TODO/plan lists ~270; settings watching ~210 (`settings.js` — and note
-it is built on the SDK's `@alpha` `resolveSettings` + `filterEscalatingDefaultMode`,
-`settings.js:5,90-91`, so a Rust port must either reimplement the merge or skip it); subagent
-transcripts ~200; hooks ~180; terminal ~140; goal extension ~140; custom slash commands ~95; MCP
-server passthrough a mere ~60. **The official Rust SDK is real scaffolding, but less of it than the
-prior note implied.** `agent-client-protocol` 2.1.0 gives you newline-delimited JSON-RPC over stdio
-(`src/stdio.rs:11-85`), the connection loop and `ConnectionTo<…>` with request/response correlation,
-cancellation plumbing (`Responder::cancellation()`, `src/jsonrpc.rs:4611`), typed structs for the
-entire ACP schema, the full `SessionUpdate` enum
-(`agent-client-protocol-schema-1.7.0/src/v1/client.rs:99-159`), the agent→client requests including
-`session/request_permission`, `fs/*`, `terminal/*` and `elicitation/create`
-(`src/schema/agent_to_client/requests.rs:10-49`), and first-class extension support — `ExtRequest`/
-`ExtNotification` with `_`-prefixed methods (`schema/v1/ext.rs:25-96`), an `[ext]` fallback variant
-on the request enums, `_meta` on ~195 schema types, plus `on_receive_dispatch`/`add_dynamic_handler`
-and derive macros — so both custom extensions (`_session/steering`, `_session/goal`) are expressible.
-It is mature: 2.2.0 released 2026-09-18, 4.5 M total downloads, authored by Zed, runtime-agnostic
-(tokio is only a dev-dependency), all handler bounds are `Send`, so **no `LocalSet` constraint** —
-a change from the 0.x era. Two corrections to the prior architecture note, though. First, the shape:
-in 2.x `Agent` is a **zero-sized role marker** (`src/role/acp.rs:291`), not a trait to implement —
-you register typed handlers on `Agent::builder()` (`role/acp.rs:335-352`; full 21-line agent at
-`examples/simple_agent.rs`). The old 0.4.x `Agent` trait with `initialize`/`prompt`/`cancel` is gone.
-Second, and more useful: it provides **zero** Claude-specific help — no stream-json parsing anywhere,
-and its only Claude reference is `AcpAgent::claude_agent()` at `src/acp_agent.rs:192-197`, which
-shells out to `npx -y @agentclientprotocol/claude-agent-acp`, i.e. the exact thing being replaced.
-**The scope-shrinking observation nobody has written down yet:** vibe-station is an ACP *client*
-(`acp_connection.rs`; `examples/acp_hello.rs` drives the adapter as a subprocess via
-`AcpAgent::from_args`), and it already owns a frozen in-process abstraction — the `AcpTransport`
-trait at `acp_transport.rs:115-178` (`initialize`/`new_session`/`load_session`/`send_prompt`/
-`cancel_active_prompt`/`steer`/`dispose`). A native driver can implement *that trait* directly and
-never serialize ACP over a pipe at all, which deletes the entire agent-side JSON-RPC surface from the
-port. And the output surface it must produce is narrower still: `normalize.rs:340-473` consumes only
-`AgentMessageChunk`, `AgentThoughtChunk`, `UserMessageChunk`, `ToolCall`, `ToolCallUpdate`,
-`CurrentModeUpdate`, `AvailableCommandsUpdate` and `Plan`, and explicitly discards
-`SessionInfoUpdate`, `ConfigOptionUpdate` and `UsageUpdate` (`normalize.rs:471-473`). **As for
-blockers — I found no technical wall, but I did find a class of risk the prior note did not name.**
-The hard part is not message mapping; it is the *turn-settlement state machine*, which is
-reverse-engineered from undocumented CLI behavior and self-documents as such. `acp-agent.js:1453`
-states outright that its orphan-coalescing ordering argument "is asserted from observed CLI behavior,
-not a documented wire contract — if a dead turn's late result could lag past the NEXT turn's dispatch
-frames, deleting a zombie and a started entry on one result would double-consume it."
-`acp-agent.js:4109-4113` rests subagent attribution on "an undocumented SDK invariant
-(`task_started.task_id` === `canUseTool`'s `agentID`…; verified against the bundled CLI)."
-`acp-agent.js:1687-1692` documents a genuine concurrency hack — the in-flight `query.next()` must be
-held across abort wake-ups because "async generators serialize `next()` calls, so racing a SECOND
-`next()` while one is pending would make the abandoned one swallow a message." There is a
-force-cancel grace timer existing purely because `query.next()` can wedge and never yield (issue
-#680, `acp-agent.js:46`, `1683-1685`, `3595-3605`). There is a documented *unfixable* hole:
-`acp-agent.js:2143-2151` explains that a turn abandoned before its echo "still hangs until cancel or
-the next prompt; only a timer could tell those apart." There is a latched boolean with a
-consciously-accepted wrong case (`1595-1606`, issue #453). There is an incremental JSON-prefix lexer
-(`scanStreamedToolInput`/`recoveredToolInput`, `179-232`) that closes a partial tool-input object at a
-top-level comma so streamed tool calls can be refined mid-flight. There is dual-lane interrupt
-reconciliation for CLIs with vs. without `interrupt_receipt_v1`, guarding the *field* not the receipt
-"so a bare `{}` success from a gateway can't read as 'everything was dropped'" (`3608-3648`). There is
-a subagent permission deadlock (issue #866, `1553-1560`) forcing every settle path through
-`settleOrDefer`. There is even a documented CLI regression worked around by a text heuristic: the
-adapter refuses to call `getContextUsage` before a fresh session's first turn because "that control
-request is not serviced (~15 s stall, issues #886/#880)" and — critically — "SDK control requests are
-serialized over one channel," so it would drag the awaited `setModel` down with it
-(`4416-4420`, `7005-7016`). **That serialization constraint is itself a design input a Rust port must
-honor.** None of this is a wall; all of it is empirical knowledge that took the upstream project many
-releases to accumulate, and a from-scratch port re-enters that discovery loop with no test suite to
-match against.
+    style VS fill:#1f6f3f,color:#fff
+    style ADP fill:#8a5a00,color:#fff
+    style SDK fill:#8a5a00,color:#fff
+    style CLI fill:#333,color:#fff
+```
 
-## 3. Bottom line
+Amber = the two Node/Bun layers to be removed. The `claude` binary stays either way.
 
-The three components do not sit on one risk gradient; they sit in three different categories, and
-conflating them is what makes this question look like a yes/no.
+### Target after the port
 
-**(a) Bypassing `claude-agent-sdk` is already proven and clearly correct.** No settings resolution, no
-retry, no reconnection, no session state is lost — all of it lives in the `claude` binary. The spike
-demonstrated the happy path with zero Node in the loop. The only caveats are corrections to the plan,
-not objections to it: use the SDK's real argv (no `--print`), set `CLAUDE_CODE_ENTRYPOINT`, and
-budget a few hundred lines for the control-channel subset, because **system prompt, hooks, agents and
-skills travel over `initialize` as a control_request, not as flags** — which means the control channel
-is on the critical path much earlier than "just for permission prompts."
+```mermaid
+flowchart TD
+    VS["vibe-station (Rust)"]
+    DRV["native driver (Rust)<br/>implements existing <code>AcpTransport</code> trait"]
+    CLI["<b>claude</b> binary"]
 
-**(b) Porting the CORE protocol logic is real-but-bounded, and smaller than the headline number.**
-~3,150 core lines in `acp-agent.js` + ~630 in `tools.js`, minus what vibe-station provably never
-consumes. The Rust ACP SDK removes all framing/schema/extension work. Going in-process behind the
-existing `AcpTransport` trait removes the agent-side JSON-RPC surface entirely. The genuine cost
-centre is the turn-settlement state machine and its accumulated empirical fixes (#680, #825, #851,
-#866, #453, #886/#880), which must be re-derived rather than read off a spec.
+    VS -->|"in-process trait call<br/>(no JSON-RPC, no pipe)"| DRV
+    DRV -->|"stream-json + control_request"| CLI
 
-**(c) Porting the FULL feature surface is not worth doing, and nothing forces it.** The two AIR
-extensions (~930 lines), elicitation (~540), model allowlisting (~560), config/modes (~630) and
-settings watching (~210) are all independently droppable. The only item with real design density is
-the SDK's in-process MCP server over the control channel — and vibe-station does not use it.
+    style VS fill:#1f6f3f,color:#fff
+    style DRV fill:#1f6f3f,color:#fff
+    style CLI fill:#333,color:#fff
+```
 
-**No new technical wall was found.** The only *new* risks worth adding to the existing
-"undocumented, therefore version-fragile" concern are three concrete behavioral constraints:
-control requests are **serialized over a single channel** (`acp-agent.js:4416-4420`), so a slow one
-head-of-line-blocks the rest; stdin must **not** be closed after the prompt once a permission/hook
-callback is registered (`sdk.mjs:118:20530`) or the CLI deadlocks; and `keep_alive` /
-`control_cancel_request` / `pending_permission_requests`-replay frames must be handled or the stream
-decoder misbehaves in ways that look like Claude bugs.
+Key structural point: vibe-station is an ACP **client** with a frozen in-process abstraction already
+(`acp_transport.rs:115-178`). A native driver implements *that trait* — so the agent-side JSON-RPC
+surface disappears from the port entirely.
+
+---
+
+## Q1 — Does `claude-agent-sdk` need porting, or can it be bypassed?
+
+### Verdict: **bypass it.** The spike is already on the right side of the line.
+
+### What `query()` does NOT do (so nothing is lost)
+
+| Suspected responsibility | Reality | Evidence |
+| --- | --- | --- |
+| Settings merging | **None.** Forwards `--setting-sources=`, `--managed-settings`, `--settings` blob and lets the CLI resolve. | `sdk.mjs:118:~7300`; merge helper `m1` at `118:213` |
+| MDM / registry / plist policy | **Bundled but unreachable** from `query()` | Defined `sdk.mjs:151:20500` (paths), `151:57103` (macOS plist), `151:205007` (Win/WSL `reg.exe`), `151:197963` (6-tier merge) — all reachable only via exported `resolveSettings` (`o5`, `151:209894`), which the transport never calls |
+| Retry / respawn / reconnect | **None.** Spawn error latched once, iterator throws. | `sdk.mjs:118:11120`; only backoff in file (`[200,800]`) is the transcript batcher, gated on `sessionStore` |
+| Session state / history / compaction | **None.** Stateless pass-through. | `class Gg` fields at `sdk.mjs:118:19873` are pure protocol plumbing |
+| Session id tracking | **None** — writes `session_id:""` | `hO`, `sdk.mjs:151:219410` |
+| PATH lookup for `claude` | **None.** Fixed candidate list over optional native packages. | `b1`, `sdk.mjs:118:17481`; musl detect `118:17296` |
+
+### What a hand-rolled spawn+parse WOULD miss
+
+These are the load-bearing bits. Ordered by how badly they bite.
+
+| # | Finding | Why it matters | Evidence |
+| --- | --- | --- | --- |
+| 1 | **System prompt, agents, hooks, skills, `toolAliases`, `supportedDialogKinds` are sent in the `initialize` control_request — not as CLI flags** | Control channel is on the critical path immediately, not "later, for permissions" | `sdk.mjs:120:~4100` |
+| 2 | **`hasBidirectionalNeeds()` suppresses close-stdin-after-prompt** whenever a `canUseTool`/hook/MCP/elicitation callback is registered | Close stdin early with a permission callback live → **CLI deadlocks** | `sdk.mjs:118:20530` |
+| 3 | Real argv is `--output-format stream-json --verbose --input-format stream-json` — **`--print` is never passed** | The spike's argv differs from the SDK's. Non-interactive mode inferred from stream-json IO + `CLAUDE_CODE_ENTRYPOINT="sdk-ts"` | `sdk.mjs:118:4903`; `grep -o -- '"--print"' sdk.mjs` → **0 hits** |
+| 4 | `keep_alive` frames consumed silently | Naive parser leaks them to the caller | `sdk.mjs:118:23865` |
+| 5 | `suppressControlResponse` sentinel = *deliberately never answer* | Answering anyway breaks the handoff to a more capable client | `sdk.mjs:118:19850` |
+| 6 | `pending_permission_requests` / `pending_user_dialog_requests` replay on the `initialize` response | Dropped permission prompts on resume | `sdk.mjs:120:~8200` |
+| 7 | `control_cancel_request` for in-flight cancellation | — | `sdk.mjs:118:~24900` |
+| 8 | stderr drain-before-exit race + 2 KB stderr tail | Turns "exit code 1" into an actionable message | `sdk.mjs:118:704`, `118:786` |
+| 9 | A `result` with `is_error` **replaces** the raw process error | Much better diagnostics | `sdk.mjs:118:~24200` |
+| 10 | SIGTERM→SIGKILL ladder (2 s / 5 s) via a **separate** forwarded abort controller | Wiring the user's signal straight to `spawn` hard-kills instead | `sdk.mjs:118:~14900`, controller at `118:3400` |
+| 11 | Module-global `process.on("exit")` child reaper | Orphaned `claude` processes | `sdk.mjs:118:806`–`949` |
+
+### Correction to the prior investigation
+
+> **`CLAUDE_CODE_EXECUTABLE` does not exist in SDK 0.3.232.**
+> `grep -c` returns **0** across `sdk.mjs`, `sdk.d.ts`, `bridge.mjs`.
+
+- vibe-station sets it at `vst-agents/src/claude.rs:420`.
+- It works because **the adapter** reads it — `dist/acp-agent.js:233-236`, applied at `4908`.
+- The SDK only honors `options.pathToClaudeCodeExecutable`.
+
+### Size of the piece worth respecting
+
+| Component | Size | Port it? |
+| --- | --- | --- |
+| `query()` itself | 3 statements (`sdk.mjs:152:477`) | Trivially |
+| Process transport `class Rk` | ~15 KB minified (`sdk.mjs:118:3022`) | argv + Node stream bookkeeping — reimplement |
+| **Control protocol `class Gg`** | **~22 KB minified ≈ 800–1000 source lines** (`sdk.mjs:118:19873`–`124:452`) | Subset only: `initialize`, `can_use_tool`, `interrupt`, `set_permission_mode`, `hook_callback` ≈ a few hundred Rust lines |
+| **In-process MCP over control channel** | `class Ik` (`sdk.mjs:118:19590`) + `connectSdkMcpServer` + `sendMcpServerMessageToCli` + `handleMcpControlRequest` | **The only piece with real design.** Bidirectional JSON-RPC id correlation + outbound-id short-circuit. **vibe-station does not use it today.** |
+
+---
+
+## Q2 — Is `claude-agent-acp` portable, and how much is needed?
+
+### Verdict: **portable, no technical wall.** But the honest number is ~3.2k lines, not 7,100.
+
+### Package inventory (11,266 lines total)
+
+| File | Lines | Keep? |
+| --- | --- | --- |
+| `acp-agent.js` | 7,114 | Partially — see split below |
+| `tools.js` | 1,111 | ~630 of it (tool shape mapping) |
+| `file-change-audit.js` | 379 | ❌ JetBrains/AIR extension |
+| `session-failure-extension.js` | 351 | ❌ JetBrains/AIR extension |
+| `elicitation.js` | 304 | ❌ optional |
+| `settings.js` | 185 | ❌ optional (and built on SDK `@alpha` APIs — `settings.js:5,90-91`) |
+| `index.js` | 98 | ❌ Node CLI entry |
+| `utils.js` | 81 | ❌ Node stream adapters |
+| `goal-extension.js` | 50 | ❌ optional |
+
+### `acp-agent.js` split
+
+```mermaid
+pie showData
+    title acp-agent.js — 7,114 lines
+    "Protocol-necessary core" : 3150
+    "Optional / rich features" : 3100
+    "Boilerplate & helpers" : 864
+```
+
+> Caveat: buckets interleave inside `runConsumer` and `createSession` rather than sitting in clean
+> blocks, and a large share of "core" lines are **prose comments** — the turn-lifecycle region
+> `1215–1845` is roughly half commentary.
+
+### (A) Protocol-necessary core — must port
+
+| Concern | Lines in `acp-agent.js` | ~Count |
+| --- | --- | --- |
+| `initialize` capabilities | `693–746` | 54 |
+| `newSession` / `loadSession` + non-optional `createSession` | `747–759`, `788–798`, `4645–4695`, ~200 of `4696–5209` | ~200 |
+| `prompt` (enqueues a Turn, owns no loop) | `973–1037` | 65 |
+| Turn activate / settle / orphan accounting | `1338–1682` | 345 |
+| Consumer loop + abort/EOF race | `1683–1845` | 163 |
+| `result` → stop reasons | `2532–2884` | 353 |
+| Idle settle via `session_state_changed` | `2049–2163` | 115 |
+| Stream → ACP mappers | `6383–6759`, `6760–6864`, `6303–6382` | 562 |
+| Prompt content mapping | `6101–6193` | 93 |
+| **Permission translation** | `4069–4275`, `4017–4068`, `447–541` | 354 |
+| `cancel` | `3443–3668`, `6865–6892` | 254 |
+| fs passthrough | `4002–4016` | 15 |
+| Wiring | `542–572`, `6893–6929` | ~250 |
+| Tool shape mapping | `tools.js:16–357`, `423–717` | ~630 |
+
+### (B) Optional — safe to skip
+
+| Feature | ~Lines | Note |
+| --- | --- | --- |
+| Config options / modes / fast mode | 630 | `3724–3860`, `4388–4644`, `5479–5675` |
+| Model resolution + allowlisting | 560 | `5676–6045`, `6930–7114` |
+| Elicitation | 540 | `elicitation.js` + `4276–4374` + refusal-fallback `2396–2481` |
+| File-change audit (JetBrains/AIR) | 480 | Negotiated as `_meta` capability at `acp-agent.js:734` |
+| Session-failure ext (JetBrains/AIR) | 450 | Same — **AIR pair = ~930 lines, largest single skippable chunk** |
+| Auth / gateway / providers | 390 | `595–692`, `850–972`, `5307–5392` |
+| TODO / plan lists | 270 | |
+| Settings watching | 210 | Requires reimplementing the SDK merge, or skip |
+| Subagent transcripts | 200 | |
+| Hooks (PostToolUse/TaskCreated/TaskCompleted) | 180 | |
+| Terminal support | 140 | |
+| Goal extension | 140 | |
+| Custom slash commands | 95 | |
+| MCP server passthrough | 60 | |
+
+### What the Rust ACP SDK gives you free
+
+`agent-client-protocol` 2.1.0 — **mature**: v2.2.0 released 2026-09-18, 4.5 M total downloads,
+authored by Zed, runtime-agnostic (tokio is dev-dependency only), all handler bounds are `Send` →
+**no `LocalSet` constraint** (a change from 0.x).
+
+| Provided | Evidence |
+| --- | --- |
+| Newline-delimited JSON-RPC over stdio | `src/stdio.rs:11-85` |
+| Connection loop, `ConnectionTo<…>`, req/resp correlation | `src/jsonrpc.rs` |
+| Cancellation plumbing | `Responder::cancellation()`, `src/jsonrpc.rs:4611` |
+| Full typed ACP schema | `agent-client-protocol-schema-1.7.0` |
+| `SessionUpdate` enum | `schema/src/v1/client.rs:99-159` |
+| Agent→client requests (`session/request_permission`, `fs/*`, `terminal/*`, `elicitation/create`) | `src/schema/agent_to_client/requests.rs:10-49` |
+| Extensions — `ExtRequest`/`ExtNotification`, `_`-prefixed methods, `[ext]` fallback, `_meta` on ~195 types, `on_receive_dispatch`, derive macros | `schema/v1/ext.rs:25-96` |
+
+**Not provided — zero Claude-specific help:**
+
+- ❌ No stream-json parsing anywhere.
+- ❌ Its only Claude reference is `AcpAgent::claude_agent()` (`src/acp_agent.rs:192-197`) — which
+  shells out to `npx -y @agentclientprotocol/claude-agent-acp`, i.e. **the exact thing being
+  replaced**.
+
+> **Correction to the prior architecture note.** In 2.x, `Agent` is a **zero-sized role marker**
+> (`src/role/acp.rs:291`), not a trait to implement. You register typed handlers on
+> `Agent::builder()` (`role/acp.rs:335-352`; full 21-line agent at `examples/simple_agent.rs`).
+> The 0.4.x `Agent` trait with `initialize`/`prompt`/`cancel` **is gone**.
+
+### The scope-shrinker nobody had written down
+
+vibe-station consumes only **8 of 14** `SessionUpdate` variants (`normalize.rs:340-473`):
+
+| Consumed | Explicitly discarded |
+| --- | --- |
+| `AgentMessageChunk`, `AgentThoughtChunk`, `UserMessageChunk`, `ToolCall`, `ToolCallUpdate`, `CurrentModeUpdate`, `AvailableCommandsUpdate`, `Plan` | `SessionInfoUpdate`, `ConfigOptionUpdate`, `UsageUpdate` (`normalize.rs:471-473`) |
+
+Combined with implementing `AcpTransport` in-process, this cuts the port well below the 3.2k figure.
+
+### The real cost centre: the turn-settlement state machine
+
+Not the message mapping — **this**. It is reverse-engineered from undocumented CLI behavior and
+says so in its own comments.
+
+```mermaid
+flowchart LR
+    P["prompt<br/>enqueue Turn"] --> E{"echo<br/>received?"}
+    E -->|no| H["⚠️ hangs until cancel<br/>or next prompt<br/>(2143-2151)"]
+    E -->|yes| A["activateTurn<br/>(1338)"]
+    A --> L["consumer loop<br/>(1683)"]
+    L --> R{"result?"}
+    R -->|yes| SD{"subagents<br/>live?"}
+    R -->|"next() wedged"| FC["⚠️ force-cancel grace<br/>timer, issue #680"]
+    SD -->|yes| DEF["settleOrDefer<br/>⚠️ deadlock #866"]
+    SD -->|no| S["settle"]
+    DEF --> S
+    FC --> S
+
+    style H fill:#7a1f1f,color:#fff
+    style FC fill:#7a1f1f,color:#fff
+    style DEF fill:#7a1f1f,color:#fff
+```
+
+| Hazard | Self-documented as | Line |
+| --- | --- | --- |
+| Orphan coalescing ordering | *"asserted from observed CLI behavior, not a documented wire contract — if a dead turn's late result could lag past the NEXT turn's dispatch frames, deleting a zombie and a started entry on one result would double-consume it"* | `1453` |
+| Subagent attribution | *"an undocumented SDK invariant (`task_started.task_id` === `canUseTool`'s `agentID`…; verified against the bundled CLI)"* | `4109-4113` |
+| Async-generator race | *"async generators serialize `next()` calls, so racing a SECOND `next()` while one is pending would make the abandoned one swallow a message"* | `1687-1692` |
+| Wedged `query.next()` | Force-cancel grace timer exists purely for this — issue **#680** | `46`, `1683-1685`, `3595-3605` |
+| Pre-echo abandonment | Documented **unfixable** hole: *"still hangs until cancel or the next prompt; only a timer could tell those apart"* | `2143-2151` |
+| Latched boolean, accepted wrong case | Issue **#453** | `1595-1606` |
+| Streamed tool-input recovery | Incremental JSON-prefix lexer closing a partial object at a top-level comma | `179-232` |
+| Interrupt reconciliation | Dual-lane for CLIs with/without `interrupt_receipt_v1`; guards the **field** not the receipt *"so a bare `{}` success from a gateway can't read as 'everything was dropped'"* | `3608-3648` |
+| Subagent permission deadlock | Issue **#866** — every settle path must route through `settleOrDefer` | `1553-1560` |
+| `getContextUsage` stall | Refuses to call it pre-first-turn: *"~15 s stall, issues #886/#880"* and *"SDK control requests are serialized over one channel"* so it would drag `setModel` down with it | `4416-4420`, `7005-7016` |
+
+**None of this is a wall.** All of it is empirical knowledge that took upstream many releases to
+accumulate, and a from-scratch port re-enters that discovery loop **with no test suite to match
+against**.
+
+---
+
+## Q3 — Bottom line
+
+The three components sit in three different risk categories. Conflating them is what makes this look
+like a yes/no question.
+
+```mermaid
+flowchart LR
+    A["<b>(a)</b> Bypass claude-agent-sdk<br/>✅ proven"] --> B["<b>(b)</b> Port adapter CORE<br/>🟡 bounded work"]
+    B --> C["<b>(c)</b> Port FULL surface<br/>⛔ don't"]
+
+    style A fill:#1f6f3f,color:#fff
+    style B fill:#8a6d00,color:#fff
+    style C fill:#5a1f1f,color:#fff
+```
+
+### Scoring
 
 | Component | Verdict | Rough scope | Confidence |
 | --- | --- | --- | --- |
-| **(a)** Bypass `claude-agent-sdk` entirely | **Low-risk / already proven.** Spike did it; SDK is a genuinely thin wrapper for spawn+prompt+parse. | ~0 (done) + a few hundred lines for the control-channel subset | High — read the real bundle; `resolveSettings` verified unreachable from `query()` |
-| **(b)** Reimplement `claude-agent-acp` CORE in Rust | **Real but bounded engineering.** No blocker; ACP framing is free; in-process `AcpTransport` avoids the agent side. Cost is the undocumented turn-settlement state machine. | ~3.2k JS-equivalent lines; less for vibe-station's 8-of-14 update surface | Medium-high — line-accounted, but comment-heavy JS makes the estimate soft |
-| **(c)** Reimplement the FULL feature surface | **Not worth it, and unnecessary.** Every rich feature is independently droppable; ~930 lines of it are vendor-specific (JetBrains/AIR). | ~3.1k more lines, mostly optional | High — each feature's line ranges are isolable |
-| **SDK in-process MCP server over control channel** | **The one piece with real design.** Port carefully *if* needed; vibe-station does not need it today. | ~22 KB minified `class Gg`, of which MCP multiplexing is the dense part | High |
-| **Genuinely new blockers** | **None found.** Three behavioral constraints to design around (serialized control channel; stdin-close deadlock; `keep_alive`/cancel/replay frames). | — | Medium — absence of evidence over one read |
+| **(a)** Bypass `claude-agent-sdk` entirely | **Low-risk / already proven.** Spike did it; genuinely thin for spawn+prompt+parse. | ~0 (done) + a few hundred lines for the control-channel subset | **High** — read the real bundle; `resolveSettings` verified unreachable from `query()` |
+| **(b)** Reimplement adapter CORE in Rust | **Real but bounded.** No blocker; ACP framing free; in-process `AcpTransport` removes the agent side. Cost = the undocumented turn-settlement state machine. | ~3.2k JS-equivalent lines; less for vibe-station's 8-of-14 surface | **Medium-high** — line-accounted, but comment-heavy JS makes it soft |
+| **(c)** Reimplement FULL feature surface | **Not worth it, and unnecessary.** Every rich feature independently droppable; ~930 lines are vendor-specific (JetBrains/AIR). | ~3.1k more lines, mostly optional | **High** — each feature's ranges are isolable |
+| SDK in-process MCP over control channel | **The one piece with real design.** Port carefully *if* needed; not needed today. | ~22 KB minified `class Gg`, MCP multiplexing is the dense part | **High** |
+| **Genuinely new blockers** | **None found.** | — | **Medium** — absence of evidence over one read |
 
-**Recommendation:** proceed on (a) and (b); explicitly descope (c). Treat the turn-settlement state
-machine, not the wire format, as the schedule risk — and before committing implementer time, build a
-differential harness that runs identical prompts through the Node path and the Rust path and diffs
-the resulting `SessionUpdate` streams, since that is the test suite the upstream project has and a
-from-scratch port otherwise does not.
+### New constraints found (beyond the known "undocumented, therefore fragile" risk)
+
+| # | Constraint | Consequence if ignored |
+| --- | --- | --- |
+| 1 | Control requests are **serialized over a single channel** (`acp-agent.js:4416-4420`) | A slow request head-of-line-blocks every other one |
+| 2 | Do **not** close stdin after the prompt once a permission/hook callback is registered (`sdk.mjs:118:20530`) | CLI deadlocks |
+| 3 | `keep_alive`, `control_cancel_request`, and `pending_permission_requests` replay must be handled | Decoder misbehaves in ways that look like Claude bugs |
+
+### Recommendation
+
+- ✅ **Proceed** on (a) and (b).
+- ⛔ **Explicitly descope** (c).
+- ⚠️ Treat the **turn-settlement state machine**, not the wire format, as the schedule risk.
+- 🔬 **Before committing implementer time:** build a differential harness that runs identical prompts
+  through the Node path and the Rust path and diffs the resulting `SessionUpdate` streams. That is
+  the test suite upstream has and a from-scratch port otherwise does not.
