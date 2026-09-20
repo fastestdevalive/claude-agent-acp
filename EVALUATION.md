@@ -268,6 +268,34 @@ flowchart LR
 accumulate, and a from-scratch port re-enters that discovery loop **with no test suite to match
 against**.
 
+### Can Rust actually express this concurrency?
+
+**Yes — and for most of these hazards Rust is a net improvement, because several are artifacts of
+JavaScript's async model rather than intrinsic protocol problems.** But there is one genuinely new
+hazard that runs the other way.
+
+| JS hazard | Rust disposition | Why |
+| --- | --- | --- |
+| Async-generator `next()` race (`1687-1692`) — must hold the in-flight `next()` across abort wake-ups or the abandoned one swallows a message | **Dissolves entirely** | `tokio::sync::mpsc::Receiver::recv` is **cancel-safe**: *"If `recv` is used as a branch in `tokio::select!` and another branch completes first, it is guaranteed that no messages were received on this channel"* (`tokio-1.53.1/src/sync/mpsc/unbounded.rs:124`). The whole `pendingNext` hack is unnecessary. |
+| Wedged `query.next()` → force-cancel grace timer (#680) | **Easier** | `tokio::select!` against a `CancellationToken` or `tokio::time::timeout`, rather than a hand-rolled re-armed timer |
+| Control requests serialized over one channel (`4416-4420`) | **Easier, and enforceable** | Single writer task owning the pipe + a `oneshot` response map. Rust's ownership makes the single-writer invariant a compile-time fact instead of a convention |
+| Orphan accounting, interrupt reconciliation, settle-deferral (#866) | **Same difficulty** | Plain state-machine logic — language-neutral. The hard part is knowing the rules, not expressing them |
+| — | ⚠️ **NEW: loss of run-to-completion atomicity** | JS is single-threaded: every synchronous stretch between `await`s is atomic *by construction*. `session.activeTurn`, `pendingOrphanResults`, `emittedToolCalls` are mutated with that guarantee implicitly. On multi-threaded tokio with `Arc<Mutex<…>>`, a line-by-line port can introduce interleavings **that never existed upstream** — and the upstream comments won't warn you, because upstream never had to think about it |
+
+**The mitigation is already the house pattern.** `acp_connection.rs:1-25` documents it: one background
+tokio task per connection owns all state, every operation arrives as a `Command` over an `mpsc` with
+a bundled `oneshot` reply. That reproduces JS's single-threaded run-to-completion semantics exactly —
+no locks, no interleaving — while keeping Rust's guarantees. `acp_run_turn.rs:128-145` already runs
+the cancel-safe `select!` shape against `updates.recv()`.
+
+**So the risk is not Rust's capability — it is a design discipline choice made early:**
+
+- ✅ **Actor task owning session state** → semantics match upstream; the hazard table above is mostly wins.
+- ⛔ **`Arc<Mutex<Session>>` shared across tasks** → you inherit every upstream race *plus* a new class
+  upstream never had. Specifically: holding a lock across `.await`, and putting a **non**-cancel-safe
+  future in a `select!` branch (the one real Rust footgun — it silently drops data the same way the
+  JS generator did).
+
 ---
 
 ## §3 — Bottom line
@@ -288,6 +316,7 @@ flowchart LR
 | **(b)** Reimplement FULL feature surface | **Not worth it, and unnecessary.** Every rich feature independently droppable; ~930 lines are vendor-specific (JetBrains/AIR). | ~3.1k more lines, mostly optional | **High** — each feature's ranges are isolable |
 | **(c)** Control-channel subset (from §1) | **Small and well-understood.** Five subtypes carry the core. | a few hundred Rust lines | **High** |
 | SDK in-process MCP over control channel | **Deferred.** The one piece with real design; not needed today. | dense but self-contained | **High** |
+| Rust concurrency capability | **Not a risk — a net win.** Cancel-safe `recv()` dissolves the worst JS hazard outright; the actor pattern is already the house style. Conditional on choosing actor-over-mutex early. | design decision, not line count | **High** — verified against tokio source and existing repo code |
 | **Genuinely new blockers** | **None found.** | — | **Medium** — absence of evidence over one read |
 
 ### New constraints found (beyond the known "undocumented, therefore fragile" risk)
@@ -303,6 +332,9 @@ flowchart LR
 - ✅ **Proceed** on the core port (a), carrying §1 as the driver's requirements spec.
 - ⛔ **Explicitly descope** the full feature surface (b).
 - ⚠️ Treat the **turn-settlement state machine**, not the wire format, as the schedule risk.
+- 🔒 **Commit to the actor pattern for session state on day one** (as `acp_connection.rs` already
+  does). Not a stylistic preference: it is what preserves upstream's implicit run-to-completion
+  atomicity. Choosing `Arc<Mutex<Session>>` instead imports a race class upstream never had.
 - 🔬 **Before committing implementer time:** build a differential harness that runs identical prompts
   through the Node path and the Rust path and diffs the resulting `SessionUpdate` streams. That is
   the test suite upstream has and a from-scratch port otherwise does not.
