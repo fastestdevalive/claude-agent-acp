@@ -1,12 +1,27 @@
 # Feasibility: a native-Rust replacement for `@agentclientprotocol/claude-agent-acp`
 
 **Question:** can a Rust ACP-driving tool (vibe-station, or anything shaped like it) drop
-Bun/Node/npm entirely for Claude support — and does `@anthropic-ai/claude-agent-sdk` have to be
-ported too?
+Bun/Node/npm entirely for Claude support?
 
-**Answer in one line:** yes — bypass the SDK (proven), port ~3.2k lines of the adapter's core
-(bounded), skip the rest (unnecessary). No technical wall found; three new behavioral constraints
-found.
+**Answer in one line:** yes — port ~3.2k lines of the adapter's core (bounded, no technical wall),
+skip the rest (unnecessary). Three new behavioral constraints found; none is a blocker.
+
+> **Settled, not evaluated here:** `@anthropic-ai/claude-agent-sdk` is **not** being ported. It is a
+> thin wrapper for the spawn+prompt+parse use case, and the existing Rust spike already talks to the
+> `claude` binary directly without it. This document takes that as given. What survives from that
+> investigation is **§1 — the requirements the SDK's behavior imposes on any direct driver**, which
+> are not optional just because the SDK isn't being ported.
+>
+> <details><summary>One-line justification, for the record</summary>
+>
+> `query()` does no settings merging (`sdk.mjs:118:~7300` — it forwards `--setting-sources=`,
+> `--managed-settings` and a `--settings` blob and lets the CLI resolve), no retry/respawn/reconnect
+> (`sdk.mjs:118:11120` latches the error once), and holds no session state (`class Gg` fields at
+> `sdk.mjs:118:19873` are pure protocol plumbing; `hO` at `151:219410` even writes `session_id:""`).
+> The bundled MDM/plist/registry policy chain is reachable only through the separately-exported
+> `resolveSettings` (`o5`, `151:209894`), which the process transport never calls — all policy
+> resolution happens inside the `claude` binary.
+> </details>
 
 ---
 
@@ -32,8 +47,8 @@ Everything below is read from real artifacts on this machine — not docs, not m
 ```mermaid
 flowchart TD
     VS["vibe-station (Rust)<br/>ACP <b>client</b>"]
-    ADP["@agentclientprotocol/claude-agent-acp<br/>11,266 lines JS · Zed"]
-    SDK["@anthropic-ai/claude-agent-sdk<br/>1.32 MB bundle · Anthropic"]
+    ADP["@agentclientprotocol/claude-agent-acp<br/>11,266 lines JS · Zed<br/><b>← the port target</b>"]
+    SDK["@anthropic-ai/claude-agent-sdk<br/>already bypassed by the spike"]
     CLI["<b>claude</b> binary<br/>323 MB · closed source"]
 
     VS -->|"ACP JSON-RPC over stdio<br/>(agent-client-protocol crate)"| ADP
@@ -42,11 +57,9 @@ flowchart TD
 
     style VS fill:#1f6f3f,color:#fff
     style ADP fill:#8a5a00,color:#fff
-    style SDK fill:#8a5a00,color:#fff
+    style SDK fill:#4a4a4a,color:#bbb
     style CLI fill:#333,color:#fff
 ```
-
-Amber = the two Node/Bun layers to be removed. The `claude` binary stays either way.
 
 ### Target after the port
 
@@ -70,62 +83,45 @@ surface disappears from the port entirely.
 
 ---
 
-## Q1 — Does `claude-agent-sdk` need porting, or can it be bypassed?
+## §1 — Requirements the direct-to-`claude` driver must satisfy
 
-### Verdict: **bypass it.** The spike is already on the right side of the line.
+These are what the SDK was doing on your behalf. Not porting it means **inheriting these as
+requirements**, ordered by how badly each bites if missed.
 
-### What `query()` does NOT do (so nothing is lost)
-
-| Suspected responsibility | Reality | Evidence |
-| --- | --- | --- |
-| Settings merging | **None.** Forwards `--setting-sources=`, `--managed-settings`, `--settings` blob and lets the CLI resolve. | `sdk.mjs:118:~7300`; merge helper `m1` at `118:213` |
-| MDM / registry / plist policy | **Bundled but unreachable** from `query()` | Defined `sdk.mjs:151:20500` (paths), `151:57103` (macOS plist), `151:205007` (Win/WSL `reg.exe`), `151:197963` (6-tier merge) — all reachable only via exported `resolveSettings` (`o5`, `151:209894`), which the transport never calls |
-| Retry / respawn / reconnect | **None.** Spawn error latched once, iterator throws. | `sdk.mjs:118:11120`; only backoff in file (`[200,800]`) is the transcript batcher, gated on `sessionStore` |
-| Session state / history / compaction | **None.** Stateless pass-through. | `class Gg` fields at `sdk.mjs:118:19873` are pure protocol plumbing |
-| Session id tracking | **None** — writes `session_id:""` | `hO`, `sdk.mjs:151:219410` |
-| PATH lookup for `claude` | **None.** Fixed candidate list over optional native packages. | `b1`, `sdk.mjs:118:17481`; musl detect `118:17296` |
-
-### What a hand-rolled spawn+parse WOULD miss
-
-These are the load-bearing bits. Ordered by how badly they bite.
-
-| # | Finding | Why it matters | Evidence |
+| # | Requirement | Consequence if missed | Evidence |
 | --- | --- | --- | --- |
-| 1 | **System prompt, agents, hooks, skills, `toolAliases`, `supportedDialogKinds` are sent in the `initialize` control_request — not as CLI flags** | Control channel is on the critical path immediately, not "later, for permissions" | `sdk.mjs:120:~4100` |
-| 2 | **`hasBidirectionalNeeds()` suppresses close-stdin-after-prompt** whenever a `canUseTool`/hook/MCP/elicitation callback is registered | Close stdin early with a permission callback live → **CLI deadlocks** | `sdk.mjs:118:20530` |
-| 3 | Real argv is `--output-format stream-json --verbose --input-format stream-json` — **`--print` is never passed** | The spike's argv differs from the SDK's. Non-interactive mode inferred from stream-json IO + `CLAUDE_CODE_ENTRYPOINT="sdk-ts"` | `sdk.mjs:118:4903`; `grep -o -- '"--print"' sdk.mjs` → **0 hits** |
-| 4 | `keep_alive` frames consumed silently | Naive parser leaks them to the caller | `sdk.mjs:118:23865` |
-| 5 | `suppressControlResponse` sentinel = *deliberately never answer* | Answering anyway breaks the handoff to a more capable client | `sdk.mjs:118:19850` |
-| 6 | `pending_permission_requests` / `pending_user_dialog_requests` replay on the `initialize` response | Dropped permission prompts on resume | `sdk.mjs:120:~8200` |
-| 7 | `control_cancel_request` for in-flight cancellation | — | `sdk.mjs:118:~24900` |
-| 8 | stderr drain-before-exit race + 2 KB stderr tail | Turns "exit code 1" into an actionable message | `sdk.mjs:118:704`, `118:786` |
-| 9 | A `result` with `is_error` **replaces** the raw process error | Much better diagnostics | `sdk.mjs:118:~24200` |
-| 10 | SIGTERM→SIGKILL ladder (2 s / 5 s) via a **separate** forwarded abort controller | Wiring the user's signal straight to `spawn` hard-kills instead | `sdk.mjs:118:~14900`, controller at `118:3400` |
-| 11 | Module-global `process.on("exit")` child reaper | Orphaned `claude` processes | `sdk.mjs:118:806`–`949` |
+| 1 | **Send `systemPrompt`, `agents`, `hooks`, `skills`, `toolAliases`, `supportedDialogKinds` in the `initialize` control_request — not as CLI flags** | Control channel is on the critical path from day one, not a later phase for permission prompts | `sdk.mjs:120:~4100` |
+| 2 | **Do not close stdin after the prompt** once a `canUseTool`/hook/MCP/elicitation callback is registered | **CLI deadlocks** | `sdk.mjs:118:20530` (`hasBidirectionalNeeds()`) |
+| 3 | Use argv `--output-format stream-json --verbose --input-format stream-json`; set `CLAUDE_CODE_ENTRYPOINT` | **`--print` is never passed by the SDK** — the spike's argv differs. Non-interactive mode is inferred from stream-json IO + the entrypoint var | `sdk.mjs:118:4903`; `grep -o -- '"--print"' sdk.mjs` → **0 hits** |
+| 4 | Consume `keep_alive` frames silently | Naive parser leaks them to the caller | `sdk.mjs:118:23865` |
+| 5 | Honor the `suppressControlResponse` sentinel = *deliberately never answer* | Answering anyway breaks handoff to a more capable client | `sdk.mjs:118:19850` |
+| 6 | Replay `pending_permission_requests` / `pending_user_dialog_requests` from the `initialize` response | Dropped permission prompts on resume | `sdk.mjs:120:~8200` |
+| 7 | Handle `control_cancel_request` for in-flight cancellation | — | `sdk.mjs:118:~24900` |
+| 8 | Drain stderr before treating exit as final; keep a 2 KB stderr tail | "exit code 1" instead of an actionable message | `sdk.mjs:118:704`, `118:786` |
+| 9 | Let a `result` with `is_error` **replace** the raw process error | Much worse diagnostics | `sdk.mjs:118:~24200` |
+| 10 | SIGTERM→SIGKILL ladder (2 s / 5 s) via a **separate** forwarded abort controller | Wiring the user's signal straight to `spawn` hard-kills instead of closing gracefully | `sdk.mjs:118:~14900`; controller at `118:3400` |
+| 11 | Reap children on parent exit | Orphaned `claude` processes | `sdk.mjs:118:806`–`949` |
+| 12 | Resolve the binary yourself | SDK does **no PATH lookup** — fixed candidate list over optional native packages, glibc/musl ordering | `b1`, `sdk.mjs:118:17481`; musl detect `118:17296` |
 
-### Correction to the prior investigation
+### Control-channel subset to implement
 
-> **`CLAUDE_CODE_EXECUTABLE` does not exist in SDK 0.3.232.**
-> `grep -c` returns **0** across `sdk.mjs`, `sdk.d.ts`, `bridge.mjs`.
-
-- vibe-station sets it at `vst-agents/src/claude.rs:420`.
-- It works because **the adapter** reads it — `dist/acp-agent.js:233-236`, applied at `4908`.
-- The SDK only honors `options.pathToClaudeCodeExecutable`.
-
-### Size of the piece worth respecting
-
-| Component | Size | Port it? |
+| Scope | Size | Needed? |
 | --- | --- | --- |
-| `query()` itself | 3 statements (`sdk.mjs:152:477`) | Trivially |
-| Process transport `class Rk` | ~15 KB minified (`sdk.mjs:118:3022`) | argv + Node stream bookkeeping — reimplement |
-| **Control protocol `class Gg`** | **~22 KB minified ≈ 800–1000 source lines** (`sdk.mjs:118:19873`–`124:452`) | Subset only: `initialize`, `can_use_tool`, `interrupt`, `set_permission_mode`, `hook_callback` ≈ a few hundred Rust lines |
-| **In-process MCP over control channel** | `class Ik` (`sdk.mjs:118:19590`) + `connectSdkMcpServer` + `sendMcpServerMessageToCli` + `handleMcpControlRequest` | **The only piece with real design.** Bidirectional JSON-RPC id correlation + outbound-id short-circuit. **vibe-station does not use it today.** |
+| `initialize`, `can_use_tool`, `interrupt`, `set_permission_mode`, `hook_callback` | ~a few hundred Rust lines | ✅ Yes — this is the core |
+| Full `class Gg` surface (~35 outbound subtypes) | ~22 KB minified ≈ 800–1000 source lines (`sdk.mjs:118:19873`–`124:452`) | ❌ No — most are one-liners for features being skipped |
+| **In-process MCP server over the control channel** — `class Ik` (`sdk.mjs:118:19590`) + `connectSdkMcpServer` + `sendMcpServerMessageToCli` + `handleMcpControlRequest` | Bidirectional JSON-RPC id correlation + outbound-id short-circuit | ❌ Not today. **The one piece with real design** — if it's ever needed, port it carefully rather than reinventing |
+
+> **Correction to the prior investigation.** `CLAUDE_CODE_EXECUTABLE` **does not exist in SDK
+> 0.3.232** — `grep -c` returns **0** across `sdk.mjs`, `sdk.d.ts`, `bridge.mjs`. vibe-station sets
+> it (`vst-agents/src/claude.rs:420`) and it works because **the adapter** reads it
+> (`dist/acp-agent.js:233-236`, applied at `4908`). The SDK only honors
+> `options.pathToClaudeCodeExecutable`. A native driver owns this resolution outright.
 
 ---
 
-## Q2 — Is `claude-agent-acp` portable, and how much is needed?
+## §2 — Is `claude-agent-acp` portable, and how much is needed?
 
-### Verdict: **portable, no technical wall.** But the honest number is ~3.2k lines, not 7,100.
+### Verdict: **portable, no technical wall.** The honest number is ~3.2k lines, not 7,100.
 
 ### Package inventory (11,266 lines total)
 
@@ -153,7 +149,7 @@ pie showData
 
 > Caveat: buckets interleave inside `runConsumer` and `createSession` rather than sitting in clean
 > blocks, and a large share of "core" lines are **prose comments** — the turn-lifecycle region
-> `1215–1845` is roughly half commentary.
+> `1215–1845` is roughly half commentary. Treat 3,150 as an estimate with real error bars.
 
 ### (A) Protocol-necessary core — must port
 
@@ -274,29 +270,24 @@ against**.
 
 ---
 
-## Q3 — Bottom line
-
-The three components sit in three different risk categories. Conflating them is what makes this look
-like a yes/no question.
+## §3 — Bottom line
 
 ```mermaid
 flowchart LR
-    A["<b>(a)</b> Bypass claude-agent-sdk<br/>✅ proven"] --> B["<b>(b)</b> Port adapter CORE<br/>🟡 bounded work"]
-    B --> C["<b>(c)</b> Port FULL surface<br/>⛔ don't"]
+    A["<b>Port adapter CORE</b><br/>🟡 bounded work<br/>~3.2k lines"] --> B["<b>Port FULL surface</b><br/>⛔ don't<br/>~3.1k more, all optional"]
 
-    style A fill:#1f6f3f,color:#fff
-    style B fill:#8a6d00,color:#fff
-    style C fill:#5a1f1f,color:#fff
+    style A fill:#8a6d00,color:#fff
+    style B fill:#5a1f1f,color:#fff
 ```
 
 ### Scoring
 
 | Component | Verdict | Rough scope | Confidence |
 | --- | --- | --- | --- |
-| **(a)** Bypass `claude-agent-sdk` entirely | **Low-risk / already proven.** Spike did it; genuinely thin for spawn+prompt+parse. | ~0 (done) + a few hundred lines for the control-channel subset | **High** — read the real bundle; `resolveSettings` verified unreachable from `query()` |
-| **(b)** Reimplement adapter CORE in Rust | **Real but bounded.** No blocker; ACP framing free; in-process `AcpTransport` removes the agent side. Cost = the undocumented turn-settlement state machine. | ~3.2k JS-equivalent lines; less for vibe-station's 8-of-14 surface | **Medium-high** — line-accounted, but comment-heavy JS makes it soft |
-| **(c)** Reimplement FULL feature surface | **Not worth it, and unnecessary.** Every rich feature independently droppable; ~930 lines are vendor-specific (JetBrains/AIR). | ~3.1k more lines, mostly optional | **High** — each feature's ranges are isolable |
-| SDK in-process MCP over control channel | **The one piece with real design.** Port carefully *if* needed; not needed today. | ~22 KB minified `class Gg`, MCP multiplexing is the dense part | **High** |
+| **(a)** Reimplement adapter CORE in Rust | **Real but bounded.** No blocker; ACP framing free; in-process `AcpTransport` removes the agent side. Cost = the undocumented turn-settlement state machine. | ~3.2k JS-equivalent lines; less for vibe-station's 8-of-14 surface | **Medium-high** — line-accounted, but comment-heavy JS makes it soft |
+| **(b)** Reimplement FULL feature surface | **Not worth it, and unnecessary.** Every rich feature independently droppable; ~930 lines are vendor-specific (JetBrains/AIR). | ~3.1k more lines, mostly optional | **High** — each feature's ranges are isolable |
+| **(c)** Control-channel subset (from §1) | **Small and well-understood.** Five subtypes carry the core. | a few hundred Rust lines | **High** |
+| SDK in-process MCP over control channel | **Deferred.** The one piece with real design; not needed today. | dense but self-contained | **High** |
 | **Genuinely new blockers** | **None found.** | — | **Medium** — absence of evidence over one read |
 
 ### New constraints found (beyond the known "undocumented, therefore fragile" risk)
@@ -309,8 +300,8 @@ flowchart LR
 
 ### Recommendation
 
-- ✅ **Proceed** on (a) and (b).
-- ⛔ **Explicitly descope** (c).
+- ✅ **Proceed** on the core port (a), carrying §1 as the driver's requirements spec.
+- ⛔ **Explicitly descope** the full feature surface (b).
 - ⚠️ Treat the **turn-settlement state machine**, not the wire format, as the schedule risk.
 - 🔬 **Before committing implementer time:** build a differential harness that runs identical prompts
   through the Node path and the Rust path and diffs the resulting `SessionUpdate` streams. That is
