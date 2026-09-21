@@ -274,7 +274,7 @@ skills/rust-coding/
 - **Decision:** a `fake-claude` binary replays recorded stream-json transcripts and answers control requests; the Node adapter and the Rust crate each run against it via `CLAUDE_CODE_EXECUTABLE` (R30); an `acp-recorder` binary records each side's ordered ACP frames.
 - **Rationale:** a live model is nondeterministic (text, ids, chunk boundaries), so a live diff cannot be stable; the same CLI transcript through both adapters isolates exactly the logic being ported.
 - **Normalization:** ids, uuids and timestamps are replaced by placeholders numbered by first appearance; everything else, including frame order, must match exactly.
-- **Real recording:** each corpus transcript is recorded once from a real `claude` (`porting/record-real.sh`, human-run, Q3) and committed; until then hand-authored transcripts unblock all phases.
+- **Real recording:** uses the already-logged-in local `claude` (no extra account); costs a few prompts per script; each corpus transcript is recorded once from a real `claude` (`porting/record-real.sh`) and committed; until then hand-authored transcripts unblock all phases.
 - **Where:** `rust/fake-claude/`, `rust/acp-recorder/`, `porting/capture.sh`, `porting/corpus/`, `porting/fixtures/`, `C/tests/differential.rs`.
 - **Transcript shape** (one JSON object per step, JSONL):
 
@@ -519,6 +519,7 @@ stdout: newline-delimited JSON
 | G9 | `cfg` confined to `process.rs` (D12) | `grep -rEn 'cfg!?\(.*(unix\|windows\|target_)' rust/claude-agent-acp-rs/src/` hits only `process.rs` | respawn |
 | G10 | Dependency pin holds (D9) | `cargo tree -p agent-client-protocol` shows `2.1.0`; `cargo tree -d` shows no ACP duplicate | respawn |
 
+- **Monitoring:** while an implementer runs, the orchestrator checks `vst session output <id> --lines=100` every 10–15 minutes; steer with `vst session send` on drift, a stall, or a stuck test (no output progress across two checks).
 - Retries: `implementer.turn.max_retries: 2`, then escalate per `PHASES.md:48`.
 - Pass → auto-commit `chore(sdlc): claude-acp-rust/<NN> implement phase <N>/<total>`.
 - Human checkpoints (`.vibekit/config.yaml` `pause_after`): after phase 2 (harness exists) and phase 6 (turn machine).
@@ -628,7 +629,7 @@ stdout: newline-delimited JSON
 - [ ] **2.1** `rust/fake-claude/` — replay engine per D13 (`expect` subset match, `$REQ` substitution, loud failure on mismatch, `keep_alive` injection option)
 - [ ] **2.2** `porting/capture.sh` — builds Node adapter, runs `acp-recorder` against it with fake-claude, writes the fixture; also dumps `<name>.argv.json` and `initialize.json` from the fake's captured stdin
 - [ ] **2.3** Corpus ≥ 10 transcripts (real recordings preferred; a hand-authored one is named `*.synthetic.transcript.jsonl` and must be re-recorded via 2.4 before phase 13): text-only · single tool · multi-tool · streamed partial tool input · permission-allow · permission-deny · cancel-mid-turn · subagent/Task with drain · error-result · idle-without-result (#825) · resume/load
-- [ ] **2.4** `porting/record-real.sh` — human-run one-time recording from real `claude` into a transcript (Q3); not run by the gate
+- [ ] **2.4** `porting/record-real.sh` — human-run one-time recording from real `claude` into a transcript ; not run by the gate
 - [ ] **2.5** Capture and commit fixtures for every corpus script
 
 **Verify phase 2:**
@@ -971,7 +972,7 @@ stdout: newline-delimited JSON
 | 12 | Two copies of `agent-client-protocol` in vibe-station's graph | Caret + committed lock + G10; `cargo tree -d` in follow-up | 0, follow-up |
 | 13 | Windows/macOS code rots | G8 cross-`check` + G9 cfg confinement | all |
 | 14 | `claude` does not exit on stdin EOF, so INV-28 cannot hold | 3.T8 proves it against the fake; re-check against real `claude` in `record-real.sh` | 3 |
-| 15 | Fake `claude` diverges from real CLI behaviour | Transcripts recorded from real `claude` once (Q3); re-record on each sync | 2 |
+| 15 | Fake `claude` diverges from real CLI behaviour | Transcripts recorded once from the logged-in local `claude`; re-record on each sync | 2 |
 | 16 | Client-side `session/load` history replay is needed by vibe-station | Q6 answered before cutover; D15 | follow-up |
 | 17 | `claude`'s own children (MCP servers, Bash subprocesses) share its process group and can outlive a SIGKILLed host; INV-28 covers `claude` only | Accept for v0.1; record in `PARITY.md`; revisit with a group-kill helper | 3 |
 
@@ -1013,6 +1014,5 @@ flowchart LR
 
 | # | Question | Blocks |
 |---|----------|--------|
-| Q3 | Which real Anthropic account records the corpus transcripts once (`record-real.sh`)? Replay needs none; recording costs a few prompts per script | 2.4 only |
 | Q5 | Does `/sdlc turn-implement`'s own `meta_harness` spawn land in this worktree? Manual `vst session create` does (B-11); the sdlc path is unobserved | first phase-0 spawn |
 | Q6 | Does vibe-station rely on history replay from `session/load` (D15)? | vibe-station cutover |
