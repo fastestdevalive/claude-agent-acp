@@ -4,7 +4,9 @@
 
 pub mod codec;
 pub mod control;
+pub mod dispatch;
 pub mod process;
+pub mod session;
 
 #[cfg(test)]
 mod tests {

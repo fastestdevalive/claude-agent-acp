@@ -192,11 +192,15 @@ skills/rust-coding/
 - **Rationale:** JS run-to-completion atomicity is implicit upstream; a line-by-line port onto shared locks imports races upstream never had (R16 shows the lock failure mode). House pattern: `vst-agents/src/acp_connection.rs:1-25`.
 - **Where:** `C/src/session.rs`. Enforced by `rust-coding` §3, §4, §10 and guard G5.
 
+> **Phase-5 deviations (implementer, D4):** (1) The actor's read loop (5.3) is one `tokio::select!` (`biased`) multiplexing the `Command` channel, the codec stream, an injected turn-completion lane and the cancel token; on cancel it drains any remaining queued stream messages via `try_recv()` before exiting (INV-15). `run_dispatch` is kept as the reusable stream-only sequential pump in `dispatch.rs` (used by 5.T1); the actor reuses the shared `dispatch::route()` classification rather than `run_dispatch` itself, because it must multiplex four inputs. (2) Phase-5 turn completion is an **injected** `mpsc::UnboundedReceiver<()>` completion lane (`Session::spawn` param) — phase 6 replaces it with `result`-frame handling; a prompt's `oneshot` reply resolves on that lane. (3) Outbound user frames go to an `Option<Control>` (D6); `None` in actor-only unit tests. (4) The one-active-turn high-water counter is an `Arc<AtomicUsize>` (fetch_max) exposed via `Session::high_water()` — an atomic, not a Mutex/RwLock, so G5 stays clean. (5) `Command::Cancel` is a placeholder variant (real behaviour is phase 11).
+
 ### Decision D5: Dispatch is a public, injectable unit from day one
 
 - **Decision:** `pub fn route(msg: &StreamMsg, view: &TurnView) -> Route` plus a runner `pub async fn run_dispatch(rx, handler: impl Handler)` in its own file.
 - **Rationale:** R12 — the prior port's untested ordering layer was rewritten three times because it was private.
 - **Where:** `C/src/dispatch.rs`; ordering test INV-13.
+
+> **Phase-5 deviation (implementer, D5):** `run_dispatch(rx, handler)` matches the plan signature exactly — a stream-only sequential pump with no `tokio::spawn` (R13); the cancel token lives in the session actor's own `select!` loop (5.3), not in `run_dispatch`. `route(&StreamMsg, &TurnView) -> Route` classifies purely by frame `type` in phase 5; `TurnView` is accepted (`_view`) as the phase-6 seam. The `Handler` trait is the injected sink (a recording handler in 5.T1).
 
 ### Decision D6: One writer owns child stdin — user messages and control traffic alike
 
@@ -295,6 +299,8 @@ skills/rust-coding/
 > **Phase-1 deviations (implementer, D13):** (1) `diff_frames`/`Frame`/`JsonPath` live in `C/tests/common/mod.rs`; `acp-recorder` cannot share them because it depends on `claude-agent-acp-rs` (a `C/tests`→`acp-recorder` dep would be a crate cycle), so the recorder's `Frame`/`Direction` are a small duplicate in `acp-recorder/src/frames.rs`. (2) The 1.T4 integration test therefore lives in `acp-recorder/tests/recorder.rs` (not `C/tests/differential.rs`). (3) The "session/cancel after N updates" call is encoded as a `cancel_after_updates: <n>` field on the `session/prompt` step (script JSON), not a separate step. (4) `thiserror` added to `acp-recorder`'s `[dependencies]` (already in the lock via `claude-agent-acp-rs`, so no new crate/version drift).
 
 > **Phase-2 deviations (implementer, D13):** (1) `fake-claude` records the received argv/env to `$FAKE_CLAUDE_ARGV_OUT` and the received `initialize` control_request to a new `$FAKE_CLAUDE_INIT_OUT` (the plan's "captured stdin" wording maps to that file). (2) The `acp-recorder` script format gained a `session/load` step (`call:"session/load"`, `session_id`, `cwd`) — a phase-1 file was touched to support the resume/load corpus script. (3) `acp-recorder::record` now returns the captured frames even when the script's final step errors (e.g. the `error-result` / `idle-without-result` corpora whose `session/prompt` legitimately returns a JSON-RPC error); a hard error is only returned when no frame was exchanged. (4) `run_script` inserts a 75 ms settle after `session/new`/`session/load` so the adapter's `setTimeout(0)` `available_commands_update` lands deterministically before the next step (2.T1 requires byte-identical captures). (5) The real SDK emits `--resume=<id>` (with `=`), not the plan's `--resume <id>`; the resume-load argv confirms it. (6) B2 rows `--model <m>` and `--mcp-config <json>` are conditional/`skipped-deliberate` and are not exercised by any corpus script; 2.T4 asserts every row the corpus does exercise (flags + `CLAUDE_CODE_ENTRYPOINT` / `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` / `NODE_OPTIONS` absent). (7) All 11 corpus transcripts are hand-authored (not yet re-recorded from real `claude`); each must be re-recorded via `record-real.sh` before phase 13 (2.3 rule). (8) **Env allow-list (security):** `fake-claude` dumps `{"argv":[...],"env":{...},"node_options_present":bool}` where `env` is restricted to exactly `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` (the two vars the B2 table requires the port to set); `node_options_present` is a boolean for the `NODE_OPTIONS`-deleted check. No other process env var (tokens, sockets, paths) is ever persisted — verified by 2.T7. (9) **Portability:** `capture.sh` runs the Node adapter under a fresh `HOME`/`CLAUDE_CONFIG_DIR` so local skills/commands/settings cannot leak into frames, and normalises the worktree root → `$ROOT` and the fake-claude binary → `$FAKE_CLAUDE` in frames and argv (2.T1 requires byte-stable fixtures across machines).
+
+> **Phase-5 fix (implementer, D13):** the phase-2 test `capture_is_deterministic_across_runs` re-runs `capture.sh`, which rewrote the committed `*.argv.json` because `fake-claude` persisted the **raw** `CLAUDE_CODE_ENTRYPOINT` value (`sdk-cli` vs `cli`, environment-dependent). A test must never mutate committed fixtures. `fake-claude::record_argv_env` now records only the **presence** of `CLAUDE_CODE_ENTRYPOINT`, normalising its value to `"$ENTRYPOINT"` in `*.argv.json` (the raw value never reaches a fixture); `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` stays raw (`"1"`). The 11 `*.argv.json` fixtures were regenerated once. 2.T1 (byte-identical across runs) and 2.T4 (presence-only) stay green; `git status --short porting` is empty after repeated gate/capture runs. **Separately observed (pre-existing, NOT fixed here — out of phase-5 scope):** `permission-deny.frames.jsonl` is nondeterministic across **full** `capture.sh` (all-corpora) runs — a `tool_call_update` frame (Bash tool-result echo, `content:[]`) races the `session/request_permission` frame in the Node adapter and flips present/absent. Confirmed with HEAD (unmodified) `fake-claude`, so it is independent of the entrypoint fix. The gate does not hit it (its phase-2 capture re-runs only `text-only`, which is deterministic); it surfaces only when a full `capture.sh` is run and should be addressed as a phase-2 corpus/recorder determinism fix (a settle or transcript reorder) before phase 13.
 
 ### Decision D14: No actor awaits an external round-trip inline
 
@@ -732,18 +738,18 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - The actor's read loop is `tokio::select!` between a cancel token and `rx.recv()` on the codec's `mpsc` (R8) — never a stored `next()` future.
 - `tokio::spawn` per message is banned in the dispatch path (R13).
 
-- [ ] **5.0** Read `rust/AGENTS.md`
-- [ ] **5.1** `session.rs` — actor, `Command` enum, reply oneshots
-- [ ] **5.2** `dispatch.rs` — `route` + `run_dispatch`, sequential, order-preserving
-- [ ] **5.3** Read loop: `select!` on cancel token vs `recv()`
-- [ ] **5.4** One-active-turn enforcement + a test-visible high-water counter
+- [x] **5.0** Read `rust/AGENTS.md`
+- [x] **5.1** `session.rs` — actor, `Command` enum, reply oneshots
+- [x] **5.2** `dispatch.rs` — `route` + `run_dispatch`, sequential, order-preserving
+- [x] **5.3** Read loop: `select!` on cancel token vs `recv()`
+- [x] **5.4** One-active-turn enforcement + a test-visible high-water counter
 
 **Verify phase 5:**
-- [ ] **5.T1** Unit — `dispatch`: 1000 messages through an injected handler arrive in send order, under `#[tokio::test(flavor = "multi_thread")]` — `inv_13_dispatch_order`
-- [ ] **5.T2** Unit — `session`: 25 concurrent `Command::Prompt` on one session with an injected fake turn-completion → high-water active turns == 1, all 25 resolve in order — `inv_14_one_active_turn`
-- [ ] **5.T3** Unit — `session`: a cancel racing the loop's idle `recv` loses no queued message — `inv_15_cancel_loses_nothing`
-- [ ] **5.T4** Regression — G5 clean: the gate's clippy run has no `disallowed-types` hit in `src/`
-- [ ] **5.T5** Regression — `timeout 120`; no test hangs
+- [x] **5.T1** Unit — `dispatch`: 1000 messages through an injected handler arrive in send order, under `#[tokio::test(flavor = "multi_thread")]` — `inv_13_dispatch_order`
+- [x] **5.T2** Unit — `session`: 25 concurrent `Command::Prompt` on one session with an injected fake turn-completion → high-water active turns == 1, all 25 resolve in order — `inv_14_one_active_turn`
+- [x] **5.T3** Unit — `session`: a cancel racing the loop's idle `recv` loses no queued message — `inv_15_cancel_loses_nothing`
+- [x] **5.T4** Regression — G5 clean: the gate's clippy run has no `disallowed-types` hit in `src/`
+- [x] **5.T5** Regression — `timeout 120`; no test hangs
 
 ---
 

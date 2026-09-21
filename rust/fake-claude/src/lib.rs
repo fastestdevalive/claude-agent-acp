@@ -137,14 +137,26 @@ const ARGV_ENV_ALLOWLIST: [&str; 2] = [
 /// `node_options_present` (whether `NODE_OPTIONS` was set). No other
 /// environment variable may ever be persisted, so live credentials and
 /// machine-specific paths never reach the committed fixtures.
+///
+/// Portability: the *presence* of `CLAUDE_CODE_ENTRYPOINT` is what matters
+/// (B2 requires the port to set it); its raw value differs by environment
+/// (`sdk-cli` vs `cli`) and must never reach a committed fixture (2.T1, the
+/// deterministic-capture invariant). It is therefore recorded only as
+/// `"$ENTRYPOINT"` — the committed argv fixture is byte-stable across
+/// environments even though the value is not.
 pub fn record_argv_env(out: &Path, argv: &[String]) -> std::io::Result<()> {
     let mut env_map = serde_json::Map::new();
     for key in ARGV_ENV_ALLOWLIST {
-        if let Some(value) = env::var_os(key) {
-            env_map.insert(
-                key.to_string(),
-                Value::String(value.to_string_lossy().into_owned()),
-            );
+        if env::var_os(key).is_some() {
+            let value = if key == "CLAUDE_CODE_ENTRYPOINT" {
+                // Presence-only: normalise away the environment-specific value.
+                "$ENTRYPOINT".to_string()
+            } else {
+                env::var_os(key)
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            env_map.insert(key.to_string(), Value::String(value));
         }
     }
     let node_options_present = env::var_os("NODE_OPTIONS").is_some();
