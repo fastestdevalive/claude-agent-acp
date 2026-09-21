@@ -1,10 +1,11 @@
-//! Turn state machine & settlement (the R7 cost centre; items 6.1–6.6).
+//! Turn state machine & settlement (the R7 cost centre; items 6.1–6.6, reworked
+//! for review 04).
 //!
 //! A turn is one `session/prompt` from enqueue to settle. This module owns the
 //! reverse-engineered state machine that settles a turn — the logic the Node
 //! adapter spreads across `dist/acp-agent.js` `1338–1682` (activate/settle/
-//! orphan), `1683–1845` (consumer loop), `2049–2163` (idle settle) and
-//! `2532–2884` (result → stop reason).
+//! orphan), `1683–1845` (consumer loop), `2049–2163` (idle settle),
+//! `2532–2884` (result → stop reason) and `3443–3612` (cancel).
 //!
 //! The session actor (phase 5, D4) drives a [`TurnMachine`] with the stream
 //! frames it classifies as session traffic ([`crate::dispatch`]); the machine
@@ -16,22 +17,25 @@
 //!
 //! ```text
 //! [*] --> Queued        : session/prompt enqueues
-//! Queued --> Activated  : echo of user message received
-//! Queued --> Abandoned  : cancel / next prompt before echo (known hole #825)
-//! Activated --> Streaming
-//! Streaming --> Deferred   : result arrives, subagents live
-//! Streaming --> Settled    : result arrives, no subagents
-//! Streaming --> Settled    : idle without result fails the turn
-//! Deferred --> Settled     : last subagent drains
-//! Streaming --> Settled    : force-cancel floor fires (phase 11)
-//! Abandoned --> Settled    : reconciled as orphan
+//! Queued --> Activated  : echo of user message received, or ensure_active_turn
+//! Queued --> Settled    : cancel sweep (message already pushed) [ADP:3471-3526]
+//! Queued --> Failed     : stream end / fail_all (never ran) [ADP:1814-1820]
+//! Activated --> Deferred   : result arrives, subagents live (#866)
+//! Activated --> Settled    : result arrives, no subagents (#773)
+//! Activated --> Failed     : idle without a result (#825)
+//! Deferred --> Settled     : followup autonomous result, or held idle drain
+//! Activated --> Settled    : stream end (deferred/scratch/cancelled)
+//! Deferred --> Settled     : cancel inline-settle [ADP:3538-3575]
+//! Activated --> Settled    : force-cancel floor (phase 11)
 //! Settled --> [*]
 //! ```
 //!
 //! "Echo" = the CLI re-emits the user message because argv has
 //! `--replay-user-messages` (B2). "Orphan" = a turn whose consumer left but
 //! whose `result` may still arrive; its result must not be consumed by the
-//! next turn (INV-30).
+//! next turn (INV-30). `owed_trailing_idles` absorbs the SDK's lagging
+//! `session_state_changed: idle` so it is not misread as the next turn being
+//! abandoned (#825 false-fail, ADP:2108-2118).
 //!
 //! ## Known unfixable hole: pre-echo abandonment (#825)
 //!
@@ -42,10 +46,45 @@
 //! is about to run. A turn abandoned before its echo therefore still hangs
 //! until cancel or the next prompt; only a timer could tell those apart
 //! (`acp-agent.js:2141-2153`). Documented, not fixed.
+//!
+//! ## Known omissions (deliberate, deferred to their own phases — review 04 #14)
+//!
+//! - **Steering** (`steeredEchoes`/`steeredSettle`, `_session/steering`):
+//!   the idle lane treats every turn as un-steered; `isSteering` is always
+//!   false. Phase that ports R32/steering must add the steer lanes.
+//! - **`msg_lifecycle_v1` orphan map** (`session.orphanCommands`): orphan
+//!   accounting uses only the coarse `pending_orphan_results` count, not the
+//!   per-uuid `command_lifecycle` lane. Coalescing of N queued commands into
+//!   one result can leave a stale count; the count self-heals at activation
+//!   (`ADP:1366`), bounding the damage. The two-phase `endedPerLevel` registry
+//!   sweep at activation (`ADP:1366-1390`) is likewise omitted: `live_subagents`
+//!   entries are removed only by their terminal frames.
+//!
+//! All three are recorded in the plan under Decision D4 and `PARITY.md` as
+//! pending, so their absence is intentional, not a silent drift.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
+
+/// Verbatim upstream message for a turn that reached `idle` with no result
+/// (`acp-agent.js:54-55`).
+pub const TURN_NO_RESULT_MESSAGE: &str = "The turn ended without a result: the agent went idle while this prompt was still in flight (e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
+
+/// Verbatim upstream message for a queued turn rejected when the stream ends
+/// (`acp-agent.js:282`).
+pub const SESSION_ENDED_MESSAGE: &str =
+    "The Claude Agent session has ended. Please start a new session.";
+
+/// The `origin.kind` values that mark a result as AUTONOMOUS (not the user's
+/// prompt) — `acp-agent.js:114-120`.
+const AUTONOMOUS_RESULT_ORIGINS: [&str; 5] = [
+    "task-notification",
+    "peer",
+    "coordinator",
+    "observer",
+    "observer-activity",
+];
 
 /// The ACP `stopReason` a settled turn reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,18 +114,71 @@ impl StopReason {
     }
 }
 
+/// The reason a turn failed — the category a client maps to a JSON-RPC error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// `Please run /login` (upstream `RequestError.authRequired`).
+    AuthRequired,
+    /// An `is_error` result from the provider.
+    ProviderError,
+    /// `error_max_budget_usd` with `is_error`.
+    BudgetExhausted,
+    /// `error_max_turns` with `is_error`.
+    ContextExhausted,
+    /// Idle reached with no result (`#825`; `TURN_NO_RESULT_MESSAGE`).
+    NoResult,
+    /// The stream ended and the turn never ran (`SESSION_ENDED_MESSAGE`).
+    SessionEnded,
+}
+
+impl FailureKind {
+    /// A default message used by [`TurnMachine::fail_all`] when the caller
+    /// supplies no per-turn detail. Result-driven failures carry the result's
+    /// own text instead (see `on_result`).
+    pub fn default_message(self) -> &'static str {
+        match self {
+            FailureKind::AuthRequired => "Authentication required. Please run /login.",
+            FailureKind::ProviderError => "The model provider returned an error.",
+            FailureKind::BudgetExhausted => "The turn exceeded its budget.",
+            FailureKind::ContextExhausted => "The context window was exhausted.",
+            FailureKind::NoResult => TURN_NO_RESULT_MESSAGE,
+            FailureKind::SessionEnded => SESSION_ENDED_MESSAGE,
+        }
+    }
+}
+
+/// Token usage attributed to a settled turn — the per-turn `accumulatedUsage`
+/// accumulator snapshot reported in every `PromptResponse` (review 04 #14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_read_tokens: u64,
+    pub cached_write_tokens: u64,
+}
+
 /// Events the turn machine emits for the session actor to act on. These are
 /// internal — ACP emission (session/update, prompt response) is phase 7+.
+/// `prompt_uuid` on every settle/fail/activate tells the actor which `oneshot`
+/// to resolve or reject (review 04 #11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
-    /// The active turn settled. The actor resolves the prompt with this
-    /// stop reason.
-    Settled { stop_reason: StopReason },
-    /// The active turn failed (idle without a result, an `is_error` result,
-    /// `Please run /login`, …). The actor rejects the prompt with this error.
-    Failed { message: String },
-    /// The active turn moved to the queue head / was activated.
-    Activated,
+    /// A turn settled. The actor resolves that prompt's oneshot with this stop
+    /// reason and usage.
+    Settled {
+        prompt_uuid: String,
+        stop_reason: StopReason,
+        usage: Usage,
+    },
+    /// A turn failed. The actor rejects that prompt's oneshot with the mapped
+    /// JSON-RPC error.
+    Failed {
+        prompt_uuid: String,
+        kind: FailureKind,
+        message: String,
+    },
+    /// A turn was activated / promoted to the queue head.
+    Activated { prompt_uuid: String },
     /// #453 result-text fallback: assistant text exists only in the `result`
     /// frame (no `stream_event` deltas, no consolidated `assistant` message),
     /// so the actor must forward it as its own message. Emission is phase 7.
@@ -140,10 +232,12 @@ impl Turn {
 ///
 /// Owned by the session actor (D4); only the actor mutates it. Fed with the
 /// session frames the actor routes to it; returns the [`TurnEvent`]s the actor
-/// must emit.
+/// must emit. Every lane ports the upstream contract at `ADP` 1338–3612,
+/// reworked per review 04.
 #[derive(Debug, Default)]
 pub struct TurnMachine {
-    /// The active (in-flight) turn, if any.
+    /// The active (in-flight) turn, if any. `settle`/`fail_active` null it, like
+    /// upstream `settleActive`/`failActive` (review 04 #5).
     active: Option<Turn>,
     /// Turns waiting for their echo / result, FIFO.
     queue: VecDeque<Turn>,
@@ -151,12 +245,23 @@ pub struct TurnMachine {
     /// completion can defer a turn (`liveBackgroundTasks`, `isSubagent`).
     live_subagents: HashMap<String, bool>,
     /// Number of late results still expected from dead (cancelled) turns
-    /// (`pendingOrphanResults`). Late results are skipped, never attributed
-    /// to a live turn (INV-30).
+    /// (`pendingOrphanResults`). Late results are skipped, never attributed to
+    /// a live turn (INV-30). Decremented before the queue-head promotion
+    /// (`ADP:1439-1442`).
     pending_orphan_results: usize,
-    /// Whether the active turn was cancelled (its result is dropped at the
-    /// cancel guard; it settles at idle instead).
+    /// Number of trailing `idle` frames still owed by settled/autonomous/
+    /// cancelled turns (`owedTrailingIdles`) — absorbed by `on_idle` so a
+    /// lagging idle can't false-fail the next live turn (#825).
+    owed_trailing_idles: usize,
+    /// Whether the active turn was cancelled (its result is dropped; it settles
+    /// `cancelled` at the next idle).
     cancelled: bool,
+    /// The last `session_state_changed` state (`lastSessionState`), read by
+    /// `cancel()`'s held-turn debt rule (`ADP:3571`).
+    last_session_state: String,
+    /// Per-active-turn token accumulator (`accumulatedUsage`), reset at
+    /// activation and snapshot into every [`TurnEvent::Settled`].
+    accumulated_usage: Usage,
 }
 
 impl TurnMachine {
@@ -175,26 +280,74 @@ impl TurnMachine {
         self.queue.push_back(turn);
     }
 
-    /// Mark the active turn cancelled. Its `result` is dropped and the turn
-    /// settles `cancelled` at the next idle (phase 11 arms the force-cancel
-    /// floor; this is the settle-lane half).
-    pub fn cancel_active(&mut self) {
+    /// A `session/cancel` notification. Ports `ADP:3443-3612`'s turn-settlement
+    /// half (the wire `interrupt` is the actor's job): sweep every queued,
+    /// non-active turn to `Settled{Cancelled}` and seed one orphan per turn
+    /// (their user messages were already pushed), inline-settle a held active
+    /// turn `cancelled`, and mark the session cancelled so the live turn
+    /// settles `cancelled` at its trailing idle. Returns the events for the
+    /// actor to resolve.
+    pub fn cancel(&mut self) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
         self.cancelled = true;
+
+        // Sweep queued turns that haven't started yet (no echo): settle them
+        // now and seed an orphan per turn so their late results are skipped,
+        // not attributed to the next head (`ADP:3471-3526`).
+        let mut remaining = VecDeque::new();
+        for turn in self.queue.drain(..) {
+            if turn.settled {
+                remaining.push_back(turn);
+            } else {
+                self.pending_orphan_results += 1;
+                events.push(TurnEvent::Settled {
+                    prompt_uuid: turn.prompt_uuid,
+                    stop_reason: StopReason::Cancelled,
+                    usage: Usage::default(),
+                });
+            }
+        }
+        self.queue = remaining;
+
+        // Inline-settle a held active turn `cancelled` — during the hold the
+        // session is usually already idle, so the interrupt may produce no
+        // fresh idle for the cancelled-settle path to run on. Pre-count the
+        // interrupt's trailer debt unless the session already sits idle
+        // (`ADP:3528-3575`).
+        if self.active.as_ref().is_some_and(is_held_turn) {
+            if self.last_session_state != "idle" {
+                self.owed_trailing_idles += 1;
+            }
+            if let Some(active) = self.active.take() {
+                if !active.settled {
+                    let prompt_uuid = active.prompt_uuid.clone();
+                    let usage = self.accumulated_usage;
+                    events.push(TurnEvent::Settled {
+                        prompt_uuid,
+                        stop_reason: StopReason::Cancelled,
+                        usage,
+                    });
+                }
+            }
+        }
+        events
     }
 
-    /// Abandon the active turn as cancelled and clear the active slot, seeding
-    /// one orphan credit for its late `result` (INV-30). Models cancel() on a
-    /// turn whose user message was already pushed to `claude`: the SDK still
-    /// runs it and emits a result with no turn to match, so the credit keeps
-    /// that late result from being attributed to the next prompt.
-    pub fn abandon_active(&mut self) -> Vec<TurnEvent> {
+    /// Force-cancel the active turn and clear the active slot, seeding one
+    /// orphan credit for its late `result` (INV-30). This is the **force-cancel
+    /// floor** lane (phase 11, `ADP:1719-1752`), NOT `cancel()` — keep that
+    /// name for the review's `cancel()`. `abandon_active` is retained as this
+    /// method for phase 11.
+    pub fn force_cancel(&mut self) -> Vec<TurnEvent> {
         let mut events = Vec::new();
         if let Some(active) = self.active.as_mut() {
             if !active.settled {
                 active.settled = true;
                 self.pending_orphan_results += 1;
                 events.push(TurnEvent::Settled {
+                    prompt_uuid: active.prompt_uuid.clone(),
                     stop_reason: StopReason::Cancelled,
+                    usage: self.accumulated_usage,
                 });
             }
         }
@@ -217,15 +370,17 @@ impl TurnMachine {
     }
 
     /// A task settled (`task_notification` / terminal `task_updated`): it is no
-    /// longer live. If the active turn held open solely for it, drain it.
+    /// longer live. Per `ADP:2336-2352`, this ONLY removes the registry entry —
+    /// the held turn drains at the followup's autonomous result or at idle, NOT
+    /// here (review 04 #8). Returns no events.
     pub fn on_task_ended(&mut self, task_id: &str) -> Vec<TurnEvent> {
         self.live_subagents.remove(task_id);
-        self.settle_deferred_if_drained()
+        Vec::new()
     }
 
     /// The echo of a queued turn's user message arrives: promote it to active,
-    /// handing off any prior active turn. Returns any events (e.g. the prior
-    /// turn settling on hand-off).
+    /// handing off any prior active turn (cancelled first, then held, then
+    /// end_turn — `ADP:3027-3079`). Returns the hand-off + activation events.
     pub fn on_echo(&mut self, uuid: &str) -> Vec<TurnEvent> {
         let mut events = Vec::new();
         // Find the queued turn owning this uuid.
@@ -241,29 +396,50 @@ impl TurnMachine {
             Some(q) => q,
             None => return events,
         };
+        if let Some(prev) = self.active.take() {
+            if !prev.settled {
+                let (outcome, usage) = if self.cancelled {
+                    // A cancel is pending for the previous turn (its trailing
+                    // idle hasn't arrived yet): settle it `cancelled` and record
+                    // the interrupt's trailer debt so that lagged idle is
+                    // absorbed, not read as the freshly-activated turn ending
+                    // (`ADP:3034-3050`).
+                    self.owed_trailing_idles += 1;
+                    (StopReason::Cancelled, self.accumulated_usage)
+                } else if prev.deferred_settle.is_some() {
+                    // A held turn hands off with its recorded outcome, not a
+                    // guessed end_turn (`ADP:3051-3060`).
+                    (
+                        prev.deferred_settle.unwrap_or(StopReason::EndTurn),
+                        self.accumulated_usage,
+                    )
+                } else {
+                    (StopReason::EndTurn, self.accumulated_usage)
+                };
+                let mut prev = prev;
+                prev.settled = true;
+                let prompt_uuid = prev.prompt_uuid.clone();
+                events.push(TurnEvent::Settled {
+                    prompt_uuid,
+                    stop_reason: outcome,
+                    usage,
+                });
+            }
+        }
         self.activate(queued, &mut events);
         events
     }
 
-    /// A `result` frame for the user's turn. Handles the stop-reason table,
-    /// `is_error`, the `#453` result-text fallback, and settle-or-defer.
+    /// A `result` frame for the user's turn. Ports the full `ADP:2532-2884`
+    /// lane: the autonomous-origin gate, `ensureActiveTurn`, owed-trailing-idle
+    /// debt, usage accumulation, the stop-reason subtype table and the #453
+    /// result-text fallback.
     ///
     /// `assistant_text_delivered` tells whether any assistant text reached the
     /// client before this result (the actor tracks `emittedAssistantText`).
     pub fn on_result(&mut self, result: &Value, assistant_text_delivered: bool) -> Vec<TurnEvent> {
         let mut events = Vec::new();
-        let Some(active) = self.active.as_mut() else {
-            // A result with no active turn is an orphan (see 6.6): consume one
-            // pending-orphan credit, never promote it onto the next turn.
-            self.consume_orphan_result();
-            return events;
-        };
-
-        // A cancelled turn's result is dropped; it settles at idle.
-        if self.cancelled {
-            return events;
-        }
-
+        let is_autonomous = is_autonomous_result(result);
         let is_error = result
             .get("is_error")
             .and_then(Value::as_bool)
@@ -272,88 +448,315 @@ impl TurnMachine {
             .get("stop_reason")
             .and_then(Value::as_str)
             .unwrap_or("");
+        let result_text = result.get("result").and_then(Value::as_str).unwrap_or("");
+        let subtype = result.get("subtype").and_then(Value::as_str).unwrap_or("");
+
+        // An autonomous result (task-notification followup, or a peer/
+        // coordinator/observer cycle) is not the user's prompt's: it owes one
+        // trailing idle and may drain a held turn, but must never touch the
+        // user-turn lifecycle — orphan accounting, failActive, the fallback or
+        // the stop reason (`ADP:2532-2539`, `2713-2727`; review 04 #4).
+        if is_autonomous {
+            self.owed_trailing_idles += 1;
+            self.settle_deferred_if_drained(&mut events);
+            return events;
+        }
+
+        // A user-turn result needs an active turn: promote the queue head
+        // (echo-less local-only commands / compaction), settling any held turn
+        // first (`ADP:1408-1489`; review 04 #2).
+        self.ensure_active_turn(&mut events);
+
+        // Every user-turn result terminates a turn and is followed by a
+        // trailing idle — record the debt so that idle is absorbed, not read as
+        // the next turn being abandoned (#825). The one exclusion: the cancelled
+        // ACTIVE turn's own result, which is dropped below and settles at idle
+        // (or the echo hand-off) instead (`ADP:2622-2626`).
+        if !(self.cancelled && self.active.is_some()) {
+            self.owed_trailing_idles += 1;
+        }
+
+        // Accumulate usage into the active turn's tally (activation reset it).
+        // Autonomous results were already returned above, so they can't leak
+        // into a user turn's tally (`ADP:2633-2639`).
+        if let Some(usage) = result.get("usage") {
+            self.accumulated_usage.input_tokens += usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            self.accumulated_usage.output_tokens += usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            self.accumulated_usage.cached_read_tokens += usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            self.accumulated_usage.cached_write_tokens += usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+        }
+
+        // A cancelled turn's result is dropped; it settles at idle.
+        if self.cancelled {
+            return events;
+        }
 
         // A refusal can arrive on any result subtype (and may set is_error) —
-        // handle it before the subtype switch (`acp-agent.js:2736-2753`).
+        // handle it before the subtype switch (`ADP:2736-2753`).
         if stop_reason == "refusal" {
-            let outcome = StopReason::Refusal;
-            self.settle_or_defer(outcome, &mut events);
+            self.settle_or_defer(StopReason::Refusal, &mut events);
             return events;
         }
 
-        // `Please run /login` on a success result is an auth failure.
-        let result_text = result.get("result").and_then(Value::as_str).unwrap_or("");
-        if !is_error && result_text.contains("Please run /login") {
-            self.fail_active("auth_required: Please run /login".to_string(), &mut events);
-            return events;
+        // The subtype table, mirroring `ADP:2771-2848` case by case (review 04
+        // #6): `max_tokens` is checked before `is_error` for success /
+        // error_during_execution only; /login applies to success regardless of
+        // is_error; the error_max_* subtypes fail on is_error with their
+        // category, else map to max_turn_requests.
+        match subtype {
+            "success" => {
+                if result_text.contains("Please run /login") {
+                    self.fail_active(
+                        FailureKind::AuthRequired,
+                        result_text.to_string(),
+                        &mut events,
+                    );
+                    return events;
+                }
+                if stop_reason == "max_tokens" {
+                    self.settle_or_defer(StopReason::MaxTokens, &mut events);
+                    return events;
+                }
+                if is_error {
+                    self.fail_active(
+                        FailureKind::ProviderError,
+                        result_text.to_string(),
+                        &mut events,
+                    );
+                    return events;
+                }
+                // #453 result-text fallback: forward the result text when no
+                // assistant text was delivered and the turn produced no output
+                // tokens (the cache-replay signature), or for a local-only
+                // command. Only the success arm and only after the max_tokens
+                // break (`ADP:2804-2809`; review 04 #13).
+                let output_tokens = result
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let is_local = self
+                    .active
+                    .as_ref()
+                    .map(Turn::is_local_only_command)
+                    .unwrap_or(false);
+                if (is_local || (!assistant_text_delivered && output_tokens == 0))
+                    && !result_text.is_empty()
+                {
+                    events.push(TurnEvent::FinalText {
+                        text: result_text.to_string(),
+                    });
+                }
+                self.settle_or_defer(StopReason::EndTurn, &mut events);
+            }
+            "error_during_execution" => {
+                if stop_reason == "max_tokens" {
+                    self.settle_or_defer(StopReason::MaxTokens, &mut events);
+                    return events;
+                }
+                if is_error {
+                    self.fail_active(
+                        FailureKind::ProviderError,
+                        error_message(result, subtype),
+                        &mut events,
+                    );
+                    return events;
+                }
+                self.settle_or_defer(StopReason::EndTurn, &mut events);
+            }
+            "error_max_budget_usd" => {
+                if is_error {
+                    self.fail_active(
+                        FailureKind::BudgetExhausted,
+                        error_message(result, subtype),
+                        &mut events,
+                    );
+                    return events;
+                }
+                self.settle_or_defer(StopReason::MaxTurnRequests, &mut events);
+            }
+            "error_max_turns" => {
+                if is_error {
+                    self.fail_active(
+                        FailureKind::ContextExhausted,
+                        error_message(result, subtype),
+                        &mut events,
+                    );
+                    return events;
+                }
+                self.settle_or_defer(StopReason::MaxTurnRequests, &mut events);
+            }
+            "error_max_structured_output_retries" => {
+                if is_error {
+                    self.fail_active(
+                        FailureKind::ProviderError,
+                        error_message(result, subtype),
+                        &mut events,
+                    );
+                    return events;
+                }
+                self.settle_or_defer(StopReason::MaxTurnRequests, &mut events);
+            }
+            // Unknown subtypes are unreachable upstream (`unreachable()`); be
+            // safe and end the turn rather than panic (D8).
+            _ => {
+                self.settle_or_defer(StopReason::EndTurn, &mut events);
+            }
         }
-
-        let subtype = result.get("subtype").and_then(Value::as_str).unwrap_or("");
-        if is_error {
-            // An is_error result becomes an error, not a stop reason (6.5).
-            self.fail_active(error_message(result, subtype), &mut events);
-            return events;
-        }
-
-        // max_tokens overrides the subtype default.
-        let outcome = if stop_reason == "max_tokens" {
-            StopReason::MaxTokens
-        } else {
-            stop_reason_for_subtype(subtype)
-        };
-
-        // #453 result-text fallback: forward the result text when no assistant
-        // text was delivered and the turn produced no output tokens (the
-        // cache-replay signature), or for a local-only command.
-        let output_tokens = result
-            .get("usage")
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let is_local = active.is_local_only_command;
-        if (is_local || (!assistant_text_delivered && output_tokens == 0))
-            && !result_text.is_empty()
-        {
-            events.push(TurnEvent::FinalText {
-                text: result_text.to_string(),
-            });
-        }
-
-        self.settle_or_defer(outcome, &mut events);
         events
     }
 
     /// A `session_state_changed: idle` frame — the SDK's authoritative turn-over
-    /// signal. An unsettled active turn that reaches idle without a result is
-    /// the #825 signature and is failed. A held (deferred) turn drains here.
+    /// signal. Absorbs owed trailing idles before failing, in the order
+    /// `ADP:2081-2155` (review 04 #3): cancelled → settle; held → absorb debt +
+    /// drain; debt > 0 → absorb; else the #825 fail.
     pub fn on_idle(&mut self) -> Vec<TurnEvent> {
         let mut events = Vec::new();
-        if self.cancelled {
+        self.last_session_state = "idle".to_string();
+        if self.cancelled && self.active.as_ref().is_some_and(|t| !t.settled) {
             // A cancelled turn settles at idle (its result was dropped).
             self.cancelled = false;
             self.settle(StopReason::Cancelled, &mut events);
             return events;
         }
-        if self.is_held(&mut events) {
-            self.settle_deferred_if_drained();
+        if self.active.as_ref().is_some_and(is_held_turn) {
+            // A held turn absorbs one outstanding trailer debt, then drains once
+            // none of its subagents is left — the fallback when no followup
+            // result came (`ADP:2090-2107`). Must NOT fall through to #825.
+            if self.owed_trailing_idles > 0 {
+                self.owed_trailing_idles -= 1;
+            }
+            self.settle_deferred_if_drained(&mut events);
             return events;
         }
-        if self.active.as_ref().is_some_and(|t| !t.settled) {
+        if self.owed_trailing_idles > 0 {
+            // A settled/autonomous turn's lagging trailing idle — absorb it
+            // (`ADP:2108-2118`), never read it as the active turn abandoned.
+            self.owed_trailing_idles -= 1;
+            return events;
+        }
+        if !self.cancelled && self.active.as_ref().is_some_and(|t| !t.settled) {
             // #825: idle without a result — the model stream dropped mid-turn.
             self.fail_active(
-                "SDK went idle without emitting a result for the active turn".to_string(),
+                FailureKind::NoResult,
+                TURN_NO_RESULT_MESSAGE.to_string(),
                 &mut events,
             );
         }
         events
     }
 
+    /// The stream ended (EOF / codec death). Settle the active turn —
+    /// `cancelled` if a cancel is pending, otherwise its deferred outcome, else
+    /// the scratch end_turn — and reject every queued turn with
+    /// `SESSION_ENDED_MESSAGE` (`ADP:1771-1820`; review 04 #10).
+    pub fn on_stream_end(&mut self) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
+        if let Some(active) = self.active.take() {
+            if !active.settled {
+                let outcome = if self.cancelled {
+                    StopReason::Cancelled
+                } else {
+                    active.deferred_settle.unwrap_or(StopReason::EndTurn)
+                };
+                let prompt_uuid = active.prompt_uuid.clone();
+                let usage = self.accumulated_usage;
+                events.push(TurnEvent::Settled {
+                    prompt_uuid,
+                    stop_reason: outcome,
+                    usage,
+                });
+            }
+        }
+        for turn in self.queue.drain(..) {
+            if !turn.settled {
+                events.push(TurnEvent::Failed {
+                    prompt_uuid: turn.prompt_uuid,
+                    kind: FailureKind::SessionEnded,
+                    message: SESSION_ENDED_MESSAGE.to_string(),
+                });
+            }
+        }
+        events
+    }
+
+    /// Reject every in-flight turn with `kind` — a held active turn resolves
+    /// with its deferred outcome instead, mirroring `failAllTurns`
+    /// (`ADP:1658-1682`; review 04 #10).
+    pub fn fail_all(&mut self, kind: FailureKind) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
+        if let Some(active) = self.active.take() {
+            if !active.settled {
+                let prompt_uuid = active.prompt_uuid.clone();
+                if let Some(outcome) = active.deferred_settle {
+                    let usage = self.accumulated_usage;
+                    events.push(TurnEvent::Settled {
+                        prompt_uuid,
+                        stop_reason: outcome,
+                        usage,
+                    });
+                } else {
+                    events.push(TurnEvent::Failed {
+                        prompt_uuid,
+                        kind,
+                        message: kind.default_message().to_string(),
+                    });
+                }
+            }
+        }
+        for turn in self.queue.drain(..) {
+            if !turn.settled {
+                events.push(TurnEvent::Failed {
+                    prompt_uuid: turn.prompt_uuid,
+                    kind,
+                    message: kind.default_message().to_string(),
+                });
+            }
+        }
+        events
+    }
+
+    /// Ensure there is an active turn before a user-turn result that carries no
+    /// echo to activate it (`ADP:1408-1489`; review 04 #2). Order: (a) a held
+    /// active turn settles with its deferred outcome and falls through; (b)
+    /// orphan accounting runs BEFORE the head check; (c) promote the queue head.
+    fn ensure_active_turn(&mut self, events: &mut Vec<TurnEvent>) {
+        if self.active.as_ref().is_some_and(is_held_turn) {
+            let outcome = self.active.as_ref().and_then(|t| t.deferred_settle);
+            if let Some(outcome) = outcome {
+                self.settle(outcome, events);
+            }
+        }
+        if self.pending_orphan_results > 0 {
+            self.pending_orphan_results -= 1;
+            return;
+        }
+        let idx = self.queue.iter().position(|t| !t.settled);
+        if let Some(idx) = idx {
+            // `idx` came from `position` above, so the removal cannot fail;
+            // handle the `None` gracefully rather than panic (D8).
+            if let Some(queued) = self.queue.remove(idx) {
+                self.activate(queued, events);
+            }
+        }
+    }
+
     /// Whether the active turn is held open for live subagents (has a stored
     /// outcome and is not settled) — the `isHeldOpen` of `acp-agent.js:125`.
-    fn is_held(&self, _events: &mut Vec<TurnEvent>) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|t| t.deferred_settle.is_some() && !t.settled)
+    fn is_held(&self) -> bool {
+        self.active.as_ref().is_some_and(is_held_turn)
     }
 
     /// Whether any subagent this turn spawned is still live — while true the
@@ -366,42 +769,45 @@ impl TurnMachine {
 
     /// Settle the active turn's stored deferred outcome once none of its
     /// subagents is live — the single drain rule (`settleDeferredIfDrained`).
-    fn settle_deferred_if_drained(&mut self) -> Vec<TurnEvent> {
-        let mut events = Vec::new();
-        if self.is_held(&mut events) {
-            let awaiting = self
-                .active
-                .as_ref()
-                .is_some_and(|t| self.turn_awaiting_subagents(t));
-            if !awaiting {
-                if let Some(outcome) = self.active.as_ref().and_then(|t| t.deferred_settle) {
-                    self.settle(outcome, &mut events);
-                }
-            }
+    fn settle_deferred_if_drained(&mut self, events: &mut Vec<TurnEvent>) {
+        if !self.is_held() {
+            return;
         }
-        events
+        let awaiting = self
+            .active
+            .as_ref()
+            .is_some_and(|t| self.turn_awaiting_subagents(t));
+        if awaiting {
+            return;
+        }
+        let outcome = self.active.as_ref().and_then(|t| t.deferred_settle);
+        if let Some(outcome) = outcome {
+            self.settle(outcome, events);
+        }
     }
 
     /// Settle the active turn with `outcome` now — unless subagents it spawned
     /// are still live, in which case store the outcome and hold it open
     /// (`settleOrDefer`, `#866`).
     fn settle_or_defer(&mut self, outcome: StopReason, events: &mut Vec<TurnEvent>) {
-        let Some(active) = self.active.as_ref() else {
-            return;
-        };
-        if active.settled {
+        let awaiting = self
+            .active
+            .as_ref()
+            .is_some_and(|t| !t.settled && self.turn_awaiting_subagents(t));
+        if !awaiting {
+            self.settle(outcome, events);
             return;
         }
-        if self.turn_awaiting_subagents(active) {
-            if let Some(active) = self.active.as_mut() {
+        if let Some(active) = self.active.as_mut() {
+            if !active.settled {
                 active.deferred_settle = Some(outcome);
             }
-        } else {
-            self.settle(outcome, events);
         }
     }
 
-    /// Settle the active turn exactly once and drop it from the queue.
+    /// Settle the active turn exactly once and clear the active slot. Ports
+    /// `settleActive` (`ADP:1579-1610`), including `activeTurn = null` (review
+    /// 04 #5).
     fn settle(&mut self, outcome: StopReason, events: &mut Vec<TurnEvent>) {
         let Some(active) = self.active.as_mut() else {
             return;
@@ -410,13 +816,19 @@ impl TurnMachine {
             return;
         }
         active.settled = true;
+        let prompt_uuid = active.prompt_uuid.clone();
+        let usage = self.accumulated_usage;
+        self.active = None;
         events.push(TurnEvent::Settled {
+            prompt_uuid,
             stop_reason: outcome,
+            usage,
         });
     }
 
-    /// Fail the active turn without tearing down the machine (`failActive`).
-    fn fail_active(&mut self, message: String, events: &mut Vec<TurnEvent>) {
+    /// Fail the active turn without tearing down the machine (`failActive`,
+    /// `ADP:1611-1631`), clearing the active slot (review 04 #5).
+    fn fail_active(&mut self, kind: FailureKind, message: String, events: &mut Vec<TurnEvent>) {
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -424,243 +836,62 @@ impl TurnMachine {
             return;
         }
         active.settled = true;
-        events.push(TurnEvent::Failed { message });
+        let prompt_uuid = active.prompt_uuid.clone();
+        self.active = None;
+        events.push(TurnEvent::Failed {
+            prompt_uuid,
+            kind,
+            message,
+        });
     }
 
-    /// Promote `queued` to active, handing off any prior active turn.
+    /// Promote `queued` to active, resetting the per-turn accumulator and the
+    /// cancelled / orphan-skip flags (`activateTurn`, `ADP:1362-1392`).
     fn activate(&mut self, queued: Turn, events: &mut Vec<TurnEvent>) {
-        if let Some(prev) = self.active.take() {
-            if !prev.settled {
-                // Hand off the previous turn as end_turn (unless held/deferred;
-                // those settle with their real outcome).
-                let outcome = prev.deferred_settle.unwrap_or(if self.cancelled {
-                    StopReason::Cancelled
-                } else {
-                    StopReason::EndTurn
-                });
-                // Mark the prior turn settled via the same path.
-                let mut prev = prev;
-                prev.settled = true;
-                events.push(TurnEvent::Settled {
-                    stop_reason: outcome,
-                });
-            }
-        }
-        // Activation resets the cancelled flag so a turn enqueued after a prior
-        // cancel isn't treated as cancelled, and clears stale orphan credits.
         self.cancelled = false;
         self.pending_orphan_results = 0;
+        self.accumulated_usage = Usage::default();
+        let prompt_uuid = queued.prompt_uuid.clone();
         self.active = Some(queued);
-        events.push(TurnEvent::Activated);
-    }
-
-    /// A late result arrived with no active turn (or the active turn was
-    /// cancelled): consume one pending-orphan credit so the next live turn's
-    /// echo-less result is not swallowed (INV-30).
-    fn consume_orphan_result(&mut self) {
-        if self.pending_orphan_results > 0 {
-            self.pending_orphan_results -= 1;
-        }
-    }
-
-    /// Seed an orphan credit for a cancelled turn whose late `result` may still
-    /// arrive (phase 11 calls this; the credit keeps that result from being
-    /// misattributed to the next prompt).
-    pub fn seed_orphan(&mut self) {
-        self.pending_orphan_results += 1;
+        events.push(TurnEvent::Activated { prompt_uuid });
     }
 }
 
-/// The non-error `result.subtype` → [`StopReason`] table
-/// (`acp-agent.js:2771-2848`). `max_tokens`/`refusal` are handled separately
-/// by the caller.
-pub fn stop_reason_for_subtype(subtype: &str) -> StopReason {
-    match subtype {
-        "success" | "error_during_execution" => StopReason::EndTurn,
-        "error_max_budget_usd" | "error_max_turns" | "error_max_structured_output_retries" => {
-            StopReason::MaxTurnRequests
-        }
-        // Unknown subtypes are unreachable upstream (`unreachable()`); be safe
-        // and end the turn rather than panic (D8).
-        _ => StopReason::EndTurn,
-    }
+/// Whether a result carries an autonomous origin (`AUTONOMOUS_RESULT_ORIGINS`).
+fn is_autonomous_result(result: &Value) -> bool {
+    let Some(origin) = result.get("origin") else {
+        return false;
+    };
+    let Some(kind) = origin.get("kind").and_then(Value::as_str) else {
+        return false;
+    };
+    AUTONOMOUS_RESULT_ORIGINS.contains(&kind)
 }
 
-/// The error message to surface for an `is_error` result (`acp-agent.js` joins
-/// `message.errors` or falls back to the subtype).
+/// Whether `turn` is held open (has a stored outcome, not yet settled).
+fn is_held_turn(turn: &Turn) -> bool {
+    turn.deferred_settle.is_some() && !turn.settled
+}
+
+/// The error message for an `is_error` result — `message.errors.join(", ")`
+/// or the subtype, per `ADP:2818`, `2826`, `2833`, `2840`.
 fn error_message(result: &Value, subtype: &str) -> String {
-    result
+    let joined = result
         .get("errors")
         .and_then(Value::as_array)
-        .and_then(|arr| {
+        .map(|arr| {
             arr.iter()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
-                .into_iter()
-                .next()
+                .join(", ")
         })
-        .map(str::to_string)
-        .unwrap_or_else(|| subtype.to_string())
+        .unwrap_or_default();
+    if joined.is_empty() {
+        subtype.to_string()
+    } else {
+        joined
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn result_frame(subtype: &str, is_error: bool) -> Value {
-        serde_json::json!({
-            "type": "result",
-            "subtype": subtype,
-            "is_error": is_error,
-            "stop_reason": "end_turn",
-            "usage": { "output_tokens": 5 },
-        })
-    }
-
-    /// 6.T1 (INV-16) — a turn with 2 live subagents does not settle until both
-    /// drain (#866): the result defers, the first drain still defers, the
-    /// second drain settles.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inv_16_subagents_hold_settle() {
-        let mut machine = TurnMachine::new();
-        machine.enqueue(Turn::new("p1".into(), false));
-        machine.on_echo("p1");
-
-        // Two subagents spawn.
-        machine.on_task_started("sub1", true);
-        machine.on_task_started("sub2", true);
-
-        // A result arrives while both are live: it must DEFER, not settle.
-        let events = machine.on_result(&result_frame("success", false), false);
-        assert!(
-            events
-                .iter()
-                .all(|e| !matches!(e, TurnEvent::Settled { .. })),
-            "turn must not settle while both subagents are live"
-        );
-
-        // Drain the first subagent: still held open.
-        let events = machine.on_task_ended("sub1");
-        assert!(
-            events
-                .iter()
-                .all(|e| !matches!(e, TurnEvent::Settled { .. })),
-            "turn must still be held open after the first subagent drains"
-        );
-
-        // Drain the second: the deferred outcome settles the turn.
-        let events = machine.on_task_ended("sub2");
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                TurnEvent::Settled {
-                    stop_reason: StopReason::EndTurn
-                }
-            )),
-            "turn must settle once all subagents drain"
-        );
-    }
-
-    /// 6.T2 (INV-29) — result text present only in the `result` frame yields a
-    /// `TurnEvent::FinalText` (the #453 fallback); emission is phase 7.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inv_29_result_text_fallback() {
-        let mut machine = TurnMachine::new();
-        machine.enqueue(Turn::new("p1".into(), false));
-        machine.on_echo("p1");
-
-        // Cache-replay signature: no assistant text delivered, output_tokens==0.
-        let result = serde_json::json!({
-            "type": "result",
-            "subtype": "success",
-            "is_error": false,
-            "result": "the whole answer",
-            "usage": { "output_tokens": 0 },
-        });
-        let events = machine.on_result(&result, false);
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TurnEvent::FinalText { text } if text == "the whole answer")),
-            "the result-text fallback must yield a FinalText event"
-        );
-    }
-
-    /// 6.T3 (INV-30) — a dead turn's late `result` is not consumed by the next
-    /// turn: the orphan credit swallows it instead of attributing it to the
-    /// fresh turn.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inv_30_orphan_result_not_reused() {
-        let mut machine = TurnMachine::new();
-        machine.enqueue(Turn::new("p1".into(), false));
-        machine.on_echo("p1");
-        // p1 is abandoned (cancelled after its message was already pushed); its
-        // late result is owed as an orphan.
-        machine.abandon_active();
-
-        // p1's late result arrives while no new turn is active: consumed as an
-        // orphan, never attributed to any turn.
-        let events = machine.on_result(&result_frame("success", false), false);
-        assert!(
-            events
-                .iter()
-                .all(|e| !matches!(e, TurnEvent::Settled { .. })),
-            "a dead turn's late result must be consumed as an orphan, not settled"
-        );
-        assert!(!machine.has_active());
-
-        // The next prompt is enqueued and activated via its echo, and its own
-        // result settles it — not swallowed by a leftover orphan credit.
-        machine.enqueue(Turn::new("p2".into(), false));
-        machine.on_echo("p2");
-        assert!(machine.has_active());
-        let events = machine.on_result(&result_frame("success", false), false);
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                TurnEvent::Settled {
-                    stop_reason: StopReason::EndTurn
-                }
-            )),
-            "the next turn's own result must settle it"
-        );
-    }
-
-    /// 6.T4 (INV-31) — idle without a `result` fails the active turn instead of
-    /// hanging (#825).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inv_31_idle_without_result_fails() {
-        let mut machine = TurnMachine::new();
-        machine.enqueue(Turn::new("p1".into(), false));
-        machine.on_echo("p1");
-
-        // No result ever arrived; the SDK goes idle.
-        let events = machine.on_idle();
-        assert!(
-            events.iter().any(|e| matches!(e, TurnEvent::Failed { .. })),
-            "idle without a result must fail the active turn"
-        );
-    }
-
-    /// 6.T5 — table test, one case per `result.subtype` → expected `StopReason`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inv_stop_reason_table() {
-        let cases = [
-            ("success", StopReason::EndTurn),
-            ("error_during_execution", StopReason::EndTurn),
-            ("error_max_budget_usd", StopReason::MaxTurnRequests),
-            ("error_max_turns", StopReason::MaxTurnRequests),
-            (
-                "error_max_structured_output_retries",
-                StopReason::MaxTurnRequests,
-            ),
-        ];
-        for (subtype, expected) in cases {
-            assert_eq!(
-                stop_reason_for_subtype(subtype),
-                expected,
-                "subtype {subtype:?} maps to {expected:?}"
-            );
-        }
-    }
-}
+mod turn_tests;
