@@ -509,16 +509,24 @@ stdout: newline-delimited JSON
 
 | # | Check | Mechanical command | Fail action |
 |---|-------|--------------------|-------------|
-| G1 | Re-run the gate; never trust the subagent (`rust-coding` §7) | `bash rust/scripts/rust-gate.sh` | respawn |
-| G2 | Every `INV-*` assigned to phase N has a test named `inv_NN_<slug>`; open it, read the assertion — a weaker assertion is a fail | `grep -rn "fn inv_NN_" rust/` then read | respawn citing the INV |
-| G3 | No test exceeds its timeout; a hang = a failure (`rust-coding` §9) | `timeout 180 cargo test -p claude-agent-acp-rs` exits 0, not 124 | respawn |
+| G1 | Re-run the gate; never trust the subagent (`rust-coding` §7) | `bash rust/scripts/rust-gate.sh` (from the fork root) | respawn |
+| G2 | Every `INV-*` assigned to phase N has a test named `inv_NN_<slug>`; open it, read the assertion — a weaker assertion is a fail. **Exempt (gate-proven, no test fn):** INV-25 (G8) and INV-33 (0.T4) | `grep -rn "fn inv_NN_" rust/` then read | respawn citing the INV |
+| G3 | No test exceeds its timeout; a hang = a failure (`rust-coding` §9) | `timeout 180 cargo test --manifest-path rust/Cargo.toml --workspace` exits 0, not 124 | respawn |
 | G4 | No unwrap/expect in `src/` outside tests (D8, R15) | clippy `unwrap_used`/`expect_used` in the gate | respawn |
 | G5 | No shared-lock session state (D4) | `clippy.toml` `disallowed-types`: `std::sync::Mutex`, `std::sync::RwLock`, `tokio::sync::Mutex`, `tokio::sync::RwLock`, `tokio::sync::broadcast::Sender`, `tokio::sync::broadcast::Receiver` (INV-33; plus `disallowed-methods` `tokio::sync::broadcast::channel`); allowlist by `#[allow]` + a comment only in `process.rs`/`control.rs` | respawn |
 | G6 | Every `src/*.rs` file with logic touched this phase has a unit test (`#[cfg(test)]`) or integration test (`tests/`) changed in the same diff; `lib.rs` re-exports exempt (D5, R12) | `git diff --name-only` vs `git diff -U0` on tests | respawn |
 | G7 | Upstream files untouched (D1); sole exception `.gitignore` (gains `.claude/`, `.vibe-station/` for the vst worktree) | `git diff --stat v0.70.0 -- . ':!rust' ':!porting' ':!skills' ':!.vibekit' ':!.gitignore'` is empty | respawn |
 | G8 | Cross-target compile (D12) | `cargo check --target x86_64-pc-windows-gnu && cargo check --target aarch64-apple-darwin` (inside the gate) | respawn |
-| G9 | `cfg` confined to `process.rs` (D12) | `grep -rEn 'cfg!?\(.*(unix\|windows\|target_)' rust/claude-agent-acp-rs/src/` hits only `process.rs` | respawn |
-| G10 | Dependency pin holds (D9) | `cargo tree -p agent-client-protocol` shows `2.1.0`; `cargo tree -d` shows no ACP duplicate | respawn |
+| G9 | `cfg` confined to `process.rs` (D12) | the command in the code block below prints nothing | respawn |
+| G10 | Dependency pin holds (D9); the schema crate is pinned transitively (`agent-client-protocol` 2.1.0 requires `=1.7.0`) | the two commands in the code block below | respawn |
+
+```sh
+# G9 — must print nothing
+grep -rEn 'cfg!?\(.*(unix|windows|target_)' rust/claude-agent-acp-rs/src/ | grep -v '/process.rs:'
+# G10 — first must list agent-client-protocol v2.1.0, second must print 0
+cargo tree --manifest-path rust/Cargo.toml -i agent-client-protocol@2.1.0 -e normal
+cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol '
+```
 
 - **Monitoring:** while an implementer runs, the orchestrator checks `vst session output <id> --lines=100` every 10–15 minutes; steer with `vst session send` on drift, a stall, or a stuck test (no output progress across two checks).
 - Retries: `implementer.turn.max_retries: 2`, then escalate per `PHASES.md:48`.
@@ -557,7 +565,7 @@ stdout: newline-delimited JSON
 | INV-22 | Cancel is idempotent; repeated cancels arm the force-cancel deadline once | 11 | `acp-agent.js:3595-3605` |
 | INV-23 | Orphaned queued turns are reconciled, not double-counted; a bare `{}` receipt is not "all dropped" | 11 | `acp-agent.js:3608-3648` |
 | INV-24 | Rust ordered ACP frames == Node's for every corpus script (normalized, D13) | 1, 8–11, 13 | R11 |
-| INV-25 | Windows and macOS targets compile | all | D12 |
+| INV-25 | Windows and macOS targets compile (gate-proven by G8, no test fn) | all | D12 |
 | INV-26 | `Channel::duplex()` and stdio yield the identical ordered frames | 12 | D9 |
 | INV-27 | No actor awaits a client round-trip inline: a cancel sent during a pending permission resolves it within the timeout | 10 | D14 |
 | INV-28 | If the host is SIGKILLed, the `claude` process itself exits (on stdin EOF); grandchildren are out of scope (Risk 17) | 3 | D12 |
@@ -565,7 +573,7 @@ stdout: newline-delimited JSON
 | INV-30 | A dead turn's late `result` is never consumed by the next turn (orphan coalescing order) | 6 | `acp-agent.js:1453` |
 | INV-31 | #825: `session_state_changed` idle without a `result` fails the active turn instead of hanging | 6 | `acp-agent.js:2141-2153` |
 | INV-32 | Codec cancel-safety: `select!` only awaits `recv()` on an `mpsc` fed by the codec task; a cancel never drops a line | 3 | R8 |
-| INV-33 | `tokio::sync::broadcast` is not used in `src/` (a `Lagged` receiver must never end forwarding); enforced by clippy, proven by 0.T4 | 0 | R14 (clippy ban, G5) |
+| INV-33 | `tokio::sync::broadcast` is not used in `src/` (a `Lagged` receiver must never end forwarding); enforced by clippy, gate-proven by 0.T4 (no test fn) | 0 | R14 (clippy ban, G5) |
 
 ---
 
@@ -576,10 +584,16 @@ stdout: newline-delimited JSON
 
 ### Phase 0 — Scaffold & gate
 
-**Context:**
-- Crate `claude-agent-acp-rs` version `0.1.0+acp.0.70.0` (D2); workspace at `rust/Cargo.toml`; Rust edition 2021+, tokio, thiserror, serde_json.
-- The gate is `cargo fmt --all --check` + `cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::complexity -D clippy::perf -D warnings` + `timeout 180 cargo test --workspace` + both G8 `cargo check --target …` lines (`rust-coding` §7, D12).
-- Rules that must be mechanical: D8 lints, G5 `clippy.toml`, G10 pin (D9).
+**Context (everything phase 0 needs, verbatim):**
+- Layout: `rust/Cargo.toml` (workspace, `resolver = "2"`, members `claude-agent-acp-rs`, `acp-recorder`, `fake-claude` — the last two may be empty stub crates now); crate `rust/claude-agent-acp-rs`, version `0.1.0+acp.0.70.0`; deps: `agent-client-protocol = "2.1"`, `tokio` (full), `serde`, `serde_json`, `thiserror`; Rust edition 2021.
+- `lib.rs` header, exactly: `#![forbid(unsafe_code)]`, `#![deny(clippy::unwrap_used, clippy::expect_used)]`, `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`.
+- `rust/clippy.toml`: `disallowed-types = ["std::sync::Mutex", "std::sync::RwLock", "tokio::sync::Mutex", "tokio::sync::RwLock", "tokio::sync::broadcast::Sender", "tokio::sync::broadcast::Receiver"]` and `disallowed-methods = ["tokio::sync::broadcast::channel"]`.
+- `rust-gate.sh` (run from the fork root, `set -euo pipefail`) runs, in order: `cargo fmt --manifest-path rust/Cargo.toml --all --check`; `cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::complexity -D clippy::perf -D warnings`; `cargo build --manifest-path rust/Cargo.toml --workspace --bins`; `timeout 180 cargo test --manifest-path rust/Cargo.toml --workspace`; `cargo check --manifest-path rust/Cargo.toml --workspace --target x86_64-pc-windows-gnu`; `cargo check --manifest-path rust/Cargo.toml --workspace --target aarch64-apple-darwin`; the G9 grep (must print nothing, else exit 1); the two G10 commands (`cargo tree … -i agent-client-protocol@2.1.0 -e normal` must succeed, the `-d | grep -c` count must be `0`).
+- G9 grep: `grep -rEn 'cfg!?\(.*(unix|windows|target_)' rust/claude-agent-acp-rs/src/ | grep -v '/process.rs:'`.
+- Lockfile: `cd rust && cargo generate-lockfile --offline` (crates are in `~/.cargo/registry`); confirm `agent-client-protocol` is `2.1.0` and `agent-client-protocol-schema` `1.7.0` in `rust/Cargo.lock`; if it resolves higher run `cargo update -p agent-client-protocol --precise 2.1.0`.
+- `rust/AGENTS.md` required headings: **Scope** (overrides root `AGENTS.md`/`CLAUDE.md` for `rust/**`; never run `npm`); **Protocol** (1 read this file, 2 load `skills/rust-coding/SKILL.md` + `coding-agent-guardrails` + `coding`, 3 write the `N.T*` tests first, 4 run `bash rust/scripts/rust-gate.sh` and paste real output, 5 record any deviation in the plan's `## Key Decisions`, 6 never touch `src/`, `package.json` or other upstream files, 7 name tests `inv_NN_<slug>` for invariant tests); **Skill mapping** (`rust-coding` §1–5, 7, 9, 10 apply; §6 wire truth = the Node adapter's ACP frames at `v0.70.0`, not `daemon/src/types.ts`; §8 not applicable); **Rules** (single session-state owner actor, no `Arc<Mutex<Session>>`; only `process.rs` may use `cfg(unix)`/`cfg(windows)`; every test runs under `timeout`).
+- `porting/SYNC.md` content: the 5 steps of the Sync workflow section in this plan — (1) take the next upstream tag only, never `upstream/main`; (2) `git diff vOLD..vNEW -- src/`; (3) if it touches a `ported` row of `PARITY.md`, port the delta; (4) re-capture fixtures and run the differential; (5) merge the tag into `parity`, bump `+acp.0.N`, update `PARITY.md`, tag `rust-vX+acp.0.N`. First run: `v0.70.0 → v0.79.0`.
+- Phase-0 stub crates need one trivial `#[test]` so G6 and `cargo test` are meaningful.
 
 - [ ] **0.0** Read `skills/rust-coding/SKILL.md`, `coding-agent-guardrails`, `coding`
 - [ ] **0.1** `rust/Cargo.toml` workspace + crate manifest; `rust/.gitignore` (`target/`); `#![forbid(unsafe_code)]` + D8 lints in `lib.rs`
@@ -587,7 +601,7 @@ stdout: newline-delimited JSON
 - [ ] **0.3** `rust/scripts/rust-gate.sh` — one canonical invocation incl. `cargo build --workspace --bins` before tests, and the G8, G9, G10 checks
 - [ ] **0.4** `rust/clippy.toml` — G5 `disallowed-types` list
 - [ ] **0.5** Generate + commit `rust/Cargo.lock` with `agent-client-protocol` `=2.1.0` and its schema crate pinned (D9)
-- [ ] **0.6** `porting/PARITY.md` seeded from `EVALUATION.md` § 2 (A)/(B); `porting/SYNC.md` from § Sync workflow
+- [ ] **0.6** `porting/PARITY.md` seeded from `porting/EVALUATION.md` § 2 (A)/(B); `porting/SYNC.md` from the content given in this phase's Context
 
 **Verify phase 0:**
 - [ ] **0.T1** Gate — `bash rust/scripts/rust-gate.sh` exits 0 on the empty crate
@@ -607,7 +621,7 @@ stdout: newline-delimited JSON
 - [ ] **1.0** Read `rust/AGENTS.md`
 - [ ] **1.1** `rust/acp-recorder/` — binary + library; args: agent command, script path, output path
 - [ ] **1.2** Script format: ordered ACP calls (`initialize`, `session/new`, `session/prompt` with text, `session/cancel` after N updates, permission reply policy allow/deny)
-- [ ] **1.3** `C/tests/differential.rs` — `diff_frames(a, b, ignore: &[JsonPath]) -> Result<(), FrameDiff>`; normalization; path-based ignore-list
+- [ ] **1.3** `C/tests/differential.rs` — `diff_frames(a, b, ignore: &[JsonPath]) -> Result<(), FrameDiff>` in `C/tests/common/mod.rs` (shared by `differential.rs`; never `pub` in `src/`); normalization; path-based ignore-list
 - [ ] **1.4** Unit tests use synthetic frame lists only (no agent needed)
 - [ ] **1.5** `rust/acp-recorder/examples/echo_agent.rs` — trivial in-repo ACP agent for 1.T4
 
@@ -626,7 +640,7 @@ stdout: newline-delimited JSON
 - The Node adapter runs at `v0.70.0` via `npm ci && npm run build` then `node dist/index.js`, with `CLAUDE_CODE_EXECUTABLE=<fake-claude path>` (R30).
 - Corpus scripts live in `porting/corpus/<name>.transcript.jsonl` + `<name>.acp.json` (the ACP-side script for the recorder); fixtures in `porting/fixtures/<name>.frames.jsonl`.
 
-- [ ] **2.0** Read `rust/AGENTS.md`
+- [ ] **2.0** Read `rust/AGENTS.md`; `npm ci` needs network or a warm npm cache — if unavailable, stop and write `BLOCKED.md`
 - [ ] **2.1** `rust/fake-claude/` — replay engine per D13 (`expect` subset match, `$REQ` substitution, loud failure on mismatch, `keep_alive` injection option)
 - [ ] **2.2** `porting/capture.sh` — builds Node adapter, runs `acp-recorder` against it with fake-claude, writes the fixture; also dumps `<name>.argv.json` and `initialize.json` from the fake's captured stdin
 - [ ] **2.3** Corpus ≥ 10 transcripts (real recordings preferred; a hand-authored one is named `*.synthetic.transcript.jsonl` and must be re-recorded via 2.4 before phase 13): text-only · single tool · multi-tool · streamed partial tool input · permission-allow · permission-deny · cancel-mid-turn · subagent/Task with drain · error-result · idle-without-result (#825) · resume/load
@@ -660,7 +674,7 @@ stdout: newline-delimited JSON
 - [ ] **3.6** Process group (`process_group(0)`, `nix::killpg`) on unix; job object + `CREATE_NO_WINDOW` on windows
 
 **Verify phase 3:**
-- [ ] **3.T1** Integration — spawn `fake-claude` for the text-only script; its captured argv/env equals `porting/fixtures/text-only.argv.json` after uuid normalization
+- [ ] **3.T1** Integration — spawn `fake-claude` for the text-only script; its captured argv equals `porting/fixtures/text-only.argv.json` after uuid normalization, and its env has `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` set and `NODE_OPTIONS` absent (other env vars are not compared)
 - [ ] **3.T2** Unit — `codec`: a garbage line is skipped, the next valid line parses — `inv_01_garbage_line_skipped`
 - [ ] **3.T3** Unit — `codec`: a 10 MB single line parses; a message split across 3 reads reassembles — `inv_02_partial_and_huge_lines`
 - [ ] **3.T4** Unit — `codec`: a 4-byte UTF-8 char split across reads decodes intact — `inv_03_utf8_split`
@@ -795,8 +809,8 @@ stdout: newline-delimited JSON
 - [ ] **8.T2** Unit — `agent`: an unhandled method returns `-32601`, never hangs or panics
 - [ ] **8.T3** Unit — `agent`: prompt blocks table (text/image/resource/resource_link) → expected Claude content
 - [ ] **8.T4** Regression — nothing but JSON-RPC frames ever reaches stdout (a stray `println!` fails)
-- [ ] **8.T6** Unit — `agent`: `session/load` with an id this process never minted spawns `--resume <id>` and returns ok (terminal → Rich Chat)
 - [ ] **8.T5** Unit — `agent`: `session/new` with a model and permission mode yields `--model` / `--permission-mode` / `--session-id=<uuid>` in the spawned argv, and the returned `sessionId` equals that uuid
+- [ ] **8.T6** Unit — `agent`: `session/load` with an id this process never minted spawns `--resume <id>` and returns ok (terminal → Rich Chat)
 
 ---
 
@@ -881,9 +895,9 @@ stdout: newline-delimited JSON
 **Verify phase 12:**
 - [ ] **12.T1** Unit — `agent`: steering idle + `promptRequired` → `{outcome:"promptRequired", reason:"noRunningTurn"}`; `idleBehavior:"x"` → `invalidParams`
 - [ ] **12.T2** Integration — stdin EOF mid-turn leaves no orphan `claude` and the binary exits 0 — `inv_06_eof_no_orphan`
-- [ ] **12.T5** Integration — SIGTERM to the binary mid-turn leaves no orphan `claude` and it exits 0 within the bounded deadline
 - [ ] **12.T3** Integration — text-only + single-tool + cancel scripts over `Channel::duplex()` and over stdio yield identical ordered frames — `inv_26_transport_parity`
 - [ ] **12.T4** Integration — `cargo run --example in_process` exits 0
+- [ ] **12.T5** Integration — SIGTERM to the binary mid-turn leaves no orphan `claude` and it exits 0 within the bounded deadline
 
 ---
 
@@ -934,7 +948,7 @@ stdout: newline-delimited JSON
 | `porting/SYNC.md` | New | 0 | Upstream sync runbook |
 | `rust/acp-recorder/examples/echo_agent.rs` | New | 1 | Trivial ACP agent used by test 1.T4 |
 | `rust/acp-recorder/` | New | 1 | Contract: `record(agent_cmd, script) -> Vec<Frame>`; binary + lib |
-| `C/tests/differential.rs` | New | 1, 8–13 | Contract: `diff_frames(a, b, ignore) -> Result<(), FrameDiff>` |
+| `C/tests/differential.rs`, `C/tests/common/mod.rs` | New | 1, 8–13 | Contract: `diff_frames(a, b, ignore) -> Result<(), FrameDiff>` |
 | `rust/fake-claude/` | New | 2 | Replays D13 transcripts; records received argv/env |
 | `porting/capture.sh` | New | 2 | Node adapter + fake-claude → fixtures |
 | `porting/record-real.sh` | New | 2 | One-time real-`claude` recording (human-run) |
