@@ -671,7 +671,7 @@ flowchart LR
 | # | Question | Blocks |
 |---|----------|--------|
 | ~~Q1~~ | ~~Fork vs Rust-in-vibe-station~~ — **resolved: fork (D1)** | — |
-| Q2 | Fork under personal `fastestdevalive` (only authed account) or an org? | B-1 |
+| ~~Q2~~ | ~~Fork location~~ — **resolved: `github.com/fastestdevalive/claude-agent-acp`** | — |
 | Q3 | Does the corpus run against a real Anthropic account, or recorded fixtures only? Real = catches more, costs per run | 0.5 |
 | ~~Q4~~ | ~~vibe-station cutover shape~~ — **resolved: in-process over `Channel::duplex()` (D9)** | — |
 | Q5 | Does `meta_harness: vibe-station` spawn implementer turns as sessions **in** the current worktree? The sdlc skill doesn't document it — B-11 checks before phase 0 | B-11 |
