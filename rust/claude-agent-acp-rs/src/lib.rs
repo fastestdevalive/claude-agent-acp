@@ -5,6 +5,7 @@
 pub mod codec;
 pub mod control;
 pub mod dispatch;
+pub mod map;
 pub mod process;
 pub mod session;
 pub mod turn;

@@ -789,19 +789,19 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Emitted variants and discards: B1. Source ranges: `ADP` `6383–6759`, `6760–6864`, `6303–6382`; partial-JSON lexer at `acp-agent.js:179-232` (closes a partial object at a top-level comma).
 - `stream_event` frames exist only because argv has `--include-partial-messages` (B2).
 
-- [ ] **7.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **7.1** `map.rs` — `assistant`/`user` consolidated → `AgentMessageChunk` / `AgentThoughtChunk` / `UserMessageChunk`
-- [ ] **7.2** `stream_event` deltas → chunk updates
-- [ ] **7.3** `tool_use` → `ToolCall`; `tool_result` → `ToolCallUpdate` (generic shape; per-tool shapes come in phase 9)
-- [ ] **7.4** Streamed partial tool input: incremental JSON-prefix lexer; refine, don't duplicate
-- [ ] **7.5** `TodoWrite` → `Plan`; `commands_changed` → `AvailableCommandsUpdate`; mode → `CurrentModeUpdate`
-- [ ] **7.6** Explicitly drop `SessionInfoUpdate` / `ConfigOptionUpdate` / `UsageUpdate`
-- [ ] **7.7** Dedupe: a block present in both `stream_event` and the consolidated message emits once
+- [x] **7.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **7.1** `map.rs` — `assistant`/`user` consolidated → `AgentMessageChunk` / `AgentThoughtChunk` / `UserMessageChunk`
+- [x] **7.2** `stream_event` deltas → chunk updates
+- [x] **7.3** `tool_use` → `ToolCall`; `tool_result` → `ToolCallUpdate` (generic shape; per-tool shapes come in phase 9)
+- [x] **7.4** Streamed partial tool input: incremental JSON-prefix lexer; refine, don't duplicate
+- [x] **7.5** `TodoWrite` → `Plan`; `commands_changed` → `AvailableCommandsUpdate`; mode → `CurrentModeUpdate`
+- [x] **7.6** Explicitly drop `SessionInfoUpdate` / `ConfigOptionUpdate` / `UsageUpdate`
+- [x] **7.7** Dedupe: a block present in both `stream_event` and the consolidated message emits once
 
 **Verify phase 7:**
-- [ ] **7.T1** Unit — `map`: table-driven, one case per emitted variant; the 3 discarded produce `None` — `inv_18_variant_mapping`
-- [ ] **7.T2** Unit — `map`: a tool input streamed in 5 fragments yields 1 `ToolCall` + N `ToolCallUpdate`, never 2 `ToolCall` — `inv_19_partial_input_refines`
-- [ ] **7.T3** Unit — `map`: dedupe case from 7.7
+- [x] **7.T1** Unit — `map`: table-driven, one case per emitted variant; the 3 discarded produce `None` — `inv_18_variant_mapping`
+- [x] **7.T2** Unit — `map`: a tool input streamed in 5 fragments yields 1 `ToolCall` + N `ToolCallUpdate`, never 2 `ToolCall` — `inv_19_partial_input_refines`
+- [x] **7.T3** Unit — `map`: dedupe case from 7.7
 
 ---
 
