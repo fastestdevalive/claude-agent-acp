@@ -298,7 +298,7 @@ skills/rust-coding/
 ### Decision D15: `session/load` resumes but does not replay history in v0.1
 
 - **Decision:** `session/load` runs `claude --resume=<id>`; the transcript replay upstream does through SDK `getSessionMessages` (R31) is `skipped-deliberate`.
-- **Rationale:** replay needs a port of `~/.claude` JSONL parsing — a new sub-project; the impact on vibe-station's `load_session` use is unknown (Q6).
+- **Rationale:** the crate must still advertise `loadSession: true` or vibe-station always starts fresh; replay needs a port of `~/.claude` JSONL parsing — a new sub-project; vibe-station does not need it: it persists its own transcript and treats `load_session` `Ok(())` as "resumed" (`vst-agents/src/json_agent_session/connection.rs:99-104`), so replay would at best be ignored and at worst duplicate stored events.
 - **Where:** `C/src/agent.rs`; recorded in `porting/PARITY.md`.
 
 ---
@@ -973,7 +973,7 @@ stdout: newline-delimited JSON
 | 13 | Windows/macOS code rots | G8 cross-`check` + G9 cfg confinement | all |
 | 14 | `claude` does not exit on stdin EOF, so INV-28 cannot hold | 3.T8 proves it against the fake; re-check against real `claude` in `record-real.sh` | 3 |
 | 15 | Fake `claude` diverges from real CLI behaviour | Transcripts recorded once from the logged-in local `claude`; re-record on each sync | 2 |
-| 16 | Client-side `session/load` history replay is needed by vibe-station | Q6 answered before cutover; D15 | follow-up |
+| 16 | Another ACP client (e.g. Zed) needs `session/load` history replay | D15 says skipped; revisit if a non-vibe-station consumer needs it | follow-up |
 | 17 | `claude`'s own children (MCP servers, Bash subprocesses) share its process group and can outlive a SIGKILLed host; INV-28 covers `claude` only | Accept for v0.1; record in `PARITY.md`; revisit with a group-kill helper | 3 |
 
 ---
@@ -1015,4 +1015,3 @@ flowchart LR
 | # | Question | Blocks |
 |---|----------|--------|
 | Q5 | Does `/sdlc turn-implement`'s own `meta_harness` spawn land in this worktree? Manual `vst session create` does (B-11); the sdlc path is unobserved | first phase-0 spawn |
-| Q6 | Does vibe-station rely on history replay from `session/load` (D15)? | vibe-station cutover |
