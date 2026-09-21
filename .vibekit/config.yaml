@@ -1,0 +1,29 @@
+# claude-acp-rust — /sdlc turn-implement config
+# Schema: ~/code/fastestdevalive/vibekit/vibekit.example.yaml
+sdlc:
+  spawn:
+    mode: meta-harness
+    # Required for implementer.mode: turn — no in-harness fallback exists.
+    meta_harness: vibe-station
+
+  agents:
+    reviewer:
+      model: sonnet          # the orchestrating session; runs every N.T* verify block itself
+      gate: llm
+      max_iterations: 2
+
+    implementer:
+      run_in: meta-harness
+      # vst mode "deepseek" = mode-1785649772352-dlzo2
+      #   cli=opencode  model=deepseek-local/deepseek-v4-flash-0731
+      model: deepseek
+      mode: turn
+      turn:
+        # Human checkpoints: after the harness exists (0), and after the
+        # turn-settlement cost centre (3). Everything else auto-advances.
+        pause_after: [0, 3]
+        models: {}
+        max_retries: 2
+
+screenshots:
+  policy: transient
