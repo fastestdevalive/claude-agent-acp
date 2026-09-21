@@ -30,6 +30,13 @@ pub enum Step {
         #[serde(default)]
         cwd: Option<PathBuf>,
     },
+    /// `session/load` (resume an existing session).
+    #[serde(rename = "session/load")]
+    LoadSession {
+        session_id: String,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+    },
     /// `session/prompt` with a text payload.
     #[serde(rename = "session/prompt")]
     Prompt {
@@ -118,6 +125,21 @@ mod tests {
             Step::Prompt {
                 text: "x".to_string(),
                 cancel_after_updates: Some(5)
+            }
+        );
+    }
+
+    #[test]
+    fn parses_load_session_step() {
+        let script = Script::parse(
+            r#"{"steps":[{"call": "session/load", "session_id": "sess-123", "cwd": "/tmp"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.steps[0],
+            Step::LoadSession {
+                session_id: "sess-123".to_string(),
+                cwd: Some(PathBuf::from("/tmp"))
             }
         );
     }

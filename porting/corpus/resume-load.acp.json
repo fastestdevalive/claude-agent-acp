@@ -1,0 +1,7 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/load", "session_id": "sess-1234-abcd", "cwd": "/tmp"}
+  ]
+}

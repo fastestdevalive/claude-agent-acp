@@ -1,0 +1,28 @@
+{
+  "argv": [
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--input-format",
+    "stream-json",
+    "--permission-prompt-tool",
+    "stdio",
+    "--resume=sess-1234-abcd",
+    "--disallowedTools",
+    "AskUserQuestion",
+    "--tools",
+    "default",
+    "--setting-sources=user,project,local",
+    "--permission-mode",
+    "default",
+    "--allow-dangerously-skip-permissions",
+    "--include-partial-messages",
+    "--replay-user-messages",
+    ""
+  ],
+  "env": {
+    "CLAUDE_CODE_ENTRYPOINT": "sdk-cli",
+    "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"
+  },
+  "node_options_present": false
+}

@@ -1,0 +1,31 @@
+{
+  "request_id": "$0",
+  "type": "control_request",
+  "request": {
+    "subtype": "$1",
+    "hooks": {
+      "PostToolUse": [
+        {
+          "hookCallbackIds": [
+            "hook_0"
+          ]
+        }
+      ],
+      "TaskCreated": [
+        {
+          "hookCallbackIds": [
+            "hook_1"
+          ]
+        }
+      ],
+      "TaskCompleted": [
+        {
+          "hookCallbackIds": [
+            "hook_2"
+          ]
+        }
+      ]
+    },
+    "forwardSubagentText": false
+  }
+}

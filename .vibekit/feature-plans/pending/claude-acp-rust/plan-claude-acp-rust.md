@@ -291,6 +291,8 @@ skills/rust-coding/
 
 > **Phase-1 deviations (implementer, D13):** (1) `diff_frames`/`Frame`/`JsonPath` live in `C/tests/common/mod.rs`; `acp-recorder` cannot share them because it depends on `claude-agent-acp-rs` (a `C/tests`→`acp-recorder` dep would be a crate cycle), so the recorder's `Frame`/`Direction` are a small duplicate in `acp-recorder/src/frames.rs`. (2) The 1.T4 integration test therefore lives in `acp-recorder/tests/recorder.rs` (not `C/tests/differential.rs`). (3) The "session/cancel after N updates" call is encoded as a `cancel_after_updates: <n>` field on the `session/prompt` step (script JSON), not a separate step. (4) `thiserror` added to `acp-recorder`'s `[dependencies]` (already in the lock via `claude-agent-acp-rs`, so no new crate/version drift).
 
+> **Phase-2 deviations (implementer, D13):** (1) `fake-claude` records the received argv/env to `$FAKE_CLAUDE_ARGV_OUT` and the received `initialize` control_request to a new `$FAKE_CLAUDE_INIT_OUT` (the plan's "captured stdin" wording maps to that file). (2) The `acp-recorder` script format gained a `session/load` step (`call:"session/load"`, `session_id`, `cwd`) — a phase-1 file was touched to support the resume/load corpus script. (3) `acp-recorder::record` now returns the captured frames even when the script's final step errors (e.g. the `error-result` / `idle-without-result` corpora whose `session/prompt` legitimately returns a JSON-RPC error); a hard error is only returned when no frame was exchanged. (4) `run_script` inserts a 75 ms settle after `session/new`/`session/load` so the adapter's `setTimeout(0)` `available_commands_update` lands deterministically before the next step (2.T1 requires byte-identical captures). (5) The real SDK emits `--resume=<id>` (with `=`), not the plan's `--resume <id>`; the resume-load argv confirms it. (6) B2 rows `--model <m>` and `--mcp-config <json>` are conditional/`skipped-deliberate` and are not exercised by any corpus script; 2.T4 asserts every row the corpus does exercise (flags + `CLAUDE_CODE_ENTRYPOINT` / `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` / `NODE_OPTIONS` absent). (7) All 11 corpus transcripts are hand-authored (not yet re-recorded from real `claude`); each must be re-recorded via `record-real.sh` before phase 13 (2.3 rule). (8) **Env allow-list (security):** `fake-claude` dumps `{"argv":[...],"env":{...},"node_options_present":bool}` where `env` is restricted to exactly `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` (the two vars the B2 table requires the port to set); `node_options_present` is a boolean for the `NODE_OPTIONS`-deleted check. No other process env var (tokens, sockets, paths) is ever persisted — verified by 2.T7. (9) **Portability:** `capture.sh` runs the Node adapter under a fresh `HOME`/`CLAUDE_CONFIG_DIR` so local skills/commands/settings cannot leak into frames, and normalises the worktree root → `$ROOT` and the fake-claude binary → `$FAKE_CLAUDE` in frames and argv (2.T1 requires byte-stable fixtures across machines).
+
 ### Decision D14: No actor awaits an external round-trip inline
 
 - **Decision:** permission prompts, inbound control requests and any client round-trip run in spawned tasks that send their result back to the session actor as a `Command`; the actor and the stdout reader never `.await` a client reply.
@@ -642,20 +644,21 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - The Node adapter runs at `v0.70.0` via `npm ci && npm run build` then `node dist/index.js`, with `CLAUDE_CODE_EXECUTABLE=<fake-claude path>` (R30).
 - Corpus scripts live in `porting/corpus/<name>.transcript.jsonl` + `<name>.acp.json` (the ACP-side script for the recorder); fixtures in `porting/fixtures/<name>.frames.jsonl`.
 
-- [ ] **2.0** Read `rust/AGENTS.md`; `npm ci` needs network or a warm npm cache — if unavailable, stop and write `BLOCKED.md`
-- [ ] **2.1** `rust/fake-claude/` — replay engine per D13 (`expect` subset match, `$REQ` substitution, loud failure on mismatch, `keep_alive` injection option)
-- [ ] **2.2** `porting/capture.sh` — builds Node adapter, runs `acp-recorder` against it with fake-claude, writes the fixture; also dumps `<name>.argv.json` and `initialize.json` from the fake's captured stdin
-- [ ] **2.3** Corpus ≥ 10 transcripts (real recordings preferred; a hand-authored one is named `*.synthetic.transcript.jsonl` and must be re-recorded via 2.4 before phase 13): text-only · single tool · multi-tool · streamed partial tool input · permission-allow · permission-deny · cancel-mid-turn · subagent/Task with drain · error-result · idle-without-result (#825) · resume/load
-- [ ] **2.4** `porting/record-real.sh` — human-run one-time recording from real `claude` into a transcript ; not run by the gate
-- [ ] **2.5** Capture and commit fixtures for every corpus script
+- [x] **2.0** Read `rust/AGENTS.md`; `npm ci` needs network or a warm npm cache — if unavailable, stop and write `BLOCKED.md`
+- [x] **2.1** `rust/fake-claude/` — replay engine per D13 (`expect` subset match, `$REQ` substitution, loud failure on mismatch, `keep_alive` injection option)
+- [x] **2.2** `porting/capture.sh` — builds Node adapter, runs `acp-recorder` against it with fake-claude, writes the fixture; also dumps `<name>.argv.json` and `initialize.json` from the fake's captured stdin
+- [x] **2.3** Corpus ≥ 10 transcripts (real recordings preferred; a hand-authored one is named `*.synthetic.transcript.jsonl` and must be re-recorded via 2.4 before phase 13): text-only · single tool · multi-tool · streamed partial tool input · permission-allow · permission-deny · cancel-mid-turn · subagent/Task with drain · error-result · idle-without-result (#825) · resume/load
+- [x] **2.4** `porting/record-real.sh` — human-run one-time recording from real `claude` into a transcript ; not run by the gate
+- [x] **2.5** Capture and commit fixtures for every corpus script
 
 **Verify phase 2:**
-- [ ] **2.T1** Integration — `capture.sh` run twice yields byte-identical fixtures (post-normalization)
-- [ ] **2.T2** Unit — `fake-claude`: an unexpected stdin frame exits non-zero with the frame in stderr
-- [ ] **2.T3** Unit — `fake-claude`: `$MATCH.request_id` and `$MATCH.uuid` are substituted from the matched frame
-- [ ] **2.T4** Integration — the union of `porting/fixtures/*.argv.json` covers every B2 row (`--replay-user-messages`, `--include-partial-messages`, `--permission-prompt-tool`, `--session-id`, …)
-- [ ] **2.T5** Integration — Node's text-only capture ends with `stopReason: end_turn`, not a force-cancel timeout
-- [ ] **2.T6** Regression — G7 command prints nothing
+- [x] **2.T1** Integration — `capture.sh` run twice yields byte-identical fixtures (post-normalization)
+- [x] **2.T2** Unit — `fake-claude`: an unexpected stdin frame exits non-zero with the frame in stderr
+- [x] **2.T3** Unit — `fake-claude`: `$MATCH.request_id` and `$MATCH.uuid` are substituted from the matched frame
+- [x] **2.T4** Integration — the union of `porting/fixtures/*.argv.json` covers every B2 row (`--replay-user-messages`, `--include-partial-messages`, `--permission-prompt-tool`, `--session-id`, …)
+- [x] **2.T5** Integration — Node's text-only capture ends with `stopReason: end_turn`, not a force-cancel timeout
+- [x] **2.T6** Regression — G7 command prints nothing
+- [x] **2.T7** Integration — `fixtures_are_portable_and_secret_free`: no file under `porting/fixtures/` contains `/home/`, `TOKEN`, `SECRET`, `AUTH_SOCK`, or any value of a current-process env var whose name matches `TOKEN|KEY|SECRET|PASS`
 
 ---
 

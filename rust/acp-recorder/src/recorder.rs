@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, TextContent,
+    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Client, ConnectionTo, LineDirection};
@@ -26,6 +26,13 @@ use crate::script::{PermissionPolicy, Script, Step};
 /// giving up (a bound; a hang is a failure).
 const UPDATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// After `session/new` / `session/load` the adapter emits a trailing
+/// `available_commands_update` via `setTimeout(0)`. Its position relative to
+/// the next step (e.g. `session/prompt`) would otherwise race, making the
+/// captured frame order non-deterministic. Pause long enough for that timer to
+/// fire before the next step so the order is stable across captures (2.T1).
+const POST_CREATE_SETTLE: Duration = Duration::from_millis(75);
 
 /// Errors produced by the recorder.
 #[derive(Debug, Error)]
@@ -46,7 +53,12 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
         let frame_direction = match direction {
             LineDirection::Stdin => Direction::Send,
             LineDirection::Stdout => Direction::Recv,
-            LineDirection::Stderr => return,
+            LineDirection::Stderr => {
+                if std::env::var_os("ACP_RECORDER_STDERR").is_some() {
+                    eprintln!("[agent-stderr] {line}");
+                }
+                return;
+            }
         };
         let Ok(json) = serde_json::from_str(line) else {
             return;
@@ -96,8 +108,24 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
         frames.push(frame);
     }
 
-    outcome?;
-    Ok(frames)
+    // The ordered frames are the deliverable even when the script's final step
+    // errored (e.g. an `error-result` corpus script, whose `session/prompt`
+    // legitimately returns a JSON-RPC error). Only fail hard when the agent
+    // never got far enough to exchange any frame (a real startup failure).
+    finish(outcome, frames)
+}
+
+/// Decide the outcome of a recording given the script's `outcome` and the
+/// frames captured so far.
+fn finish(
+    outcome: Result<(), agent_client_protocol::Error>,
+    frames: Vec<Frame>,
+) -> Result<Vec<Frame>, Error> {
+    match outcome {
+        Ok(()) => Ok(frames),
+        Err(error) if frames.is_empty() => Err(Error::Protocol(error)),
+        Err(_) => Ok(frames),
+    }
 }
 
 fn parse_agent(agent_cmd: &str) -> Result<AcpAgent, Error> {
@@ -166,6 +194,24 @@ async fn run_script(
                     .block_task()
                     .await?;
                 session_id = Some(response.session_id);
+                tokio::time::sleep(POST_CREATE_SETTLE).await;
+            }
+            Step::LoadSession {
+                session_id: sid,
+                cwd,
+            } => {
+                let cwd = cwd
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+                let response = connection
+                    .send_request(LoadSessionRequest::new(sid.clone(), cwd))
+                    .block_task()
+                    .await?;
+                // `session/load` keeps the loaded session id active (the response
+                // carries modes/configOptions, not a new id).
+                let _ = response;
+                session_id = Some(sid.clone().into());
+                tokio::time::sleep(POST_CREATE_SETTLE).await;
             }
             Step::Prompt {
                 text,
@@ -309,6 +355,43 @@ mod tests {
     async fn wait_for_updates_gives_up_after_timeout() {
         let count = Arc::new(AtomicUsize::new(0));
         assert!(!wait_for_updates(&count, usize::MAX, Duration::from_millis(50)).await);
+    }
+
+    #[test]
+    fn post_create_settle_is_positive() {
+        assert!(POST_CREATE_SETTLE > Duration::ZERO);
+        assert!(POST_CREATE_SETTLE < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn finish_keeps_frames_on_script_error() {
+        let frames = vec![Frame::recv(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "error": {"code": -32603, "message": "Internal error: boom"}
+        }))];
+        let outcome: Result<(), agent_client_protocol::Error> =
+            Err(agent_client_protocol::Error::internal_error().data("boom"));
+        let result = finish(outcome, frames.clone());
+        assert!(
+            result.is_ok(),
+            "captured frames survive a script-level error"
+        );
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn finish_fails_when_no_frames_captured() {
+        let outcome: Result<(), agent_client_protocol::Error> =
+            Err(agent_client_protocol::Error::internal_error().data("no frames"));
+        assert!(finish(outcome, vec![]).is_err());
+    }
+
+    #[test]
+    fn finish_ok_passes_frames_through() {
+        let frames = vec![Frame::send(serde_json::json!({"method": "initialize"}))];
+        let result = finish(Ok(()), frames.clone());
+        assert_eq!(result.unwrap().len(), 1);
     }
 
     #[test]
