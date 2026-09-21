@@ -206,6 +206,8 @@ skills/rust-coding/
 - **Inbound handling:** `keep_alive` (R6) dropped; inbound `control_request` handled in a spawned task (D14); inbound `control_cancel_request` aborts that task's handler (INV-10).
 - **`suppressControlResponse`:** an SDK-internal JS symbol (`sdk.mjs:118:19850`); the port has no handler that declines to answer, so it is `skipped-deliberate` in `PARITY.md`.
 
+> **Phase-4 deviations (implementer, D6):** (1) `Control::spawn` takes the child stdin as an `impl AsyncWrite` plus a **control-traffic-only** inbound `mpsc::UnboundedReceiver<Value>` — control.rs does not consume the codec's full frame stream; the phase-5 dispatch routes only `keep_alive`/`control_response`/`control_request`/`control_cancel_request` frames here and session frames to the session actor. (2) The inbound `control_request` handler is injected as `ControlOptions.on_request: Option<Arc<RequestHandler>>` where `RequestHandler = Box<dyn Fn(Value) -> BoxFuture<Value> + Send + Sync>` (a boxed future, no `futures` crate); the default (`None`) answers `{subtype:"error"}`. (3) The `initialize` request is built from `InitializeOptions` via `build_request()`, which always emits `forwardSubagentText` (the fixture carries `false`); optional `systemPrompt`/`agents`/`skills`/`toolAliases`/`hooks` are emitted only when set (matching the adapter dropping `undefined`). (4) `request_id` is a 13-char base36 string seeded from `SystemTime` nanos XOR a per-process `AtomicU64` counter (no `rand` dep). (5) The `pending_permission_requests` replay (4.5) routes each entry through the same spawned-task inbound handler via a new `Outbound::Replay` command (mirroring the SDK's `processPendingPermissionRequests`). (6) 4.T7/4.T8/4.T9 are not invariant-tied (INV-7..12 map to 4.T1..4.T6), so they use descriptive test names (`slow_outbound_does_not_block_inbound`, `pending_permission_replayed`, `unknown_subtype_errors`) rather than `inv_NN_` slugs. (7) Supporting change: `Process::take_stdin()` added in `process.rs` so the session actor can hand child stdin to `Control::spawn` (D6); the kill-ladder's `close_stdin`/`dispose` paths are unaffected (stdin is already `None` once taken).
+
 ### Decision D7: stdin stays open for the whole session
 
 - **Decision:** stdin is closed only by `dispose()` / teardown (D12 ladder), never after a turn.
@@ -702,24 +704,24 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - `initialize` request field set = exactly what `porting/fixtures/initialize.json` shows (phase 2; includes `systemPrompt`, `agents`, `hooks`, `skills`, `toolAliases`, and the rest); response parsed for `commands`, `models`, `account`, `pending_permission_requests`.
 - stdin is never closed after a turn (D7).
 
-- [ ] **4.0** Read `rust/AGENTS.md`
-- [ ] **4.1** `control.rs` — single writer task; `send_user`, `send_request`, `send_response`, `send_cancel`
-- [ ] **4.2** `request_id` generation; correlation map; unknown-id drop
-- [ ] **4.3** Inbound router: `control_response` · `control_request` · `control_cancel_request` · `keep_alive`
-- [ ] **4.4** `initialize` handshake matching `initialize.json`; parse the response
-- [ ] **4.5** `pending_permission_requests` replay from the initialize response
-- [ ] **4.6** Unknown inbound subtype → `{subtype:"error"}` response
+- [x] **4.0** Read `rust/AGENTS.md`
+- [x] **4.1** `control.rs` — single writer task; `send_user`, `send_request`, `send_response`, `send_cancel`
+- [x] **4.2** `request_id` generation; correlation map; unknown-id drop
+- [x] **4.3** Inbound router: `control_response` · `control_request` · `control_cancel_request` · `keep_alive`
+- [x] **4.4** `initialize` handshake matching `initialize.json`; parse the response
+- [x] **4.5** `pending_permission_requests` replay from the initialize response
+- [x] **4.6** Unknown inbound subtype → `{subtype:"error"}` response
 
 **Verify phase 4:**
-- [ ] **4.T1** Unit — `control`: `keep_alive` is consumed, the caller sees nothing — `inv_07_keep_alive_consumed`
-- [ ] **4.T2** Unit — `control`: 100 concurrent frames of mixed kinds → exactly 100 whole lines on stdin — `inv_08_single_stdin_writer`
-- [ ] **4.T3** Unit — `control`: a response for an unknown `request_id` is dropped, no panic — `inv_09_unknown_id_dropped`
-- [ ] **4.T4** Unit — `control`: an inbound `control_cancel_request` aborts the pending handler and writes no response — `inv_10_inbound_cancel_aborts_handler`
-- [ ] **4.T5** Unit — `control`: the emitted `initialize` frame equals `porting/fixtures/initialize.json` (after id normalization) — `inv_11_initialize_matches_adapter`
-- [ ] **4.T6** Integration — vs `fake-claude`: after a `result` frame, a second `user` frame is written to the same stdin and the fake answers it — `inv_12_stdin_stays_open`
-- [ ] **4.T7** Regression — a slow outbound control request does not block inbound stream parsing (R5 is outbound only)
-- [ ] **4.T8** Unit — `control`: a `pending_permission_requests` entry in the initialize response is replayed to the handler
-- [ ] **4.T9** Unit — `control`: an inbound control request with an unknown subtype gets `{subtype:"error"}` written back
+- [x] **4.T1** Unit — `control`: `keep_alive` is consumed, the caller sees nothing — `inv_07_keep_alive_consumed`
+- [x] **4.T2** Unit — `control`: 100 concurrent frames of mixed kinds → exactly 100 whole lines on stdin — `inv_08_single_stdin_writer`
+- [x] **4.T3** Unit — `control`: a response for an unknown `request_id` is dropped, no panic — `inv_09_unknown_id_dropped`
+- [x] **4.T4** Unit — `control`: an inbound `control_cancel_request` aborts the pending handler and writes no response — `inv_10_inbound_cancel_aborts_handler`
+- [x] **4.T5** Unit — `control`: the emitted `initialize` frame equals `porting/fixtures/initialize.json` (after id normalization) — `inv_11_initialize_matches_adapter`
+- [x] **4.T6** Integration — vs `fake-claude`: after a `result` frame, a second `user` frame is written to the same stdin and the fake answers it — `inv_12_stdin_stays_open`
+- [x] **4.T7** Regression — a slow outbound control request does not block inbound stream parsing (R5 is outbound only)
+- [x] **4.T8** Unit — `control`: a `pending_permission_requests` entry in the initialize response is replayed to the handler
+- [x] **4.T9** Unit — `control`: an inbound control request with an unknown subtype gets `{subtype:"error"}` written back
 
 ---
 

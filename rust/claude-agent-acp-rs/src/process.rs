@@ -276,6 +276,14 @@ impl Process {
         self.child.id()
     }
 
+    /// Take ownership of the child's stdin writer.
+    ///
+    /// The control channel (Decision D6) is the sole writer to child stdin; the
+    /// session actor hands it this handle when it spawns the control task.
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.stdin.take()
+    }
+
     /// Write raw bytes to the child's stdin.
     pub async fn write_stdin(&mut self, data: &[u8]) -> Result<(), SpawnError> {
         let stdin = self.stdin.as_mut().ok_or_else(|| {
