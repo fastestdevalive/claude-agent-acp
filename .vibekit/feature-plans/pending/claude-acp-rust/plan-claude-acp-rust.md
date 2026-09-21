@@ -638,7 +638,7 @@ stdout: newline-delimited JSON
 | B-6 | ✅ Move evidence under `porting/` | `git mv EVALUATION.md porting/EVALUATION.md && git commit` |
 | B-7 | ✅ Local `main` mirrors upstream | `git checkout -B main upstream/main` |
 | B-8 | ✅ Publish, make `parity` default | `git push -u origin parity main && gh repo edit --default-branch parity` |
-| B-9 | vst project default branch → `parity` | vst project settings |
+| B-9 | ⚠️ not settable — vst has no project-update CLI/REST endpoint; project `defaultBranch` stays `main` | **Always pass `--base=parity`** to `vst worktree create` for this project |
 | B-10 | Stage the worktree — **idle, no prompt** | `vst worktree create claude-acp-rust-eval --branch=feat/rust-port --base=parity --mode=<claude-sonet id> --no-parent` |
 
 | B-11 | Verify subagent placement | a 1-line smoke spawn from the worktree's session appears **inside** that worktree in the vst UI — not as a new worktree (Q5) |
