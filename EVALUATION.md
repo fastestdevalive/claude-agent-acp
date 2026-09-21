@@ -77,6 +77,10 @@ flowchart TD
     style CLI fill:#333,color:#fff
 ```
 
+> **Superseded by plan D9.** Because the port lives in a fork of the upstream adapter, it ships as a
+> drop-in ACP agent **binary** instead — the fork cannot depend on vibe-station's `AcpTransport`.
+> The in-process shape above remains an option for vibe-station's own follow-up cutover.
+
 Key structural point: vibe-station is an ACP **client** with a frozen in-process abstraction already
 (`acp_transport.rs:115-178`). A native driver implements *that trait* — so the agent-side JSON-RPC
 surface disappears from the port entirely.

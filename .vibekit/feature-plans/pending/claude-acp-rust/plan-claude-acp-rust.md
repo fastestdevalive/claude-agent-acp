@@ -1,9 +1,11 @@
 ---
 feature: claude-acp-rust
 status: pending
-evaluation: ../../../EVALUATION.md
+evaluation: ../../../../porting/EVALUATION.md
 skill: rust-coding (vendored at skills/rust-coding/SKILL.md)
 implementer_mode: turn
+repo: fork of agentclientprotocol/claude-agent-acp, branch `parity`
+upstream_base: v0.70.0 (d0aafb1)
 ---
 
 <!--
@@ -17,6 +19,7 @@ RULES — read before writing or implementing:
 # Native Rust driver for Claude ACP — replacing `@agentclientprotocol/claude-agent-acp`
 
 Drive the `claude` binary directly from Rust. Zero Bun/Node/npm for Claude support.
+Ships as a drop-in ACP agent binary inside a fork of the upstream adapter, at parity with a pinned upstream release tag.
 
 ---
 
@@ -24,32 +27,43 @@ Drive the `claude` binary directly from Rust. Zero Bun/Node/npm for Claude suppo
 
 | | |
 |---|---|
-| **Goal** | A Rust crate that implements vibe-station's existing `AcpTransport` trait by driving `claude` directly over stream-json + control_request |
+| **Goal** | A Rust crate + drop-in ACP agent binary that drives `claude` directly over stream-json + control_request (D9) |
+| **Goal** | Parity with upstream tag `v0.70.0` — the version vibe-station runs today (D11) |
 | **Goal** | Every phase gated by tests the orchestrator verifies cover named invariants — not just "green" |
 | **Goal** | A differential harness vs the Node adapter, built **first**, not last |
 | **Non-goal** | Porting `@anthropic-ai/claude-agent-sdk` — settled, see `EVALUATION.md` § Settled |
 | **Non-goal** | Feature parity with the adapter's full surface — see `EVALUATION.md` § 2 (B) |
 | **Non-goal** | Publishing to crates.io in this feature |
+| **Non-goal** | vibe-station cutover — separate follow-up plan in the vibe-station repo (D9) |
+| **Non-goal** | Catching up `v0.70.0 → v0.79.0` — the first sync cycle, after this plan (D11) |
 
 ---
 
 ## Change Map
 
 ```
-rust/vst-claude-native/
-  src/
-    lib.rs            + crate root, #![forbid(unsafe_code)]
-    process.rs        + spawn, argv, lifecycle
-    codec.rs          + stream-json line codec
-    control.rs        + control_request channel
-    session.rs        + session actor
-    turn.rs           + turn state machine
-    map.rs            + Claude msg -> ACP SessionUpdate
-    permission.rs     + can_use_tool -> ACP
-    transport.rs      + AcpTransport impl
-  tests/
-    differential.rs   + Node-vs-Rust frame diff
+rust/
+  AGENTS.md             + Rust rules; overrides root (D10)
+  scripts/rust-gate.sh  + fmt + clippy + test
+  claude-agent-acp-rs/
+    src/
+      lib.rs            + crate root, forbid(unsafe)
+      process.rs        + spawn, argv, lifecycle
+      codec.rs          + stream-json line codec
+      control.rs        + control_request channel
+      session.rs        + session actor
+      turn.rs           + turn state machine
+      map.rs            + Claude msg -> SessionUpdate
+      permission.rs     + can_use_tool -> ACP
+      agent.rs          + ACP agent handlers
+      bin/claude-agent-acp-rs.rs  + drop-in binary
+    tests/
+      harness/          + ACP client recorder
+      differential.rs   + Node-vs-Rust frame diff
+src/                    (upstream TS — never modified)
 porting/
+  EVALUATION.md       ~ moved from repo root
+  SYNC.md             + upstream sync runbook
   capture.sh          + record Node adapter frames
   PARITY.md           + per-feature port status
 skills/rust-coding/
@@ -58,9 +72,9 @@ skills/rust-coding/
 
 | Today | After this plan |
 |-------|-----------------|
-| Claude turns spawn `bun <claude-agent-acp>` as a subprocess | Claude turns run in-process in Rust, no Node |
+| ACP clients spawn `bun <claude-agent-acp>/dist/index.js` | ACP clients spawn `claude-agent-acp-rs` — same ACP surface, no Node |
 | `CLAUDE_CODE_EXECUTABLE=claude` passed to the adapter | Driver resolves the binary itself |
-| ACP frames serialized over a pipe to the adapter | `AcpTransport` called in-process, no pipe |
+| Rust port has no home with upstream history | Fork branch `parity` = upstream tag + `rust/` |
 | No WS/stream-level differential test vs Node | Ordered-frame differential harness, phase 0 |
 | `rust-coding` skill exists only in a git-ignored worktree | Vendored and committed |
 
@@ -69,6 +83,7 @@ skills/rust-coding/
 ## Research
 
 > Evidence only. Every finding below is cited by a Key Decision or a phase item.
+> `vst-*` paths are in the vibe-station repo (`~/code/fastestdevalive/vibe-station/rust/`), not the fork.
 
 | # | Finding | Source |
 |---|---------|--------|
@@ -81,7 +96,7 @@ skills/rust-coding/
 | R7 | Turn settlement is a reverse-engineered state machine w/ fixes for #453 #680 #825 #851 #866 #886 | `EVALUATION.md` § cost centre |
 | R8 | `tokio::sync::mpsc::Receiver::recv` is **cancel-safe** — dissolves the JS async-generator hazard | `tokio-1.53.1/src/sync/mpsc/unbounded.rs:124` |
 | R9 | vibe-station consumes only 8 of 14 `SessionUpdate` variants | `vst-agents/src/normalize.rs:340-473` |
-| R10 | `AcpTransport` is a frozen in-process trait — no agent-side JSON-RPC needed | `vst-agents/src/acp_transport.rs:115-178` |
+| R10 | `AcpTransport` lives in vibe-station's `vst-agents` — a crate in the fork cannot implement it without a cross-repo dependency | `vst-agents/src/acp_transport.rs:115-178` |
 | **R11** | **Prior port: the parity harness covered REST only. Every WS bug was found by live browser repro, not tests** | `vst-daemon/tests/parity_harness.rs`; commits `3612191` `7761826` `fc330cc` |
 | **R12** | **Prior port: dispatch/ordering layer was rewritten 3× and has zero tests — private items in `server.rs`** | `vst-daemon/src/server.rs:933-997` |
 | R13 | Prior port: `tokio::spawn`-per-message destroyed arrival ordering the keyed lock depended on | `server.rs:953-997`; commit `fc330cc` |
@@ -89,19 +104,34 @@ skills/rust-coding/
 | R15 | Prior port: `.expect()` on a recoverable race aborted the **whole daemon** | `vst-store/src/transcript.rs:781`; commit `14b03f1` |
 | R16 | Prior port: re-entrant lock via a held guard caused an indefinite hang; `rust-coding` §10 records §9's guess was wrong | `skills/rust-coding/SKILL.md` §9–10 |
 | R17 | Semver build-metadata convention already in this workspace's lockfile: `1.1.6+spec-1.1.0` | `rust/Cargo.lock` |
+| R18 | Upstream is at `v0.79.0`; vibe-station pins `v0.70.0` — 9 minor versions of drift | `gh api .../tags`; `vst-agents/examples/acp_hello.rs` |
+| R19 | Upstream `AGENTS.md` / `CLAUDE.md` instruct `npm run check` + conventional-commit PR titles — TS-only rules | upstream `AGENTS.md` |
+| R20 | Upstream ships `publish.yml` + release-please workflows | upstream `.github/workflows/` |
+| R21 | `agent-client-protocol` 2.x agent side = `Agent::builder()` handler registration; JSON-RPC framing free | `EVALUATION.md` § 2 |
+| R22 | TS source at `v0.70.0`: `src/acp-agent.ts` 406 KB — the port reads **src/**, not dist | `gh api .../contents/src?ref=v0.70.0` |
 
 ---
 
 ## Key Decisions
 
-### D1 — Repo layout: fork upstream, Rust lives in `rust/`
+### D1 — Repo layout: fork upstream, Rust lives in `rust/` — ✅ accepted
 
 - **What:** fork `github.com/agentclientprotocol/claude-agent-acp`; add a top-level `rust/` Cargo workspace; never modify their TS.
 - **Why:** the porting workflow is `git diff <old-tag>..<new-tag> -- src/` → port the delta. That only works if both trees share a history.
 - **Why not a separate repo:** you would have to vendor or submodule the TS anyway to diff it; a fork does that for free with zero merge conflict risk (you only *add* `rust/`).
-- **Where:** fork root `rust/`, consumed by vibe-station as a git dependency pinned to a tag.
+- **Where:** fork `fastestdevalive/claude-agent-acp`, root `rust/`.
+- **Branch model** — parity holds on exactly one branch:
 
-### D2 — Versioning: `x.y.z+acp.<upstream>`, NOT a mirrored version
+| Branch | Tracks | Rule |
+|--------|--------|------|
+| `upstream/main` | upstream | never touched |
+| fork `main` | mirror of upstream `main` | only `gh repo sync`; never commit |
+| fork **`parity`** (default) | an upstream **release tag** + `rust/` | "Rust at parity with TS" holds at every HEAD |
+| `feat/*` worktrees | branched off `parity` | merged back only when their phase gates pass |
+
+- `parity` advances tag-by-tag (`v0.70.0` → `v0.71.0` …), never to upstream `main` — a tag is a fixed thing to be at parity *with*.
+
+### D2 — Versioning: `x.y.z+acp.<upstream>`, NOT a mirrored version — ✅ accepted
 
 - **What:** crate version is independent semver with upstream as **build metadata** — e.g. `0.1.0+acp.0.70.0`.
 - **Why not mirroring:** you cannot ship a Rust-only bugfix without either lying about parity or bumping a number that claims an upstream change happened.
@@ -109,7 +139,7 @@ skills/rust-coding/
 - **Precedent:** already in this workspace's own lockfile — `1.1.6+spec-1.1.0` (R17).
 - **Tag format:** `rust-v0.1.0+acp.0.70.0`.
 
-### D3 — "Parity" means parity of the **ported subset**, tracked in `PARITY.md`
+### D3 — "Parity" means parity of the **ported subset**, tracked in `PARITY.md` — ✅ accepted
 
 - **What:** `porting/PARITY.md` — one row per upstream feature: `ported` / `skipped-deliberate` / `pending`.
 - **Why:** `EVALUATION.md` § 2 (B) deliberately skips ~3.1k lines. Without an explicit ledger, every upstream release marks you "out of parity" forever and the signal becomes noise.
@@ -144,14 +174,38 @@ skills/rust-coding/
 - **Why:** R15 — one `.expect()` on an idempotent-migration race core-dumped the entire daemon.
 - **Rule:** `rust-coding` §1. Panics are for broken invariants only.
 
+### D9 — Deliverable is a **drop-in ACP agent binary**, not an `AcpTransport` impl
+
+- **What:** one crate, `rust/claude-agent-acp-rs/` — a library (the driver) + a `bin` target that speaks ACP over stdio via `Agent::builder()` (R21).
+- **Why:** consequence of D1. The fork cannot implement vibe-station's `AcpTransport` without depending on `vst-agents` — a cross-repo cycle.
+- **Bonus:** the differential harness compares Node and Rust at the **identical boundary** — same ACP client, same stdio, same frames. Strongest possible parity check.
+- **Bonus:** any ACP client (Zed, vibe-station, others) can use it unchanged.
+- **Cost:** the agent-side JSON-RPC surface returns, but the Rust SDK provides it free (R21).
+- **Supersedes:** `EVALUATION.md` § target diagram (in-process `AcpTransport`).
+- **Follow-up (separate plan, vibe-station repo):** swap the spawn command in `vst-agents/src/claude.rs:414-424`, or an in-process adapter over the library.
+
+### D10 — Rust work has its own `rust/AGENTS.md`; upstream CI stays off
+
+- **What:** `rust/AGENTS.md` states: for anything under `rust/`, it overrides the root `AGENTS.md`/`CLAUDE.md`.
+- **Why:** R19 — implementers read the root `AGENTS.md` first and would run `npm run check` and follow TS PR rules.
+- **What:** GitHub Actions disabled on the fork.
+- **Why:** R20 — `publish.yml` + release-please must never run from the fork.
+
+### D11 — Port base is `v0.70.0`, not upstream HEAD
+
+- **What:** `parity` starts at tag `v0.70.0` (`d0aafb1`).
+- **Why:** it is what vibe-station runs; every `EVALUATION.md` line citation is against it; the differential baseline must match production.
+- **Then:** `v0.70.0 → v0.79.0` (R18) is the **first sync cycle** per `porting/SYNC.md` — which doubles as the first real test of the D1 workflow.
+- **Citations:** `acp-agent.js:N` refs are the npm `dist/`. Implementers read `src/*.ts` at `v0.70.0` (R22); regenerate `dist/` with `npm ci && npm run build` when a dist line must be checked.
+
 ---
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    VST["vibe-station<br/>run_turn"]
-    TR["transport.rs<br/><code>impl AcpTransport</code>"]
+    CL["any ACP client<br/>vibe-station · Zed · harness"]
+    AG["agent.rs + bin/<br/><code>Agent::builder()</code> handlers"]
     SA["session.rs — <b>session actor</b><br/>owns ALL state, no locks"]
     TU["turn.rs<br/>turn state machine"]
     CT["control.rs<br/>single-writer + oneshot map"]
@@ -159,16 +213,16 @@ flowchart TD
     PR["process.rs<br/>spawn / lifecycle"]
     CLI["<b>claude</b> binary"]
 
-    VST -->|in-process call| TR
-    TR -->|Command + oneshot| SA
+    CL <-->|"ACP JSON-RPC over stdio<br/>(agent-client-protocol crate)"| AG
+    AG -->|Command + oneshot| SA
     SA --> TU
     SA --> CT
     CT -->|control_request| CD
     TU -->|user message| CD
     CD <-->|stream-json lines| PR
     PR <--> CLI
-    CD -->|SessionUpdate| SA
-    SA -->|mpsc| VST
+    CD -->|parsed messages| SA
+    SA -->|session/update| AG
 
     style SA fill:#1f6f3f,color:#fff
     style TU fill:#8a6d00,color:#fff
@@ -177,30 +231,32 @@ flowchart TD
 
 - Green = the single owner of mutable state (D4).
 - Amber = the cost centre (R7).
+- The binary replaces `bun dist/index.js` 1:1 — same stdio, same ACP surface (D9).
 
 ---
 
 ## System boundaries
 
-### B1 — `vst-claude-native` ↔ vibe-station (in-process)
+### B1 — ACP client ↔ `claude-agent-acp-rs` (stdio, JSON-RPC)
 
-```
-trait AcpTransport  (EXISTING — vst-agents/src/acp_transport.rs:115-178, do not change)
-  initialize()            -> Result<InitializeResponse, Error>
-  new_session(cwd)        -> Result<SessionId, Error>
-  load_session(id)        -> Result<(), Error>
-  send_prompt(id, blocks) -> Turn { updates: mpsc::Receiver<SessionNotification> }
-  cancel_active_prompt(id)-> Result<(), Error>
-  steer(id, prompt)       -> Result<SteerOutcome, Error>
-  dispose()               -> Result<(), Error>
-```
+| Direction | Method | Handled | Notes |
+|-----------|--------|:-------:|-------|
+| client → agent | `initialize` | ✅ | capabilities + `_meta.steering.supported: true` |
+| client → agent | `session/new` | ✅ | returns `sessionId` = Claude's native resume id |
+| client → agent | `session/load` | ✅ | resume via `--resume=<id>` |
+| client → agent | `session/prompt` | ✅ | resolves with `stopReason` when the turn settles |
+| client → agent | `session/cancel` (notification) | ✅ | → control `interrupt` |
+| client → agent | `_session/steering` (ext) | ✅ | `"now"` priority injection; idle → `{outcome:"promptRequired"}` |
+| client → agent | everything else (`authenticate`, `set_mode`, `_session/goal`, …) | ❌ | JSON-RPC `-32601` method-not-found; `skipped-deliberate` in `PARITY.md` |
+| agent → client | `session/update` | ✅ | 8 variants only — see below |
+| agent → client | `session/request_permission` | ✅ | from `can_use_tool` (phase 5) |
 
-- **Source of truth:** the trait. It is frozen — a divergence is a bug in this crate, not a trait change.
 - **Emitted `SessionUpdate` variants (only these 8, R9):** `AgentMessageChunk`, `AgentThoughtChunk`, `UserMessageChunk`, `ToolCall`, `ToolCallUpdate`, `CurrentModeUpdate`, `AvailableCommandsUpdate`, `Plan`.
-- **Never emitted:** `SessionInfoUpdate`, `ConfigOptionUpdate`, `UsageUpdate` — discarded by `normalize.rs:471-473`.
-- **On failure:** every method returns `Err`; the driver never panics into the daemon (D8).
+- **Not emitted:** `SessionInfoUpdate`, `ConfigOptionUpdate`, `UsageUpdate` — ignore-listed in the harness, `skipped-deliberate` in `PARITY.md`.
+- **Source of truth:** the Node adapter at `v0.70.0` for every ✅ row — a divergence is a bug here.
+- **On failure:** JSON-RPC error response; the process never panics (D8).
 
-### B2 — `vst-claude-native` ↔ `claude` binary (subprocess)
+### B2 — `claude-agent-acp-rs` ↔ `claude` binary (subprocess)
 
 ```
 argv:  claude --output-format stream-json --verbose --input-format stream-json   (R4, no --print)
@@ -231,12 +287,12 @@ stdout: newline-delimited JSON
 
 ### Implementer subagent (deepseek mode) must, per phase
 
-1. Load `skills/rust-coding/SKILL.md`, then `coding-agent-guardrails`, then `coding`.
+1. Read `rust/AGENTS.md` (overrides the root `AGENTS.md` — D10), then load `skills/rust-coding/SKILL.md`, `coding-agent-guardrails`, `coding`.
 2. Write the `N.T*` tests **before or alongside** the implementation — not after.
 3. Run the full gate and paste real output:
    ```
    bash rust/scripts/rust-gate.sh          # fmt + clippy + test, per rust-coding §7
-   timeout 180 cargo test -p vst-claude-native
+   timeout 180 cargo test -p claude-agent-acp-rs
    ```
 4. Write any deviation into `## Key Decisions` before finishing — it will not exist for phase N+1.
 
@@ -247,8 +303,9 @@ stdout: newline-delimited JSON
 | G1 | Re-run the gate itself. Never trust the subagent's word (`rust-coding` §7). | respawn |
 | G2 | **Every `INV-*` assigned to phase N has a named test that actually asserts it** — open the test, read the assertion. A test named for an invariant that asserts something weaker is a fail. | respawn w/ the specific INV cited |
 | G3 | No test exceeds its timeout. A hang is a failure, same severity as a panic (`rust-coding` §9). | respawn |
-| G4 | `grep -rn "unwrap()\|expect(" src/` — every hit is on a type-system-guaranteed invariant or it fails (D8, R15). | respawn |
-| G5 | `grep -rn "Arc<Mutex<.*Session" src/` returns nothing (D4). | respawn |
+| G4 | `grep -rn "unwrap()\|expect(" rust/claude-agent-acp-rs/src/` — every hit is on a type-system-guaranteed invariant or it fails (D8, R15). | respawn |
+| G5 | `grep -rn "Arc<Mutex<.*Session" rust/` returns nothing (D4). | respawn |
+| G7 | `git diff v0.70.0 -- src/ package.json` is empty — upstream TS untouched (D1). | respawn |
 | G6 | Any item rewritten in a previous phase has a unit test now (D5, R12). | respawn |
 
 - Retries: `implementer.turn.max_retries: 2`, then escalate per `PHASES.md:48`.
@@ -295,20 +352,24 @@ stdout: newline-delimited JSON
 
 > R11 is the reason this is phase 0 and not phase 8. The prior port shipped a REST-only harness and
 > found every WS bug by hand in a browser.
+> **Precondition:** the § Bootstrap steps are done — fork exists, `parity` branch is at `v0.70.0`.
 
-- [ ] **0.1** Fork upstream; add `rust/` workspace; `Cargo.toml` version `0.1.0+acp.0.70.0` (D2)
-- [ ] **0.2** Vendor `skills/rust-coding/SKILL.md` into the fork; it is git-ignored upstream
+- [ ] **0.1** `rust/` Cargo workspace; crate `claude-agent-acp-rs` version `0.1.0+acp.0.70.0` (D2); `rust/.gitignore` for `target/`
+- [ ] **0.2** `rust/AGENTS.md` — overrides root `AGENTS.md`/`CLAUDE.md` for `rust/**`; points at `skills/rust-coding/SKILL.md` (D10)
 - [ ] **0.3** `rust/scripts/rust-gate.sh` per `rust-coding` §7 — one canonical invocation
-- [ ] **0.4** `porting/capture.sh` — run the Node adapter over a scripted prompt corpus, record the **ordered** ACP frame stream to a fixture
-- [ ] **0.5** Corpus ≥8 scripts: text-only · single tool · multi-tool · permission-prompt · denied-permission · cancel-mid-turn · subagent/Task · error-result
-- [ ] **0.6** `tests/differential.rs` — diff ordered Rust frames vs the fixture; ignore-list for known-skipped features (D3)
-- [ ] **0.7** `porting/PARITY.md` seeded from `EVALUATION.md` § 2 (A)/(B)
+- [ ] **0.4** Harness ACP client (Rust, `Client::builder()`) that drives **any** ACP agent binary over stdio and records the **ordered** frame stream
+- [ ] **0.5** `porting/capture.sh` — runs the harness client against the Node adapter (`npm ci && npm run build` at `v0.70.0`) → fixture
+- [ ] **0.6** Corpus ≥8 scripts: text-only · single tool · multi-tool · permission-prompt · denied-permission · cancel-mid-turn · subagent/Task · error-result
+- [ ] **0.7** `tests/differential.rs` — same client against the Rust binary, diff vs fixture; ignore-list for `skipped-deliberate` features (D3)
+- [ ] **0.8** `porting/PARITY.md` seeded from `porting/EVALUATION.md` § 2 (A)/(B)
+- [ ] **0.9** `porting/SYNC.md` — the upstream sync runbook (§ Sync workflow below, as a checklist)
 
 **Verify phase 0:**
 - [ ] **0.T1** Integration — `capture.sh`: produces a stable fixture across 2 consecutive runs (no nondeterministic ordering)
 - [ ] **0.T2** Unit — `differential`: a deliberately reordered frame stream **fails** the diff (the harness detects ordering, not just set equality) — **INV-24**
 - [ ] **0.T3** Unit — `differential`: an ignore-listed feature's absence passes
 - [ ] **0.T4** Gate — `rust-gate.sh` clean on an empty crate
+- [ ] **0.T5** Regression — `git diff v0.70.0 -- src/ package.json` is empty: no upstream TS touched (D1)
 
 ---
 
@@ -423,18 +484,18 @@ stdout: newline-delimited JSON
 
 ---
 
-### Phase 7 — `AcpTransport` impl & wiring
+### Phase 7 — ACP agent binary (drop-in)
 
-- [ ] **7.1** `transport.rs` — implement the frozen trait (B1); do not change it
-- [ ] **7.2** `steer` → control-channel injection with `"now"` priority
-- [ ] **7.3** Wire into `vst-agents/src/claude.rs` behind an env flag, Node path still default
-- [ ] **7.4** `dispose()` — drain, then teardown, bounded deadline (prior port L11)
+- [ ] **7.1** `agent.rs` — `Agent::builder()` handlers for every ✅ row in B1; unhandled → `-32601`
+- [ ] **7.2** `_session/steering` ext → control-channel injection with `"now"` priority
+- [ ] **7.3** `bin/claude-agent-acp-rs.rs` — stdio transport; stdout is ACP-only, all logs to stderr
+- [ ] **7.4** Shutdown on stdin EOF / SIGTERM: drain, then teardown, bounded deadline (prior port L11)
 
 **Verify phase 7:**
-- [ ] **7.T1** Integration — every `AcpTransport` method against a real `claude`, asserting shape not content
-- [ ] **7.T2** Integration — flag off → Node path byte-identical to today (regression)
-- [ ] **7.T3** Integration — `dispose()` mid-turn leaves no orphan and no panic — **INV-6**
-- [ ] **7.T4** Regression — full `vst-agents` suite green
+- [ ] **7.T1** Integration — harness client runs `initialize → session/new → session/prompt → session/cancel` against the real binary + real `claude`, asserting shape not content
+- [ ] **7.T2** Unit — `agent`: an unhandled method returns `-32601`, never hangs or panics
+- [ ] **7.T3** Integration — stdin EOF mid-turn leaves no orphan `claude` and exits 0 — **INV-6**
+- [ ] **7.T4** Regression — nothing but JSON-RPC frames ever reaches stdout (a stray `println!` fails the test)
 
 ---
 
@@ -459,24 +520,32 @@ stdout: newline-delimited JSON
 
 ## Files & Phase Impact
 
+> Paths relative to the fork root. `C` = `rust/claude-agent-acp-rs`.
+
 | File | Status | Phase | Description / Contract |
 |------|--------|-------|------------------------|
-| `rust/Cargo.toml` | New | 0 | Workspace; version `0.1.0+acp.0.70.0` (D2) |
+| `porting/EVALUATION.md` | Moved | bootstrap | From repo root; the feasibility evidence |
+| `skills/rust-coding/SKILL.md` | Vendored | bootstrap | Was git-ignored in vibe-station |
+| `.vibekit/config.yaml` | New | bootstrap | turn-implement, `meta_harness: vibe-station`, implementer `deepseek` |
+| `rust/Cargo.toml` | New | 0 | Workspace; crate `0.1.0+acp.0.70.0` (D2) |
+| `rust/.gitignore` | New | 0 | `target/` |
+| `rust/AGENTS.md` | New | 0 | Overrides root `AGENTS.md` for `rust/**` (D10) |
 | `rust/scripts/rust-gate.sh` | New | 0 | fmt + clippy + test, `rust-coding` §7 |
 | `porting/capture.sh` | New | 0 | Records Node adapter ordered frames |
 | `porting/PARITY.md` | New | 0, 8 | Per-feature port ledger (D3) |
-| `skills/rust-coding/SKILL.md` | Vendored | 0 | Was git-ignored upstream |
-| `.../tests/differential.rs` | New | 0, 4–8 | Ordered-frame diff vs Node |
-| `.../src/process.rs` | New | 1 | Spawn, argv, lifecycle, kill ladder |
-| `.../src/codec.rs` | New | 1 | stream-json line codec |
-| `.../src/control.rs` | New | 2 | Control channel, single writer |
-| `.../src/session.rs` | New | 3 | Session actor — sole state owner (D4) |
-| `.../src/turn.rs` | New | 3, 6 | Turn state machine, settlement |
-| `.../src/map.rs` | New | 4 | Claude msg → `SessionUpdate` |
-| `.../src/permission.rs` | New | 5 | `can_use_tool` → ACP |
-| `.../src/transport.rs` | New | 7 | `impl AcpTransport` |
-| `vst-agents/src/claude.rs` | Modified | 7 | Flag-gated native path; Node default |
-| `vst-agents/src/acp_transport.rs` | Unchanged | — | Frozen contract (B1) |
+| `porting/SYNC.md` | New | 0 | Upstream sync runbook |
+| `C/tests/harness/` | New | 0 | ACP client that records ordered frames from any agent |
+| `C/tests/differential.rs` | New | 0, 4–8 | Ordered-frame diff vs Node |
+| `C/src/process.rs` | New | 1 | Spawn, argv, lifecycle, kill ladder |
+| `C/src/codec.rs` | New | 1 | stream-json line codec |
+| `C/src/control.rs` | New | 2 | Control channel, single writer |
+| `C/src/session.rs` | New | 3 | Session actor — sole state owner (D4) |
+| `C/src/turn.rs` | New | 3, 6 | Turn state machine, settlement |
+| `C/src/map.rs` | New | 4 | Claude msg → `SessionUpdate` |
+| `C/src/permission.rs` | New | 5 | `can_use_tool` → ACP |
+| `C/src/agent.rs` | New | 7 | ACP handlers per B1 |
+| `C/src/bin/claude-agent-acp-rs.rs` | New | 7 | Drop-in stdio binary |
+| `src/**`, `package.json` | Unchanged | — | Upstream TS; G7 enforces |
 
 ---
 
@@ -485,13 +554,56 @@ stdout: newline-delimited JSON
 | # | Risk | Mitigation | Owner phase |
 |---|------|-----------|-------------|
 | 1 | Turn settlement re-derived wrong; symptoms look like Claude bugs | Differential harness exists before any code (phase 0); INV-13..17 | 0, 3 |
-| 2 | Upstream changes the wire format with no notice | `PARITY.md` + pinned tag; harness re-run on every upstream pull | 0, 8 |
+| 2 | Upstream changes the wire format with no notice | `PARITY.md` + pinned tag; harness re-run every sync (§ Sync workflow) | 0, 8 |
 | 3 | Implementer reaches for `Arc<Mutex<Session>>` to make it compile | G5 is a mechanical grep in every phase gate | all |
 | 4 | Ordering layer untested again (R12 repeat) | D5 makes it public + injectable; G6 | 3 |
 | 5 | A hang reported as "still working" | G3; `timeout` on every test invocation (`rust-coding` §9) | all |
-| 6 | `.expect()` takes down the daemon (R15 repeat) | G4 grep; `rust-coding` §1 | all |
+| 6 | `.expect()` takes down the process (R15 repeat) | G4 grep; `rust-coding` §1 | all |
 | 7 | Deepseek implementer silently skips tests | Orchestrator re-runs the gate (G1) and reads assertions (G2), never trusts self-report | all |
-| 8 | Corpus too small to catch ordering bugs | ≥8 scripts incl. cancel + subagent + error paths (0.5) | 0 |
+| 8 | Corpus too small to catch ordering bugs | ≥8 scripts incl. cancel + subagent + error paths (0.6) | 0 |
+| 9 | Implementer follows upstream `AGENTS.md` (npm, TS PR rules) | `rust/AGENTS.md` override; stated first in every turn prompt (D10) | all |
+| 10 | Fork runs upstream `publish.yml` / release-please | Actions disabled on the fork at bootstrap (D10) | bootstrap |
+| 11 | Implementer "fixes" something in upstream `src/` | G7: `git diff v0.70.0 -- src/` must be empty | all |
+
+---
+
+## Bootstrap — before phase 0 (human-run, one time)
+
+> Not an sdlc phase. Run by the human (or on explicit go-ahead) before `/sdlc` starts.
+
+| # | Step | Command |
+|---|------|---------|
+| B-1 | Fork on GitHub, no clone | `gh repo fork agentclientprotocol/claude-agent-acp --clone=false` |
+| B-2 | Disable Actions on the fork (D10) | `gh api -X PUT repos/fastestdevalive/claude-agent-acp/actions/permissions -F enabled=false` |
+| B-3 | Point this repo at the fork | `git remote add origin git@github.com:fastestdevalive/claude-agent-acp.git && git remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git && git fetch --all --tags` |
+| B-4 | Archive the eval history | `git branch eval-archive main` |
+| B-5 | Build `parity` from the tag, replaying eval commits (drops the local `.gitignore`-only root commit) | `git checkout -b parity v0.70.0 && git cherry-pick <root>..eval-archive` |
+| B-6 | Move evidence under `porting/` | `git mv EVALUATION.md porting/EVALUATION.md && git commit` |
+| B-7 | Local `main` mirrors upstream | `git checkout -B main upstream/main` |
+| B-8 | Publish, make `parity` default | `git push -u origin parity main && gh repo edit --default-branch parity` |
+| B-9 | vst project default branch → `parity` | vst project settings |
+| B-10 | Stage the worktree — **idle, no prompt** | `vst worktree create claude-acp-rust-eval --branch=feat/rust-port --base=parity --mode=<claude-sonet id> --no-parent` |
+
+- Start phase 0 later with `/sdlc claude-acp-rust turn-implement` **inside** that worktree's session.
+
+---
+
+## Sync workflow — every upstream release (becomes `porting/SYNC.md` in 0.9)
+
+```mermaid
+flowchart LR
+    T["upstream tag<br/>v0.N+1"] --> D["git diff vOLD..vNEW -- src/"]
+    D --> C{"touches a<br/>ported row?"}
+    C -->|no| M
+    C -->|yes| P["port delta<br/>(sdlc plan)"]
+    P --> H["re-capture fixture<br/>+ differential"]
+    H --> M["merge tag into parity<br/>bump +acp.0.N+1<br/>update PARITY.md"]
+    M --> G["tag rust-vX+acp.0.N+1"]
+```
+
+- `parity` only ever merges **tags**, one at a time, never `upstream/main`.
+- A tag whose diff touches no `ported` row still advances `parity` — the build metadata bump is the record.
+- First run: `v0.70.0 → v0.79.0` (D11) — expect it to take several tags.
 
 ---
 
@@ -499,6 +611,7 @@ stdout: newline-delimited JSON
 
 | # | Question | Blocks |
 |---|----------|--------|
-| Q1 | Confirm D1 (fork + `rust/`) vs Rust-in-vibe-station | Phase 0.1 |
-| Q2 | Fork hosted where — personal GH, or an org? | Phase 0.1 |
-| Q3 | Does the corpus run against a real Anthropic account in CI, or fixtures only? | Phase 0.4 |
+| ~~Q1~~ | ~~Fork vs Rust-in-vibe-station~~ — **resolved: fork (D1)** | — |
+| Q2 | Fork under personal `fastestdevalive` (only authed account) or an org? | B-1 |
+| Q3 | Does the corpus run against a real Anthropic account, or recorded fixtures only? Real = catches more, costs per run | 0.5 |
+| Q4 | vibe-station cutover shape: swap spawn command (trivial) or in-process adapter over the library? | follow-up plan |
