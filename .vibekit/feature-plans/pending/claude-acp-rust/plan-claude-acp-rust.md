@@ -194,6 +194,8 @@ skills/rust-coding/
 
 > **Phase-5 deviations (implementer, D4):** (1) The actor's read loop (5.3) is one `tokio::select!` (`biased`) multiplexing the `Command` channel, the codec stream, an injected turn-completion lane and the cancel token; on cancel it drains any remaining queued stream messages via `try_recv()` before exiting (INV-15). `run_dispatch` is kept as the reusable stream-only sequential pump in `dispatch.rs` (used by 5.T1); the actor reuses the shared `dispatch::route()` classification rather than `run_dispatch` itself, because it must multiplex four inputs. (2) Phase-5 turn completion is an **injected** `mpsc::UnboundedReceiver<()>` completion lane (`Session::spawn` param) — phase 6 replaces it with `result`-frame handling; a prompt's `oneshot` reply resolves on that lane. (3) Outbound user frames go to an `Option<Control>` (D6); `None` in actor-only unit tests. (4) The one-active-turn high-water counter is an `Arc<AtomicUsize>` (fetch_max) exposed via `Session::high_water()` — an atomic, not a Mutex/RwLock, so G5 stays clean. (5) `Command::Cancel` is a placeholder variant (real behaviour is phase 11).
 
+> **Phase-6 deviation (implementer, D4):** `turn.rs` is delivered as a **self-contained, actor-driven state machine** (`Turn`, `TurnMachine`, `StopReason`, `TurnEvent`) with its own unit tests — the phase-6 file impact lists only `C/src/turn.rs`, and the session actor (`session.rs`) is **not** in that phase's file set. The actor's phase-5 injected `completions` lane therefore remains in place; the phase-6 items 6.1–6.6 (activate/settle/defer, echo, settle-or-defer with the live-subagent set, idle lane, stop-reason table + #453 fallback, orphan accounting) are all implemented and unit-tested on the machine directly. The actor rewiring to drive `TurnMachine` from `result`/`idle`/`task_*` frames happens when `session.rs` enters the file impact (a later phase). The pre-echo abandonment hole (`acp-agent.js:2141-2153`) is documented in `turn.rs` module docs, not fixed, per 6.2.
+
 ### Decision D5: Dispatch is a public, injectable unit from day one
 
 - **Decision:** `pub fn route(msg: &StreamMsg, view: &TurnView) -> Route` plus a runner `pub async fn run_dispatch(rx, handler: impl Handler)` in its own file.
@@ -763,21 +765,21 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Every settle path routes through `settle_or_defer` when subagents are live (#866).
 - `result.subtype` → `StopReason` table is read from `acp-agent.js:2532-2884` and copied into `turn.rs` as a table-driven fn.
 
-- [ ] **6.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **6.1** `turn.rs` — `Turn` struct; `activate` (on echo), `settle`, `defer`
-- [ ] **6.2** Echo tracking; abandonment documented as a known hole (#825)
-- [ ] **6.3** `settle_or_defer` with a live-subagent set fed by `task_started` / `task_notification` frames (#866)
-- [ ] **6.4** Idle lane: `session_state_changed` = idle settles the turn, or fails it if no `result` arrived (#825)
-- [ ] **6.5** `result` → stop-reason table; `is_error` results become errors; #453 result-text fallback
-- [ ] **6.6** Orphan accounting: dead turns' late `result` coalesced in the documented order (`1453`)
+- [x] **6.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **6.1** `turn.rs` — `Turn` struct; `activate` (on echo), `settle`, `defer`
+- [x] **6.2** Echo tracking; abandonment documented as a known hole (#825)
+- [x] **6.3** `settle_or_defer` with a live-subagent set fed by `task_started` / `task_notification` frames (#866)
+- [x] **6.4** Idle lane: `session_state_changed` = idle settles the turn, or fails it if no `result` arrived (#825)
+- [x] **6.5** `result` → stop-reason table; `is_error` results become errors; #453 result-text fallback
+- [x] **6.6** Orphan accounting: dead turns' late `result` coalesced in the documented order (`1453`)
 
 **Verify phase 6:**
-- [ ] **6.T1** Unit — `turn`: a turn with 2 live subagents does not settle until both drain — `inv_16_subagents_hold_settle`
-- [ ] **6.T2** Unit — `turn`: result text present only in the `result` frame yields a `TurnEvent::FinalText` (internal event; ACP emission is phase 7) — `inv_29_result_text_fallback`
-- [ ] **6.T3** Unit — `turn`: a dead turn's late `result` is not consumed by the next turn — `inv_30_orphan_result_not_reused`
-- [ ] **6.T4** Unit — `turn`: idle without a `result` fails the active turn — `inv_31_idle_without_result_fails`
-- [ ] **6.T5** Unit — `turn`: table test, one case per `result.subtype` → expected `StopReason`
-- [ ] **6.T6** Regression — `#[tokio::test(flavor = "multi_thread")]` on 6.T1–6.T4; `timeout 120`
+- [x] **6.T1** Unit — `turn`: a turn with 2 live subagents does not settle until both drain — `inv_16_subagents_hold_settle`
+- [x] **6.T2** Unit — `turn`: result text present only in the `result` frame yields a `TurnEvent::FinalText` (internal event; ACP emission is phase 7) — `inv_29_result_text_fallback`
+- [x] **6.T3** Unit — `turn`: a dead turn's late `result` is not consumed by the next turn — `inv_30_orphan_result_not_reused`
+- [x] **6.T4** Unit — `turn`: idle without a `result` fails the active turn — `inv_31_idle_without_result_fails`
+- [x] **6.T5** Unit — `turn`: table test, one case per `result.subtype` → expected `StopReason`
+- [x] **6.T6** Regression — `#[tokio::test(flavor = "multi_thread")]` on 6.T1–6.T4; `timeout 120`
 
 ---
 
