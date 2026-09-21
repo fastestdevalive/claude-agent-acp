@@ -268,6 +268,7 @@ skills/rust-coding/
 - **Guard G8:** `cargo check --target x86_64-pc-windows-gnu` and `--target aarch64-apple-darwin` pass every phase (verified for the ACP crate in a scratch build).
 - **Runtime tests:** Linux only here; Windows/macOS runtime = own `rust-ci.yml` matrix, a follow-up (why D10 keeps Actions on).
 - **If a dependency blocks cross-`check`:** record it here, don't silently drop the target.
+- **Phase-3 deviation (implementer):** the Windows job object is provided by tokio's `kill_on_drop(true)` (which assigns the child to a job object on Windows and kills it on drop/close) rather than a separate `win32job` crate; no extra crate was needed and G8 still passes. The `CLAUDE_CODE_ENTRYPOINT` value captured into `porting/fixtures/*.argv.json` is environment/version-dependent (`sdk-cli` vs `cli`); 3.T1 asserts presence only, never the value.
 
 ### Decision D13: Differential harness runs both sides against a fake `claude`
 
@@ -670,26 +671,26 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - stderr: keep a 2 KB rolling tail; on exit drain up to `stderr_drain_cap` (200 ms) before reporting.
 - Host-death guarantee: `claude` exits when its stdin reaches EOF (INV-28); `kill_on_drop(true)` + group kill on `dispose()`.
 
-- [ ] **3.0** Read `rust/AGENTS.md`
-- [ ] **3.1** `process.rs` — spawn with the full B2 argv/env; `NODE_OPTIONS` removed
-- [ ] **3.2** Binary resolution: `ServeOptions.claude_path` → `CLAUDE_CODE_EXECUTABLE` → PATH; typed error on miss; pure fn taking an injected `Os` enum (`claude` / `claude.exe`)
-- [ ] **3.3** `codec.rs` — newline-delimited JSON, partial-line buffer, UTF-8 carry, own task → `mpsc`
-- [ ] **3.4** stderr tail + drain-before-exit
-- [ ] **3.5** Kill ladder per D12 with `Timings`; user abort goes through a **separate** forwarded token, never straight to `kill`
-- [ ] **3.6** Process group (`process_group(0)`, `nix::killpg`) on unix; job object + `CREATE_NO_WINDOW` on windows
+- [x] **3.0** Read `rust/AGENTS.md`
+- [x] **3.1** `process.rs` — spawn with the full B2 argv/env; `NODE_OPTIONS` removed
+- [x] **3.2** Binary resolution: `ServeOptions.claude_path` → `CLAUDE_CODE_EXECUTABLE` → PATH; typed error on miss; pure fn taking an injected `Os` enum (`claude` / `claude.exe`)
+- [x] **3.3** `codec.rs` — newline-delimited JSON, partial-line buffer, UTF-8 carry, own task → `mpsc`
+- [x] **3.4** stderr tail + drain-before-exit
+- [x] **3.5** Kill ladder per D12 with `Timings`; user abort goes through a **separate** forwarded token, never straight to `kill`
+- [x] **3.6** Process group (`process_group(0)`, `nix::killpg`) on unix; job object + `CREATE_NO_WINDOW` on windows
 
 **Verify phase 3:**
-- [ ] **3.T1** Integration — spawn `fake-claude` for the text-only script; its captured argv equals `porting/fixtures/text-only.argv.json` after uuid normalization, and its env has `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` set and `NODE_OPTIONS` absent (other env vars are not compared)
-- [ ] **3.T2** Unit — `codec`: a garbage line is skipped, the next valid line parses — `inv_01_garbage_line_skipped`
-- [ ] **3.T3** Unit — `codec`: a 10 MB single line parses; a message split across 3 reads reassembles — `inv_02_partial_and_huge_lines`
-- [ ] **3.T4** Unit — `codec`: a 4-byte UTF-8 char split across reads decodes intact — `inv_03_utf8_split`
-- [ ] **3.T5** Integration — fake child writes to stderr then exits → full tail in the error, within the cap — `inv_04_stderr_drained`
-- [ ] **3.T6** Integration — fake child ignoring stdin close: SIGTERM only after `stdin_close_wait`, SIGKILL only after `term_to_kill_wait` (durations shrunk via `Timings`) — `inv_05_kill_ladder` (also asserts a user abort goes through the ladder, never straight to SIGKILL)
-- [ ] **3.T7** Integration — after `dispose()`, `kill(pid,0)` returns `ESRCH` for the recorded child pid — `inv_06_no_orphan_after_dispose`
-- [ ] **3.T8** Integration — a helper binary spawns a child via the crate then is SIGKILLed; the child is gone within 5 s — `inv_28_host_sigkill_no_orphan`
-- [ ] **3.T9** Unit — `codec`: cancelling the consumer's `select!` mid-stream loses no line — `inv_32_codec_cancel_safe`
-- [ ] **3.T10** Unit — `process`: `resolve_binary(Os::Windows)` returns `claude.exe`; unix returns `claude`
-- [ ] **3.T11** Gate — G8 cross-target `check` passes — `INV-25`
+- [x] **3.T1** Integration — spawn `fake-claude` for the text-only script; its captured argv equals `porting/fixtures/text-only.argv.json` after uuid normalization, and its env has `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` set and `NODE_OPTIONS` absent (other env vars are not compared)
+- [x] **3.T2** Unit — `codec`: a garbage line is skipped, the next valid line parses — `inv_01_garbage_line_skipped`
+- [x] **3.T3** Unit — `codec`: a 10 MB single line parses; a message split across 3 reads reassembles — `inv_02_partial_and_huge_lines`
+- [x] **3.T4** Unit — `codec`: a 4-byte UTF-8 char split across reads decodes intact — `inv_03_utf8_split`
+- [x] **3.T5** Integration — fake child writes to stderr then exits → full tail in the error, within the cap — `inv_04_stderr_drained`
+- [x] **3.T6** Integration — fake child ignoring stdin close: SIGTERM only after `stdin_close_wait`, SIGKILL only after `term_to_kill_wait` (durations shrunk via `Timings`) — `inv_05_kill_ladder` (also asserts a user abort goes through the ladder, never straight to SIGKILL)
+- [x] **3.T7** Integration — after `dispose()`, `kill(pid,0)` returns `ESRCH` for the recorded child pid — `inv_06_no_orphan_after_dispose`
+- [x] **3.T8** Integration — a helper binary spawns a child via the crate then is SIGKILLed; the child is gone within 5 s — `inv_28_host_sigkill_no_orphan`
+- [x] **3.T9** Unit — `codec`: cancelling the consumer's `select!` mid-stream loses no line — `inv_32_codec_cancel_safe`
+- [x] **3.T10** Unit — `process`: `resolve_binary(Os::Windows)` returns `claude.exe`; unix returns `claude`
+- [x] **3.T11** Gate — G8 cross-target `check` passes — `INV-25`
 
 ---
 

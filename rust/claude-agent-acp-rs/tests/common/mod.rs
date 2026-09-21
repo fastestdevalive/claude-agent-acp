@@ -2,7 +2,8 @@
 //!
 //! This module is `tests/`-only: it is never compiled into the crate itself and
 //! never `pub` in `src/` (guard G6). It provides the ordered-frame differ used
-//! by the Node-vs-Rust differential harness (Decision D13).
+//! by the Node-vs-Rust differential harness (Decision D13) plus process-transport
+//! helpers (phase 3).
 //!
 //! A "frame" is one JSON-RPC message exchanged over the wire in one direction.
 //! The differ compares two ordered frame lists after:
@@ -11,6 +12,11 @@
 //!    `usage_update` frame the Rust side never emits),
 //! 2. removing nodes at plain-field ignore paths (e.g. `result.configOptions`),
 //! 3. normalising ids/uuids/timestamps to first-appearance placeholders.
+//!
+//! Because this shared module is `mod`-included by several independent test
+//! binaries (each with a different slice of helpers in use), `dead_code` is
+//! allowed: a helper unused by one test binary is used by another.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -419,4 +425,110 @@ fn is_timestamp(s: &str) -> bool {
         && b[6].is_ascii_digit()
         && b[8].is_ascii_digit()
         && b[9].is_ascii_digit()
+}
+
+// ---------------------------------------------------------------------------
+// Process-transport test helpers (phase 3).
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// The fork root (parent of `rust/`).
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("repo root resolves")
+}
+
+/// The built `fake-claude` binary (the gate builds it under `rust/target/debug`).
+pub fn fake_claude_binary() -> PathBuf {
+    repo_root().join("rust/target/debug/fake-claude")
+}
+
+/// Build and return the path to a crate example binary.
+pub fn build_example(name: &str) -> PathBuf {
+    let root = repo_root();
+    let status = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--manifest-path",
+            "rust/Cargo.toml",
+            "--example",
+            name,
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("spawn cargo build --example");
+    assert!(
+        status.success(),
+        "cargo build --example {name} must succeed"
+    );
+    root.join("rust/target/debug/examples").join(name)
+}
+
+/// Read a JSON file into a `serde_json::Value`.
+pub fn read_json(path: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).expect("read json file");
+    serde_json::from_str(&text).expect("parse json file")
+}
+
+/// Poll for `path` to exist and be non-empty, up to `timeout`.
+pub fn wait_for_file(path: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > 0 {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {}", path.display()));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Replace the `--session-id=<uuid>` argument with `--session-id=$0` so a
+/// captured argv can be compared against the normalised fixture (3.T1).
+pub fn normalize_argv_session_id(argv: &mut [String]) {
+    for arg in argv.iter_mut() {
+        if arg.starts_with("--session-id=") {
+            *arg = "--session-id=$0".to_string();
+        }
+    }
+}
+
+/// Poll up to `timeout` for the child pid to be gone (`kill(pid,0)` = `ESRCH`).
+pub fn wait_pid_gone(pid: u32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if pid_is_gone(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Whether `kill(pid, 0)` reports the process does not exist (ESRCH).
+#[cfg(unix)]
+pub fn pid_is_gone(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    matches!(
+        kill(Pid::from_raw(pid as i32), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
+/// Windows runtime is out of scope for phase-3 tests (D12): pid liveness checks
+/// are unix-only.
+#[cfg(not(unix))]
+pub fn pid_is_gone(_pid: u32) -> bool {
+    true
 }
