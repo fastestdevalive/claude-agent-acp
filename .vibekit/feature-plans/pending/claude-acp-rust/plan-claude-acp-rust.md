@@ -289,6 +289,8 @@ skills/rust-coding/
 - Why: the Node adapter activates a turn only when the echoed `user` frame's `uuid` equals the `promptUuid` it wrote (`acp-agent.js:990-991`, `1517`, `3018-3022`); without the echo uuid every prompt hangs until the force-cancel floor.
 - `expect` = subset match on the next stdin frame; steps run in order; an unmatched frame fails the run loudly.
 
+> **Phase-1 deviations (implementer, D13):** (1) `diff_frames`/`Frame`/`JsonPath` live in `C/tests/common/mod.rs`; `acp-recorder` cannot share them because it depends on `claude-agent-acp-rs` (a `C/tests`→`acp-recorder` dep would be a crate cycle), so the recorder's `Frame`/`Direction` are a small duplicate in `acp-recorder/src/frames.rs`. (2) The 1.T4 integration test therefore lives in `acp-recorder/tests/recorder.rs` (not `C/tests/differential.rs`). (3) The "session/cancel after N updates" call is encoded as a `cancel_after_updates: <n>` field on the `session/prompt` step (script JSON), not a separate step. (4) `thiserror` added to `acp-recorder`'s `[dependencies]` (already in the lock via `claude-agent-acp-rs`, so no new crate/version drift).
+
 ### Decision D14: No actor awaits an external round-trip inline
 
 - **Decision:** permission prompts, inbound control requests and any client round-trip run in spawned tasks that send their result back to the session actor as a `Command`; the actor and the stdout reader never `.await` a client reply.
@@ -618,18 +620,18 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Client side uses `Client::builder()` from `agent-client-protocol` 2.1 (R21).
 - The differ normalizes ids/uuids/timestamps to first-appearance placeholders (D13) and compares in order; the ignore-list is **JSON-path based** (e.g. `result.configOptions`, `result.modes`, `result.models`, `result.authMethods`, `params.update[sessionUpdate=usage_update]`) because Node's `initialize` / `session/new` / `session/load` responses carry fields the Rust side skips on purpose (`acp-agent.js:727`, `4641`, `4652-4653`, `4671-4672`).
 
-- [ ] **1.0** Read `rust/AGENTS.md`
-- [ ] **1.1** `rust/acp-recorder/` — binary + library; args: agent command, script path, output path
-- [ ] **1.2** Script format: ordered ACP calls (`initialize`, `session/new`, `session/prompt` with text, `session/cancel` after N updates, permission reply policy allow/deny)
-- [ ] **1.3** `C/tests/differential.rs` — `diff_frames(a, b, ignore: &[JsonPath]) -> Result<(), FrameDiff>` in `C/tests/common/mod.rs` (shared by `differential.rs`; never `pub` in `src/`); normalization; path-based ignore-list
-- [ ] **1.4** Unit tests use synthetic frame lists only (no agent needed)
-- [ ] **1.5** `rust/acp-recorder/examples/echo_agent.rs` — trivial in-repo ACP agent for 1.T4
+- [x] **1.0** Read `rust/AGENTS.md`
+- [x] **1.1** `rust/acp-recorder/` — binary + library; args: agent command, script path, output path
+- [x] **1.2** Script format: ordered ACP calls (`initialize`, `session/new`, `session/prompt` with text, `session/cancel` after N updates, permission reply policy allow/deny)
+- [x] **1.3** `C/tests/differential.rs` — `diff_frames(a, b, ignore: &[JsonPath]) -> Result<(), FrameDiff>` in `C/tests/common/mod.rs` (shared by `differential.rs`; never `pub` in `src/`); normalization; path-based ignore-list
+- [x] **1.4** Unit tests use synthetic frame lists only (no agent needed)
+- [x] **1.5** `rust/acp-recorder/examples/echo_agent.rs` — trivial in-repo ACP agent for 1.T4
 
 **Verify phase 1:**
-- [ ] **1.T1** Unit — `diff_frames`: a stream with two frames swapped **fails**; the same set in order passes — `inv_24_order_sensitive`
-- [ ] **1.T2** Unit — `diff_frames`: differing uuids/timestamps only → pass; differing text → fail
-- [ ] **1.T3** Unit — `diff_frames`: a differing field on an ignored JSON path passes; the same difference on a non-ignored path fails; an ignored whole frame (`usage_update`) missing on one side passes
-- [ ] **1.T4** Integration — `acp-recorder` against a trivial in-repo echo agent records `initialize` request + response in order
+- [x] **1.T1** Unit — `diff_frames`: a stream with two frames swapped **fails**; the same set in order passes — `inv_24_order_sensitive`
+- [x] **1.T2** Unit — `diff_frames`: differing uuids/timestamps only → pass; differing text → fail
+- [x] **1.T3** Unit — `diff_frames`: a differing field on an ignored JSON path passes; the same difference on a non-ignored path fails; an ignored whole frame (`usage_update`) missing on one side passes
+- [x] **1.T4** Integration — `acp-recorder` against a trivial in-repo echo agent records `initialize` request + response in order
 
 ---
 
