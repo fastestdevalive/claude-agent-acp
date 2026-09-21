@@ -19,7 +19,7 @@ RULES — read before writing or implementing:
 # Native Rust driver for Claude ACP — replacing `@agentclientprotocol/claude-agent-acp`
 
 Drive the `claude` binary directly from Rust. Zero Bun/Node/npm for Claude support.
-Ships as a drop-in ACP agent binary inside a fork of the upstream adapter, at parity with a pinned upstream release tag.
+A Rust **library** that serves ACP over any transport — linked into vibe-station as a cargo dependency on every platform, plus a thin stdio binary. Lives in a fork of the upstream adapter, at parity with a pinned upstream release tag.
 
 ---
 
@@ -27,7 +27,9 @@ Ships as a drop-in ACP agent binary inside a fork of the upstream adapter, at pa
 
 | | |
 |---|---|
-| **Goal** | A Rust crate + drop-in ACP agent binary that drives `claude` directly over stream-json + control_request (D9) |
+| **Goal** | A Rust library that drives `claude` directly and serves ACP over any transport (D9) |
+| **Goal** | Consumed by vibe-station as a cargo git dependency — compiled into `vst-daemon` for each target, no extra sidecar (D9) |
+| **Goal** | Linux now; Windows + macOS **compile** from day one so they never rot (D12) |
 | **Goal** | Parity with upstream tag `v0.70.0` — the version vibe-station runs today (D11) |
 | **Goal** | Every phase gated by tests the orchestrator verifies cover named invariants — not just "green" |
 | **Goal** | A differential harness vs the Node adapter, built **first**, not last |
@@ -35,6 +37,7 @@ Ships as a drop-in ACP agent binary inside a fork of the upstream adapter, at pa
 | **Non-goal** | Feature parity with the adapter's full surface — see `EVALUATION.md` § 2 (B) |
 | **Non-goal** | Publishing to crates.io in this feature |
 | **Non-goal** | vibe-station cutover — separate follow-up plan in the vibe-station repo (D9) |
+| **Non-goal** | Runtime-testing on Windows/macOS — compile-checked here; a CI matrix is a follow-up (D12) |
 | **Non-goal** | Catching up `v0.70.0 → v0.79.0` — the first sync cycle, after this plan (D11) |
 
 ---
@@ -55,8 +58,10 @@ rust/
       turn.rs           + turn state machine
       map.rs            + Claude msg -> SessionUpdate
       permission.rs     + can_use_tool -> ACP
-      agent.rs          + ACP agent handlers
+      agent.rs          + serve(transport) API
       bin/claude-agent-acp-rs.rs  + drop-in binary
+    examples/
+      in_process.rs     + Channel wiring demo
     tests/
       harness/          + ACP client recorder
       differential.rs   + Node-vs-Rust frame diff
@@ -72,7 +77,9 @@ skills/rust-coding/
 
 | Today | After this plan |
 |-------|-----------------|
-| ACP clients spawn `bun <claude-agent-acp>/dist/index.js` | ACP clients spawn `claude-agent-acp-rs` — same ACP surface, no Node |
+| vibe-station spawns `bun <claude-agent-acp>/dist/index.js` | vibe-station links the crate; ACP runs in-memory, no process, no Node |
+| Other ACP clients need Node | They spawn `claude-agent-acp-rs` over stdio |
+| Desktop app would need a per-platform Node sidecar | Nothing extra to ship — compiled into `vst-daemon` per target |
 | `CLAUDE_CODE_EXECUTABLE=claude` passed to the adapter | Driver resolves the binary itself |
 | Rust port has no home with upstream history | Fork branch `parity` = upstream tag + `rust/` |
 | No WS/stream-level differential test vs Node | Ordered-frame differential harness, phase 0 |
@@ -108,6 +115,10 @@ skills/rust-coding/
 | R19 | Upstream `AGENTS.md` / `CLAUDE.md` instruct `npm run check` + conventional-commit PR titles — TS-only rules | upstream `AGENTS.md` |
 | R20 | Upstream ships `publish.yml` + release-please workflows | upstream `.github/workflows/` |
 | R21 | `agent-client-protocol` 2.x agent side = `Agent::builder()` handler registration; JSON-RPC framing free | `EVALUATION.md` § 2 |
+| R23 | `Channel::duplex()` is an in-memory ACP transport; `connect_with(transport: impl ConnectTo<Host>)` accepts it | `agent-client-protocol-2.1.0/src/jsonrpc.rs:6471-6487`, `:1871-1875` |
+| R24 | Tauri ships sidecars **per target triple** (`vst-daemon-x86_64-unknown-linux-gnu`, …) via `externalBin` | `desktop/src-tauri/tauri.conf.json:42`; `desktop/src-tauri/binaries/` |
+| R25 | SDK's Windows lifecycle differs: no SIGTERM (straight to 5 s kill), `windowsHide`, `.exe` suffix, reap via stdin close | `EVALUATION.md` § 1 rows 10–12 |
+| R26 | vibe-station pins `agent-client-protocol = "=2.1.0"` exactly | `vst-agents/Cargo.toml:27` |
 | R22 | TS source at `v0.70.0`: `src/acp-agent.ts` 406 KB — the port reads **src/**, not dist | `gh api .../contents/src?ref=v0.70.0` |
 
 ---
@@ -174,22 +185,29 @@ skills/rust-coding/
 - **Why:** R15 — one `.expect()` on an idempotent-migration race core-dumped the entire daemon.
 - **Rule:** `rust-coding` §1. Panics are for broken invariants only.
 
-### D9 — Deliverable is a **drop-in ACP agent binary**, not an `AcpTransport` impl
+### D9 — Library first: one ACP agent, any transport — ✅ revised
 
-- **What:** one crate, `rust/claude-agent-acp-rs/` — a library (the driver) + a `bin` target that speaks ACP over stdio via `Agent::builder()` (R21).
-- **Why:** consequence of D1. The fork cannot implement vibe-station's `AcpTransport` without depending on `vst-agents` — a cross-repo cycle.
-- **Bonus:** the differential harness compares Node and Rust at the **identical boundary** — same ACP client, same stdio, same frames. Strongest possible parity check.
-- **Bonus:** any ACP client (Zed, vibe-station, others) can use it unchanged.
-- **Cost:** the agent-side JSON-RPC surface returns, but the Rust SDK provides it free (R21).
-- **Supersedes:** `EVALUATION.md` § target diagram (in-process `AcpTransport`).
-- **Follow-up (separate plan, vibe-station repo):** swap the spawn command in `vst-agents/src/claude.rs:414-424`, or an in-process adapter over the library.
+- **What:** the crate's primary API is `serve(transport: impl ConnectTo<Agent>)` — the ACP agent, built with `Agent::builder()` (R21), served over whatever transport the caller hands it.
+- **Transports:**
+
+| Consumer | Transport | How |
+|----------|-----------|-----|
+| vibe-station | `Channel::duplex()` — in-memory, no process (R23) | `vst-daemon` links the crate; `acp_connection.rs` passes a `Channel` end to its existing `connect_with` instead of `AcpAgent` |
+| Differential harness, Zed, other ACP clients | stdio | `bin/claude-agent-acp-rs.rs` = `serve(Stdio::new())` |
+
+- **Why a library, not only a binary:** Tauri ships each sidecar per target triple (R24). A separate binary would be a 4th sidecar to build per platform — the same packaging pain as the npm per-platform packages we're escaping. A library rides inside `vst-daemon`: `cargo build --target X` covers it.
+- **Why ACP as the in-process boundary:** vibe-station's client logic stays untouched — only the transport changes. And the harness tests the **same handler code** both transports run.
+- **No cross-repo cycle:** the fork depends only on `agent-client-protocol`; vibe-station depends on the fork. Nothing depends on `vst-agents`.
+- **Dependency pin:** `agent-client-protocol = "2.1"` (caret) so cargo unifies with vibe-station's `=2.1.0` (R26) — one copy of the crate, identical types. A bump is a coordinated change in both repos.
+- **vibe-station consumes:** `claude-agent-acp-rs = { git = "…/claude-agent-acp", tag = "rust-v0.1.0+acp.0.70.0" }`.
+- **Supersedes:** `EVALUATION.md` § target diagram. **Follow-up (vibe-station repo):** the ~1-line transport swap in `acp_connection.rs` + removing the Node spawn in `claude.rs:414-424`.
 
 ### D10 — Rust work has its own `rust/AGENTS.md`; upstream CI stays off
 
 - **What:** `rust/AGENTS.md` states: for anything under `rust/`, it overrides the root `AGENTS.md`/`CLAUDE.md`.
 - **Why:** R19 — implementers read the root `AGENTS.md` first and would run `npm run check` and follow TS PR rules.
-- **What:** GitHub Actions disabled on the fork.
-- **Why:** R20 — `publish.yml` + release-please must never run from the fork.
+- **What:** disable upstream's three workflows individually (`ci.yml`, `conventional-prs.yml`, `publish.yml`) — **not** Actions wholesale.
+- **Why:** R20 — `publish.yml` + release-please must never run from the fork, but Actions must stay available for our own Rust CI matrix (D12).
 
 ### D11 — Port base is `v0.70.0`, not upstream HEAD
 
@@ -198,14 +216,31 @@ skills/rust-coding/
 - **Then:** `v0.70.0 → v0.79.0` (R18) is the **first sync cycle** per `porting/SYNC.md` — which doubles as the first real test of the D1 workflow.
 - **Citations:** `acp-agent.js:N` refs are the npm `dist/`. Implementers read `src/*.ts` at `v0.70.0` (R22); regenerate `dist/` with `npm ci && npm run build` when a dist line must be checked.
 
+### D12 — Platforms: Linux now; Windows + macOS compile from day one
+
+- **What:** all OS-specific code lives in `process.rs` only, behind `#[cfg(unix)]` / `#[cfg(windows)]`. Nothing else in the crate may use `cfg(target_os)`.
+
+| Concern | Unix (linux, macOS) | Windows |
+|---------|---------------------|---------|
+| Kill ladder | SIGTERM → grace → SIGKILL, to the **process group** | no SIGTERM — close stdin, then hard kill after 5 s (R25) |
+| Process tree | own process group (`setsid`), `killpg` | job object, kill-on-close |
+| Console | n/a | `CREATE_NO_WINDOW` — else a console flashes (R25 `windowsHide`) |
+| Binary name | `claude` | `claude.exe` |
+| Reap on parent exit | kill the group | job object closes with the handle |
+
+- **Guard G8:** `cargo check --target x86_64-pc-windows-gnu` and `--target aarch64-apple-darwin` pass every phase — `cfg` code can't rot unnoticed.
+- **Runtime tests:** Linux only in this plan. Windows/macOS runtime tests = our own `rust-ci.yml` matrix on GitHub runners, a follow-up (why D10 keeps Actions on).
+- **If a dependency's build script blocks cross-`check`:** flag it in `## Key Decisions`, don't silently drop the target.
+
 ---
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    CL["any ACP client<br/>vibe-station · Zed · harness"]
-    AG["agent.rs + bin/<br/><code>Agent::builder()</code> handlers"]
+    VS["vibe-station<br/>vst-daemon (links the crate)"]
+    CL["stdio clients<br/>harness · Zed"]
+    AG["agent.rs — <code>serve(transport)</code><br/><code>Agent::builder()</code> handlers"]
     SA["session.rs — <b>session actor</b><br/>owns ALL state, no locks"]
     TU["turn.rs<br/>turn state machine"]
     CT["control.rs<br/>single-writer + oneshot map"]
@@ -213,7 +248,8 @@ flowchart TD
     PR["process.rs<br/>spawn / lifecycle"]
     CLI["<b>claude</b> binary"]
 
-    CL <-->|"ACP JSON-RPC over stdio<br/>(agent-client-protocol crate)"| AG
+    VS <-->|"ACP over Channel::duplex()<br/>in-memory, no process"| AG
+    CL <-->|"ACP over stdio<br/>bin/claude-agent-acp-rs"| AG
     AG -->|Command + oneshot| SA
     SA --> TU
     SA --> CT
@@ -231,13 +267,20 @@ flowchart TD
 
 - Green = the single owner of mutable state (D4).
 - Amber = the cost centre (R7).
-- The binary replaces `bun dist/index.js` 1:1 — same stdio, same ACP surface (D9).
+- One agent, two transports: in-memory for vibe-station, stdio for everything else (D9).
+- Only `process.rs` knows which OS it runs on (D12).
 
 ---
 
 ## System boundaries
 
-### B1 — ACP client ↔ `claude-agent-acp-rs` (stdio, JSON-RPC)
+### B1 — ACP client ↔ `claude-agent-acp-rs` (JSON-RPC over `Channel` or stdio)
+
+```rust
+// the crate's public entry point — identical behaviour on every transport
+pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOptions)
+    -> Result<(), Error>
+```
 
 | Direction | Method | Handled | Notes |
 |-----------|--------|:-------:|-------|
@@ -306,6 +349,8 @@ stdout: newline-delimited JSON
 | G4 | `grep -rn "unwrap()\|expect(" rust/claude-agent-acp-rs/src/` — every hit is on a type-system-guaranteed invariant or it fails (D8, R15). | respawn |
 | G5 | `grep -rn "Arc<Mutex<.*Session" rust/` returns nothing (D4). | respawn |
 | G7 | `git diff v0.70.0 -- src/ package.json` is empty — upstream TS untouched (D1). | respawn |
+| G8 | `cargo check --target x86_64-pc-windows-gnu` and `--target aarch64-apple-darwin` pass (D12). | respawn |
+| G9 | `grep -rn "cfg(unix)\|cfg(windows)\|cfg(target_os" rust/claude-agent-acp-rs/src/` hits only `process.rs` (D12). | respawn |
 | G6 | Any item rewritten in a previous phase has a unit test now (D5, R12). | respawn |
 
 - Retries: `implementer.turn.max_retries: 2`, then escalate per `PHASES.md:48`.
@@ -343,6 +388,8 @@ stdout: newline-delimited JSON
 | INV-22 | Cancel is idempotent; repeated cancels do not extend the deadline | 6 | `acp-agent.js:3595-3605` |
 | INV-23 | Orphaned queued turns are reconciled, not double-counted | 6 | `acp-agent.js:3608-3648` |
 | INV-24 | Rust frame stream == Node frame stream for the scripted corpus, **in order** | 0, 8 | R11 |
+| INV-25 | Windows and macOS targets compile | all | D12 |
+| INV-26 | In-memory `Channel` and stdio transports produce the identical frame stream | 7 | D9 |
 
 ---
 
@@ -379,8 +426,9 @@ stdout: newline-delimited JSON
 - [ ] **1.2** Binary resolution: explicit path → `CLAUDE_CODE_EXECUTABLE` → PATH. Typed error on miss
 - [ ] **1.3** `codec.rs` — newline-delimited JSON, partial-line buffering, UTF-8 continuation carry
 - [ ] **1.4** stderr: 2 KB rolling tail + drain-before-exit (200 ms cap)
-- [ ] **1.5** Kill ladder w/ a **separate** forwarded abort token
-- [ ] **1.6** Child registry + reap on parent exit
+- [ ] **1.5** Kill ladder w/ a **separate** forwarded abort token — unix: SIGTERM→SIGKILL to the process group; windows: stdin close → 5 s kill (D12)
+- [ ] **1.6** Child registry + reap on parent exit — unix: process group; windows: job object (D12)
+- [ ] **1.7** Windows spawn flags: `CREATE_NO_WINDOW`; `claude.exe` resolution (D12)
 
 **Verify phase 1:**
 - [ ] **1.T1** Unit — `codec`: garbage line is skipped, stream continues — **INV-1**
@@ -390,6 +438,8 @@ stdout: newline-delimited JSON
 - [ ] **1.T5** Integration — `process`: abort sends SIGTERM first, SIGKILL only after grace — **INV-5**
 - [ ] **1.T6** Integration — `process`: after `dispose()`, `pgrep` finds no child — **INV-6**
 - [ ] **1.T7** Regression — `timeout 60`: no test hangs (`rust-coding` §9)
+- [ ] **1.T8** Gate — G8 cross-target `cargo check` passes for windows + macOS — **INV-25**
+- [ ] **1.T9** Unit — `process`: binary-name resolution returns `claude.exe` under `cfg(windows)` logic (pure fn, tested on linux via an injected OS enum)
 
 ---
 
@@ -486,9 +536,10 @@ stdout: newline-delimited JSON
 
 ### Phase 7 — ACP agent binary (drop-in)
 
-- [ ] **7.1** `agent.rs` — `Agent::builder()` handlers for every ✅ row in B1; unhandled → `-32601`
+- [ ] **7.1** `agent.rs` — `pub async fn serve(transport, opts)`; `Agent::builder()` handlers for every ✅ row in B1; unhandled → `-32601`
 - [ ] **7.2** `_session/steering` ext → control-channel injection with `"now"` priority
-- [ ] **7.3** `bin/claude-agent-acp-rs.rs` — stdio transport; stdout is ACP-only, all logs to stderr
+- [ ] **7.3** `bin/claude-agent-acp-rs.rs` — `serve(Stdio::new())`; stdout is ACP-only, all logs to stderr
+- [ ] **7.5** `examples/in_process.rs` — `Channel::duplex()`: agent on one end, `Client::builder().connect_with(other_end, …)` on the other — the exact shape vibe-station will use
 - [ ] **7.4** Shutdown on stdin EOF / SIGTERM: drain, then teardown, bounded deadline (prior port L11)
 
 **Verify phase 7:**
@@ -496,6 +547,7 @@ stdout: newline-delimited JSON
 - [ ] **7.T2** Unit — `agent`: an unhandled method returns `-32601`, never hangs or panics
 - [ ] **7.T3** Integration — stdin EOF mid-turn leaves no orphan `claude` and exits 0 — **INV-6**
 - [ ] **7.T4** Regression — nothing but JSON-RPC frames ever reaches stdout (a stray `println!` fails the test)
+- [ ] **7.T5** Integration — the text-only + single-tool corpus run over `Channel::duplex()` and over stdio yield identical ordered frames — **INV-26**
 
 ---
 
@@ -536,14 +588,15 @@ stdout: newline-delimited JSON
 | `porting/SYNC.md` | New | 0 | Upstream sync runbook |
 | `C/tests/harness/` | New | 0 | ACP client that records ordered frames from any agent |
 | `C/tests/differential.rs` | New | 0, 4–8 | Ordered-frame diff vs Node |
-| `C/src/process.rs` | New | 1 | Spawn, argv, lifecycle, kill ladder |
+| `C/src/process.rs` | New | 1 | Spawn, argv, lifecycle, kill ladder — **the only file with `cfg(unix/windows)`** (D12) |
 | `C/src/codec.rs` | New | 1 | stream-json line codec |
 | `C/src/control.rs` | New | 2 | Control channel, single writer |
 | `C/src/session.rs` | New | 3 | Session actor — sole state owner (D4) |
 | `C/src/turn.rs` | New | 3, 6 | Turn state machine, settlement |
 | `C/src/map.rs` | New | 4 | Claude msg → `SessionUpdate` |
 | `C/src/permission.rs` | New | 5 | `can_use_tool` → ACP |
-| `C/src/agent.rs` | New | 7 | ACP handlers per B1 |
+| `C/src/agent.rs` | New | 7 | `pub async fn serve(transport, opts)` — the crate's public API (D9) |
+| `C/examples/in_process.rs` | New | 7 | `Channel::duplex()` wiring — vibe-station's shape |
 | `C/src/bin/claude-agent-acp-rs.rs` | New | 7 | Drop-in stdio binary |
 | `src/**`, `package.json` | Unchanged | — | Upstream TS; G7 enforces |
 
@@ -564,6 +617,8 @@ stdout: newline-delimited JSON
 | 9 | Implementer follows upstream `AGENTS.md` (npm, TS PR rules) | `rust/AGENTS.md` override; stated first in every turn prompt (D10) | all |
 | 10 | Fork runs upstream `publish.yml` / release-please | Actions disabled on the fork at bootstrap (D10) | bootstrap |
 | 11 | Implementer "fixes" something in upstream `src/` | G7: `git diff v0.70.0 -- src/` must be empty | all |
+| 12 | Two copies of `agent-client-protocol` in vibe-station's graph → type mismatch | Caret `"2.1"` in the fork unifies with vibe-station's `=2.1.0` (D9); check `cargo tree -d` in the follow-up | follow-up |
+| 13 | Windows/macOS code rots while only Linux runs | G8 cross-`check` + G9 cfg confinement every phase (D12) | all |
 
 ---
 
@@ -573,8 +628,9 @@ stdout: newline-delimited JSON
 
 | # | Step | Command |
 |---|------|---------|
+| B-0 | Add cross-check targets (D12) | `rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin` |
 | B-1 | Fork on GitHub, no clone | `gh repo fork agentclientprotocol/claude-agent-acp --clone=false` |
-| B-2 | Disable Actions on the fork (D10) | `gh api -X PUT repos/fastestdevalive/claude-agent-acp/actions/permissions -F enabled=false` |
+| B-2 | Disable upstream's workflows, keep Actions on (D10) | `for w in ci.yml conventional-prs.yml publish.yml; do gh workflow disable $w -R fastestdevalive/claude-agent-acp; done` |
 | B-3 | Point this repo at the fork | `git remote add origin git@github.com:fastestdevalive/claude-agent-acp.git && git remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git && git fetch --all --tags` |
 | B-4 | Archive the eval history | `git branch eval-archive main` |
 | B-5 | Build `parity` from the tag, replaying eval commits (drops the local `.gitignore`-only root commit) | `git checkout -b parity v0.70.0 && git cherry-pick <root>..eval-archive` |
@@ -583,6 +639,8 @@ stdout: newline-delimited JSON
 | B-8 | Publish, make `parity` default | `git push -u origin parity main && gh repo edit --default-branch parity` |
 | B-9 | vst project default branch → `parity` | vst project settings |
 | B-10 | Stage the worktree — **idle, no prompt** | `vst worktree create claude-acp-rust-eval --branch=feat/rust-port --base=parity --mode=<claude-sonet id> --no-parent` |
+
+| B-11 | Verify subagent placement | a 1-line smoke spawn from the worktree's session appears **inside** that worktree in the vst UI — not as a new worktree (Q5) |
 
 - Start phase 0 later with `/sdlc claude-acp-rust turn-implement` **inside** that worktree's session.
 
@@ -614,4 +672,5 @@ flowchart LR
 | ~~Q1~~ | ~~Fork vs Rust-in-vibe-station~~ — **resolved: fork (D1)** | — |
 | Q2 | Fork under personal `fastestdevalive` (only authed account) or an org? | B-1 |
 | Q3 | Does the corpus run against a real Anthropic account, or recorded fixtures only? Real = catches more, costs per run | 0.5 |
-| Q4 | vibe-station cutover shape: swap spawn command (trivial) or in-process adapter over the library? | follow-up plan |
+| ~~Q4~~ | ~~vibe-station cutover shape~~ — **resolved: in-process over `Channel::duplex()` (D9)** | — |
+| Q5 | Does `meta_harness: vibe-station` spawn implementer turns as sessions **in** the current worktree? The sdlc skill doesn't document it — B-11 checks before phase 0 | B-11 |

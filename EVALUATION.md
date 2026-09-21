@@ -77,9 +77,10 @@ flowchart TD
     style CLI fill:#333,color:#fff
 ```
 
-> **Superseded by plan D9.** Because the port lives in a fork of the upstream adapter, it ships as a
-> drop-in ACP agent **binary** instead — the fork cannot depend on vibe-station's `AcpTransport`.
-> The in-process shape above remains an option for vibe-station's own follow-up cutover.
+> **Refined by plan D9.** The port ships as a **library** that serves ACP over any transport.
+> vibe-station links it and talks to it over an in-memory `Channel::duplex()` — still in-process and
+> no pipe, but through ACP rather than `AcpTransport`, because the fork cannot depend on
+> vibe-station's trait. A thin stdio binary serves other ACP clients and the differential harness.
 
 Key structural point: vibe-station is an ACP **client** with a frozen in-process abstraction already
 (`acp_transport.rs:115-178`). A native driver implements *that trait* — so the agent-side JSON-RPC
