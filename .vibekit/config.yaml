@@ -19,9 +19,9 @@ sdlc:
       model: deepseek
       mode: turn
       turn:
-        # Human checkpoints: after the harness exists (0), and after the
-        # turn-settlement cost centre (3). Everything else auto-advances.
-        pause_after: [0, 3]
+        # Human checkpoints: after the harness exists (2), and after the
+        # turn-settlement cost centre (6). Everything else auto-advances.
+        pause_after: [2, 6]
         models: {}
         max_retries: 2
 
