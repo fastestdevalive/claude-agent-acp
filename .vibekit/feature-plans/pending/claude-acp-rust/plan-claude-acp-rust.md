@@ -595,19 +595,19 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - `porting/SYNC.md` content: the 5 steps of the Sync workflow section in this plan — (1) take the next upstream tag only, never `upstream/main`; (2) `git diff vOLD..vNEW -- src/`; (3) if it touches a `ported` row of `PARITY.md`, port the delta; (4) re-capture fixtures and run the differential; (5) merge the tag into `parity`, bump `+acp.0.N`, update `PARITY.md`, tag `rust-vX+acp.0.N`. First run: `v0.70.0 → v0.79.0`.
 - Phase-0 stub crates need one trivial `#[test]` so G6 and `cargo test` are meaningful.
 
-- [ ] **0.0** Read `skills/rust-coding/SKILL.md`, `coding-agent-guardrails`, `coding`
-- [ ] **0.1** `rust/Cargo.toml` workspace + crate manifest; `rust/.gitignore` (`target/`); `#![forbid(unsafe_code)]` + D8 lints in `lib.rs`
-- [ ] **0.2** `rust/AGENTS.md` — overrides root for `rust/**`; implementer protocol; `rust-coding` section mapping (D10)
-- [ ] **0.3** `rust/scripts/rust-gate.sh` — one canonical invocation incl. `cargo build --workspace --bins` before tests, and the G8, G9, G10 checks
-- [ ] **0.4** `rust/clippy.toml` — G5 `disallowed-types` list
-- [ ] **0.5** Generate + commit `rust/Cargo.lock` with `agent-client-protocol` `=2.1.0` and its schema crate pinned (D9)
-- [ ] **0.6** `porting/PARITY.md` seeded from `porting/EVALUATION.md` § 2 (A)/(B); `porting/SYNC.md` from the content given in this phase's Context
+- [x] **0.0** Read `skills/rust-coding/SKILL.md`, `coding-agent-guardrails`, `coding`
+- [x] **0.1** `rust/Cargo.toml` workspace + crate manifest; `rust/.gitignore` (`target/`); `#![forbid(unsafe_code)]` + D8 lints in `lib.rs`
+- [x] **0.2** `rust/AGENTS.md` — overrides root for `rust/**`; implementer protocol; `rust-coding` section mapping (D10)
+- [x] **0.3** `rust/scripts/rust-gate.sh` — one canonical invocation incl. `cargo build --workspace --bins` before tests, and the G8, G9, G10 checks
+- [x] **0.4** `rust/clippy.toml` — G5 `disallowed-types` list
+- [x] **0.5** Generate + commit `rust/Cargo.lock` with `agent-client-protocol` `=2.1.0` and its schema crate pinned (D9)
+- [x] **0.6** `porting/PARITY.md` seeded from `porting/EVALUATION.md` § 2 (A)/(B); `porting/SYNC.md` from the content given in this phase's Context
 
 **Verify phase 0:**
-- [ ] **0.T1** Gate — `bash rust/scripts/rust-gate.sh` exits 0 on the empty crate
-- [ ] **0.T2** Gate — `rust/scripts/selftest-gate.sh` mutates a temp copy (`cargo update -p agent-client-protocol --precise 2.2.0`) and G10 fails; skipped with a notice when offline; always restores
-- [ ] **0.T3** Regression — G7 command prints nothing (upstream untouched)
-- [ ] **0.T4** Gate — `selftest-gate.sh` in a temp copy: a scratch `.unwrap()` in `src/` fails clippy (D8), and a scratch `tokio::sync::broadcast::channel` fails clippy (INV-33/G5)
+- [x] **0.T1** Gate — `bash rust/scripts/rust-gate.sh` exits 0 on the empty crate
+- [x] **0.T2** Gate — `rust/scripts/selftest-gate.sh` mutates a temp copy (`cargo update -p agent-client-protocol --precise 2.2.0`) and G10 fails; skipped with a notice when offline; always restores
+- [x] **0.T3** Regression — G7 command prints nothing (upstream untouched)
+- [x] **0.T4** Gate — `selftest-gate.sh` in a temp copy: a scratch `.unwrap()` in `src/` fails clippy (D8), and a scratch `tokio::sync::broadcast::channel` fails clippy (INV-33/G5)
 
 ---
 
