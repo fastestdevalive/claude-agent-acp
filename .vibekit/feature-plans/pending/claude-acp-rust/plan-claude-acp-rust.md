@@ -208,6 +208,7 @@ skills/rust-coding/
 - **Why:** R19 — implementers read the root `AGENTS.md` first and would run `npm run check` and follow TS PR rules.
 - **What:** disable upstream's three workflows individually (`ci.yml`, `conventional-prs.yml`, `publish.yml`) — **not** Actions wholesale.
 - **Why:** R20 — `publish.yml` + release-please must never run from the fork, but Actions must stay available for our own Rust CI matrix (D12).
+- **Defence in depth (verified at bootstrap):** `publish.yml` triggers only on push to `main`; the fork has no secrets; npm OIDC trusted publishing is bound to the upstream repo.
 
 ### D11 — Port base is `v0.70.0`, not upstream HEAD
 
@@ -628,15 +629,15 @@ stdout: newline-delimited JSON
 
 | # | Step | Command |
 |---|------|---------|
-| B-0 | Add cross-check targets (D12) | `rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin` |
-| B-1 | Fork on GitHub, no clone | `gh repo fork agentclientprotocol/claude-agent-acp --clone=false` |
-| B-2 | Disable upstream's workflows, keep Actions on (D10) | `for w in ci.yml conventional-prs.yml publish.yml; do gh workflow disable $w -R fastestdevalive/claude-agent-acp; done` |
-| B-3 | Point this repo at the fork | `git remote add origin git@github.com:fastestdevalive/claude-agent-acp.git && git remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git && git fetch --all --tags` |
-| B-4 | Archive the eval history | `git branch eval-archive main` |
-| B-5 | Build `parity` from the tag, replaying eval commits (drops the local `.gitignore`-only root commit) | `git checkout -b parity v0.70.0 && git cherry-pick <root>..eval-archive` |
-| B-6 | Move evidence under `porting/` | `git mv EVALUATION.md porting/EVALUATION.md && git commit` |
-| B-7 | Local `main` mirrors upstream | `git checkout -B main upstream/main` |
-| B-8 | Publish, make `parity` default | `git push -u origin parity main && gh repo edit --default-branch parity` |
+| B-0 | ✅ Add cross-check targets (D12) | `rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin` |
+| B-1 | ✅ Fork on GitHub, no clone | `gh repo fork agentclientprotocol/claude-agent-acp --clone=false` |
+| B-2 | ✅ done — nothing to disable yet: a fresh fork's workflows are unregistered and don't run until opted in on the Actions tab | **When enabling Actions for `rust-ci.yml` later:** in the same step run `for w in ci.yml conventional-prs.yml publish.yml; do gh workflow disable $w -R fastestdevalive/claude-agent-acp; done` |
+| B-3 | ✅ Point this repo at the fork | `git remote add origin git@github.com:fastestdevalive/claude-agent-acp.git && git remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git && git fetch --all --tags` |
+| B-4 | ✅ Archive the eval history | `git branch eval-archive main` |
+| B-5 | ✅ Build `parity` from the tag, replaying eval commits (drops the local `.gitignore`-only root commit) | `git checkout -b parity v0.70.0 && git cherry-pick <root>..eval-archive` |
+| B-6 | ✅ Move evidence under `porting/` | `git mv EVALUATION.md porting/EVALUATION.md && git commit` |
+| B-7 | ✅ Local `main` mirrors upstream | `git checkout -B main upstream/main` |
+| B-8 | ✅ Publish, make `parity` default | `git push -u origin parity main && gh repo edit --default-branch parity` |
 | B-9 | vst project default branch → `parity` | vst project settings |
 | B-10 | Stage the worktree — **idle, no prompt** | `vst worktree create claude-acp-rust-eval --branch=feat/rust-port --base=parity --mode=<claude-sonet id> --no-parent` |
 
