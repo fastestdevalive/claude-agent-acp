@@ -958,10 +958,14 @@ async fn held_cancel_debt_uses_running_state() {
     // A defers (held) and the session moves to running (a followup).
     machine.on_task_started("sub1", true);
     machine.on_result(&result_frame("success", false), false);
+    // The hold's own trailer idle arrives and is absorbed; A stays held and the
+    // session records "idle".
+    machine.on_idle();
+    // A followup transitions the session to running — must be recorded.
     machine.on_session_state("running");
 
-    // Cancel inline-settles the held turn; because the session is NOT idle it
-    // owes one trailing idle.
+    // Cancel inline-settles the held turn; because the recorded state is
+    // "running" (not "idle") it owes one trailing idle.
     machine.cancel();
 
     // B enqueued + echoed (next prompt).
@@ -975,4 +979,72 @@ async fn held_cancel_debt_uses_running_state() {
         "the owed trailing idle must be absorbed, not fail B (#825 false-fail)"
     );
     assert!(machine.has_active(), "B must remain active");
+}
+
+/// Review-05 minor (1): `on_idle` must NOT clear `cancelled` after settling a
+/// cancelled turn — upstream leaves it set until the next `activateTurn`. With
+/// the guard held, a late result (no active turn, no orphan credit) after that
+/// idle is dropped by the cancelled guard and emits no stray `FinalText`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_idle_keeps_guard_no_stray_final_text() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    // No queue: cancel sweeps nothing, so no orphan credit is seeded.
+    machine.cancel();
+    // A's own result is dropped (cancelled), then idle settles A cancelled.
+    machine.on_result(&result_frame("success", false), false);
+    machine.on_idle();
+    assert!(!machine.has_active(), "A settled at the cancelled idle");
+
+    // A late result arrives with no active turn and no orphan credit. The #453
+    // signature (text + 0 output tokens) would emit a stray `FinalText` if
+    // `on_idle` had cleared the cancelled guard.
+    let events = machine.on_result(
+        &serde_json::json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"stray text","usage":{"output_tokens":0}}),
+        false,
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::FinalText { .. })),
+        "a late result after a cancelled idle must not emit a stray FinalText"
+    );
+}
+
+/// Review-05 minor (2): a held turn's cancel reports the usage its result
+/// recorded (`deferredSettle.usage`), not the live accumulator (`ADP:3574`).
+#[tokio::test(flavor = "multi_thread")]
+async fn held_cancel_reports_deferred_usage() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    machine.on_task_started("sub", true);
+    // A defers, snapshotting this specific usage.
+    let usage = serde_json::json!({
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "cache_read_input_tokens": 1,
+        "cache_creation_input_tokens": 2,
+    });
+    let _ = machine.on_result(&result_frame_usage("success", false, usage), false);
+    assert!(machine.has_active(), "A is held open");
+
+    let events = machine.cancel();
+    let cancelled = events.iter().find_map(|e| match e {
+        TurnEvent::Settled {
+            prompt_uuid, usage, ..
+        } if prompt_uuid == "pA" => Some(*usage),
+        _ => None,
+    });
+    assert_eq!(
+        cancelled,
+        Some(Usage {
+            input_tokens: 7,
+            output_tokens: 3,
+            cached_read_tokens: 1,
+            cached_write_tokens: 2,
+        }),
+        "a held turn's cancel must report the deferred usage snapshot"
+    );
 }

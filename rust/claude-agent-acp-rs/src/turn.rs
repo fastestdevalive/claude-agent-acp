@@ -157,6 +157,17 @@ pub struct Usage {
     pub cached_write_tokens: u64,
 }
 
+/// The outcome and usage snapshot stored when a turn's settlement is deferred
+/// (`Turn.deferredSettle` upstream — `{ stopReason, usage: accumulatedUsage }`,
+/// `ADP:1788-1805`). A held turn's result has already recorded its stop reason
+/// and the usage accumulated up to that result; the hold settles with this
+/// snapshot, not the live accumulator (`ADP:3059`, `ADP:3574`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredSettle {
+    stop_reason: StopReason,
+    usage: Usage,
+}
+
 /// Events the turn machine emits for the session actor to act on. These are
 /// internal — ACP emission (session/update, prompt response) is phase 7+.
 /// `prompt_uuid` on every settle/fail/activate tells the actor which `oneshot`
@@ -193,9 +204,10 @@ pub struct Turn {
     /// `#453` result-text fallback's other trigger (`isLocalOnlyCommand`).
     is_local_only_command: bool,
     settled: bool,
-    /// Set when the turn held open for its live subagents: the outcome its
-    /// `result` already recorded, settled once the subagents drain.
-    deferred_settle: Option<StopReason>,
+    /// Set when the turn held open for its live subagents: the outcome (and
+    /// usage snapshot) its `result` already recorded, settled once the
+    /// subagents drain or the user moves on.
+    deferred_settle: Option<DeferredSettle>,
     /// Task ids of the subagents this turn spawned (`spawnedTaskIds`).
     spawned_task_ids: HashSet<String>,
 }
@@ -321,7 +333,13 @@ impl TurnMachine {
             if let Some(active) = self.active.take() {
                 if !active.settled {
                     let prompt_uuid = active.prompt_uuid.clone();
-                    let usage = self.accumulated_usage;
+                    // A held turn's cancel reports the usage its result already
+                    // recorded (`deferredSettle.usage`), not the live accumulator
+                    // (`ADP:3574`; review-05 minor).
+                    let usage = active
+                        .deferred_settle
+                        .map(|d| d.usage)
+                        .unwrap_or(self.accumulated_usage);
                     events.push(TurnEvent::Settled {
                         prompt_uuid,
                         stop_reason: StopReason::Cancelled,
@@ -406,13 +424,10 @@ impl TurnMachine {
                     // (`ADP:3034-3050`).
                     self.owed_trailing_idles += 1;
                     (StopReason::Cancelled, self.accumulated_usage)
-                } else if prev.deferred_settle.is_some() {
-                    // A held turn hands off with its recorded outcome, not a
-                    // guessed end_turn (`ADP:3051-3060`).
-                    (
-                        prev.deferred_settle.unwrap_or(StopReason::EndTurn),
-                        self.accumulated_usage,
-                    )
+                } else if let Some(deferred) = prev.deferred_settle {
+                    // A held turn hands off with its recorded outcome and usage
+                    // snapshot, not a guessed end_turn (`ADP:3051-3060`).
+                    (deferred.stop_reason, deferred.usage)
                 } else {
                     (StopReason::EndTurn, self.accumulated_usage)
                 };
@@ -673,13 +688,16 @@ impl TurnMachine {
         let mut events = Vec::new();
         if let Some(active) = self.active.take() {
             if !active.settled {
-                let outcome = if self.cancelled {
-                    StopReason::Cancelled
+                let (outcome, usage) = if self.cancelled {
+                    (StopReason::Cancelled, self.accumulated_usage)
+                } else if let Some(deferred) = active.deferred_settle {
+                    // A held turn's result already recorded its outcome and usage
+                    // snapshot — the hold settles with those (`ADP:3059`).
+                    (deferred.stop_reason, deferred.usage)
                 } else {
-                    active.deferred_settle.unwrap_or(StopReason::EndTurn)
+                    (StopReason::EndTurn, self.accumulated_usage)
                 };
                 let prompt_uuid = active.prompt_uuid.clone();
-                let usage = self.accumulated_usage;
                 events.push(TurnEvent::Settled {
                     prompt_uuid,
                     stop_reason: outcome,
@@ -707,11 +725,11 @@ impl TurnMachine {
         if let Some(active) = self.active.take() {
             if !active.settled {
                 let prompt_uuid = active.prompt_uuid.clone();
-                if let Some(outcome) = active.deferred_settle {
-                    let usage = self.accumulated_usage;
+                if let Some(deferred) = active.deferred_settle {
+                    let usage = deferred.usage;
                     events.push(TurnEvent::Settled {
                         prompt_uuid,
-                        stop_reason: outcome,
+                        stop_reason: deferred.stop_reason,
                         usage,
                     });
                 } else {
@@ -750,9 +768,8 @@ impl TurnMachine {
             if !is_held_turn(active) {
                 return;
             }
-            let outcome = active.deferred_settle;
-            if let Some(outcome) = outcome {
-                self.settle(outcome, events);
+            if let Some(deferred) = active.deferred_settle {
+                self.settle_with_usage(deferred.stop_reason, deferred.usage, events);
             }
         }
         if self.pending_orphan_results > 0 {
@@ -796,9 +813,9 @@ impl TurnMachine {
         if awaiting {
             return;
         }
-        let outcome = self.active.as_ref().and_then(|t| t.deferred_settle);
-        if let Some(outcome) = outcome {
-            self.settle(outcome, events);
+        let deferred = self.active.as_ref().and_then(|t| t.deferred_settle);
+        if let Some(deferred) = deferred {
+            self.settle_with_usage(deferred.stop_reason, deferred.usage, events);
         }
     }
 
@@ -816,15 +833,32 @@ impl TurnMachine {
         }
         if let Some(active) = self.active.as_mut() {
             if !active.settled {
-                active.deferred_settle = Some(outcome);
+                // Snapshot the outcome AND the usage accumulated so far; a held
+                // turn settles with this snapshot, not the later accumulator.
+                active.deferred_settle = Some(DeferredSettle {
+                    stop_reason: outcome,
+                    usage: self.accumulated_usage,
+                });
             }
         }
     }
 
     /// Settle the active turn exactly once and clear the active slot. Ports
     /// `settleActive` (`ADP:1579-1610`), including `activeTurn = null` (review
-    /// 04 #5).
+    /// 04 #5). Reports the live per-turn accumulator (`accumulatedUsage`).
     fn settle(&mut self, outcome: StopReason, events: &mut Vec<TurnEvent>) {
+        self.settle_with_usage(outcome, self.accumulated_usage, events);
+    }
+
+    /// Settle the active turn with an explicit usage snapshot — used by the
+    /// held-settle lanes, which report the usage the turn's result recorded
+    /// (`deferredSettle.usage`) rather than the live accumulator.
+    fn settle_with_usage(
+        &mut self,
+        outcome: StopReason,
+        usage: Usage,
+        events: &mut Vec<TurnEvent>,
+    ) {
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -833,7 +867,6 @@ impl TurnMachine {
         }
         active.settled = true;
         let prompt_uuid = active.prompt_uuid.clone();
-        let usage = self.accumulated_usage;
         self.active = None;
         events.push(TurnEvent::Settled {
             prompt_uuid,

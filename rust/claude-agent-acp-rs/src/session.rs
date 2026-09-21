@@ -757,4 +757,59 @@ mod tests {
             "a local-only command's result text must be forwarded as FinalText"
         );
     }
+
+    /// Review-05 row 2 (actor-level): a `session_state_changed{state:"running"}`
+    /// frame routed through `handle_session_frame` overwrites a stale `"idle"`
+    /// state, so a held turn cancelled mid-followup owes an interrupt trailer
+    /// that absorbs the next prompt's trailing idle (no #825 false-fail).
+    #[tokio::test]
+    async fn session_state_running_frame_routes_through_actor() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, _urx) = mpsc::unbounded_channel::<SessionNotification>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+
+        // A active + held (deferred on a live subagent).
+        machine.enqueue(Turn::new("pA".into(), false));
+        machine.on_echo("pA");
+        machine.on_task_started("sub1", true);
+        let _ = machine.on_result(
+            &json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","usage":{}}),
+            false,
+        );
+        // The hold's own trailer idle arrives and is absorbed; A stays held and
+        // the session records "idle".
+        let _ = machine.on_idle();
+
+        // Drive the `running` transition through the ACTOR frame path.
+        handle_session_frame(
+            json!({"type":"system","subtype":"session_state_changed","state":"running"}),
+            &mut machine,
+            &mut map_state,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &utx,
+            "s",
+            &hw,
+        );
+
+        // Cancel the held turn: only if the routed state is "running" (not the
+        // absorbed "idle") does cancel() owe an interrupt trailer.
+        machine.cancel();
+
+        // B enqueued + echoed (next prompt).
+        machine.enqueue(Turn::new("pB".into(), false));
+        machine.on_echo("pB");
+
+        // The interrupt's trailing idle must be absorbed, not fail B (#825).
+        let events = machine.on_idle();
+        assert!(
+            events.is_empty(),
+            "the owed trailing idle must be absorbed, not fail B"
+        );
+        assert!(machine.has_active(), "B must remain active");
+    }
 }
