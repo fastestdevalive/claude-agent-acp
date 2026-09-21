@@ -56,13 +56,40 @@ pub enum SessionError {
     #[error("session closed")]
     Closed,
     #[error("session/prompt failed: {message}")]
-    PromptFailed { kind: FailureKind, message: String },
+    PromptFailed {
+        kind: FailureKind,
+        message: String,
+        /// Whether the turn's assistant message carried an `error` (the Node's
+        /// `lastAssistantError`). The wire `data.errorKind` is only attached when
+        /// this is true (`errorKindData(lastAssistantError)`, phase 9).
+        assistant_had_error: bool,
+    },
     #[error("failed to start the session: {0}")]
     Start(String),
 }
 
+/// One item on the session → agent outbound channel (phase 9 flush barrier).
+///
+/// The agent forwards `Update`s to the client as notifications and uses a
+/// `Flush` barrier to guarantee the tool-call notifications emitted before a
+/// turn settles are written to the wire *before* the prompt response (fixes the
+/// notification-vs-response race that `inv_24_tools` exposed). The FIFO channel
+/// means the forwarding task processes the `Flush` only after every `Update`
+/// sent before it, so resolving its `oneshot` is a happens-after guarantee.
+///
+/// `large_enum_variant` allowed: `Update` (the common case) is intentionally
+/// large; boxing it would only add an indirection to the hot path for no
+/// benefit over the rare `Flush` marker.
+#[allow(clippy::large_enum_variant)]
+pub enum SessionOutbound {
+    /// A `session/update` notification to forward to the client.
+    Update(SessionNotification),
+    /// A barrier: every `Update` sent before this has been forwarded. Resolving
+    /// the `oneshot` signals the prompt task it may now write its response.
+    Flush(oneshot::Sender<()>),
+}
+
 /// The result of a settled `session/prompt`.
-#[derive(Debug, Clone)]
 pub struct PromptReply {
     /// The turn's ACP `stopReason`.
     pub stop_reason: String,
@@ -72,6 +99,21 @@ pub struct PromptReply {
     /// The turn's streaming updates (e.g. a `FinalText` `agent_message_chunk`)
     /// that must be forwarded to the client *before* the prompt response.
     pub updates: Vec<SessionNotification>,
+    /// Resolves once every session update emitted before this turn settled has
+    /// been forwarded to the client (phase 9). The prompt task awaits it before
+    /// writing the response so a `tool_call` lands ahead of the `result`.
+    pub flush_rx: Option<oneshot::Receiver<()>>,
+}
+
+impl std::fmt::Debug for PromptReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromptReply")
+            .field("stop_reason", &self.stop_reason)
+            .field("usage", &self.usage)
+            .field("updates", &self.updates)
+            .field("flush_rx", &self.flush_rx.as_ref().map(|_| "<oneshot>"))
+            .finish()
+    }
 }
 
 /// Token usage reported in a `session/prompt` response.
@@ -143,7 +185,7 @@ impl Session {
     pub async fn start(
         opts: SessionOptions,
         session_id: String,
-    ) -> Result<(Session, mpsc::UnboundedReceiver<SessionNotification>), SessionError> {
+    ) -> Result<(Session, mpsc::UnboundedReceiver<SessionOutbound>), SessionError> {
         // Spawn the child and its stack: process -> control (stdin) + codec
         // (stdout lines) + stderr tail.
         let mut process = process::spawn(&opts.spawn)
@@ -155,7 +197,7 @@ impl Session {
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
         let control = Control::spawn(stdin, control_in_rx, ControlOptions::default());
 
-        let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionNotification>();
+        let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
         let high_water = Arc::new(AtomicUsize::new(0));
         let hw = high_water.clone();
@@ -257,7 +299,7 @@ async fn run(
     _process: crate::process::Process,
     control: Control,
     control_in_tx: mpsc::UnboundedSender<Value>,
-    update_tx: mpsc::UnboundedSender<SessionNotification>,
+    update_tx: mpsc::UnboundedSender<SessionOutbound>,
     _timings: Timings,
     session_id: String,
     high_water: Arc<AtomicUsize>,
@@ -268,6 +310,10 @@ async fn run(
     let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
         HashMap::new();
     let mut emitted_assistant_text = false;
+    // Whether the current turn's assistant message carried an `error` (the
+    // Node's `lastAssistantError`, reset per prompt; phase 9). The wire
+    // `data.errorKind` is only attached when this is true.
+    let mut assistant_had_error = false;
 
     loop {
         tokio::select! {
@@ -281,11 +327,19 @@ async fn run(
                         let _ = control.send_user(frame).await;
                         machine.enqueue(Turn::new(uuid.clone(), is_local_only));
                         pending.insert(uuid, reply);
+                        assistant_had_error = false;
                     }
                     Command::Cancel => {
                         // 8.9: settle swept queued turns, then interrupt.
                         let events = machine.cancel();
-                        handle_events(&events, &mut pending, &update_tx, &session_id, &high_water);
+                        handle_events(
+                            &events,
+                            &mut pending,
+                            &update_tx,
+                            &session_id,
+                            &high_water,
+                            assistant_had_error,
+                        );
                         // Send the `interrupt` on a spawned task: awaiting the
                         // correlated control_response here would block the actor's
                         // single-task loop (which is what routes that response back
@@ -304,7 +358,14 @@ async fn run(
                 let Some(line) = msg else {
                     // Stream EOF / codec death (8.9): settle/reject every turn.
                     let events = machine.on_stream_end();
-                    handle_events(&events, &mut pending, &update_tx, &session_id, &high_water);
+                    handle_events(
+                        &events,
+                        &mut pending,
+                        &update_tx,
+                        &session_id,
+                        &high_water,
+                        assistant_had_error,
+                    );
                     break;
                 };
                 dispatch_stream(
@@ -314,6 +375,7 @@ async fn run(
                     &mut map_state,
                     &mut pending,
                     &mut emitted_assistant_text,
+                    &mut assistant_had_error,
                     &update_tx,
                     &session_id,
                     &high_water,
@@ -334,7 +396,8 @@ async fn dispatch_stream(
     map_state: &mut MapState,
     pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
     emitted_assistant_text: &mut bool,
-    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    assistant_had_error: &mut bool,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     high_water: &AtomicUsize,
 ) {
@@ -350,6 +413,7 @@ async fn dispatch_stream(
                 map_state,
                 pending,
                 emitted_assistant_text,
+                assistant_had_error,
                 update_tx,
                 session_id,
                 high_water,
@@ -367,7 +431,8 @@ fn handle_session_frame(
     map_state: &mut MapState,
     pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
     emitted_assistant_text: &mut bool,
-    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    assistant_had_error: &mut bool,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     high_water: &AtomicUsize,
 ) {
@@ -378,7 +443,14 @@ fn handle_session_frame(
         "user" => {
             if let Some(uuid) = line.get("uuid").and_then(Value::as_str) {
                 let events = machine.on_echo(uuid);
-                handle_events(&events, pending, update_tx, session_id, high_water);
+                handle_events(
+                    &events,
+                    pending,
+                    update_tx,
+                    session_id,
+                    high_water,
+                    *assistant_had_error,
+                );
             }
         }
         "result" => {
@@ -388,7 +460,14 @@ fn handle_session_frame(
             if !is_autonomous(&line) {
                 *emitted_assistant_text = false;
             }
-            handle_events(&events, pending, update_tx, session_id, high_water);
+            handle_events(
+                &events,
+                pending,
+                update_tx,
+                session_id,
+                high_water,
+                *assistant_had_error,
+            );
         }
         "system" => {
             let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or("");
@@ -402,7 +481,14 @@ fn handle_session_frame(
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
                     if is_terminal_task_update(&line) {
                         let events = machine.on_task_ended(task_id);
-                        handle_events(&events, pending, update_tx, session_id, high_water);
+                        handle_events(
+                            &events,
+                            pending,
+                            update_tx,
+                            session_id,
+                            high_water,
+                            *assistant_had_error,
+                        );
                     }
                 }
                 "session_state_changed" => {
@@ -410,7 +496,14 @@ fn handle_session_frame(
                     machine.on_session_state(state);
                     if state == "idle" {
                         let events = machine.on_idle();
-                        handle_events(&events, pending, update_tx, session_id, high_water);
+                        handle_events(
+                            &events,
+                            pending,
+                            update_tx,
+                            session_id,
+                            high_water,
+                            *assistant_had_error,
+                        );
                     }
                 }
                 "commands_changed" => {
@@ -420,6 +513,12 @@ fn handle_session_frame(
             }
         }
         "stream_event" | "assistant" => {
+            // The Node snapshots `lastAssistantError` from a top-level `error`
+            // on the assistant frame (`acp-agent.ts:4333-4335`); record it so
+            // the turn's failure can attach `data.errorKind` only when present.
+            if frame_type == "assistant" && line.get("error").is_some() {
+                *assistant_had_error = true;
+            }
             let updates = if frame_type == "stream_event" {
                 map::map_stream_event(&line, map_state)
             } else {
@@ -464,9 +563,10 @@ fn handle_session_frame(
 fn handle_events(
     events: &[TurnEvent],
     pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
-    _update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     high_water: &AtomicUsize,
+    assistant_had_error: bool,
 ) {
     // A `FinalText` precedes its turn's `Settled` in the same batch; collect it
     // and hand it to the prompt task so it can forward the chunk before the
@@ -507,10 +607,18 @@ fn handle_events(
                             total_tokens,
                         })
                     };
+                    let (flush_tx, flush_rx) = oneshot::channel();
+                    // Phase 9 flush barrier: enqueued after every update this
+                    // turn emitted, so the forwarding task writes them all
+                    // before it resolves `flush_rx`; the prompt task awaits it
+                    // before responding, keeping a `tool_call` ahead of the
+                    // `result` on the wire.
+                    let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
                     let _ = reply.send(Ok(PromptReply {
                         stop_reason: stop_reason.as_str().to_string(),
                         usage,
                         updates: std::mem::take(&mut final_texts),
+                        flush_rx: Some(flush_rx),
                     }));
                 }
             }
@@ -523,6 +631,7 @@ fn handle_events(
                     let _ = reply.send(Err(SessionError::PromptFailed {
                         kind: *kind,
                         message: message.clone(),
+                        assistant_had_error,
                     }));
                 }
             }
@@ -579,7 +688,7 @@ fn is_top_level_text(update: &SessionUpdate, line: &Value) -> bool {
 /// Emit a `commands_changed` system frame as an `AvailableCommandsUpdate`.
 fn emit_commands_changed(
     line: &Value,
-    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
 ) {
     let commands = line.get("commands").cloned().unwrap_or(Value::Null);
@@ -592,18 +701,18 @@ fn emit_commands_changed(
         session_id.to_string(),
         SessionUpdate::AvailableCommandsUpdate(update),
     );
-    let _ = update_tx.send(notif);
+    let _ = update_tx.send(SessionOutbound::Update(notif));
 }
 
 /// Send a batch of updates to the client as `session/update` notifications.
 fn emit_updates(
     updates: &[SessionUpdate],
-    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
 ) {
     for update in updates {
         let notif = SessionNotification::new(session_id.to_string(), update.clone());
-        let _ = update_tx.send(notif);
+        let _ = update_tx.send(SessionOutbound::Update(notif));
     }
 }
 
@@ -620,16 +729,16 @@ mod tests {
         let mut _map_state = MapState::default();
         let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
             HashMap::new();
-        let (_tx, rx) = mpsc::unbounded_channel::<SessionNotification>();
+        let (_tx, rx) = mpsc::unbounded_channel::<SessionOutbound>();
         let _ = rx; // update sink unused here
-        let (utx, _urx) = mpsc::unbounded_channel::<SessionNotification>();
+        let (utx, _urx) = mpsc::unbounded_channel::<SessionOutbound>();
         let hw = Arc::new(AtomicUsize::new(0));
 
         // p1 echoed + result settles it (A's result).
         machine.enqueue(Turn::new("p1".into(), false));
         let _ = machine.on_echo("p1");
         let events = machine.on_result(&json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"ok","usage":{}}), false);
-        handle_events(&events, &mut pending, &utx, "s", &hw);
+        handle_events(&events, &mut pending, &utx, "s", &hw, false);
 
         // p2 queued + echoed (next echo).
         machine.enqueue(Turn::new("p2".into(), false));
@@ -768,9 +877,10 @@ mod tests {
         let mut map_state = MapState::default();
         let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
             HashMap::new();
-        let (utx, _urx) = mpsc::unbounded_channel::<SessionNotification>();
+        let (utx, _urx) = mpsc::unbounded_channel::<SessionOutbound>();
         let hw = Arc::new(AtomicUsize::new(0));
         let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
 
         // A active + held (deferred on a live subagent).
         machine.enqueue(Turn::new("pA".into(), false));
@@ -791,6 +901,7 @@ mod tests {
             &mut map_state,
             &mut pending,
             &mut emitted_assistant_text,
+            &mut assistant_had_error,
             &utx,
             "s",
             &hw,

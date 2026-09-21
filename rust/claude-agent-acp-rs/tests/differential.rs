@@ -120,28 +120,172 @@ fn inv_24_ignore_paths() {
     );
 }
 
+/// 9b.T1 — the normalizer materialises a `tool_call`'s omitted `status`/
+/// `content` defaults, so an explicit `"pending"`/`[]` on one side equals an
+/// omitted one on the other. Only on `tool_call` frames.
+#[test]
+fn inv_24_tool_call_default_status_content() {
+    // Node: explicit `status: "pending"` and `content: []`.
+    let node = Frame::recv(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "33333333-3333-3333-3333-333333333333",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "toolu_01ABC",
+                "title": "echo hi",
+                "kind": "execute",
+                "status": "pending",
+                "content": []
+            }
+        }
+    }));
+    // Rust: the crate omits `status` (pending default) and empty `content`.
+    let rust = Frame::recv(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "33333333-3333-3333-3333-333333333333",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "toolu_01ABC",
+                "title": "echo hi",
+                "kind": "execute"
+            }
+        }
+    }));
+    assert!(
+        diff_frames(&[node], &[rust], &[]).is_ok(),
+        "an omitted tool_call default must equal an explicit default"
+    );
+}
+
+/// 9b.T2 — a differing `status` on a `tool_call_update` is NOT equal: updates
+/// are never default-normalised.
+#[test]
+fn inv_24_tool_call_update_status_must_match() {
+    let a = Frame::recv(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "33333333-3333-3333-3333-333333333333",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01ABC",
+                "status": "completed"
+            }
+        }
+    }));
+    let b = Frame::recv(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "33333333-3333-3333-3333-333333333333",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01ABC",
+                "status": "failed"
+            }
+        }
+    }));
+    assert!(
+        diff_frames(&[a], &[b], &[]).is_err(),
+        "a differing status on a tool_call_update must not compare equal"
+    );
+}
+
+/// 9b.T3 — a differing `content` on a `tool_call_update` is NOT equal.
+#[test]
+fn inv_24_tool_call_update_content_must_match() {
+    let a = Frame::recv(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "33333333-3333-3333-3333-333333333333",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01ABC",
+                "content": [{"type": "content", "content": {"type": "text", "text": "hi"}}]
+            }
+        }
+    }));
+    let b = Frame::recv(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "33333333-3333-3333-3333-333333333333",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01ABC",
+                "content": [{"type": "content", "content": {"type": "text", "text": "bye"}}]
+            }
+        }
+    }));
+    assert!(
+        diff_frames(&[a], &[b], &[]).is_err(),
+        "a differing content on a tool_call_update must not compare equal"
+    );
+}
+
 /// The JSON-path ignore list shared by every phase-8 differential: the fields
 /// the Rust side intentionally diverges on (modes/configOptions/models/
 /// authMethods per plan 1.3, and usage updates the port never emits).
 fn differential_ignore() -> Vec<JsonPath> {
+    base_ignore()
+}
+
+/// The ignores common to every differential: the fields the Rust side
+/// intentionally diverges on regardless of phase.
+///
+/// Tool frames are NOT ignored — `kind`/`title`/`status`/`content`/
+/// `locations`/`rawInput`/`_meta` are compared against the fixture. The only
+/// crate-inherent serialization difference — the pinned `agent-client-protocol`
+/// crate omits `status` (the `pending` default) and empty `content` on a
+/// `tool_call`, which the Node adapter always emits — is reconciled by the
+/// frame normalizer materialising those defaults on both sides (see
+/// `normalize_tool_call_defaults` in `common/mod.rs`), not by an ignore path.
+fn base_ignore() -> Vec<JsonPath> {
     vec![
         JsonPath::new("result.modes"),
         JsonPath::new("result.configOptions"),
         JsonPath::new("result.models"),
         JsonPath::new("result.authMethods"),
         JsonPath::new("params.update[sessionUpdate=usage_update]"),
-        // Tool shapes (kind/title/locations/content) are phase 9's concern; the
-        // phase-8 mapper emits a generic ToolCall. Ignore the tool frames so
-        // phase-8 differentials verify turn-settlement parity, not tool shaping.
-        JsonPath::new("params.update[sessionUpdate=tool_call]"),
-        JsonPath::new("params.update[sessionUpdate=tool_call_update]"),
     ]
+}
+
+/// The ignore set for the phase-9 tool-shape differentials (`inv_24_tools`).
+fn tools_differential_ignore() -> Vec<JsonPath> {
+    base_ignore()
+}
+
+/// 9.T3 — single-tool, multi-tool, streamed-partial-input, subagent, and
+/// error-result scripts diff clean against the Node fixtures WITHOUT ignoring
+/// the tool frames, verifying per-tool `kind`/`title`/`locations`/`_meta`.
+#[test]
+fn inv_24_tools() {
+    for name in [
+        "single-tool",
+        "multi-tool",
+        "streamed-partial-input",
+        "subagent-drain",
+        "error-result",
+    ] {
+        run_and_diff_with(name, &tools_differential_ignore());
+    }
 }
 
 /// Run the Rust binary against `name`'s corpus script via the recorder +
 /// fake-claude, and diff the captured frames against the committed Node
 /// fixture. Missing binaries fail loudly (8.6). `#[ignore]`-able per-corpus.
 fn run_and_diff(name: &str) {
+    run_and_diff_with(name, &differential_ignore());
+}
+
+/// As [`run_and_diff`], but with an explicit ignore set (the phase-9 tool
+/// differentials use `tools_differential_ignore`).
+fn run_and_diff_with(name: &str, ignore: &[JsonPath]) {
     let root = repo_root();
     let script = root.join(format!("porting/corpus/{name}.acp.json"));
     let transcript = root.join(format!("porting/corpus/{name}.transcript.jsonl"));
@@ -167,8 +311,7 @@ fn run_and_diff(name: &str) {
     // path; normalise it to `$ROOT` like capture.sh does before diffing.
     let frames = normalize_root_paths(frames, &root);
     let expected = parse_fixture_frames(&fixture);
-    let ignore = differential_ignore();
-    if let Err(diff) = diff_frames(&frames, &expected, &ignore) {
+    if let Err(diff) = diff_frames(&frames, &expected, ignore) {
         panic!("{name} differential failed:\n{diff}");
     }
     let _ = std::fs::remove_dir_all(&tmp);

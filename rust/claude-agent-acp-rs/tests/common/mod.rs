@@ -11,7 +11,9 @@
 //! 1. dropping whole frames matched by an ignore path's value filter (e.g. a
 //!    `usage_update` frame the Rust side never emits),
 //! 2. removing nodes at plain-field ignore paths (e.g. `result.configOptions`),
-//! 3. normalising ids/uuids/timestamps to first-appearance placeholders.
+//! 3. materialising ACP defaults the pinned crate omits on `tool_call` frames
+//!    (absent `status` → `"pending"`, absent `content` → `[]`) on both sides,
+//! 4. normalising ids/uuids/timestamps to first-appearance placeholders.
 //!
 //! Because this shared module is `mod`-included by several independent test
 //! binaries (each with a different slice of helpers in use), `dead_code` is
@@ -314,11 +316,21 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
     let mut norm_b = Norm::default();
     let a: Vec<(Direction, Value)> = filtered_a
         .into_iter()
-        .map(|f| (f.0, normalize(f.1, &mut norm_a)))
+        .map(|f| {
+            (
+                f.0,
+                normalize(normalize_tool_call_defaults(f.1), &mut norm_a),
+            )
+        })
         .collect();
     let b: Vec<(Direction, Value)> = filtered_b
         .into_iter()
-        .map(|f| (f.0, normalize(f.1, &mut norm_b)))
+        .map(|f| {
+            (
+                f.0,
+                normalize(normalize_tool_call_defaults(f.1), &mut norm_b),
+            )
+        })
         .collect();
 
     for (i, (left, right)) in a.iter().zip(b.iter()).enumerate() {
@@ -376,6 +388,40 @@ fn filter_frames(frames: &[Frame], ignore: &[JsonPath]) -> Vec<(Direction, Value
         out.push((frame.direction, json));
     }
     out
+}
+
+/// Materialise ACP defaults the pinned crate omits, so an omitted default
+/// equals an explicit default on BOTH sides of a differential (Decision D13).
+///
+/// The `agent-client-protocol` crate marks `ToolCall.status` and `ToolCall.content`
+/// with `skip_serializing_if = is_default` / `Vec::is_empty`, so a `tool_call`
+/// frame with `Pending` status and empty content serialises without them, while
+/// the Node adapter always emits `"pending"` / `[]`. We re-insert those defaults
+/// on any `params.update` whose `sessionUpdate == "tool_call"`. This is done for
+/// `tool_call` frames ONLY — never for `tool_call_update` or any other kind,
+/// where `status`/`content` must match exactly.
+fn normalize_tool_call_defaults(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            for (_, v) in map.iter_mut() {
+                *v = normalize_tool_call_defaults(std::mem::take(v));
+            }
+            if map.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call") {
+                map.entry("status")
+                    .or_insert_with(|| Value::String("pending".to_string()));
+                map.entry("content")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+            }
+            Value::Object(map)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(normalize_tool_call_defaults)
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Replace ids/uuids/timestamps with first-appearance placeholders.

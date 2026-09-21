@@ -39,6 +39,8 @@ use agent_client_protocol::schema::v1::{
 };
 use serde_json::Value;
 
+use crate::tools;
+
 /// Whether a consolidated message is the assistant's or the user's side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgRole {
@@ -153,6 +155,8 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
 
 /// 7.3 — a `tool_use` block becomes a `ToolCall` on first surface, or a
 /// refining `ToolCallUpdate` when the id was already emitted (7.7 dedupe).
+/// Phase 9: shapes `kind`/`title`/`locations`/`content` and the `_meta`
+/// `claudeCode` from `tools::tool_shape`/`tools::tool_meta`.
 fn tool_call_from_use(block: &Value, state: &mut MapState) -> SessionUpdate {
     let id = block["id"].as_str().unwrap_or("").to_string();
     let name = block["name"].as_str().unwrap_or("Other").to_string();
@@ -166,13 +170,16 @@ fn tool_call_from_use(block: &Value, state: &mut MapState) -> SessionUpdate {
     state.emitted.insert(id.clone());
     state.tool_use_cache.insert(id.clone(), block.clone());
 
-    let mut meta = serde_json::Map::new();
-    meta.insert("toolName".to_string(), Value::String(name.clone()));
+    let input = raw_input.clone().unwrap_or(Value::Null);
+    let shape = tools::tool_shape(&name, &input);
     SessionUpdate::ToolCall(
-        ToolCall::new(id, name)
+        ToolCall::new(id, shape.title)
+            .kind(shape.kind)
             .status(ToolCallStatus::Pending)
+            .content(shape.content)
+            .locations(shape.locations)
             .raw_input(raw_input)
-            .meta(meta),
+            .meta(tools::tool_meta(&name, &input)),
     )
 }
 
@@ -201,25 +208,39 @@ fn tool_update_from_result(block: &Value, state: &mut MapState) -> SessionUpdate
     state.tool_use_cache.remove(&id);
 
     let raw_output = block.get("content").cloned();
+    let result_input = block.get("content").cloned().unwrap_or(Value::Null);
     let mut fields = ToolCallUpdateFields::new().status(status);
+    if let Some(content) = tools::tool_result_content(&name, &result_input, is_error) {
+        fields = fields.content(content);
+    }
     if let Some(raw_output) = raw_output {
         fields = fields.raw_output(raw_output);
     }
 
-    let mut meta = serde_json::Map::new();
-    meta.insert("toolName".to_string(), Value::String(name));
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields).meta(meta))
+    SessionUpdate::ToolCallUpdate(
+        ToolCallUpdate::new(id, fields).meta(tools::tool_meta(&name, &result_input)),
+    )
 }
 
 /// 7.3/7.7 — a refining `ToolCallUpdate` for an already-surfaced tool call.
+/// Phase 9: applies the shape (`kind`/`title`/`content`/`locations`) plus the
+/// `_meta` `claudeCode`.
 fn tool_call_update_refine(id: String, name: &str, raw_input: Option<Value>) -> SessionUpdate {
-    let mut fields = ToolCallUpdateFields::new().title(name.to_string());
+    let input = raw_input.clone().unwrap_or(Value::Null);
+    let shape = tools::tool_shape(name, &input);
+    let mut fields = ToolCallUpdateFields::new()
+        .kind(shape.kind)
+        .title(shape.title)
+        .content(shape.content);
+    if !shape.locations.is_empty() {
+        fields = fields.locations(shape.locations);
+    }
     if let Some(raw_input) = raw_input {
         fields = fields.raw_input(raw_input);
     }
-    let mut meta = serde_json::Map::new();
-    meta.insert("toolName".to_string(), Value::String(name.to_string()));
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields).meta(meta))
+    SessionUpdate::ToolCallUpdate(
+        ToolCallUpdate::new(id, fields).meta(tools::tool_meta(name, &input)),
+    )
 }
 
 /// 7.1 — a text/thinking/image block becomes a chunk update.
@@ -480,13 +501,29 @@ fn input_json_delta(
 }
 
 /// Build a refining `ToolCallUpdate` for a partially-recovered tool input.
+/// Phase 9: applies `kind`/`title`/`locations` from the shape but never
+/// `content` (content built from partial input is misleading; the consolidated
+/// message supplies it moments later — mirrors `streamedInputRefinement`).
 fn streamed_input_refinement(streamed: &StreamedInput, input: Value) -> SessionUpdate {
-    let fields = ToolCallUpdateFields::new()
-        .title(streamed.name.clone())
+    let name = streamed.name.clone();
+    let shape = tools::tool_shape(&name, &input);
+    let mut fields = ToolCallUpdateFields::new()
+        .kind(shape.kind)
+        .title(shape.title)
         .raw_input(input);
-    let mut meta = serde_json::Map::new();
-    meta.insert("toolName".to_string(), Value::String(streamed.name.clone()));
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(streamed.id.clone(), fields).meta(meta))
+    if !shape.locations.is_empty() {
+        fields = fields.locations(shape.locations);
+    }
+    SessionUpdate::ToolCallUpdate(
+        ToolCallUpdate::new(streamed.id.clone(), fields)
+            .meta(tools::tool_meta(&name, &streamed_input_value(streamed))),
+    )
+}
+
+/// The accumulated partial input as a JSON value (best-effort; the shape's meta
+/// only needs the name/description fields, so an incomplete parse is fine).
+fn streamed_input_value(streamed: &StreamedInput) -> Value {
+    serde_json::from_str(&streamed.partial_json).unwrap_or(Value::Null)
 }
 
 /// The incremental JSON-prefix lexer (7.4), ported from `scanStreamedToolInput`

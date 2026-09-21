@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::control::InitializeOptions;
 use crate::process::{SpawnOptions, Timings};
-use crate::session::{Session, SessionError, SessionOptions};
+use crate::session::{Session, SessionError, SessionOptions, SessionOutbound};
 
 /// The `_meta`/agentCapabilities that match the Node adapter at v0.70.0.
 ///
@@ -281,14 +281,27 @@ fn options_from_meta(params: &Value) -> (Option<String>, Option<String>) {
 fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
     use crate::turn::FailureKind::*;
     let (message, data) = match err {
-        SessionError::PromptFailed { kind, message } => {
+        SessionError::PromptFailed {
+            kind,
+            message,
+            assistant_had_error,
+        } => {
             let data = match kind {
                 AuthRequired => None,
-                ProviderError => Some(json!({"errorKind": "provider_error"})),
-                BudgetExhausted => Some(json!({"errorKind": "budget_exhausted"})),
-                ContextExhausted => Some(json!({"errorKind": "context_exhausted"})),
-                NoResult => Some(json!({"errorKind": "no_result"})),
-                SessionEnded => None,
+                // `errorKindData(lastAssistantError)` (acp-agent.js:5282) only
+                // attaches `data.errorKind` when the assistant frame carried an
+                // `error`; otherwise the wire error has no `data`.
+                ProviderError if *assistant_had_error => {
+                    Some(json!({"errorKind": "provider_error"}))
+                }
+                BudgetExhausted if *assistant_had_error => {
+                    Some(json!({"errorKind": "budget_exhausted"}))
+                }
+                ContextExhausted if *assistant_had_error => {
+                    Some(json!({"errorKind": "context_exhausted"}))
+                }
+                NoResult if *assistant_had_error => Some(json!({"errorKind": "no_result"})),
+                _ => None,
             };
             let message = if *kind == AuthRequired {
                 format!("authRequired: {message}")
@@ -390,7 +403,7 @@ fn register_session(
     registry: &mut Registry,
     session_id: &str,
     session: Session,
-    update_rx: mpsc::UnboundedReceiver<SessionNotification>,
+    update_rx: mpsc::UnboundedReceiver<SessionOutbound>,
     connection: &ConnectionTo<agent_client_protocol::Client>,
 ) {
     registry
@@ -400,8 +413,19 @@ fn register_session(
     let connection = connection.clone();
     tokio::spawn(async move {
         let mut update_rx = update_rx;
-        while let Some(notif) = update_rx.recv().await {
-            let _ = connection.send_notification(notif);
+        while let Some(item) = update_rx.recv().await {
+            match item {
+                SessionOutbound::Update(notif) => {
+                    let _ = connection.send_notification(notif);
+                }
+                // Phase 9 flush barrier: every update sent before this marker
+                // has been forwarded; resolve the oneshot so the prompt task
+                // may write its response (keeps a `tool_call` ahead of the
+                // `result` on the wire).
+                SessionOutbound::Flush(done) => {
+                    let _ = done.send(());
+                }
+            }
         }
     });
 }
@@ -537,6 +561,12 @@ async fn handle_request(
                                     }),
                                 );
                             }
+                        }
+                        // Phase 9: await the flush barrier so every session
+                        // update this turn emitted (e.g. a `tool_call`) is
+                        // written before the response.
+                        if let Some(flush_rx) = reply.flush_rx {
+                            let _ = flush_rx.await;
                         }
                         let _ = responder.respond(result);
                     }

@@ -9,6 +9,7 @@ pub mod dispatch;
 pub mod map;
 pub mod process;
 pub mod session;
+pub mod tools;
 pub mod turn;
 
 #[cfg(test)]
