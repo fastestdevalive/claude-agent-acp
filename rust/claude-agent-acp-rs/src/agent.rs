@@ -288,6 +288,31 @@ fn options_from_meta(params: &Value) -> (Option<String>, Option<String>) {
     (model, permission)
 }
 
+/// Decide the `_session/steering` outcome (R32 / B1 row).
+///
+/// Validates `idleBehavior` (`_meta.steering.idleBehavior`): any value other
+/// than `"promptRequired"` → `invalidParams` ("unsupported steering
+/// idleBehavior"). Then, given whether a turn is in flight, maps to the wire
+/// outcome:
+///
+/// - in flight → `{outcome:"injected"}` (the caller injects at `now` priority),
+/// - idle + `promptRequired` → `{outcome:"promptRequired", reason:"noRunningTurn"}`,
+/// - idle, no opt-in → `{outcome:"startedNewTurn"}` (detached new turn).
+///
+/// `idle_behavior` is `None` when `_meta.steering.idleBehavior` is absent.
+pub fn steer_outcome(turn_in_flight: bool, idle_behavior: Option<&str>) -> Result<Value, Error> {
+    if idle_behavior.is_some_and(|b| b != "promptRequired") {
+        return Err(Error::invalid_params().data("unsupported steering idleBehavior"));
+    }
+    if turn_in_flight {
+        Ok(json!({ "outcome": "injected" }))
+    } else if idle_behavior == Some("promptRequired") {
+        Ok(json!({ "outcome": "promptRequired", "reason": "noRunningTurn" }))
+    } else {
+        Ok(json!({ "outcome": "startedNewTurn" }))
+    }
+}
+
 /// Map a [`SessionError`] to the JSON-RPC error's `(message, data)` (review-04
 /// wiring: the actor maps `AuthRequired` → authRequired, else `internalError`
 /// with `errorKind` data). The message is the full `"Internal error: <detail>"`
@@ -609,6 +634,61 @@ async fn handle_request(
             });
             Ok(())
         }
+        "_session/steering" => {
+            // R32 / B1 row. A steered message is injected into the running turn
+            // at `now` priority via the control writer, or the host-owned
+            // `promptRequired` fallback is reported when idle.
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if session_id.is_empty() {
+                return responder.respond_with_error(
+                    Error::invalid_params().data("steer params require a non-empty sessionId"),
+                );
+            }
+            let prompt = params.get("prompt").and_then(Value::as_array);
+            if prompt.is_none_or(Vec::is_empty) {
+                return responder.respond_with_error(
+                    Error::invalid_params().data("steer params require a non-empty prompt array"),
+                );
+            }
+            let idle_behavior = params
+                .pointer("/_meta/steering/idleBehavior")
+                .and_then(Value::as_str);
+            // Reject an unsupported `idleBehavior` before routing to the actor
+            // (the R32 invalidParams case; `steer_outcome` guards it too).
+            if idle_behavior.is_some_and(|b| b != "promptRequired") {
+                return responder.respond_with_error(
+                    Error::invalid_params().data("unsupported steering idleBehavior"),
+                );
+            }
+            let session = match registry.sessions.get(&session_id) {
+                Some(s) => s.clone(),
+                None => {
+                    return responder
+                        .respond_with_error(Error::internal_error().data("Session not found"));
+                }
+            };
+            let first_text = prompt
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let is_local_only = is_local_only_command(first_text);
+            let is_prompt_required = idle_behavior == Some("promptRequired");
+            let uuid = uuid_v4();
+            let frame = prompt_to_claude(&params, &session_id, &uuid);
+            let reply_rx = session.steer(uuid, frame, is_local_only, is_prompt_required);
+            tokio::spawn(async move {
+                let outcome = reply_rx
+                    .await
+                    .unwrap_or_else(|_| json!({ "outcome": "error" }));
+                let _ = responder.respond(outcome);
+            });
+            Ok(())
+        }
         _ => {
             // Unhandled method (8.1): -32601.
             responder.respond_with_error(
@@ -738,5 +818,63 @@ mod tests {
         let argv = crate::process::build_argv(&spawn);
         assert_eq!(resume_from_argv(&argv), Some("sess-id"));
         assert!(session_id_from_argv(&argv).is_none());
+    }
+
+    /// 12.T1 — `_session/steering` outcome decisions (R32 / B1):
+    /// idle + `promptRequired` → `{outcome:"promptRequired",
+    /// reason:"noRunningTurn"}`; `idleBehavior:"x"` → `invalidParams`.
+    #[test]
+    fn inv_steering_idle_prompt_required_and_invalid_behavior() {
+        // Idle + promptRequired opt-in.
+        let outcome = steer_outcome(false, Some("promptRequired")).expect("ok");
+        assert_eq!(
+            outcome,
+            json!({ "outcome": "promptRequired", "reason": "noRunningTurn" }),
+            "idle + promptRequired must yield the promptRequired outcome"
+        );
+
+        // Bad idleBehavior → invalidParams (code -32602).
+        let err = steer_outcome(false, Some("x")).expect_err("must reject bad idleBehavior");
+        assert_eq!(
+            serde_json::to_value(&err)
+                .ok()
+                .and_then(|v| v.get("code").cloned())
+                .and_then(|c| c.as_i64()),
+            Some(-32602),
+            "bad idleBehavior must be invalidParams"
+        );
+        let err = steer_outcome(true, Some("anything-else")).expect_err("must reject");
+        assert_eq!(
+            serde_json::to_value(&err)
+                .ok()
+                .and_then(|v| v.get("code").cloned())
+                .and_then(|c| c.as_i64()),
+            Some(-32602),
+            "a non-promptRequired idleBehavior must be invalidParams even with a turn in flight"
+        );
+
+        // Absent idleBehavior (the legacy default) is accepted.
+        assert!(
+            steer_outcome(false, None).is_ok(),
+            "absent idleBehavior is valid"
+        );
+        assert!(
+            steer_outcome(true, None).is_ok(),
+            "absent idleBehavior is valid"
+        );
+    }
+
+    /// 12.T1 companion — a turn in flight injects (returns `injected`); the
+    /// idle legacy default starts a new turn. Guards the non-error arms of
+    /// `steer_outcome` so the R32 table is fully covered.
+    #[test]
+    fn inv_steering_in_flight_and_idle_default() {
+        let injected = steer_outcome(true, None).expect("ok");
+        assert_eq!(injected, json!({ "outcome": "injected" }));
+        let injected = steer_outcome(true, Some("promptRequired")).expect("ok");
+        assert_eq!(injected, json!({ "outcome": "injected" }));
+
+        let started = steer_outcome(false, None).expect("ok");
+        assert_eq!(started, json!({ "outcome": "startedNewTurn" }));
     }
 }

@@ -162,6 +162,17 @@ enum Command {
         frame: Value,
         reply: oneshot::Sender<Value>,
     },
+    /// Steer the running turn (12.1, `_session/steering`, R32). `frame` is the
+    /// `user` message to inject; `is_prompt_required` is whether the client
+    /// opted into the host-owned `promptRequired` idle fallback. `reply`
+    /// resolves with the `{outcome: …}` wire value the actor decides.
+    Steer {
+        uuid: String,
+        frame: Value,
+        is_local_only: bool,
+        is_prompt_required: bool,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// Configuration used to start a session (phase 8 / 8.2, 8.4).
@@ -304,6 +315,27 @@ impl Session {
             uuid,
             frame,
             is_local_only,
+            reply: reply_tx,
+        });
+        reply_rx
+    }
+
+    /// Steer the session (12.1): inject a message into the running turn at
+    /// `now` priority, or report the idle `promptRequired` / `startedNewTurn`
+    /// outcome. Returns the `oneshot` resolving with the `{outcome: …}` value.
+    pub fn steer(
+        &self,
+        uuid: String,
+        frame: Value,
+        is_local_only: bool,
+        is_prompt_required: bool,
+    ) -> oneshot::Receiver<Value> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(Command::Steer {
+            uuid,
+            frame,
+            is_local_only,
+            is_prompt_required,
             reply: reply_tx,
         });
         reply_rx
@@ -556,6 +588,55 @@ async fn run_loop(
                             &session_id,
                             &mut pending_permissions,
                         );
+                    }
+                    Command::Steer {
+                        uuid,
+                        frame,
+                        is_local_only,
+                        is_prompt_required,
+                        reply,
+                    } => {
+                        // 12.1 (R32): decide the outcome from whether a turn is
+                        // in flight. The agent already rejected a bad
+                        // `idleBehavior`, so `steer_outcome` only maps the
+                        // in-flight / idle decision here.
+                        let turn_in_flight = machine.has_unsettled();
+                        let idle_behavior = if is_prompt_required {
+                            Some("promptRequired")
+                        } else {
+                            None
+                        };
+                        let outcome = match crate::agent::steer_outcome(
+                            turn_in_flight,
+                            idle_behavior,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => serde_json::to_value(e).unwrap_or_else(|_| {
+                                json!({ "error": { "code": -32602, "message": "invalid params" } })
+                            }),
+                        };
+                        match outcome.get("outcome").and_then(Value::as_str) {
+                            Some("injected") => {
+                                // `now` priority injection into the running turn:
+                                // push the user message on the same stdin writer
+                                // (D6), pre-empting the current generation (R32).
+                                let mut injected = frame;
+                                injected["priority"] = json!("now");
+                                let _ = control.send_user(injected).await;
+                            }
+                            Some("startedNewTurn") => {
+                                // Idle, no opt-in: start a detached turn like a
+                                // normal prompt (it streams updates and settles
+                                // internally; nothing awaits its oneshot).
+                                let (ptx, _prx) = oneshot::channel();
+                                let _ = control.send_user(frame).await;
+                                machine.enqueue(Turn::new(uuid.clone(), is_local_only));
+                                pending.insert(uuid, ptx);
+                                assistant_had_error = false;
+                            }
+                            _ => {}
+                        }
+                        let _ = reply.send(outcome);
                     }
                 }
             }

@@ -564,6 +564,32 @@ fn current_os() -> Os {
     Os::Windows
 }
 
+/// A future that resolves when the host requests shutdown: SIGTERM on unix.
+///
+/// On non-unix platforms there is no SIGTERM; the future never resolves
+/// (shutdown happens only via stdin EOF), matching the D12 platform split.
+/// All `cfg` lives in `process.rs` (guard G9), so the stdio binary can await
+/// this without any platform-specific code (12.2).
+#[cfg(unix)]
+pub async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            term.recv().await;
+        }
+        Err(_) => {
+            // No handler could be installed; park (shutdown via stdin EOF).
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Non-unix: no SIGTERM; shutdown happens only via stdin EOF.
+#[cfg(not(unix))]
+pub async fn wait_for_shutdown_signal() {
+    std::future::pending::<()>().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1127,3 +1127,37 @@ async fn inv_23_receipt_field_guard() {
         );
     }
 }
+
+/// 12.1 — `TurnMachine::has_unsettled` (the `_session/steering` in-flight
+/// check, `acp-agent.js:1141`): true when any turn is active or queued
+/// unsettled, false only when the machine is fully settled/empty.
+#[test]
+fn has_unsettled_tracks_in_flight_turns() {
+    let mut machine = TurnMachine::new();
+    assert!(
+        !machine.has_unsettled(),
+        "an empty machine has no turn in flight"
+    );
+
+    // A queued-but-not-yet-echoed turn is in flight.
+    machine.enqueue(Turn::new("p1".into(), false));
+    assert!(
+        machine.has_unsettled(),
+        "a queued turn awaiting its echo is in flight"
+    );
+
+    // Active (echoed) is also in flight.
+    let _ = machine.on_echo("p1");
+    assert!(machine.has_unsettled(), "an active turn is in flight");
+
+    // Once settled, nothing is in flight.
+    let events = machine.on_result(&result_frame("success", false), false);
+    assert!(
+        settled_events(&events).contains(&("p1", StopReason::EndTurn)),
+        "the active turn settles"
+    );
+    assert!(
+        !machine.has_unsettled(),
+        "a fully-settled machine has no turn in flight"
+    );
+}

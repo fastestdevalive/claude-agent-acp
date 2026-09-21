@@ -233,6 +233,144 @@ async fn inv_session_load_foreign_id_resumes() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// 12.1 end-to-end — `_session/steering` over the channel: idle +
+/// `promptRequired` → `{outcome:"promptRequired", reason:"noRunningTurn"}`;
+/// `idleBehavior:"x"` → `invalidParams`; and a turn in flight → `{outcome:
+/// "injected"}`. Exercises the session actor's `Command::Steer` path (12.1).
+#[tokio::test]
+async fn inv_steering_end_to_end() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("acp-agent-steer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+    // A transcript that holds a turn in flight (echo + assistant, no result).
+    let transcript = tmp.join("steer.transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"expect\":{\"type\":\"control_request\",\"request\":{\"subtype\":\"initialize\"}},\"emit\":[{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$REQ\",\"response\":{\"models\":[],\"commands\":[]}}}]}\n{\"expect\":{\"type\":\"user\"},\"emit\":[{\"type\":\"user\",\"uuid\":\"$MATCH.uuid\",\"isReplay\":true,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hold\"}]}},{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"working\"}]}}]}\n",
+    )
+    .expect("write transcript");
+
+    let timings = claude_agent_acp_rs::process::Timings {
+        force_cancel_grace: Duration::from_millis(1000),
+        ..claude_agent_acp_rs::process::Timings::default()
+    };
+    let opts = ServeOptions {
+        claude_path: Some(fake_claude_binary()),
+        extra_env: vec![(
+            "FAKE_CLAUDE_SCRIPT".to_string(),
+            transcript.to_string_lossy().into_owned(),
+        )],
+        default_cwd: Some(root.clone()),
+        timings,
+    };
+    let (agent_channel, client_channel) = Channel::duplex();
+    let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
+
+    let result = Client
+        .builder()
+        .connect_with(
+            client_channel,
+            move |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                // initialize
+                connection
+                    .send_request(UntypedMessage::new(
+                        "initialize",
+                        json!({ "protocolVersion": 1 }),
+                    )?)
+                    .block_task()
+                    .await?;
+                // session/new
+                let created = connection
+                    .send_request(UntypedMessage::new("session/new", json!({}))?)
+                    .block_task()
+                    .await?;
+                let session_id = created["sessionId"].as_str().unwrap_or("").to_string();
+
+                // Idle (no turn yet) + promptRequired opt-in -> promptRequired.
+                let steer_params = json!({
+                    "sessionId": session_id,
+                    "prompt": [ { "type": "text", "text": "follow up" } ],
+                    "_meta": { "steering": { "idleBehavior": "promptRequired" } }
+                });
+                let resp = connection
+                    .send_request(UntypedMessage::new("_session/steering", steer_params)?)
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    resp,
+                    json!({ "outcome": "promptRequired", "reason": "noRunningTurn" }),
+                    "idle + promptRequired must yield promptRequired"
+                );
+
+                // Bad idleBehavior -> invalidParams.
+                let steer_params = json!({
+                    "sessionId": session_id,
+                    "prompt": [ { "type": "text", "text": "x" } ],
+                    "_meta": { "steering": { "idleBehavior": "x" } }
+                });
+                let resp = connection
+                    .send_request(UntypedMessage::new("_session/steering", steer_params)?)
+                    .block_task()
+                    .await;
+                let err = resp.expect_err("bad idleBehavior must error");
+                assert_eq!(
+                    serde_json::to_value(&err)
+                        .ok()
+                        .and_then(|v| v.get("code").cloned())
+                        .and_then(|c| c.as_i64()),
+                    Some(-32602),
+                    "bad idleBehavior must be invalidParams"
+                );
+
+                // Start a turn that stays in flight (mid-turn transcript), then
+                // steer while it is running -> injected.
+                let prompt_task = {
+                    let connection = connection.clone();
+                    let session_id = session_id.clone();
+                    tokio::spawn(async move {
+                        if let Ok(msg) = UntypedMessage::new(
+                            "session/prompt",
+                            json!({
+                                "sessionId": session_id,
+                                "prompt": [ { "type": "text", "text": "hold" } ]
+                            }),
+                        ) {
+                            let _ = connection.send_request(msg).block_task().await;
+                        }
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(300)).await;
+
+                let steer_params = json!({
+                    "sessionId": session_id,
+                    "prompt": [ { "type": "text", "text": "interject" } ],
+                    "_meta": { "steering": { "idleBehavior": "promptRequired" } }
+                });
+                let resp = connection
+                    .send_request(UntypedMessage::new("_session/steering", steer_params)?)
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    resp,
+                    json!({ "outcome": "injected" }),
+                    "a turn in flight must inject (now priority)"
+                );
+
+                // Let the test wind down; drop the in-flight prompt task.
+                drop(prompt_task);
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "steering drive resolves");
+    drop(result);
+    let _ = timeout(Duration::from_secs(5), serve_task).await;
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// 8.T4 — nothing but JSON-RPC frames ever reaches stdout: a stray `println!`
 /// on the binary's stdout would surface as a non-JSON line. Spawn the real
 /// binary over stdio, send an `initialize` request, close stdin, and assert

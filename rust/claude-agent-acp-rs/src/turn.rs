@@ -294,6 +294,14 @@ impl TurnMachine {
         self.active.as_ref().is_some_and(|t| !t.settled)
     }
 
+    /// Whether a turn is in flight: an active unsettled turn, or any queued
+    /// turn awaiting its echo. Mirrors the Node's `turnInFlight` check
+    /// (`(session.turnQueue ?? []).find((turn) => !turn.settled)`,
+    /// `acp-agent.js:1141`), used by `_session/steering`.
+    pub fn has_unsettled(&self) -> bool {
+        self.has_active() || self.queue.iter().any(|t| !t.settled)
+    }
+
     /// Enqueue a prompt turn (it awaits its echo before activation).
     pub fn enqueue(&mut self, turn: Turn) {
         self.queue.push_back(turn);

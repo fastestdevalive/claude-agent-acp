@@ -6,6 +6,8 @@
 //!   here as JSON.
 //! - `FAKE_CLAUDE_INIT_OUT` — optional path; the first `initialize`
 //!   control_request received on stdin is written here as JSON.
+//! - `FAKE_CLAUDE_PID_OUT` — optional path; this process's pid is written here
+//!   as text at startup (phase 12 orphan tests).
 
 use std::process::ExitCode;
 
@@ -18,6 +20,13 @@ fn main() -> ExitCode {
     };
     let argv_out = std::env::var("FAKE_CLAUDE_ARGV_OUT").ok();
     let init_out = std::env::var("FAKE_CLAUDE_INIT_OUT").ok();
+    let pid_out = std::env::var("FAKE_CLAUDE_PID_OUT").ok();
+
+    // Publish this child's pid before replay starts so a phase-12 orphan test
+    // can assert it is gone (ESRCH) after the host tears down (INV-6).
+    if let Some(pid_out) = pid_out {
+        let _ = std::fs::write(pid_out, std::process::id().to_string());
+    }
 
     let path = std::path::PathBuf::from(&script);
     let transcript = match load_transcript(&path) {
