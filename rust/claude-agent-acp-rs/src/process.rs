@@ -121,6 +121,8 @@ pub struct SpawnOptions {
     pub session_id: Option<String>,
     /// `--resume=<id>` for `session/load`.
     pub resume: Option<String>,
+    /// `--model <m>` (conditional, B2 / phase 8).
+    pub model: Option<String>,
     /// `--permission-mode <mode>`.
     pub permission_mode: Option<String>,
     /// `--setting-sources=<csv>` (default `user,project,local`).
@@ -147,6 +149,7 @@ impl Default for SpawnOptions {
             default_cwd: None,
             session_id: None,
             resume: None,
+            model: None,
             permission_mode: None,
             setting_sources: vec!["user".into(), "project".into(), "local".into()],
             disallowed_tools: Vec::new(),
@@ -171,6 +174,11 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         "--input-format".into(),
         "stream-json".into(),
     ];
+
+    if let Some(model) = &opts.model {
+        argv.push("--model".into());
+        argv.push(model.clone());
+    }
 
     if opts.permission_prompt_tool {
         argv.push("--permission-prompt-tool".into());

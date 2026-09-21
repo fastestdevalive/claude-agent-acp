@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, TextContent,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{AcpAgent, Client, ConnectionTo, LineDirection};
+use agent_client_protocol::{AcpAgent, Client, ConnectionTo, LineDirection, SentRequest};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -176,6 +177,8 @@ async fn run_script(
     update_count: Arc<AtomicUsize>,
 ) -> Result<(), agent_client_protocol::Error> {
     let mut session_id: Option<agent_client_protocol::schema::v1::SessionId> = None;
+    // In-flight `no_wait` prompts awaited by a later `session/wait` step.
+    let mut pending: Vec<SentRequest<PromptResponse>> = Vec::new();
 
     for step in &script.steps {
         match step {
@@ -216,6 +219,7 @@ async fn run_script(
             Step::Prompt {
                 text,
                 cancel_after_updates,
+                no_wait,
             } => {
                 let Some(sid) = session_id.as_ref() else {
                     return Err(agent_client_protocol::Error::invalid_params()
@@ -235,7 +239,13 @@ async fn run_script(
                     }
                     connection.send_notification(CancelNotification::new(sid.clone()))?;
                 }
-                let _response = sent.block_task().await?;
+                if *no_wait {
+                    // Leave the prompt in flight (queued/active) so a later step
+                    // (e.g. `session/cancel`) acts on it; `session/wait` settles it.
+                    pending.push(sent);
+                } else {
+                    let _response = sent.block_task().await?;
+                }
             }
             Step::Cancel => {
                 let Some(sid) = session_id.as_ref() else {
@@ -243,6 +253,11 @@ async fn run_script(
                         .data("session/cancel before any session/new"));
                 };
                 connection.send_notification(CancelNotification::new(sid.clone()))?;
+            }
+            Step::WaitPrompts => {
+                for sent in pending.drain(..) {
+                    let _response = sent.block_task().await?;
+                }
             }
         }
     }

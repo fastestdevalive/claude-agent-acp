@@ -838,3 +838,141 @@ async fn inv_stop_reason_table() {
         Some(StopReason::MaxTurnRequests)
     );
 }
+
+/// Review-05 row 1(i): A active + B queued -> A's result settles A, B stays
+/// queued, and B's echo activates B. Without the `ensure_active_turn` early
+/// return this would settle/misattribute B and hang A.
+#[tokio::test(flavor = "multi_thread")]
+async fn result_for_active_turn_while_queued_settles_active() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.enqueue(Turn::new("pB".into(), false));
+    // A is echoed -> active.
+    machine.on_echo("pA");
+    assert!(machine.has_active(), "A is the active turn");
+
+    // A's own result arrives while B is queued.
+    let events = machine.on_result(&result_frame("success", false), false);
+    assert_eq!(
+        settled_events(&events),
+        vec![("pA", StopReason::EndTurn)],
+        "A's result must settle A, not promote/settle B"
+    );
+    // B stays queued (not activated).
+    assert!(!machine.has_active(), "B must not be active yet");
+    // B's echo activates B.
+    let events = machine.on_echo("pB");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Activated { prompt_uuid } if prompt_uuid == "pB")),
+        "B's echo must activate B"
+    );
+    assert!(machine.has_active());
+}
+
+/// Review-05 row 1(ii): A active + B queued -> cancel -> A's result -> idle ->
+/// p3 (echo-less) enqueued -> B's late result must not activate p3 (INV-30).
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_late_result_never_activates_echo_less() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.enqueue(Turn::new("pB".into(), false));
+    machine.on_echo("pA");
+
+    // Cancel sweeps B -> orphan credit.
+    machine.cancel();
+
+    // A's own result arrives (dropped, cancelled), then idle settles A.
+    machine.on_result(&result_frame("success", false), false);
+    let events = machine.on_idle();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "pA")),
+        "A settles at idle"
+    );
+
+    // p3 (echo-less local-only) enqueued.
+    machine.enqueue(Turn::new("p3".into(), true));
+
+    // B's late result arrives: it is an orphan, must NOT activate/settle p3.
+    let events = machine.on_result(&result_frame("success", false), false);
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "p3")),
+        "B's orphaned result must never settle p3"
+    );
+    assert!(
+        !machine.has_active(),
+        "B's orphaned result must not activate p3"
+    );
+}
+
+/// Review-05 row 1(iii): A held + /context queued -> its result settles A with
+/// the deferred outcome, then promotes and settles /context.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_turn_result_promotes_and_settles_local_only() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    // A spawns a subagent -> a result defers A.
+    machine.on_task_started("sub1", true);
+    let events = machine.on_result(&result_frame("success", false), false);
+    assert!(
+        settled_events(&events).is_empty(),
+        "A defers while subagent live"
+    );
+    assert!(machine.has_active());
+
+    // /context queued (echo-less).
+    machine.enqueue(Turn::new("ctx".into(), true));
+
+    // The followup autonomous result drains A (deferred end_turn), then a user
+    // result for /context promotes and settles it.
+    machine.on_result(&autonomous_result("success"), false);
+    let events = machine.on_result(
+        &serde_json::json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"context out","usage":{"output_tokens":0}}),
+        false,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "ctx")),
+        "the /context result must settle the promoted local-only turn"
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, TurnEvent::FinalText { .. })));
+}
+
+/// Review-05 row 2: a held turn cancelled while the session is `running` owes
+/// an interrupt trailer so the next echoed prompt's trailing idle is absorbed,
+/// not a false #825 fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_cancel_debt_uses_running_state() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    // A defers (held) and the session moves to running (a followup).
+    machine.on_task_started("sub1", true);
+    machine.on_result(&result_frame("success", false), false);
+    machine.on_session_state("running");
+
+    // Cancel inline-settles the held turn; because the session is NOT idle it
+    // owes one trailing idle.
+    machine.cancel();
+
+    // B enqueued + echoed (next prompt).
+    machine.enqueue(Turn::new("pB".into(), false));
+    machine.on_echo("pB");
+
+    // The interrupt's trailing idle arrives while B is active + unsettled.
+    let events = machine.on_idle();
+    assert!(
+        events.is_empty(),
+        "the owed trailing idle must be absorbed, not fail B (#825 false-fail)"
+    );
+    assert!(machine.has_active(), "B must remain active");
+}

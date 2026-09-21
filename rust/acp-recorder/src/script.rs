@@ -43,10 +43,19 @@ pub enum Step {
         text: String,
         #[serde(default)]
         cancel_after_updates: Option<usize>,
+        /// Send the prompt without awaiting its response (`no_wait`), so it can
+        /// sit queued/active while the script drives a cancel or a later prompt
+        /// (the phase-8 "queued prompt" scenario). `session/wait` then settles
+        /// every in-flight prompt.
+        #[serde(default)]
+        no_wait: bool,
     },
     /// `session/cancel` notification on the current session.
     #[serde(rename = "session/cancel")]
     Cancel,
+    /// Await the responses of every `no_wait` prompt issued so far.
+    #[serde(rename = "session/wait")]
+    WaitPrompts,
 }
 
 /// A full recording script.
@@ -102,7 +111,8 @@ mod tests {
             script.steps[2],
             Step::Prompt {
                 text: "hello".to_string(),
-                cancel_after_updates: None
+                cancel_after_updates: None,
+                no_wait: false
             }
         );
         assert_eq!(script.steps[3], Step::Cancel);
@@ -124,9 +134,39 @@ mod tests {
             script.steps[0],
             Step::Prompt {
                 text: "x".to_string(),
-                cancel_after_updates: Some(5)
+                cancel_after_updates: Some(5),
+                no_wait: false
             }
         );
+    }
+
+    #[test]
+    fn parses_no_wait_and_wait_prompts() {
+        let script = Script::parse(
+            r#"{"steps": [
+                {"call": "session/prompt", "text": "a", "no_wait": true},
+                {"call": "session/prompt", "text": "b"},
+                {"call": "session/wait"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.steps[0],
+            Step::Prompt {
+                text: "a".to_string(),
+                cancel_after_updates: None,
+                no_wait: true
+            }
+        );
+        assert_eq!(
+            script.steps[1],
+            Step::Prompt {
+                text: "b".to_string(),
+                cancel_after_updates: None,
+                no_wait: false
+            }
+        );
+        assert_eq!(script.steps[2], Step::WaitPrompts);
     }
 
     #[test]

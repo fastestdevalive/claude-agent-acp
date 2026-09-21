@@ -227,6 +227,12 @@ fn chunk_from_block(block: &Value, role: MsgRole) -> Option<SessionUpdate> {
     match block["type"].as_str() {
         Some("text") | Some("text_delta") => {
             let text = block["text"].as_str()?;
+            // Node skips empty text chunks (`toAcpNotifications`: `chunk.text &&
+            // ...`); a `content_block_start` text block with `""` must not
+            // surface an empty `agent_message_chunk`.
+            if text.is_empty() {
+                return None;
+            }
             Some(text_chunk(text, role))
         }
         Some("thinking") | Some("thinking_delta") => {

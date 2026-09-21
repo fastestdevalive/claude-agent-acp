@@ -1,0 +1,9 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "first"},
+    {"call": "session/prompt", "text": "second"}
+  ]
+}

@@ -618,6 +618,14 @@ impl TurnMachine {
         events
     }
 
+    /// A `session_state_changed` frame arrives: record the session state. The
+    /// actor routes `idle` to [`Self::on_idle`]; non-idle states are recorded so
+    /// `cancel()`'s held-turn trailer-debt rule (`ADP:3571`) sees a non-idle
+    /// state instead of a stale `"idle"` (review-05 row 2).
+    pub fn on_session_state(&mut self, state: &str) {
+        self.last_session_state = state.to_string();
+    }
+
     /// A `session_state_changed: idle` frame — the SDK's authoritative turn-over
     /// signal. Absorbs owed trailing idles before failing, in the order
     /// `ADP:2081-2155` (review 04 #3): cancelled → settle; held → absorb debt +
@@ -627,7 +635,6 @@ impl TurnMachine {
         self.last_session_state = "idle".to_string();
         if self.cancelled && self.active.as_ref().is_some_and(|t| !t.settled) {
             // A cancelled turn settles at idle (its result was dropped).
-            self.cancelled = false;
             self.settle(StopReason::Cancelled, &mut events);
             return events;
         }
@@ -733,8 +740,17 @@ impl TurnMachine {
     /// active turn settles with its deferred outcome and falls through; (b)
     /// orphan accounting runs BEFORE the head check; (c) promote the queue head.
     fn ensure_active_turn(&mut self, events: &mut Vec<TurnEvent>) {
-        if self.active.as_ref().is_some_and(is_held_turn) {
-            let outcome = self.active.as_ref().and_then(|t| t.deferred_settle);
+        // ADP:1408-1412 — if there is already an active turn, only a HELD one is
+        // settled here (and falls through to promote the next head); any other
+        // active turn is the one this result belongs to, so return immediately
+        // (review-05 row 1: without this, a normal echoed turn's own result
+        // would settle it and promote the queued head, or consume an orphan
+        // credit that belongs to a swept turn).
+        if let Some(active) = self.active.as_ref() {
+            if !is_held_turn(active) {
+                return;
+            }
+            let outcome = active.deferred_settle;
             if let Some(outcome) = outcome {
                 self.settle(outcome, events);
             }

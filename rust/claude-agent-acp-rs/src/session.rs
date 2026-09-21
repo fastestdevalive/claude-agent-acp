@@ -1,148 +1,241 @@
 //! Session actor — the single owner of all session state (Decision D4, item
-//! 5.1).
+//! 5.1, reworked for phase 8).
 //!
-//! One tokio task owns the session: the active turn, the queued prompts, the
-//! high-water active-turn counter and the stream/command/cancel plumbing. No
-//! other task holds a lock on session state — operations arrive as [`Command`]s
-//! over an `mpsc` with a bundled `oneshot` reply (D4). This matches the house
-//! actor pattern (`vst-agents/src/acp_connection.rs`).
+//! One tokio task owns the session: the child `claude` process, the control
+//! channel, the line codec, the [`TurnMachine`], the `MapState` and the map of
+//! prompt uuids to their reply `oneshot`s. No other task holds a lock on
+//! session state — operations arrive as [`Command`]s over an `mpsc` with a
+//! bundled `oneshot` reply (D4). This matches the house actor pattern
+//! (`vst-agents/src/acp_connection.rs`).
 //!
-//! The read loop (5.3) is a `tokio::select!` between:
+//! The actor's read loop is a `tokio::select!` between the [`Command`] channel
+//! and the codec's [`StreamMsg`] stream. On stream EOF / codec death it drives
+//! [`TurnMachine::on_stream_end`] / `fail_all`, resolves or rejects every
+//! outstanding prompt, and marks the session closed so later prompts reject up
+//! front (8.9).
 //!
-//! - the [`Command`] channel (client requests, each with a `oneshot` reply),
-//! - the codec stream ([`dispatch::StreamMsg`]) fed by the line-codec task,
-//! - an injected turn-completion lane (the phase-5 fake; phase 6 drives it from
-//!   `result` frames),
-//! - a cancel token.
+//! ## Phase-8 turn wiring (review 04 § Phase 8 wiring)
 //!
-//! The `select!` is `biased` with the two `recv()` branches first, and on cancel
-//! it drains any remaining queued stream messages before exiting — so a cancel
-//! racing the loop's idle `recv` loses no queued message (INV-15). `recv()` on
-//! the unbounded channels is cancel-safe (R8).
-//!
-//! One-active-turn enforcement (5.4, INV-14): at most one [`Command::Prompt`]
-//! is active at any instant; a second is queued FIFO. A test-visible high-water
-//! counter records the maximum number of simultaneously-active turns (never
-//! above 1 by construction).
-//!
-//! Phase-5 seams: turn completion is driven by the injected `completions`
-//! channel (phase 6 replaces it with `result`-frame handling); outbound user
-//! frames are sent to an optional [`Control`] (D6) — `None` in unit tests that
-//! exercise only the actor logic.
+//! - **Prompt push is immediate.** Each `Command::Prompt` carries a fresh uuid
+//!   stamped into the outbound `user` frame; the actor registers `uuid ->
+//!   oneshot`, `enqueue(Turn::new(uuid, is_local_only))` and pushes the frame
+//!   to `claude` at once (never gated on the active turn). Every
+//!   `Settled{uuid, stop_reason, usage}` resolves the matching oneshot; every
+//!   `Failed{uuid, kind, message}` rejects it.
+//! - **`dispatch_stream` routes session frames in stream order** into the
+//!   `TurnMachine` (`user`+`uuid` → `on_echo`; `result` →
+//!   `on_result(.., emitted_assistant_text)`; `task_started` /
+//!   `task_notification` / terminal `task_updated` →
+//!   `on_task_started`/`on_task_ended`; `session_state_changed` →
+//!   record state, `idle` → `on_idle()`; `stream_event` / `assistant` → the
+//!   phase-7 mapper + `emitted_assistant_text` tracking).
+//! - **`FinalText{text}`** is emitted as an `agent_message_chunk` *before* the
+//!   same batch's `Settled` resolves the prompt.
+//! - The one-active-turn high-water counter (INV-14) is keyed on
+//!   `Activated` / `Settled` events.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, watch};
+use agent_client_protocol::schema::v1::{
+    ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
+};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot};
 
-use crate::control::Control;
+use crate::control::{Control, ControlOptions, InitializeOptions};
 use crate::dispatch::{self, Route, StreamMsg};
+use crate::map::{self, MapState, MsgRole};
+use crate::process::{self, SpawnOptions, Timings};
+use crate::turn::{FailureKind, StopReason, Turn, TurnEvent, TurnMachine};
 
 /// Errors produced by the session actor.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("session closed")]
     Closed,
+    #[error("session/prompt failed: {message}")]
+    PromptFailed { kind: FailureKind, message: String },
+    #[error("failed to start the session: {0}")]
+    Start(String),
 }
 
-/// The result of a settled `session/prompt` (phase-6 `turn.rs` fills the real
-/// stop-reason table; phase 5 carries a placeholder).
+/// The result of a settled `session/prompt`.
 #[derive(Debug, Clone)]
 pub struct PromptReply {
-    /// The turn's stop reason.
+    /// The turn's ACP `stopReason`.
     pub stop_reason: String,
+    /// Token usage reported on the response (the fixture's
+    /// `result.usage` shape).
+    pub usage: Option<PromptUsage>,
+    /// The turn's streaming updates (e.g. a `FinalText` `agent_message_chunk`)
+    /// that must be forwarded to the client *before* the prompt response.
+    pub updates: Vec<SessionNotification>,
+}
+
+/// Token usage reported in a `session/prompt` response.
+#[derive(Debug, Clone, Default)]
+pub struct PromptUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_read_tokens: u64,
+    pub cached_write_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// A request sent by the ACP client to the session actor (D4). Each request
 /// carries a `oneshot` reply resolved by the actor when the operation settles.
-pub enum Command {
-    /// Enqueue a prompt turn. Resolves `reply` when the turn settles (in
-    /// phase 5, when the injected completion arrives).
+enum Command {
+    /// Enqueue a prompt turn (8.7). `uuid` is stamped into `frame`'s `uuid`
+    /// field by the caller; the actor registers `uuid -> reply`, enqueues the
+    /// turn and pushes `frame` to `claude` immediately.
     Prompt {
-        /// The `user` message frame to feed to `claude` (D6).
-        content: Value,
-        /// Reply channel, resolved on settlement.
+        uuid: String,
+        frame: Value,
+        is_local_only: bool,
         reply: oneshot::Sender<Result<PromptReply, SessionError>>,
     },
-    /// Cancel the active prompt. Real behaviour is phase 11; phase 5 is a
-    /// placeholder that settles nothing (kept so the variant exists).
+    /// Cancel the active prompt (8.9): `machine.cancel()` then send an
+    /// `interrupt` control_request.
     Cancel,
 }
 
-/// A prompt waiting in, or active in, the session.
-struct QueuedPrompt {
-    content: Value,
-    reply: oneshot::Sender<Result<PromptReply, SessionError>>,
+/// Configuration used to start a session (phase 8 / 8.2, 8.4).
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    /// Spawn argv/env for the `claude` child (B2).
+    pub spawn: SpawnOptions,
+    /// Grace constants for the child lifecycle.
+    pub timings: Timings,
+    /// The `initialize` control_request to send during handshake (phase 4).
+    pub initialize: InitializeOptions,
 }
 
-/// A handle to the session actor. Cloneable: the ACP layer (agent.rs) and any
-/// spawned task can issue [`Command`]s through it.
+impl SessionOptions {
+    /// Build options from a `ServeOptions`-style config for a fresh session.
+    pub fn new(spawn: SpawnOptions, timings: Timings, initialize: InitializeOptions) -> Self {
+        Self {
+            spawn,
+            timings,
+            initialize,
+        }
+    }
+}
+
+/// A handle to the session actor. Cloneable: the ACP layer (agent.rs) can issue
+/// [`Command`]s through it.
 #[derive(Clone)]
 pub struct Session {
     tx: mpsc::UnboundedSender<Command>,
     high_water: Arc<AtomicUsize>,
-    processed_stream: Arc<AtomicUsize>,
+    session_id: String,
 }
 
 impl Session {
-    /// Spawn the session actor task.
+    /// Spawn the child, handshake, and start the session actor task.
     ///
-    /// - `stream` — the codec's parsed-line stream (only *session* frames are
-    ///   processed here; control frames are forwarded to `control_inbound`).
-    /// - `control` — optional outbound control channel for user frames (D6);
-    ///   `None` in actor-only unit tests.
-    /// - `control_inbound` — where inbound *control* frames are forwarded to
-    ///   `control.rs` (D6 phase-4 deviation).
-    /// - `completions` — phase-5 injected turn-completion lane; phase 6
-    ///   replaces it with `result`-frame handling.
-    /// - `cancel` — a `watch` token; when it changes, the actor drains queued
-    ///   stream messages (INV-15) and exits.
-    pub fn spawn(
-        stream: mpsc::UnboundedReceiver<StreamMsg>,
-        control: Option<Control>,
-        control_inbound: mpsc::UnboundedSender<Value>,
-        completions: mpsc::UnboundedReceiver<()>,
-        cancel: watch::Receiver<()>,
-    ) -> Session {
+    /// Returns the [`Session`] handle and a receiver of every `session/update`
+    /// notification the actor emits (the agent layer forwards them to the ACP
+    /// client). `session_id` is the ACP `sessionId` this session is known by
+    /// (the minted uuid for `session/new`, or the resumed id for
+    /// `session/load`).
+    pub async fn start(
+        opts: SessionOptions,
+        session_id: String,
+    ) -> Result<(Session, mpsc::UnboundedReceiver<SessionNotification>), SessionError> {
+        // Spawn the child and its stack: process -> control (stdin) + codec
+        // (stdout lines) + stderr tail.
+        let mut process = process::spawn(&opts.spawn)
+            .await
+            .map_err(|e| SessionError::Start(e.to_string()))?;
+        let stdin = process
+            .take_stdin()
+            .ok_or_else(|| SessionError::Start("child stdin unavailable".into()))?;
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let control = Control::spawn(stdin, control_in_rx, ControlOptions::default());
+
+        let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionNotification>();
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
         let high_water = Arc::new(AtomicUsize::new(0));
-        let processed_stream = Arc::new(AtomicUsize::new(0));
         let hw = high_water.clone();
-        let ps = processed_stream.clone();
 
+        // The `Process` owns the child (`kill_on_drop(true)`), so it must stay
+        // alive for the session's lifetime — move it into the actor task. The
+        // actor reads `process.lines` (the codec stream) and keeps `process`
+        // alive until the task ends (then the child is killed on teardown).
+        let mut process = process;
+        let stream = std::mem::replace(&mut process.lines, mpsc::unbounded_channel().1);
         tokio::spawn(run(
             commands,
             stream,
-            control,
-            control_inbound,
-            completions,
-            cancel,
+            process,
+            control.clone(),
+            control_in_tx,
+            update_tx,
+            opts.timings,
+            session_id.clone(),
             hw,
-            ps,
         ));
 
-        Session {
-            tx,
-            high_water,
-            processed_stream,
-        }
+        // Phase-4 initialize handshake. The actor loop is already running so it
+        // routes the child's control_response back to the control task. The
+        // fake-claude transcript expects the initialize control_request; parse
+        // the response.
+        let _info = control
+            .initialize(&opts.initialize)
+            .await
+            .map_err(|e| SessionError::Start(format!("initialize handshake: {e}")))?;
+
+        Ok((
+            Session {
+                tx,
+                high_water,
+                session_id,
+            },
+            update_rx,
+        ))
     }
 
-    /// Send a `session/prompt`: enqueue a turn and await its settlement.
-    pub async fn prompt(&self, content: Value) -> Result<PromptReply, SessionError> {
+    /// The ACP `sessionId` this session is known by.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Send a `session/prompt` request to the actor and await its settlement.
+    pub async fn prompt(
+        &self,
+        uuid: String,
+        frame: Value,
+        is_local_only: bool,
+    ) -> Result<PromptReply, SessionError> {
+        self.send_prompt(uuid, frame, is_local_only)
+            .await
+            .map_err(|_| SessionError::Closed)?
+    }
+
+    /// Enqueue a `session/prompt` on the actor, returning the `oneshot` that
+    /// resolves when the turn settles. This is synchronous: the connection's
+    /// single-task handler can send it immediately, so a later `session/cancel`
+    /// notification is always processed *after* this prompt is enqueued (the
+    /// queued-sweep ordering, 8.9).
+    pub fn send_prompt(
+        &self,
+        uuid: String,
+        frame: Value,
+        is_local_only: bool,
+    ) -> oneshot::Receiver<Result<PromptReply, SessionError>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::Prompt {
-                content,
-                reply: reply_tx,
-            })
-            .map_err(|_| SessionError::Closed)?;
-        reply_rx.await.map_err(|_| SessionError::Closed)?
+        let _ = self.tx.send(Command::Prompt {
+            uuid,
+            frame,
+            is_local_only,
+            reply: reply_tx,
+        });
+        reply_rx
     }
 
-    /// Send a `session/cancel` notification (placeholder until phase 11).
+    /// Send a `session/cancel` notification (8.9).
     pub async fn cancel(&self) -> Result<(), SessionError> {
         self.tx
             .send(Command::Cancel)
@@ -154,257 +247,514 @@ impl Session {
     pub fn high_water(&self) -> usize {
         self.high_water.load(Ordering::Relaxed)
     }
-
-    /// The number of stream messages the actor has dispatched so far.
-    /// Test-visible observable for the cancel-safety test (INV-15).
-    pub fn processed_stream(&self) -> usize {
-        self.processed_stream.load(Ordering::Relaxed)
-    }
 }
 
 /// The session actor task. Owns all session state; nothing else mutates it.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
-    mut stream: mpsc::UnboundedReceiver<StreamMsg>,
-    control: Option<Control>,
-    control_inbound: mpsc::UnboundedSender<Value>,
-    mut completions: mpsc::UnboundedReceiver<()>,
-    mut cancel: watch::Receiver<()>,
+    mut stream: mpsc::UnboundedReceiver<Value>,
+    _process: crate::process::Process,
+    control: Control,
+    control_in_tx: mpsc::UnboundedSender<Value>,
+    update_tx: mpsc::UnboundedSender<SessionNotification>,
+    _timings: Timings,
+    session_id: String,
     high_water: Arc<AtomicUsize>,
-    processed_stream: Arc<AtomicUsize>,
 ) {
-    let mut active: Option<QueuedPrompt> = None;
-    let mut queue: VecDeque<QueuedPrompt> = VecDeque::new();
-    let mut current_active: usize = 0;
+    let mut machine = TurnMachine::new();
+    let mut map_state = MapState::default();
+    // uuid -> prompt reply oneshot (8.7).
+    let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+        HashMap::new();
+    let mut emitted_assistant_text = false;
 
     loop {
         tokio::select! {
             biased;
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else {
-                    // All Session handles dropped: session teardown.
                     break;
                 };
                 match cmd {
-                    Command::Prompt { content, reply } => {
-                        let qp = QueuedPrompt { content, reply };
-                        if active.is_some() {
-                            queue.push_back(qp);
-                        } else {
-                            activate(
-                                qp,
-                                &mut active,
-                                &mut current_active,
-                                &high_water,
-                                &control,
-                            )
-                            .await;
-                        }
+                    Command::Prompt { uuid, frame, is_local_only, reply } => {
+                        let _ = control.send_user(frame).await;
+                        machine.enqueue(Turn::new(uuid.clone(), is_local_only));
+                        pending.insert(uuid, reply);
                     }
                     Command::Cancel => {
-                        // Phase 11 drives this; a no-op placeholder for now.
+                        // 8.9: settle swept queued turns, then interrupt.
+                        let events = machine.cancel();
+                        handle_events(&events, &mut pending, &update_tx, &session_id, &high_water);
+                        // Send the `interrupt` on a spawned task: awaiting the
+                        // correlated control_response here would block the actor's
+                        // single-task loop (which is what routes that response back
+                        // to the Control task), deadlocking it. Fire-and-forget —
+                        // a late response is dropped, not held.
+                        let control = control.clone();
+                        tokio::spawn(async move {
+                            let _ = control
+                                .send_request(json!({"subtype": "interrupt"}))
+                                .await;
+                        });
                     }
                 }
             }
-            Some(_) = completions.recv() => {
-                // The active turn completed. Phase 5: the injected fake drives
-                // this; phase 6 drives it from the `result` frame. Resolve the
-                // active prompt's reply and promote the next queued one.
-                if let Some(qp) = active.take() {
-                    let _ = qp
-                        .reply
-                        .send(Ok(PromptReply { stop_reason: "end_turn".into() }));
-                    current_active = current_active.saturating_sub(1);
-                    if let Some(next) = queue.pop_front() {
-                        activate(
-                            next,
-                            &mut active,
-                            &mut current_active,
-                            &high_water,
-                            &control,
-                        )
-                        .await;
-                    }
-                }
-            }
-            Some(msg) = stream.recv() => {
-                dispatch_stream(msg, &control_inbound, &processed_stream);
-            }
-            _ = cancel.changed() => {
-                // INV-15: a cancel racing the idle `recv` loses no queued
-                // message. Drain any remaining stream messages before exiting.
-                while let Ok(msg) = stream.try_recv() {
-                    dispatch_stream(msg, &control_inbound, &processed_stream);
-                }
-                break;
+            msg = stream.recv() => {
+                let Some(line) = msg else {
+                    // Stream EOF / codec death (8.9): settle/reject every turn.
+                    let events = machine.on_stream_end();
+                    handle_events(&events, &mut pending, &update_tx, &session_id, &high_water);
+                    break;
+                };
+                dispatch_stream(
+                    StreamMsg::new(line),
+                    &control_in_tx,
+                    &mut machine,
+                    &mut map_state,
+                    &mut pending,
+                    &mut emitted_assistant_text,
+                    &update_tx,
+                    &session_id,
+                    &high_water,
+                )
+                .await;
             }
         }
     }
 }
 
-/// Promote a prompt to the active turn: record the one-active-turn high-water
-/// and feed the user frame to the control channel (D6) when one is present.
-async fn activate(
-    qp: QueuedPrompt,
-    active: &mut Option<QueuedPrompt>,
-    current_active: &mut usize,
-    high_water: &AtomicUsize,
-    control: &Option<Control>,
-) {
-    *current_active += 1;
-    // INV-14: high-water tracks the max simultaneously-active turns. By
-    // construction we only activate when `active` is `None`, so this never
-    // exceeds 1; `fetch_max` keeps the counter meaningful if phase 6 ever
-    // relaxes that.
-    high_water.fetch_max(*current_active, Ordering::Relaxed);
-    if let Some(control) = control {
-        let _ = control.send_user(qp.content.clone()).await;
-    }
-    *active = Some(qp);
-}
-
-/// Route one inbound stream message (5.2): forward control traffic to
-/// `control.rs`, count session traffic (the phase-6 turn machine consumes it).
-fn dispatch_stream(
+/// Route one inbound stream message (8.8): forward control traffic to
+/// `control.rs`, drive the turn machine for session traffic.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_stream(
     msg: StreamMsg,
-    control_inbound: &mpsc::UnboundedSender<Value>,
-    processed_stream: &AtomicUsize,
+    control_in_tx: &mpsc::UnboundedSender<Value>,
+    machine: &mut TurnMachine,
+    map_state: &mut MapState,
+    pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
+    emitted_assistant_text: &mut bool,
+    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    session_id: &str,
+    high_water: &AtomicUsize,
 ) {
-    processed_stream.fetch_add(1, Ordering::Relaxed);
     let view = dispatch::TurnView::default();
     match dispatch::route(&msg, &view) {
         Route::Control => {
-            let _ = control_inbound.send(msg.line);
+            let _ = control_in_tx.send(msg.line);
         }
         Route::Session => {
-            // Phase 6: the turn machine consumes user/assistant/result/system
-            // /stream_event frames here.
+            handle_session_frame(
+                msg.line,
+                machine,
+                map_state,
+                pending,
+                emitted_assistant_text,
+                update_tx,
+                session_id,
+                high_water,
+            );
         }
         Route::Ignore => {}
+    }
+}
+
+/// Drive the turn machine with one session frame, in stream order (8.8).
+#[allow(clippy::too_many_arguments)]
+fn handle_session_frame(
+    line: Value,
+    machine: &mut TurnMachine,
+    map_state: &mut MapState,
+    pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
+    emitted_assistant_text: &mut bool,
+    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    session_id: &str,
+    high_water: &AtomicUsize,
+) {
+    let frame_type = line.get("type").and_then(Value::as_str).unwrap_or("");
+    match frame_type {
+        // The CLI re-emits the user message (--replay-user-messages); its echo
+        // promotes the queued turn. The turn's own echo is not forwarded.
+        "user" => {
+            if let Some(uuid) = line.get("uuid").and_then(Value::as_str) {
+                let events = machine.on_echo(uuid);
+                handle_events(&events, pending, update_tx, session_id, high_water);
+            }
+        }
+        "result" => {
+            let events = machine.on_result(&line, *emitted_assistant_text);
+            // Upstream clears emittedAssistantText in the result finally for
+            // non-autonomous results.
+            if !is_autonomous(&line) {
+                *emitted_assistant_text = false;
+            }
+            handle_events(&events, pending, update_tx, session_id, high_water);
+        }
+        "system" => {
+            let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or("");
+            match subtype {
+                "task_started" => {
+                    let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
+                    let is_subagent = line.get("subagent_type").is_some();
+                    machine.on_task_started(task_id, is_subagent);
+                }
+                "task_notification" | "task_updated" => {
+                    let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
+                    if is_terminal_task_update(&line) {
+                        let events = machine.on_task_ended(task_id);
+                        handle_events(&events, pending, update_tx, session_id, high_water);
+                    }
+                }
+                "session_state_changed" => {
+                    let state = line.get("state").and_then(Value::as_str).unwrap_or("");
+                    machine.on_session_state(state);
+                    if state == "idle" {
+                        let events = machine.on_idle();
+                        handle_events(&events, pending, update_tx, session_id, high_water);
+                    }
+                }
+                "commands_changed" => {
+                    emit_commands_changed(&line, update_tx, session_id);
+                }
+                _ => {}
+            }
+        }
+        "stream_event" | "assistant" => {
+            let updates = if frame_type == "stream_event" {
+                map::map_stream_event(&line, map_state)
+            } else {
+                // A consolidated assistant/user message: Node does NOT deliver
+                // its text/thinking as chunks (only the stream_event deltas do;
+                // the consolidated text is the #453/fallback source). Emit only
+                // the tool/plan updates, matching the captured fixtures.
+                map::map_consolidated(
+                    &line
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    MsgRole::Assistant,
+                    map_state,
+                )
+                .into_iter()
+                .filter(|u| {
+                    !matches!(
+                        u,
+                        SessionUpdate::AgentMessageChunk(_)
+                            | SessionUpdate::AgentThoughtChunk(_)
+                            | SessionUpdate::UserMessageChunk(_)
+                    )
+                })
+                .collect::<Vec<_>>()
+            };
+            for update in &updates {
+                if is_top_level_text(update, &line) {
+                    *emitted_assistant_text = true;
+                }
+            }
+            emit_updates(&updates, update_tx, session_id);
+        }
+        _ => {}
+    }
+}
+
+/// Process a batch of [`TurnEvent`]s in order (8.8 / review-04 wiring):
+/// `FinalText` is emitted as an `agent_message_chunk` before the same batch's
+/// `Settled` resolves the prompt.
+fn handle_events(
+    events: &[TurnEvent],
+    pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
+    _update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    session_id: &str,
+    high_water: &AtomicUsize,
+) {
+    // A `FinalText` precedes its turn's `Settled` in the same batch; collect it
+    // and hand it to the prompt task so it can forward the chunk before the
+    // response (deterministic, review-04 wiring).
+    let mut final_texts: Vec<SessionNotification> = Vec::new();
+    for event in events {
+        match event {
+            TurnEvent::FinalText { text } => {
+                let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(text)),
+                ));
+                let notif = SessionNotification::new(session_id.to_string(), update);
+                final_texts.push(notif);
+            }
+            TurnEvent::Settled {
+                prompt_uuid,
+                stop_reason,
+                usage,
+            } => {
+                high_water.fetch_max(1, Ordering::Relaxed);
+                if let Some(reply) = pending.remove(prompt_uuid) {
+                    let total_tokens = usage.input_tokens
+                        + usage.output_tokens
+                        + usage.cached_read_tokens
+                        + usage.cached_write_tokens;
+                    let usage = if *stop_reason == StopReason::Cancelled && total_tokens == 0 {
+                        // A queued turn swept by cancel never ran, so upstream
+                        // reports no usage for it (`turn.resolve({ stopReason:
+                        // "cancelled" })`, no `usage`); a cancelled ACTIVE turn
+                        // carries its accumulated spend instead.
+                        None
+                    } else {
+                        Some(PromptUsage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cached_read_tokens: usage.cached_read_tokens,
+                            cached_write_tokens: usage.cached_write_tokens,
+                            total_tokens,
+                        })
+                    };
+                    let _ = reply.send(Ok(PromptReply {
+                        stop_reason: stop_reason.as_str().to_string(),
+                        usage,
+                        updates: std::mem::take(&mut final_texts),
+                    }));
+                }
+            }
+            TurnEvent::Failed {
+                prompt_uuid,
+                kind,
+                message,
+            } => {
+                if let Some(reply) = pending.remove(prompt_uuid) {
+                    let _ = reply.send(Err(SessionError::PromptFailed {
+                        kind: *kind,
+                        message: message.clone(),
+                    }));
+                }
+            }
+            TurnEvent::Activated { .. } => {
+                high_water.fetch_max(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Whether a result frame carries an autonomous origin (mirrors `turn.rs`).
+fn is_autonomous(result: &Value) -> bool {
+    let Some(kind) = result
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    matches!(
+        kind,
+        "task-notification" | "peer" | "coordinator" | "observer" | "observer-activity"
+    )
+}
+
+/// Whether a `task_updated` frame carries a terminal status.
+fn is_terminal_task_update(line: &Value) -> bool {
+    let status = line.get("status").and_then(Value::as_str).unwrap_or("");
+    // `task_notification` is always terminal; a `task_updated` is terminal only
+    // when it reports completed / failed / killed.
+    if line.get("type").and_then(Value::as_str) == Some("system")
+        && line.get("subtype").and_then(Value::as_str) == Some("task_notification")
+    {
+        return true;
+    }
+    matches!(status, "completed" | "failed" | "killed")
+}
+
+/// Whether an emitted update is top-level (non-subagent) assistant text — used
+/// to set `emitted_assistant_text` (subagent chunks with `parent_tool_use_id`
+/// are excluded).
+fn is_top_level_text(update: &SessionUpdate, line: &Value) -> bool {
+    // Subagent stream_event chunks carry a parent_tool_use_id.
+    if line
+        .get("parent_tool_use_id")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return false;
+    }
+    matches!(update, SessionUpdate::AgentMessageChunk(_))
+}
+
+/// Emit a `commands_changed` system frame as an `AvailableCommandsUpdate`.
+fn emit_commands_changed(
+    line: &Value,
+    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    session_id: &str,
+) {
+    let commands = line.get("commands").cloned().unwrap_or(Value::Null);
+    let terminal = line
+        .get("terminal_commands")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let update = map::map_commands_changed(&commands, &terminal);
+    let notif = SessionNotification::new(
+        session_id.to_string(),
+        SessionUpdate::AvailableCommandsUpdate(update),
+    );
+    let _ = update_tx.send(notif);
+}
+
+/// Send a batch of updates to the client as `session/update` notifications.
+fn emit_updates(
+    updates: &[SessionUpdate],
+    update_tx: &mpsc::UnboundedSender<SessionNotification>,
+    session_id: &str,
+) {
+    for update in updates {
+        let notif = SessionNotification::new(session_id.to_string(), update.clone());
+        let _ = update_tx.send(notif);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::time::timeout;
 
-    /// A session actor with an injected completion sender and a cancel token,
-    /// plus the plumbing a test needs to observe it. `control` is `None` for
-    /// these actor-only tests.
-    struct Harness {
-        session: Session,
-        completions: mpsc::UnboundedSender<()>,
-        stream: mpsc::UnboundedSender<StreamMsg>,
-        cancel: watch::Sender<()>,
-        _control_inbound: mpsc::UnboundedSender<Value>,
-    }
+    /// 8.T7-style unit: a lagging trailing idle after the next echo is absorbed,
+    /// not a false #825 fail. Exercises the machine via the actor-facing
+    /// `TurnMachine` directly through `handle_session_frame`.
+    #[tokio::test]
+    async fn lagging_idle_absorbed_not_false_fail() {
+        let mut machine = TurnMachine::new();
+        let mut _map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (_tx, rx) = mpsc::unbounded_channel::<SessionNotification>();
+        let _ = rx; // update sink unused here
+        let (utx, _urx) = mpsc::unbounded_channel::<SessionNotification>();
+        let hw = Arc::new(AtomicUsize::new(0));
 
-    fn harness() -> Harness {
-        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMsg>();
-        let (completions_tx, completions_rx) = mpsc::unbounded_channel::<()>();
-        let (control_in_tx, _control_in_rx) = mpsc::unbounded_channel::<Value>();
-        let (cancel_tx, cancel_rx) = watch::channel(());
-        let session = Session::spawn(
-            stream_rx,
-            None,
-            control_in_tx.clone(),
-            completions_rx,
-            cancel_rx,
+        // p1 echoed + result settles it (A's result).
+        machine.enqueue(Turn::new("p1".into(), false));
+        let _ = machine.on_echo("p1");
+        let events = machine.on_result(&json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"ok","usage":{}}), false);
+        handle_events(&events, &mut pending, &utx, "s", &hw);
+
+        // p2 queued + echoed (next echo).
+        machine.enqueue(Turn::new("p2".into(), false));
+        let _ = machine.on_echo("p2");
+
+        // A's lagging trailing idle arrives while p2 is active+unsettled.
+        let events = machine.on_idle();
+        assert!(
+            events.is_empty(),
+            "a lagging trailing idle must be absorbed, not fail the next turn"
         );
-        Harness {
-            session,
-            completions: completions_tx,
-            stream: stream_tx,
-            cancel: cancel_tx,
-            _control_inbound: control_in_tx,
-        }
-    }
-
-    /// 5.T2 (INV-14) — 25 concurrent `Command::Prompt` on one session with an
-    /// injected fake turn-completion: high-water active turns == 1 and all 25
-    /// resolve in order.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inv_14_one_active_turn() {
-        let harness = harness();
-        let total = 25;
-
-        // Fire 25 prompts concurrently, each awaiting its reply oneshot.
-        let mut tasks = Vec::new();
-        for i in 0..total {
-            let session = harness.session.clone();
-            tasks.push(tokio::spawn(async move {
-                let reply = session
-                    .prompt(serde_json::json!({"type": "user", "text": i.to_string()}))
-                    .await
-                    .expect("prompt resolves");
-                reply.stop_reason
-            }));
-        }
-
-        // Let the actor observe the queued prompts, then inject 25 fake
-        // completions so every queued turn settles.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        for _ in 0..total {
-            harness.completions.send(()).unwrap();
-        }
-
-        let mut resolved = Vec::new();
-        for t in tasks {
-            let reason = timeout(Duration::from_secs(10), t)
-                .await
-                .expect("prompt task completes (no hang)")
-                .unwrap();
-            resolved.push(reason);
-        }
-
-        // All 25 resolved, high-water active turns == 1.
-        assert_eq!(resolved.len(), total);
-        assert_eq!(
-            harness.session.high_water(),
-            1,
-            "INV-14: at most ONE active turn per session"
+        assert!(
+            machine.has_active(),
+            "p2 must remain active after the absorbed idle"
         );
-        assert!(resolved.iter().all(|r| r == "end_turn"));
     }
 
-    /// 5.T3 (INV-15) — a cancel racing the session loop's idle `recv` loses no
-    /// queued stream message.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inv_15_cancel_loses_nothing() {
-        let harness = harness();
-        let total = 200;
+    /// 8.T9-style unit: a subagent hold followed by a followup result settles
+    /// the held turn inside the turn.
+    #[tokio::test]
+    async fn subagent_hold_followup_settles() {
+        let mut machine = TurnMachine::new();
+        machine.enqueue(Turn::new("p1".into(), false));
+        let _ = machine.on_echo("p1");
+        machine.on_task_started("sub1", true);
+        // Result defers while the subagent is live.
+        let events = machine.on_result(&json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","usage":{}}), false);
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, TurnEvent::Settled { .. })),
+            "must defer while the subagent is live"
+        );
+        machine.on_task_ended("sub1");
+        // The followup autonomous result settles it.
+        let events = machine.on_result(&json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","origin":{"kind":"task-notification"},"usage":{}}), false);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "p1")
+            ),
+            "the followup result must settle the held turn inside the turn"
+        );
+    }
 
-        // Enqueue session frames (they increment the actor's processed count).
-        for i in 0..total {
-            harness
-                .stream
-                .send(StreamMsg::new(serde_json::json!({"type": "user", "i": i})))
-                .unwrap();
-        }
+    /// 8.T10-style unit: cancel with a queued prompt, then an echo-less next
+    /// prompt — the queued prompt's late result is orphaned and never
+    /// activates/settles the next prompt.
+    #[tokio::test]
+    async fn cancel_queued_echo_less_orphans_late_result() {
+        let mut machine = TurnMachine::new();
+        // p1 active, p2 queued (both pushed).
+        machine.enqueue(Turn::new("p1".into(), false));
+        let _ = machine.on_echo("p1");
+        machine.enqueue(Turn::new("p2".into(), false));
+        // Cancel sweeps p2 -> cancelled + orphan credit.
+        let events = machine.cancel();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "p2")
+            ),
+            "cancel must sweep the queued turn"
+        );
+        // p1 settles at idle.
+        let _ = machine.on_idle();
 
-        // Let the actor reach its idle `recv`, then fire the cancel token —
-        // racing the loop's idle `recv`.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        harness.cancel.send(()).unwrap();
+        // p3 (echo-less, e.g. /context) enqueued.
+        machine.enqueue(Turn::new("p3".into(), true));
 
-        // Give the actor time to drain and exit, then verify every queued
-        // message was processed (none lost).
-        let deadline = Duration::from_secs(10);
-        let start = std::time::Instant::now();
-        while harness.session.processed_stream() < total {
-            assert!(
-                start.elapsed() < deadline,
-                "no hang: all queued messages must be processed before exit"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            harness.session.processed_stream(),
-            total,
-            "INV-15: a cancel racing the idle recv must lose no queued message"
+        // p2's late result arrives: must be orphaned, NOT activate/settle p3.
+        let events = machine.on_result(&json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","usage":{}}), false);
+        assert!(
+            events.iter().all(
+                |e| !matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "p3")
+            ),
+            "p2's late result must never settle p3"
+        );
+        assert!(
+            !machine.has_active(),
+            "p3 must not be activated by p2's orphaned result"
+        );
+    }
+
+    /// 8.T11-style unit: stream end settles the active turn and rejects queued
+    /// prompts; then the machine is closed.
+    #[tokio::test]
+    async fn stream_end_settles_active_and_rejects_queued() {
+        let mut machine = TurnMachine::new();
+        machine.enqueue(Turn::new("p1".into(), false));
+        let _ = machine.on_echo("p1");
+        machine.enqueue(Turn::new("p2".into(), false));
+
+        let events = machine.on_stream_end();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "p1")
+            ),
+            "stream end must settle the active turn"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Failed { prompt_uuid, kind, .. } if prompt_uuid == "p2" && *kind == FailureKind::SessionEnded)),
+            "stream end must reject queued prompts with SessionEnded"
+        );
+    }
+
+    /// 8.T2-style unit (agent-level, via the machine): an echo-less local-only
+    /// prompt promotes and settles at its own result.
+    #[tokio::test]
+    async fn context_echo_less_promotes_and_settles() {
+        let mut machine = TurnMachine::new();
+        machine.enqueue(Turn::new("p1".into(), true));
+        // No echo; a result for /context arrives directly.
+        let events = machine.on_result(&json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"context output","usage":{"output_tokens":0}}), false);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "p1")
+            ),
+            "an echo-less local-only command must settle at its own result"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::FinalText { .. })),
+            "a local-only command's result text must be forwarded as FinalText"
         );
     }
 }

@@ -53,6 +53,10 @@ pub struct Step {
     /// Inject a `keep_alive` frame after `emit` (test of R6).
     #[serde(default)]
     pub keep_alive: bool,
+    /// Exit (close stdout) after emitting this step — simulating `claude`
+    /// dying mid-turn before its `result` (8.T11, stream-EOF lane).
+    #[serde(default)]
+    pub exit: bool,
 }
 
 /// A whole transcript (the file `$FAKE_CLAUDE_SCRIPT`).
@@ -330,6 +334,12 @@ pub fn replay(
         }
         stdout.flush()?;
         step_index += 1;
+        if step.exit {
+            // The transcript asks us to die here (e.g. mid-turn before a
+            // `result`): return so main exits and stdout closes, letting the
+            // host see the stream EOF.
+            return Ok(step_index);
+        }
     }
 }
 

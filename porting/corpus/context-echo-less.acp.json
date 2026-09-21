@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "/context"}
+  ]
+}

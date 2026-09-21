@@ -2,6 +2,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod agent;
 pub mod codec;
 pub mod control;
 pub mod dispatch;

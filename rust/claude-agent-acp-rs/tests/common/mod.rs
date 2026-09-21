@@ -448,6 +448,16 @@ pub fn fake_claude_binary() -> PathBuf {
     repo_root().join("rust/target/debug/fake-claude")
 }
 
+/// The built `acp-recorder` binary (the gate builds it under `rust/target/debug`).
+pub fn acp_recorder_binary() -> PathBuf {
+    repo_root().join("rust/target/debug/acp-recorder")
+}
+
+/// The built `claude-agent-acp-rs` binary under test.
+pub fn rust_agent_binary() -> PathBuf {
+    repo_root().join("rust/target/debug/claude-agent-acp-rs")
+}
+
 /// Build and return the path to a crate example binary.
 pub fn build_example(name: &str) -> PathBuf {
     let root = repo_root();
@@ -473,6 +483,104 @@ pub fn build_example(name: &str) -> PathBuf {
 pub fn read_json(path: &Path) -> serde_json::Value {
     let text = std::fs::read_to_string(path).expect("read json file");
     serde_json::from_str(&text).expect("parse json file")
+}
+
+/// Parse a `{direction, frame}` JSONL fixture into [`Frame`]s (phase 8, 8.6).
+pub fn parse_fixture_frames(path: &Path) -> Vec<Frame> {
+    let text = std::fs::read_to_string(path).expect("read fixture frames");
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).expect("fixture frame line");
+        let direction = match v["direction"].as_str() {
+            Some("send") => Direction::Send,
+            Some("recv") => Direction::Recv,
+            other => panic!("bad direction: {other:?}"),
+        };
+        out.push(Frame {
+            direction,
+            json: v["frame"].clone(),
+        });
+    }
+    out
+}
+
+/// Run the `acp-recorder` binary against `agent_cmd` with the given `script`,
+/// a fake-`claude` transcript, and an output path. Returns the ordered frames.
+///
+/// The agent command is the Rust binary under test; `FAKE_CLAUDE_SCRIPT`
+/// selects the transcript, and `CLAUDE_CODE_EXECUTABLE` points the agent at
+/// the fake-`claude` binary. A missing binary fails loudly (8.6).
+pub fn run_recorder(
+    agent_cmd: &str,
+    script_path: &Path,
+    transcript_path: &Path,
+    out_path: &Path,
+) -> Vec<Frame> {
+    let recorder = acp_recorder_binary();
+    let fake = fake_claude_binary();
+    assert!(
+        recorder.exists(),
+        "acp-recorder binary missing: {}",
+        recorder.display()
+    );
+    assert!(
+        fake.exists(),
+        "fake-claude binary missing: {}",
+        fake.display()
+    );
+    assert!(
+        transcript_path.exists(),
+        "transcript missing: {}",
+        transcript_path.display()
+    );
+
+    let status = std::process::Command::new(&recorder)
+        .arg(agent_cmd)
+        .arg(script_path)
+        .arg(out_path)
+        .current_dir(repo_root())
+        .env("FAKE_CLAUDE_SCRIPT", transcript_path)
+        .env("CLAUDE_CODE_EXECUTABLE", &fake)
+        .status()
+        .expect("spawn acp-recorder");
+    assert!(
+        status.success(),
+        "acp-recorder exited non-zero for {agent_cmd}"
+    );
+    parse_fixture_frames(out_path)
+}
+
+/// Normalise repo-root absolute paths inside captured frames to the `$ROOT`
+/// placeholder, mirroring `capture.sh`'s `normalize_frames`. The fixture is
+/// committed with `$ROOT` in place of the machine-specific worktree path.
+pub fn normalize_root_paths(frames: Vec<Frame>, root: &Path) -> Vec<Frame> {
+    let root_str = root.to_string_lossy().into_owned();
+    frames
+        .into_iter()
+        .map(|frame| Frame {
+            direction: frame.direction,
+            json: replace_strings(frame.json, &root_str, "$ROOT"),
+        })
+        .collect()
+}
+
+/// Recursively replace exact occurrences of `from` in string nodes with `to`.
+fn replace_strings(value: Value, from: &str, to: &str) -> Value {
+    match value {
+        Value::String(s) => Value::String(s.replace(from, to)),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, replace_strings(v, from, to)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|v| replace_strings(v, from, to))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Poll for `path` to exist and be non-empty, up to `timeout`.
