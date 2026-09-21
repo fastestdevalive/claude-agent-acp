@@ -7,6 +7,7 @@ pub mod codec;
 pub mod control;
 pub mod dispatch;
 pub mod map;
+pub mod permission;
 pub mod process;
 pub mod session;
 pub mod tools;

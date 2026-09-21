@@ -319,7 +319,10 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
         .map(|f| {
             (
                 f.0,
-                normalize(normalize_tool_call_defaults(f.1), &mut norm_a),
+                normalize(
+                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
+                    &mut norm_a,
+                ),
             )
         })
         .collect();
@@ -328,7 +331,10 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
         .map(|f| {
             (
                 f.0,
-                normalize(normalize_tool_call_defaults(f.1), &mut norm_b),
+                normalize(
+                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
+                    &mut norm_b,
+                ),
             )
         })
         .collect();
@@ -420,6 +426,34 @@ fn normalize_tool_call_defaults(value: Value) -> Value {
                 .map(normalize_tool_call_defaults)
                 .collect(),
         ),
+        other => other,
+    }
+}
+
+/// Normalise the JSON-RPC `id` of a `session/request_permission` request (and
+/// its response) to a fixed token. The Node adapter sends these with a fixed
+/// `id:0` while the pinned crate assigns a fresh uuid to every outgoing
+/// request; the `id` is a volatile correlation id (like a uuid/timestamp), so
+/// it is mapped to a fixed `$PERM_REQ` on both sides. The response is detected
+/// by its `result.outcome` shape (the permission decision). A fixed token (not
+/// a `Norm` placeholder) is used because the committed fixtures are already
+/// pre-normalised by `capture.sh` (their other ids are `$0..$k` strings that do
+/// not consume `Norm` slots), while the live Rust side produces real uuids that
+/// do.
+fn normalize_request_permission_id(value: Value) -> Value {
+    let is_request =
+        value.get("method").and_then(Value::as_str) == Some("session/request_permission");
+    let is_response = value.get("result").and_then(|r| r.get("outcome")).is_some();
+    if !is_request && !is_response {
+        return value;
+    }
+    match value {
+        Value::Object(mut map) => {
+            if map.contains_key("id") {
+                map.insert("id".into(), Value::String("$PERM_REQ".into()));
+            }
+            Value::Object(map)
+        }
         other => other,
     }
 }

@@ -21,7 +21,7 @@
     ""
   ],
   "env": {
-    "CLAUDE_CODE_ENTRYPOINT": "cli",
+    "CLAUDE_CODE_ENTRYPOINT": "$ENTRYPOINT",
     "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"
   },
   "node_options_present": false

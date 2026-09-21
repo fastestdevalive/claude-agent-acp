@@ -324,6 +324,15 @@ pub fn replay(
         }
 
         for emit in &step.emit {
+            // A transcript may insert a pacing marker to separate two emits that
+            // otherwise race in the host (e.g. hold the `can_use_tool`
+            // control_request until the `assistant` tool_use has been processed,
+            // making a permission capture deterministic — phase 10). The marker
+            // is not a real frame: fake-claude sleeps instead of writing it.
+            if let Some(ms) = emit.get("sleep_ms").and_then(Value::as_u64) {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                continue;
+            }
             let resolved = substitute(emit, &frame);
             let mut text = serde_json::to_string(&resolved)?;
             text.push('\n');
@@ -380,6 +389,43 @@ mod tests {
         let expect = serde_json::json!({"type": "result", "subtype": "success"});
         let frame = serde_json::json!({"type": "result", "subtype": "error"});
         assert!(!subset_match(&expect, &frame));
+    }
+
+    /// A `{"sleep_ms": N}` emit marker is consumed (never written as a frame)
+    /// and pauses replay, so a transcript can pace two otherwise-racing emits
+    /// (phase 10 deterministic-capture fix).
+    #[test]
+    fn sleep_marker_pauses_without_writing_a_frame() {
+        let text = "{\"expect\":{\"type\":\"user\"},\"emit\":[{\"type\":\"assistant\",\"n\":1},{\"sleep_ms\":1},{\"type\":\"result\",\"n\":2}]}\n";
+        let transcript = Transcript::parse(text).unwrap();
+        let mut stdout = Vec::new();
+        let start = std::time::Instant::now();
+        let steps = replay(
+            &transcript,
+            &[],
+            None,
+            None,
+            br#"{"type":"user","uuid":"u","message":{}}"#.as_slice(),
+            &mut stdout,
+        )
+        .unwrap();
+        assert_eq!(steps, 1);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let frames: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            frames.len(),
+            2,
+            "sleep marker must not be written as a frame"
+        );
+        assert_eq!(frames[0]["n"], 1);
+        assert_eq!(frames[1]["n"], 2);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(1),
+            "sleep marker must pause replay"
+        );
     }
 
     #[test]

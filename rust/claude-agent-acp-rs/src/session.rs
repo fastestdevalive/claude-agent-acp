@@ -44,9 +44,10 @@ use agent_client_protocol::schema::v1::{
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::control::{Control, ControlOptions, InitializeOptions};
+use crate::control::{Control, ControlOptions, InitializeOptions, RequestHandler};
 use crate::dispatch::{self, Route, StreamMsg};
 use crate::map::{self, MapState, MsgRole};
+use crate::permission;
 use crate::process::{self, SpawnOptions, Timings};
 use crate::turn::{FailureKind, StopReason, Turn, TurnEvent, TurnMachine};
 
@@ -87,6 +88,13 @@ pub enum SessionOutbound {
     /// A barrier: every `Update` sent before this has been forwarded. Resolving
     /// the `oneshot` signals the prompt task it may now write its response.
     Flush(oneshot::Sender<()>),
+    /// Send a `session/request_permission` request to the client and await its
+    /// outcome (phase 10). The agent's forwarding task resolves `reply` with the
+    /// raw JSON-RPC `result` (`Ok`) or a transport error (`Err`).
+    RequestPermission {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 /// The result of a settled `session/prompt`.
@@ -141,6 +149,13 @@ enum Command {
     /// Cancel the active prompt (8.9): `machine.cancel()` then send an
     /// `interrupt` control_request.
     Cancel,
+    /// Handle an inbound `can_use_tool` control_request (phase 10). `reply`
+    /// resolves with the `control_response` frame (the R28 deny / allow
+    /// payload) once the client's permission outcome is known (10.1, D14).
+    Permission {
+        frame: Value,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// Configuration used to start a session (phase 8 / 8.2, 8.4).
@@ -195,10 +210,20 @@ impl Session {
             .take_stdin()
             .ok_or_else(|| SessionError::Start("child stdin unavailable".into()))?;
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
-        let control = Control::spawn(stdin, control_in_rx, ControlOptions::default());
+
+        // The actor's command channel must exist before the control channel is
+        // spawned, so the inbound `can_use_tool` handler can route frames to the
+        // actor (phase 10).
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(
+            stdin,
+            control_in_rx,
+            ControlOptions {
+                on_request: Some(build_permission_request_handler(tx.clone())),
+            },
+        );
 
         let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
-        let (tx, commands) = mpsc::unbounded_channel::<Command>();
         let high_water = Arc::new(AtomicUsize::new(0));
         let hw = high_water.clone();
 
@@ -291,16 +316,85 @@ impl Session {
     }
 }
 
+/// Build the inbound `control_request` handler injected into the control
+/// channel (phase 10). A `can_use_tool` request is routed to the session actor
+/// via [`Command::Permission`] (which owns the `MapState` needed to
+/// `ensure_tool_call_emitted`); the reply resolves with the `control_response`.
+/// Any other subtype falls through to the default `{subtype:"error"}` response
+/// (4.6 / 4.T9).
+fn build_permission_request_handler(
+    command_tx: mpsc::UnboundedSender<Command>,
+) -> Arc<RequestHandler> {
+    Arc::new(Box::new(move |frame: Value| {
+        let command_tx = command_tx.clone();
+        Box::pin(async move {
+            let request_id = frame
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let subtype = frame
+                .pointer("/request/subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if subtype == "can_use_tool" {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = command_tx.send(Command::Permission {
+                    frame,
+                    reply: reply_tx,
+                });
+                reply_rx
+                    .await
+                    .unwrap_or_else(|_| permission::deny_control_response(&request_id))
+            } else {
+                json!({
+                    "type": "control_response",
+                    "response": { "subtype": "error", "request_id": request_id },
+                })
+            }
+        })
+    }))
+}
+
 /// The session actor task. Owns all session state; nothing else mutates it.
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    mut commands: mpsc::UnboundedReceiver<Command>,
-    mut stream: mpsc::UnboundedReceiver<Value>,
+    commands: mpsc::UnboundedReceiver<Command>,
+    stream: mpsc::UnboundedReceiver<Value>,
     _process: crate::process::Process,
     control: Control,
     control_in_tx: mpsc::UnboundedSender<Value>,
     update_tx: mpsc::UnboundedSender<SessionOutbound>,
     _timings: Timings,
+    session_id: String,
+    high_water: Arc<AtomicUsize>,
+) {
+    // The `_process` handle is held only for its lifetime (it owns the child and
+    // kills it on drop); the actor loop itself never touches it, so the core
+    // loop is factored into `run_loop` and exercised directly by unit tests
+    // (INV-27 drives the real actor command path without spawning a child).
+    run_loop(
+        commands,
+        stream,
+        control,
+        control_in_tx,
+        update_tx,
+        session_id,
+        high_water,
+    )
+    .await
+}
+
+/// The session actor's core `select!` loop — the real command-dispatch path.
+/// Factored out of [`run`] so tests can drive the actor without a child
+/// process (INV-27).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    mut stream: mpsc::UnboundedReceiver<Value>,
+    control: Control,
+    control_in_tx: mpsc::UnboundedSender<Value>,
+    update_tx: mpsc::UnboundedSender<SessionOutbound>,
     session_id: String,
     high_water: Arc<AtomicUsize>,
 ) {
@@ -314,6 +408,16 @@ async fn run(
     // Node's `lastAssistantError`, reset per prompt; phase 9). The wire
     // `data.errorKind` is only attached when this is true.
     let mut assistant_had_error = false;
+    // Subagent attribution (10.5): `task_id -> parentToolUseId` for live
+    // background tasks, mirroring the Node's `liveBackgroundTasks` so a
+    // subagent's `can_use_tool` is attributed to the Agent/Task tool call that
+    // spawned it.
+    let mut live_background: HashMap<String, String> = HashMap::new();
+    // Pending permission round-trips (phase 10): `request_id -> JoinHandle`.
+    // `Command::Cancel` aborts every one so a pending permission resolves as
+    // `Cancelled` (R28 deny written back to the control writer, INV-21 / 27;
+    // CUJ 2).
+    let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -330,6 +434,15 @@ async fn run(
                         assistant_had_error = false;
                     }
                     Command::Cancel => {
+                        // Abort every pending permission round-trip (CUJ 2):
+                        // dropping the `reply` oneshot makes control.rs's
+                        // on-request handler resolve with the R28 deny payload,
+                        // so the pending permission settles `Cancelled` (INV-21 /
+                        // INV-27) while the actor stays free.
+                        for handle in pending_permissions.values() {
+                            handle.abort();
+                        }
+                        pending_permissions.clear();
                         // 8.9: settle swept queued turns, then interrupt.
                         let events = machine.cancel();
                         handle_events(
@@ -352,6 +465,24 @@ async fn run(
                                 .await;
                         });
                     }
+                    Command::Permission { frame, reply } => {
+                        // The client round-trip (10.1, D14) runs in a spawned task
+                        // so the actor never awaits it inline (INV-27): a
+                        // `session/cancel` notification stays processable while a
+                        // permission is pending.
+                        // Prune finished round-trips first so the registry stays a
+                        // live-set of pending permissions (abortable on cancel).
+                        pending_permissions.retain(|_, h| !h.is_finished());
+                        handle_permission(
+                            frame,
+                            reply,
+                            &mut map_state,
+                            &mut live_background,
+                            &update_tx,
+                            &session_id,
+                            &mut pending_permissions,
+                        );
+                    }
                 }
             }
             msg = stream.recv() => {
@@ -373,6 +504,7 @@ async fn run(
                     &control_in_tx,
                     &mut machine,
                     &mut map_state,
+                    &mut live_background,
                     &mut pending,
                     &mut emitted_assistant_text,
                     &mut assistant_had_error,
@@ -394,6 +526,7 @@ async fn dispatch_stream(
     control_in_tx: &mpsc::UnboundedSender<Value>,
     machine: &mut TurnMachine,
     map_state: &mut MapState,
+    live_background: &mut HashMap<String, String>,
     pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
     emitted_assistant_text: &mut bool,
     assistant_had_error: &mut bool,
@@ -411,6 +544,7 @@ async fn dispatch_stream(
                 msg.line,
                 machine,
                 map_state,
+                live_background,
                 pending,
                 emitted_assistant_text,
                 assistant_had_error,
@@ -429,6 +563,7 @@ fn handle_session_frame(
     line: Value,
     machine: &mut TurnMachine,
     map_state: &mut MapState,
+    live_background: &mut HashMap<String, String>,
     pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
     emitted_assistant_text: &mut bool,
     assistant_had_error: &mut bool,
@@ -476,11 +611,20 @@ fn handle_session_frame(
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
                     let is_subagent = line.get("subagent_type").is_some();
                     machine.on_task_started(task_id, is_subagent);
+                    // Subagent attribution (10.5): record the Agent/Task tool
+                    // call (`tool_use_id`) that spawned this task, so a
+                    // subagent's `can_use_tool` is attributed to it.
+                    if is_subagent {
+                        if let Some(parent) = line.get("tool_use_id").and_then(Value::as_str) {
+                            live_background.insert(task_id.to_string(), parent.to_string());
+                        }
+                    }
                 }
                 "task_notification" | "task_updated" => {
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
                     if is_terminal_task_update(&line) {
                         let events = machine.on_task_ended(task_id);
+                        live_background.remove(task_id);
                         handle_events(
                             &events,
                             pending,
@@ -555,6 +699,91 @@ fn handle_session_frame(
         }
         _ => {}
     }
+}
+
+/// Handle an inbound `can_use_tool` control_request (10.1–10.5).
+///
+/// Emits the `tool_call` if the client has not seen it yet (`ensureToolCallEmitted`,
+/// INV-20 / #851), then spawns a task (D14) that sends `session/request_permission`,
+/// maps the outcome to the `control_response` (10.3 / 10.4) and resolves `reply`.
+/// The actor never awaits the client round-trip inline (INV-27).
+fn handle_permission(
+    frame: Value,
+    reply: oneshot::Sender<Value>,
+    map_state: &mut MapState,
+    live_background: &mut HashMap<String, String>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    pending_permissions: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    let can = permission::parse_can_use_tool(&frame);
+    // Subagent attribution (10.5): the parent Agent/Task tool call that spawned
+    // the subagent (`liveBackgroundTasks`).
+    let parent = can
+        .agent_id
+        .as_deref()
+        .and_then(|id| live_background.get(id).cloned());
+    let request_id = can.request_id.clone();
+
+    // ensureToolCallEmitted (10.2, INV-20): surface the tool_call before the
+    // permission request references it, unless the streamed tool_use already did.
+    if let Some(update) = permission::ensure_tool_call_emitted(
+        &can.tool_name,
+        &can.tool_input,
+        &can.tool_use_id,
+        parent.as_deref(),
+        map_state,
+    ) {
+        let notif = SessionNotification::new(session_id.to_string(), update);
+        let _ = update_tx.send(SessionOutbound::Update(notif));
+    }
+
+    // Build the `request_permission` params (10.1) before moving `can` into the
+    // spawned round-trip task.
+    let tool_call = permission::build_tool_call(
+        &can.tool_name,
+        &can.tool_input,
+        &can.tool_use_id,
+        parent.as_deref(),
+    );
+    let params = permission::build_request_permission(
+        session_id,
+        tool_call,
+        &can.tool_name,
+        &can.suggestions,
+    );
+
+    // Spawn the round-trip (D14): ask the agent layer to send
+    // `session/request_permission` and await the outcome, map it, resolve `reply`
+    // (the `control.rs` on-request task writes the response frame). The handle is
+    // registered so `Command::Cancel` can abort it (CUJ 2, INV-27).
+    let update_tx = update_tx.clone();
+    let handle = tokio::spawn(async move {
+        let (ptx, prx) = oneshot::channel();
+        let _ = update_tx.send(SessionOutbound::RequestPermission { params, reply: ptx });
+        let response = match prx.await {
+            Ok(Ok(value)) => match permission::map_outcome(&value) {
+                permission::Outcome::Allow => {
+                    permission::allow_control_response(&can.request_id, &can.tool_input)
+                }
+                permission::Outcome::AllowAlways => permission::allow_always_control_response(
+                    &can.request_id,
+                    &can.tool_input,
+                    &can.tool_name,
+                    &can.suggestions,
+                ),
+                permission::Outcome::Deny | permission::Outcome::Cancelled => {
+                    permission::deny_control_response(&can.request_id)
+                }
+            },
+            // The request errored or the round-trip was dropped (e.g. the client
+            // closed / cancelled): refuse the tool (R28 deny) so the turn settles
+            // on the next `result` (INV-21).
+            Ok(Err(_)) | Err(_) => permission::deny_control_response(&can.request_id),
+        };
+        let _ = reply.send(response);
+    });
+    pending_permissions.insert(request_id, handle);
 }
 
 /// Process a batch of [`TurnEvent`]s in order (8.8 / review-04 wiring):
@@ -881,6 +1110,7 @@ mod tests {
         let hw = Arc::new(AtomicUsize::new(0));
         let mut emitted_assistant_text = false;
         let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
 
         // A active + held (deferred on a live subagent).
         machine.enqueue(Turn::new("pA".into(), false));
@@ -899,6 +1129,7 @@ mod tests {
             json!({"type":"system","subtype":"session_state_changed","state":"running"}),
             &mut machine,
             &mut map_state,
+            &mut live_background,
             &mut pending,
             &mut emitted_assistant_text,
             &mut assistant_had_error,
@@ -922,5 +1153,236 @@ mod tests {
             "the owed trailing idle must be absorbed, not fail B"
         );
         assert!(machine.has_active(), "B must remain active");
+    }
+
+    /// 10.T3 (INV-27, Unit — `session`): a permission round-trip is spawned, not
+    /// awaited inline. Drives the REAL actor path (`run_loop` + a real
+    /// `Control` over a duplex stdin): start a `can_use_tool` permission the
+    /// client never answers, then deliver `Command::Cancel` while it is pending,
+    /// and assert (a) the actor processes the cancel without being blocked, and
+    /// (b) the pending permission resolves `Cancelled` — the R28 deny payload is
+    /// written back to the control writer — and the prompt turn settles
+    /// `cancelled`.
+    #[tokio::test]
+    async fn inv_27_no_inline_await() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::timeout;
+
+        // Build the real actor stack exactly as `Session::start` does: a
+        // `Control` over a duplex stdin whose on-request handler routes
+        // `can_use_tool` to the actor, plus the real `run_loop` actor.
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(
+            a,
+            control_in_rx,
+            ControlOptions {
+                on_request: Some(build_permission_request_handler(tx.clone())),
+            },
+        );
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            stream_rx,
+            control,
+            control_in_tx.clone(),
+            update_tx,
+            "s1".into(),
+            hw,
+        ));
+
+        // Reader: turn the duplex "stdin" (b) into whole lines.
+        let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim().to_string();
+                        if !trimmed.is_empty() {
+                            let _ = ltx.send(trimmed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // A prompt turn is active so we can observe it settle `cancelled`.
+        let (preply_tx, preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type": "user", "uuid": "p1", "message": {}}),
+            is_local_only: false,
+            reply: preply_tx,
+        })
+        .unwrap();
+        let _echo = timeout(Duration::from_secs(5), lrx.recv())
+            .await
+            .expect("user frame written to stdin")
+            .expect("stream open");
+
+        // Start a `can_use_tool` permission; the client (update_rx) never answers.
+        let can_frame = json!({
+            "type": "control_request",
+            "request_id": "permreq1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "echo hi"},
+                "tool_use_id": "toolu_01PERM",
+                "agent_id": null,
+                "permission_suggestions": [],
+            }
+        });
+        control_in_tx.send(can_frame).unwrap();
+
+        // The actor must spawn the round-trip and emit the `RequestPermission`
+        // outbound (the agent layer would send `session/request_permission`).
+        // The client never answers, so the permission stays pending — proof the
+        // actor is NOT awaiting the round-trip inline. (An `Update(ToolCall)`
+        // from `ensure_tool_call_emitted` precedes it on the channel.) The
+        // outbound is KEPT alive (its `reply` oneshot is the round-trip's
+        // pending sender): if we dropped it the round-trip would self-resolve as
+        // a dropped error — a different deny path that would mask a missing
+        // cancel-abort.
+        let request_permission: SessionOutbound = loop {
+            let outbound = timeout(Duration::from_secs(5), update_rx.recv())
+                .await
+                .expect("an outbound is emitted")
+                .expect("outbound stream open");
+            if matches!(outbound, SessionOutbound::RequestPermission { .. }) {
+                break outbound;
+            }
+        };
+        let _ = &request_permission;
+
+        // Deliver `session/cancel` while the permission is still pending.
+        tx.send(Command::Cancel).unwrap();
+
+        // (a) + (b) The actor processes the cancel: it aborts the pending
+        // permission round-trip, so control.rs's on-request handler resolves with
+        // the R28 deny payload and writes it back to the control writer (stdin).
+        let denied = find_deny_response(&mut lrx).await;
+        assert_eq!(denied["type"], "control_response");
+        assert_eq!(denied["response"]["response"]["behavior"], "deny");
+        assert_eq!(
+            denied["response"]["response"]["message"],
+            "User refused permission to run tool"
+        );
+        assert!(
+            denied["response"]["response"]["interrupt"].is_null(),
+            "the R28 deny must not carry an interrupt"
+        );
+
+        // The actor remains responsive after the cancel: drive the trailing idle
+        // so the active prompt turn settles `cancelled`.
+        stream_tx
+            .send(json!({"type": "system", "subtype": "session_state_changed", "state": "idle"}))
+            .unwrap();
+        let reply = timeout(Duration::from_secs(5), preply_rx)
+            .await
+            .expect("the prompt turn must settle")
+            .expect("prompt reply resolved")
+            .expect("the prompt turn settles Ok");
+        assert_eq!(
+            reply.stop_reason, "cancelled",
+            "the prompt turn must settle cancelled after the pending permission is aborted"
+        );
+    }
+
+    /// Read stdin lines until the R28 deny `control_response` is seen.
+    async fn find_deny_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
+        use std::time::Duration;
+        use tokio::time::timeout;
+        loop {
+            let line = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a control_response is written to stdin")
+                .expect("stream open");
+            let v: Value = serde_json::from_str(&line).expect("line is JSON");
+            if v.get("type").and_then(Value::as_str) == Some("control_response")
+                && v.pointer("/response/response/behavior")
+                    .and_then(Value::as_str)
+                    == Some("deny")
+            {
+                return v;
+            }
+        }
+    }
+
+    /// 10.T5 (Regression): a subagent's permission request is attributed to its
+    /// parent tool call. A `task_started` records the spawning Agent/Task call,
+    /// and a `can_use_tool` with that `agent_id` emits a `tool_call` carrying the
+    /// parent's `parentToolUseId` in `_meta.claudeCode`.
+    #[tokio::test]
+    async fn subagent_permission_attributed_to_parent() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+
+        // The subagent starts, spawned by the Agent/Task call `toolu_PARENT`.
+        handle_session_frame(
+            json!({"type":"system","subtype":"task_started","task_id":"sub1","tool_use_id":"toolu_PARENT","subagent_type":"Task"}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+        );
+
+        // A permission request from inside that subagent.
+        let frame = json!({
+            "type": "control_request",
+            "request_id": "permreq1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "ls"},
+                "tool_use_id": "toolu_SUB",
+                "agent_id": "sub1",
+                "permission_suggestions": [],
+            }
+        });
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        handle_permission(
+            frame,
+            reply_tx,
+            &mut map_state,
+            &mut live_background,
+            &utx,
+            "s",
+            &mut pending_permissions,
+        );
+
+        // The emitted tool_call must carry the parent's parentToolUseId.
+        let item = urx.recv().await.expect("a tool_call is emitted");
+        let SessionOutbound::Update(notif) = item else {
+            panic!("expected a session/update notification");
+        };
+        let json = serde_json::to_value(&notif.update).unwrap();
+        assert_eq!(
+            json["_meta"]["claudeCode"]["parentToolUseId"],
+            json!("toolu_PARENT")
+        );
+        assert_eq!(json["_meta"]["claudeCode"]["toolName"], json!("Bash"));
+        assert_eq!(json["toolCallId"], json!("toolu_SUB"));
     }
 }

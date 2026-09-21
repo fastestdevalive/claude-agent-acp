@@ -358,3 +358,47 @@ fn inv_24_cancel_queued_echo_less() {
 fn inv_24_eof_mid_turn() {
     run_and_diff("eof-mid-turn");
 }
+
+/// 10.T4 — the permission-allow and permission-deny scripts diff clean against
+/// the (deterministic, phase-10) Node fixtures. The `can_use_tool` round-trip
+/// surfaces the `tool_call`, sends `session/request_permission`, and the allow /
+/// deny outcome settles the turn on the next `result` (INV-20 / INV-21).
+#[test]
+fn inv_24_permissions() {
+    run_and_diff("permission-allow");
+    run_and_diff("permission-deny");
+}
+
+/// Phase-10 — the `session/request_permission` request id (a volatile
+/// correlation id: `0` from the Node, a uuid from the pinned crate) and its
+/// echoed response id are normalised to the same fixed token, so a uuid-bearing
+/// Rust frame equals the Node's fixed `0` frame.
+#[test]
+fn request_permission_id_is_normalised_to_fixed_token() {
+    let node_request = Frame::recv(json!({
+        "jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
+        "params": {"sessionId": "s", "options": [], "toolCall": {"toolCallId": "t", "title": "x"}}
+    }));
+    let rust_request = Frame::recv(json!({
+        "jsonrpc": "2.0", "id": "11111111-1111-1111-1111-111111111111",
+        "method": "session/request_permission",
+        "params": {"sessionId": "s", "options": [], "toolCall": {"toolCallId": "t", "title": "x"}}
+    }));
+    assert!(
+        diff_frames(&[node_request], &[rust_request], &[]).is_ok(),
+        "the request_permission request id must be normalised to a fixed token"
+    );
+
+    // The client's echoed response id is normalised the same way.
+    let node_response = Frame::send(json!({
+        "jsonrpc": "2.0", "id": 0, "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
+    }));
+    let rust_response = Frame::send(json!({
+        "jsonrpc": "2.0", "id": "22222222-2222-2222-2222-222222222222",
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
+    }));
+    assert!(
+        diff_frames(&[node_response], &[rust_response], &[]).is_ok(),
+        "the request_permission response id must be normalised to the fixed token"
+    );
+}

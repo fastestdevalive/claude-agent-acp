@@ -251,6 +251,10 @@ pub fn session_spawn_options(
         session_id: Some(session_id),
         model,
         permission_mode,
+        // The Node adapter always passes `--permission-prompt-tool stdio` (B2):
+        // without it `claude` never emits `can_use_tool`, so permission
+        // translation (phase 10) would never trigger against a real CLI.
+        permission_prompt_tool: true,
         replay_user_messages: true,
         include_partial_messages: true,
         ..SpawnOptions::default()
@@ -424,6 +428,24 @@ fn register_session(
                 // `result` on the wire).
                 SessionOutbound::Flush(done) => {
                     let _ = done.send(());
+                }
+                // Phase 10: a permission request from the session actor. Spawn a
+                // task that sends `session/request_permission` to the client and
+                // resolves the oneshot with the raw `result` (or an error), so the
+                // forwarding task is never blocked on the client round-trip (D14).
+                SessionOutbound::RequestPermission { params, reply } => {
+                    let connection = connection.clone();
+                    tokio::spawn(async move {
+                        let result = match UntypedMessage::new("session/request_permission", params)
+                        {
+                            Ok(msg) => {
+                                let sent = connection.send_request(msg);
+                                sent.block_task().await.map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let _ = reply.send(result);
+                    });
                 }
             }
         }
@@ -689,6 +711,11 @@ mod tests {
             argv.windows(2)
                 .any(|w| w == ["--permission-mode", "acceptEdits"]),
             "permission mode -> --permission-mode: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--permission-prompt-tool", "stdio"]),
+            "the adapter always passes --permission-prompt-tool stdio (B2): {argv:?}"
         );
     }
 

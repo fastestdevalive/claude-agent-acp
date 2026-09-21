@@ -66,6 +66,21 @@ pub struct MapState {
     streamed_inputs: HashMap<(String, u64), StreamedInput>,
 }
 
+impl MapState {
+    /// Whether a tool-call id has already surfaced to the client (used by
+    /// `permission::ensure_tool_call_emitted`, INV-20 / #851).
+    pub(crate) fn has_emitted(&self, id: &str) -> bool {
+        self.emitted.contains(id)
+    }
+
+    /// Mark a tool-call id as surfaced (and cache its tool_use block) so a
+    /// later `tool_use` refines rather than emits a duplicate (INV-20).
+    pub(crate) fn mark_emitted(&mut self, id: String, block: Value) {
+        self.emitted.insert(id.clone());
+        self.tool_use_cache.insert(id, block);
+    }
+}
+
 /// Accumulator for a still-streaming tool input (7.4), mirroring the Node
 /// adapter's per-`(streamKey, index)` record (`acp-agent.js:6784-6795`).
 #[derive(Debug, Clone)]

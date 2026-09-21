@@ -323,6 +323,50 @@ skills/rust-coding/
 - **Rationale:** if either awaits `session/request_permission` inline, stream parsing and `session/cancel` stall — a deadlock of the same class as #866.
 - **Where:** `C/src/permission.rs`, `C/src/session.rs`; INV-27.
 
+> **Phase-10 deviations (implementer, D14):** (1) The inbound `can_use_tool`
+> control_request is routed to the session actor via a new `Command::Permission`
+> (the actor owns the `MapState` needed for `ensureToolCallEmitted`, INV-20);
+> the actor spawns the `session/request_permission` round-trip (D14) and resolves
+> the reply with the `control_response`, which the `control.rs` on-request task
+> writes (single-writer-to-stdin, D6 — the round-trip task never writes stdin
+> directly). (2) A `Cancelled` outcome (or a dropped/errored round-trip, e.g. the
+> client closes during a pending permission, INV-27) maps to the R28 deny payload
+> so the turn continues and settles on the next `result` (INV-21). (3)
+> `session_spawn_options` now sets `permission_prompt_tool: true` (B2): the Node
+> always passes `--permission-prompt-tool stdio`, and without it a real `claude`
+> never emits `can_use_tool`, so phase 10's translation would never trigger.
+> (4) The pinned `agent-client-protocol` crate assigns a fresh uuid to every
+> outgoing request id while the Node sends `session/request_permission` with a
+> fixed `id:0`; the differential normalises that request id (and its echoed
+> response id) to a fixed `$PERM_REQ` token — a volatile correlation id, like the
+> uuid/timestamp normalisation, not a frame reorder or ignore (see D13).
+> (5) Deterministic-capture fix (extra task): the Node's `tool_call_update`
+> (refine) vs `session/request_permission` ordering was nondeterministic
+> (flipped in ~1/8 captures) because the SDK's `canUseTool` races the assistant
+> message processing. A `{"sleep_ms":150}` pacing marker was added to the
+> fake-claude permission transcripts between the `assistant` tool_use and the
+> `can_use_tool`, forcing the stable single-`tool_call` order (State B), verified
+> 6/6 byte-identical.
+> (6) **Phase 10b (targeted fix, orchestrator review):** `inv_27_no_inline_await`
+> was rewritten to drive the REAL actor path — it runs `run_loop` (factored out
+> of `run`, which only holds the `Process` for lifetime) plus a real `Control`
+> over a duplex stdin whose on-request handler routes `can_use_tool` to the
+> actor; it starts a `can_use_tool` permission the client never answers, delivers
+> `Command::Cancel` while it is pending, and asserts the pending permission
+> resolves `Cancelled` (the R28 deny payload is written back to the control
+> writer) and the prompt turn settles `cancelled`. This exposed a real gap: the
+> actor spawned the `session/request_permission` round-trip (D14) but nothing
+> aborted or withdrew it on cancel — the spawned task could await a never-answered
+> client reply forever and no deny payload was written. Fixed in `session.rs`:
+> the actor now keeps a `pending_permissions: HashMap<request_id, JoinHandle>`
+> registry (pruned each `Command::Permission`), and `Command::Cancel` aborts every
+> pending permission round-trip — dropping its `reply` oneshot makes control.rs's
+> on-request handler resolve with the R28 deny payload (INV-21 semantics), so the
+> pending permission settles `Cancelled` while the actor stays free (CUJ 2).
+> `turn.rs` was not changed. Mutation-checked: removing the cancel-abort makes
+> the rewritten test FAIL (no deny `control_response` written → `find_deny_response`
+> times out), confirming it would have caught a broken/awaited-inline cancel path.
+
 ### Decision D15: `session/load` resumes but does not replay history in v0.1
 
 - **Decision:** `session/load` runs `claude --resume=<id>`; the transcript replay upstream does through SDK `getSessionMessages` (R31) is `skipped-deliberate`.
@@ -884,20 +928,20 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Allow-always adds `_meta.permission` rule updates; source `ADP` `4069–4275`, `4017–4068`, `447–541`.
 - Subagent attribution: `task_started.task_id === can_use_tool.agentID` (`acp-agent.js:4109-4113`).
 
-- [ ] **10.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **10.1** `permission.rs` — spawned task per request → ACP `session/request_permission`
-- [ ] **10.2** `ensure_tool_call_emitted` before any permission request (#851)
-- [ ] **10.3** Outcome mapping: allow / allow-always (rule additions) / deny / client-cancelled
-- [ ] **10.4** Deny sends the R28 payload; the turn continues
-- [ ] **10.5** Subagent permission attributed to its parent tool call
+- [x] **10.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **10.1** `permission.rs` — spawned task per request → ACP `session/request_permission`
+- [x] **10.2** `ensure_tool_call_emitted` before any permission request (#851)
+- [x] **10.3** Outcome mapping: allow / allow-always (rule additions) / deny / client-cancelled
+- [x] **10.4** Deny sends the R28 payload; the turn continues
+- [x] **10.5** Subagent permission attributed to its parent tool call
 
 **Verify phase 10:**
-- [ ] **10.T1** Unit — `permission`: a request for an unseen tool id first emits the `ToolCall` — `inv_20_permission_after_toolcall`
-- [ ] **10.T2** Unit — `permission`: deny → exact R28 payload written; turn settles on the next `result` — `inv_21_deny_payload_and_continue`
-- [ ] **10.T3** Unit — `session`: a `session/cancel` during a pending permission resolves it as cancelled within the timeout — `inv_27_no_inline_await`
-- [ ] **10.T4** Integration — `differential`: permission-allow and permission-deny scripts diff clean — `inv_24_permissions`
-- [ ] **10.T5** Regression — a subagent's permission request is attributed to its parent tool call
-- [ ] **10.T6** Unit — `permission`: allow-always emits the `_meta.permission` rule additions
+- [x] **10.T1** Unit — `permission`: a request for an unseen tool id first emits the `ToolCall` — `inv_20_permission_after_toolcall`
+- [x] **10.T2** Unit — `permission`: deny → exact R28 payload written; turn settles on the next `result` — `inv_21_deny_payload_and_continue`
+- [x] **10.T3** Unit — `session`: a `session/cancel` during a pending permission resolves it as cancelled within the timeout — `inv_27_no_inline_await`
+- [x] **10.T4** Integration — `differential`: permission-allow and permission-deny scripts diff clean — `inv_24_permissions`
+- [x] **10.T5** Regression — a subagent's permission request is attributed to its parent tool call
+- [x] **10.T6** Unit — `permission`: allow-always emits the `_meta.permission` rule additions
 
 ---
 
