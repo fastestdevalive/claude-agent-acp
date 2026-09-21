@@ -298,7 +298,8 @@ skills/rust-coding/
 ### Decision D15: `session/load` resumes but does not replay history in v0.1
 
 - **Decision:** `session/load` runs `claude --resume=<id>`; the transcript replay upstream does through SDK `getSessionMessages` (R31) is `skipped-deliberate`.
-- **Rationale:** the crate must still advertise `loadSession: true` or vibe-station always starts fresh; replay needs a port of `~/.claude` JSONL parsing — a new sub-project; vibe-station does not need it: it persists its own transcript and treats `load_session` `Ok(())` as "resumed" (`vst-agents/src/json_agent_session/connection.rs:99-104`), so replay would at best be ignored and at worst duplicate stored events.
+- **Rationale:** the crate must still advertise `loadSession: true` or vibe-station always starts fresh; replay needs a port of `~/.claude` JSONL parsing — a new sub-project; vibe-station does not need it, including for terminal ↔ Rich Chat switching: on the channel toggle it backfills history itself by parsing Claude's native JSONL (`vst-routes/src/sessions.rs:3799-3800` → `vst-agents/src/claude_import.rs:101`), and it treats `load_session` `Ok(())` as "resumed" (`vst-agents/src/json_agent_session/connection.rs:99-104`); replay would be ignored or duplicate stored events.
+- **Identity requirement:** for Claude the ACP `sessionId` must equal the CLI's native chat id (`docs/AGENT-CHAT-ID-CAPTURE.md`, "identical" strategy), so Rich Chat → terminal works via `claude --resume <sessionId>`; and `session/load` must accept an id the crate did not mint (a terminal-started session's id) and pass it to `--resume`.
 - **Where:** `C/src/agent.rs`; recorded in `porting/PARITY.md`.
 
 ---
@@ -794,6 +795,7 @@ stdout: newline-delimited JSON
 - [ ] **8.T2** Unit — `agent`: an unhandled method returns `-32601`, never hangs or panics
 - [ ] **8.T3** Unit — `agent`: prompt blocks table (text/image/resource/resource_link) → expected Claude content
 - [ ] **8.T4** Regression — nothing but JSON-RPC frames ever reaches stdout (a stray `println!` fails)
+- [ ] **8.T6** Unit — `agent`: `session/load` with an id this process never minted spawns `--resume <id>` and returns ok (terminal → Rich Chat)
 - [ ] **8.T5** Unit — `agent`: `session/new` with a model and permission mode yields `--model` / `--permission-mode` / `--session-id=<uuid>` in the spawned argv, and the returned `sessionId` equals that uuid
 
 ---
