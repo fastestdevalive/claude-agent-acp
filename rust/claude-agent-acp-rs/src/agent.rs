@@ -50,13 +50,23 @@ pub struct ServeOptions {
 impl ServeOptions {
     /// Build options from the process environment: `CLAUDE_CODE_EXECUTABLE`
     /// (binary), `CLAUDE_CODE_DEFAULT_CWD` (cwd). Used by the stdio binary.
+    /// `CLAUDE_ACP_FORCE_CANCEL_GRACE_MS` overrides the force-cancel backstop
+    /// grace (milliseconds; default 30 s, R29) so the differential harness can
+    /// shorten a wedged-cancel settle (11.2 / 11.T4).
     pub fn from_env() -> Self {
         let claude_path = std::env::var_os("CLAUDE_CODE_EXECUTABLE").map(PathBuf::from);
         let default_cwd = std::env::var_os("CLAUDE_CODE_DEFAULT_CWD").map(PathBuf::from);
+        let mut timings = Timings::default();
+        if let Ok(ms) = std::env::var("CLAUDE_ACP_FORCE_CANCEL_GRACE_MS") {
+            if let Ok(ms) = ms.parse::<u64>() {
+                timings.force_cancel_grace = std::time::Duration::from_millis(ms);
+            }
+        }
         Self {
             claude_path,
+            extra_env: Vec::new(),
             default_cwd,
-            ..Self::default()
+            timings,
         }
     }
 }

@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
@@ -149,6 +150,11 @@ enum Command {
     /// Cancel the active prompt (8.9): `machine.cancel()` then send an
     /// `interrupt` control_request.
     Cancel,
+    /// The `interrupt` control_response receipt came back (phase 11): carry its
+    /// `still_queued` (or `None` for a bare `{}` receipt) so the actor can
+    /// reconcile the orphan-credit count (`machine.reconcile_orphan_receipt`,
+    /// INV-23).
+    InterruptReceipt { still_queued: Option<Vec<String>> },
     /// Handle an inbound `can_use_tool` control_request (phase 10). `reply`
     /// resolves with the `control_response` frame (the R28 deny / allow
     /// payload) once the client's permission outcome is known (10.1, D14).
@@ -235,6 +241,7 @@ impl Session {
         let stream = std::mem::replace(&mut process.lines, mpsc::unbounded_channel().1);
         tokio::spawn(run(
             commands,
+            tx.clone(),
             stream,
             process,
             control.clone(),
@@ -360,12 +367,13 @@ fn build_permission_request_handler(
 #[allow(clippy::too_many_arguments)]
 async fn run(
     commands: mpsc::UnboundedReceiver<Command>,
+    command_tx: mpsc::UnboundedSender<Command>,
     stream: mpsc::UnboundedReceiver<Value>,
     _process: crate::process::Process,
     control: Control,
     control_in_tx: mpsc::UnboundedSender<Value>,
     update_tx: mpsc::UnboundedSender<SessionOutbound>,
-    _timings: Timings,
+    timings: Timings,
     session_id: String,
     high_water: Arc<AtomicUsize>,
 ) {
@@ -373,12 +381,16 @@ async fn run(
     // kills it on drop); the actor loop itself never touches it, so the core
     // loop is factored into `run_loop` and exercised directly by unit tests
     // (INV-27 drives the real actor command path without spawning a child).
+    // A clone of the command sender is threaded into the loop so the spawned
+    // `interrupt` task can report its receipt back to the actor (phase 11).
     run_loop(
         commands,
+        command_tx,
         stream,
         control,
         control_in_tx,
         update_tx,
+        timings.force_cancel_grace,
         session_id,
         high_water,
     )
@@ -391,10 +403,12 @@ async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     mut commands: mpsc::UnboundedReceiver<Command>,
+    command_tx: mpsc::UnboundedSender<Command>,
     mut stream: mpsc::UnboundedReceiver<Value>,
     control: Control,
     control_in_tx: mpsc::UnboundedSender<Value>,
     update_tx: mpsc::UnboundedSender<SessionOutbound>,
+    force_cancel_grace: Duration,
     session_id: String,
     high_water: Arc<AtomicUsize>,
 ) {
@@ -418,10 +432,38 @@ async fn run_loop(
     // `Cancelled` (R28 deny written back to the control writer, INV-21 / 27;
     // CUJ 2).
     let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // The force-cancel backstop (11.2, INV-17, #680): the absolute deadline at
+    // which a wedged stream's active turn is force-settled `cancelled`. Armed at
+    // most once per cancel sequence (`!forceCancelTimer`), cleared as soon as no
+    // active turn remains (upstream `disarmForceCancel` on every settle path).
+    let mut force_cancel_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        // The force-cancel sleep: armed -> wait until the deadline; otherwise
+        // park (far future). Rebuilt each iteration from the absolute deadline,
+        // so an armed floor always fires at the same instant.
+        let force_cancel_sleep = match force_cancel_deadline {
+            Some(deadline) => Box::pin(tokio::time::sleep_until(deadline)),
+            None => Box::pin(tokio::time::sleep(Duration::from_secs(3600))),
+        };
         tokio::select! {
             biased;
+            _ = force_cancel_sleep => {
+                if force_cancel_deadline.is_some() {
+                    // The interrupt didn't make the SDK yield within the grace:
+                    // force the active turn to settle `cancelled` (INV-17, #680).
+                    force_cancel_deadline = None;
+                    let events = machine.force_cancel();
+                    handle_events(
+                        &events,
+                        &mut pending,
+                        &update_tx,
+                        &session_id,
+                        &high_water,
+                        assistant_had_error,
+                    );
+                }
+            }
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else {
                     break;
@@ -453,17 +495,49 @@ async fn run_loop(
                             &high_water,
                             assistant_had_error,
                         );
+                        // Arm the force-cancel backstop at most once per turn
+                        // (11.2, INV-22): if the interrupt below doesn't make the
+                        // SDK yield (a wedged TaskOutput block, #680), the active
+                        // turn is force-settled `cancelled` once the grace elapses.
+                        // Re-sent cancels retry interrupt() but never push the
+                        // deadline out. Only armed while an active turn remains.
+                        if machine.has_active() && force_cancel_deadline.is_none() {
+                            force_cancel_deadline =
+                                Some(tokio::time::Instant::now() + force_cancel_grace);
+                        }
                         // Send the `interrupt` on a spawned task: awaiting the
                         // correlated control_response here would block the actor's
                         // single-task loop (which is what routes that response back
-                        // to the Control task), deadlocking it. Fire-and-forget —
-                        // a late response is dropped, not held.
+                        // to the Control task), deadlocking it. The task reports
+                        // the receipt's `still_queued` back so the actor can
+                        // reconcile the orphan-credit count (11.3, INV-23).
                         let control = control.clone();
+                        let command_tx = command_tx.clone();
                         tokio::spawn(async move {
-                            let _ = control
+                            if let Ok(receipt) = control
                                 .send_request(json!({"subtype": "interrupt"}))
-                                .await;
+                                .await
+                            {
+                                let still_queued = receipt
+                                    .get("response")
+                                    .and_then(|r| r.get("still_queued"))
+                                    .and_then(Value::as_array)
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(Value::as_str)
+                                            .map(String::from)
+                                            .collect()
+                                    });
+                                let _ = command_tx
+                                    .send(Command::InterruptReceipt { still_queued });
+                            }
                         });
+                    }
+                    Command::InterruptReceipt { still_queued } => {
+                        // 11.3 / 11.4: reconcile the orphan count against the
+                        // receipt. A bare `{}` receipt (field absent) is handled
+                        // inside the machine as count-everything.
+                        machine.reconcile_orphan_receipt(still_queued.as_deref());
                     }
                     Command::Permission { frame, reply } => {
                         // The client round-trip (10.1, D14) runs in a spawned task
@@ -514,6 +588,14 @@ async fn run_loop(
                 )
                 .await;
             }
+        }
+        // Disarm the force-cancel backstop as soon as no active turn remains —
+        // upstream `disarmForceCancel` runs on every path that settles the
+        // active turn (settle/fail/force-cancel/stream-end), so a timer can never
+        // fire on an already-settled turn, and a LATER turn's cancel can arm it
+        // fresh.
+        if !machine.has_active() {
+            force_cancel_deadline = None;
         }
     }
 }
@@ -1187,10 +1269,12 @@ mod tests {
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
         tokio::spawn(run_loop(
             commands,
+            tx.clone(),
             stream_rx,
             control,
             control_in_tx.clone(),
             update_tx,
+            Duration::from_secs(30),
             "s1".into(),
             hw,
         ));
@@ -1384,5 +1468,265 @@ mod tests {
         );
         assert_eq!(json["_meta"]["claudeCode"]["toolName"], json!("Bash"));
         assert_eq!(json["toolCallId"], json!("toolu_SUB"));
+    }
+
+    /// Spawn a bare `run_loop` actor over a duplex stdin with an injected
+    /// force-cancel grace, returning `(command_tx, stream_tx)` to drive it.
+    /// Used by the phase-11 force-cancel / cancel-idempotency tests (INV-17,
+    /// INV-22, 11.T5).
+    fn spawn_actor(
+        grace: Duration,
+    ) -> (mpsc::UnboundedSender<Command>, mpsc::UnboundedSender<Value>) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(a, control_in_rx, ControlOptions { on_request: None });
+        let (update_tx, _update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx,
+            update_tx,
+            grace,
+            "s1".into(),
+            hw,
+        ));
+        // Drain the child stdin so the duplex never fills up (the actor writes
+        // the prompt user frame and the interrupt request to it).
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+        (tx, stream_tx)
+    }
+
+    /// 11.T1 (INV-17) — a stream that never yields after cancel settles the
+    /// active turn `cancelled` at the injected force-cancel grace (#680, R29),
+    /// rather than hanging forever. Also asserts the settle did NOT happen
+    /// immediately (it waited for the grace to elapse) — an implementation that
+    /// force-cancels on the first cancel without waiting would otherwise pass
+    /// this vacously.
+    #[tokio::test]
+    async fn inv_17_force_cancel_floor() {
+        use tokio::time::timeout;
+        const GRACE: Duration = Duration::from_millis(200);
+        let (tx, stream_tx) = spawn_actor(GRACE);
+        let (preply_tx, preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type": "user", "uuid": "p1", "message": {}}),
+            is_local_only: false,
+            reply: preply_tx,
+        })
+        .unwrap();
+        // Feed the echo so p1 becomes active.
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p1", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}))
+            .unwrap();
+        // Let the actor process the echo so p1 is ACTIVE (not merely queued)
+        // before we cancel — otherwise `machine.cancel()` sweeps it as a queued
+        // turn and settles immediately, never exercising the force-cancel floor.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        // Cancel arms the force-cancel backstop (p1 is active, unsettled).
+        let started = tokio::time::Instant::now();
+        tx.send(Command::Cancel).unwrap();
+        // Wedged: no result, no idle ever arrives. The grace elapses and the
+        // backstop force-settles the active turn `cancelled`.
+        let reply = timeout(Duration::from_secs(5), preply_rx)
+            .await
+            .expect("the prompt must settle within the force-cancel grace")
+            .expect("prompt reply resolved")
+            .expect("the turn settles Ok");
+        assert_eq!(
+            reply.stop_reason, "cancelled",
+            "a wedged stream settles cancelled at the force-cancel grace"
+        );
+        // The floor: it must not settle before the grace elapses. A buggy
+        // force-cancel-on-first-cancel settles in ~0ms and fails this; the real
+        // backstop waits the full grace.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= GRACE - Duration::from_millis(100),
+            "the force-cancel backstop must wait the grace before settling \
+             (elapsed {elapsed:?}, grace {GRACE:?})"
+        );
+    }
+
+    /// 11.T2 (INV-22) — cancel is idempotent: repeated cancels SPACED across the
+    /// force-cancel grace arm the deadline ONCE, never re-arming it to push the
+    /// settle out. Runs under paused time so the settle instant is exact:
+    /// cancel #1 at `t0` arms a single deadline at `t0 + G`; the later cancels
+    /// (at `t0 + 0.2G` … `t0 + 0.8G`) must NOT re-arm it. A buggy
+    /// re-arm-on-every-cancel implementation would push the deadline to the last
+    /// cancel's `now + G` (= `t0 + 1.8G`), which the timing assertions below
+    /// catch deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn inv_22_cancel_idempotent() {
+        use tokio::time::{advance, Instant};
+        const G: Duration = Duration::from_millis(1000);
+
+        let (tx, stream_tx) = spawn_actor(G);
+        let (preply_tx, mut preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type": "user", "uuid": "p1", "message": {}}),
+            is_local_only: false,
+            reply: preply_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p1", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}))
+            .unwrap();
+        // Let the actor enqueue + echo p1 so it is active before we time cancel #1.
+        tokio::task::yield_now().await;
+
+        let t0 = Instant::now();
+        // cancel #1 at t0: this is the ONLY cancel that may arm the deadline.
+        tx.send(Command::Cancel).unwrap();
+        // Let the actor process cancel #1 and arm the deadline at `t0 + G`
+        // BEFORE any further time advances, so the armed instant is exactly t0.
+        tokio::task::yield_now().await;
+
+        // Further cancels spaced across the grace (0.2G, 0.4G, 0.6G, 0.8G).
+        // A re-arming implementation would set deadline = last cancel's now + G
+        // = (t0 + 0.8G) + G = t0 + 1.8G — far past the single-armed t0 + G.
+        let spacings = [
+            Duration::from_millis(200), // -> t0 + 0.2G
+            Duration::from_millis(200), // -> t0 + 0.4G
+            Duration::from_millis(200), // -> t0 + 0.6G
+            Duration::from_millis(200), // -> t0 + 0.8G
+        ];
+        for d in spacings {
+            advance(d).await;
+            tokio::task::yield_now().await;
+            tx.send(Command::Cancel).unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        // Poll in small steps until the turn settles, recording the virtual
+        // instant (relative to t0) at which it did.
+        let mut settled_at: Option<Duration> = None;
+        let mut reply: Option<PromptReply> = None;
+        for _ in 0..1000 {
+            match preply_rx.try_recv() {
+                Ok(Ok(r)) => {
+                    settled_at = Some(Instant::now().duration_since(t0));
+                    reply = Some(r);
+                    break;
+                }
+                Ok(Err(_)) => panic!("the turn must settle Ok"),
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    panic!("reply closed without resolving")
+                }
+            }
+            advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let settled_at =
+            settled_at.expect("the wedged turn must settle via the force-cancel backstop");
+        let reply = reply.expect("the single prompt resolves exactly one reply");
+        assert_eq!(reply.stop_reason, "cancelled");
+
+        // (a) The single armed deadline fires at ~t0 + G — not before it, and
+        // not pushed out by the later cancels.
+        assert!(
+            settled_at >= G,
+            "the settle must not precede the single armed deadline (settled at {settled_at:?}, G = {G:?})"
+        );
+        assert!(
+            settled_at <= G + Duration::from_millis(200),
+            "the settle must happen at ~the single armed deadline, not pushed out \
+             (settled at {settled_at:?}, expected ~{G:?})"
+        );
+        // (b) Strictly BEFORE where a re-arm-at-last-cancel (t0 + 0.8G + G = 1.8G)
+        // deadline would fire — proving the deadline was armed exactly once.
+        assert!(
+            settled_at < G + Duration::from_millis(800),
+            "repeated cancels must not re-arm the deadline to the last cancel's now + G \
+             (settled at {settled_at:?}; a re-arming implementation would fire at ~{G:?} + 800ms)"
+        );
+        // The oneshot resolved exactly once (a single prompt yields exactly one
+        // `Settled`/reply), so no double-settle of the active turn.
+    }
+
+    /// 11.T5 (regression) — a cancel followed by a new prompt on the SAME
+    /// session works: after the cancelled turn settles, a fresh prompt
+    /// activates, runs and settles normally (the cancelled flag is cleared on
+    /// activation, `activate()`).
+    #[tokio::test]
+    async fn cancel_then_new_prompt_same_session() {
+        use tokio::time::timeout;
+        let (tx, stream_tx) = spawn_actor(Duration::from_millis(300));
+
+        // p1: active, cancel, then the trailing idle settles it `cancelled`.
+        let (p1_tx, p1_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type": "user", "uuid": "p1", "message": {}}),
+            is_local_only: false,
+            reply: p1_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p1", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}))
+            .unwrap();
+        tx.send(Command::Cancel).unwrap();
+        // The trailing idle settles the cancelled active turn.
+        stream_tx
+            .send(json!({"type": "system", "subtype": "session_state_changed", "state": "idle"}))
+            .unwrap();
+        let r1 = timeout(Duration::from_secs(5), p1_rx)
+            .await
+            .expect("p1 settles")
+            .expect("p1 resolved")
+            .expect("p1 Ok");
+        assert_eq!(r1.stop_reason, "cancelled");
+
+        // p2: a fresh prompt on the same session activates, runs and settles.
+        let (p2_tx, p2_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p2".into(),
+            frame: json!({"type": "user", "uuid": "p2", "message": {}}),
+            is_local_only: false,
+            reply: p2_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p2", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "second"}]}}))
+            .unwrap();
+        stream_tx
+            .send(json!({"type": "result", "subtype": "success", "is_error": false,
+                         "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}))
+            .unwrap();
+        stream_tx
+            .send(json!({"type": "system", "subtype": "session_state_changed", "state": "idle"}))
+            .unwrap();
+        let r2 = timeout(Duration::from_secs(5), p2_rx)
+            .await
+            .expect("p2 settles")
+            .expect("p2 resolved")
+            .expect("p2 Ok");
+        assert_eq!(
+            r2.stop_reason, "end_turn",
+            "a new prompt on the same session settles normally after a cancel"
+        );
     }
 }

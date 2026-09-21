@@ -13,3 +13,9 @@ thiserror = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` / `tokio::time::advance`
+# used by the paused-time tests (inv_17/inv_22). Test-only, never affects the
+# library build.
+tokio = { version = "1", features = ["test-util"] }

@@ -202,6 +202,9 @@ skills/rust-coding/
 
 > **Phase-9 deviations (implementer, D4):** (1) `session.rs`/`agent.rs` gained two phase-9-required wirings beyond the plan's literal file impact (`tools.rs`, `map.rs`, differential): a `SessionOutbound::Flush` barrier (agent forwarding task resolves a `oneshot` only after every prior `Update` is sent) that the prompt task awaits before writing its response, keeping a `tool_call` ahead of the `result` on the wire (`inv_24_tools` exposed this race); and an `assistant_had_error` flag threaded through `handle_events` → `PromptFailed`, mirroring upstream `lastAssistantError`/`errorKindData` (`acp-agent.js:5282`) so `data.errorKind` is attached only when the assistant frame carried an `error` — the `error-result` fixture's error has no `data`, which the pre-phase-9 mapper got wrong. (2) The `inv_24_tools` differential (and all tool-bearing differentials) compares `params.update.status` and `params.update.content` byte-for-byte against the fixture on EVERY frame kind — no ignore path. The one crate-inherent serialization difference, that the pinned `agent-client-protocol` crate omits `status` (the `pending` default) and empty `content` on a `tool_call` which the Node adapter always emits, is reconciled by the frame normalizer materialising those defaults on both sides (phase 9b; see the D13 bullet), never by an ignore path. (3) The tools unit tests are `inv_24_*` (not `inv_30_*`): INV-30 is already the orphan-coalescing invariant (`inv_30_orphan_result_not_reused`), so tool shapes live under the INV-24 frame-equality umbrella alongside `inv_24_tools`.
 
+> **Phase-11 deviations (implementer, D4):** (1) The force-cancel backstop and the interrupt-receipt reconciliation are **actor wirings in `session.rs`** beyond the plan's literal phase-11 file impact (`turn.rs`): `run_loop` gains a `force_cancel_grace` param and a `force_cancel_deadline` state, armed at most once per cancel sequence when an active turn remains and cleared whenever `!machine.has_active()` (upstream `disarmForceCancel`); the spawned `interrupt` task reports its receipt back as `Command::InterruptReceipt` so the actor calls `machine.reconcile_orphan_receipt`. The orphan reconciliation itself lives in `turn.rs` (11.3/11.4). (2) `map.rs` gains `messageId` stamping on stream-event chunk updates (`message_start`'s `message.id` → subsequent chunks, `acp-agent.js:2889`/`6211`) — a message-mapping gap surfaced by the `cancel-mid-turn` differential (its fake-claude uses `stream_event` frames, the first corpus to do so), required for `inv_24_cancel` (11.T4). (3) `agent.rs` `from_env` reads `CLAUDE_ACP_FORCE_CANCEL_GRACE_MS` so the differential harness can shorten the wedged-cancel settle; `common/mod.rs` sets it to 1000 ms. (4) `cancel-mid-turn` settles `cancelled` via the force-cancel backstop (the fake-claude emits a `cancelled` `result` but no trailing idle), matching the Node fixture captured at the default 30 s grace — the 1000 ms harness grace produces the same frames (the result arrives well within it). (5) **Test-fix (11b):** `inv_22_cancel_idempotent` is rewritten to make re-arming observable — it now runs under `#[tokio::test(start_paused = true)]` (which required adding `tokio`'s `test-util` feature to the crate's `[dev-dependencies]`, test-only), sends 5 cancels **spaced** at `t0, t0+0.2G, t0+0.4G, t0+0.6G, t0+0.8G`, and asserts the wedged turn settles at ~`t0+G` (not before, and strictly before `t0+1.8G`, where a re-arm-at-last-cancel would fire) with exactly one reply. Mutation-checked: removing the `is_none()` guard (re-arm every cancel) makes it fail at `session.rs:1651` (`settled at 1.8s, expected ~1s`). `inv_17_force_cancel_floor` is strengthened to assert the settle does NOT happen immediately (an elapsed floor ~the grace), which exposed that the old test let p1 settle as a *queued* sweep instead of the backstop — the echo is now yielded before cancel so p1 is truly active. The implementation itself was already correct (armed once via `force_cancel_deadline.is_none()`); no `session.rs` behavior change was needed. `cancel_then_new_prompt_same_session` needs no strengthening (it asserts concrete `cancelled`/`end_turn` and is a different invariant).
+
+
 ### Decision D5: Dispatch is a public, injectable unit from day one
 
 - **Decision:** `pub fn route(msg: &StreamMsg, view: &TurnView) -> Route` plus a runner `pub async fn run_dispatch(rx, handler: impl Handler)` in its own file.
@@ -951,18 +954,18 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - `session/cancel` → control `interrupt`; upstream arms the force-cancel timer inside `cancel()` (`acp-agent.js:3593-3605`), default 30 s, injectable via `Timings.force_cancel_grace` (R29).
 - Reconciliation: with `interrupt_receipt_v1`, use the `still_queued` lane; otherwise the legacy count lane; guard the **field**, not the receipt (`acp-agent.js:3608-3648`).
 
-- [ ] **11.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **11.1** `cancel_active_prompt` → control `interrupt`
-- [ ] **11.2** Force-cancel deadline armed once per cancel sequence (wedged stream settles `cancelled`) (#680)
-- [ ] **11.3** Orphan reconciliation: `still_queued` lane + legacy count lane
-- [ ] **11.4** Field guard: a bare `{}` receipt falls back to count-everything
+- [x] **11.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **11.1** `cancel_active_prompt` → control `interrupt`
+- [x] **11.2** Force-cancel deadline armed once per cancel sequence (wedged stream settles `cancelled`) (#680)
+- [x] **11.3** Orphan reconciliation: `still_queued` lane + legacy count lane
+- [x] **11.4** Field guard: a bare `{}` receipt falls back to count-everything
 
 **Verify phase 11:**
-- [ ] **11.T1** Unit — `cancel`: a stream that never yields settles `cancelled` at the injected grace — `inv_17_force_cancel_floor`
-- [ ] **11.T2** Unit — `cancel`: 5 rapid cancels arm the deadline once — `inv_22_cancel_idempotent`
-- [ ] **11.T3** Unit — `cancel`: receipt with `still_queued` reconciles; a bare `{}` falls back to count-everything — `inv_23_receipt_field_guard`
-- [ ] **11.T4** Integration — `differential`: cancel-mid-turn script diffs clean — `inv_24_cancel`
-- [ ] **11.T5** Regression — cancel then a new prompt on the same session works
+- [x] **11.T1** Unit — `cancel`: a stream that never yields settles `cancelled` at the injected grace — `inv_17_force_cancel_floor`
+- [x] **11.T2** Unit — `cancel`: 5 rapid cancels arm the deadline once — `inv_22_cancel_idempotent`
+- [x] **11.T3** Unit — `cancel`: receipt with `still_queued` reconciles; a bare `{}` falls back to count-everything — `inv_23_receipt_field_guard`
+- [x] **11.T4** Integration — `differential`: cancel-mid-turn script diffs clean — `inv_24_cancel`
+- [x] **11.T5** Regression — cancel then a new prompt on the same session works
 
 ---
 

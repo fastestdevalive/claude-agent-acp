@@ -621,6 +621,11 @@ pub fn run_recorder(
         .current_dir(repo_root())
         .env("FAKE_CLAUDE_SCRIPT", transcript_path)
         .env("CLAUDE_CODE_EXECUTABLE", &fake)
+        // Shorten the force-cancel backstop so a wedged-cancel settle
+        // (`cancel-mid-turn`, 11.T4) completes fast instead of waiting the 30 s
+        // default. The grace only fires when a cancel leaves the active turn
+        // un-settled past the deadline, which only that corpus exercises.
+        .env("CLAUDE_ACP_FORCE_CANCEL_GRACE_MS", "1000")
         .status()
         .expect("spawn acp-recorder");
     assert!(

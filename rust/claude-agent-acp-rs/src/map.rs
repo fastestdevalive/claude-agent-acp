@@ -33,9 +33,9 @@ use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock, ContentChunk,
-    CurrentModeUpdate, ImageContent, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, UnstructuredCommandInput,
+    CurrentModeUpdate, ImageContent, MessageId, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
 };
 use serde_json::Value;
 
@@ -64,6 +64,11 @@ pub struct MapState {
     emitted: HashSet<String>,
     tool_use_cache: HashMap<String, Value>,
     streamed_inputs: HashMap<(String, u64), StreamedInput>,
+    /// The Anthropic API message id of the message currently streaming
+    /// (`currentStreamMessageId`), captured from `message_start`'s `message.id`
+    /// so the streamed chunk updates that follow (whose delta events don't carry
+    /// it) are all tagged with the same replay-stable id (`acp-agent.js:2889`).
+    current_stream_message_id: String,
 }
 
 impl MapState {
@@ -415,10 +420,13 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
             // The block itself is mapped like a one-block consolidated
             // assistant message (7.1/7.3) — the tool_use becomes a ToolCall and
             // is marked emitted so the consolidated message dedupes (7.7).
-            map_consolidated(
-                &Value::Array(vec![block.clone()]),
-                MsgRole::Assistant,
-                state,
+            apply_stream_message_id(
+                map_consolidated(
+                    &Value::Array(vec![block.clone()]),
+                    MsgRole::Assistant,
+                    state,
+                ),
+                &state.current_stream_message_id,
             )
         }
         Some("content_block_delta") => {
@@ -428,14 +436,29 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
                 input_json_delta(state, &stream_key, index, delta)
             } else {
                 // A text/thinking delta maps like a one-block assistant message.
-                map_consolidated(
-                    &Value::Array(vec![delta.clone()]),
-                    MsgRole::Assistant,
-                    state,
+                apply_stream_message_id(
+                    map_consolidated(
+                        &Value::Array(vec![delta.clone()]),
+                        MsgRole::Assistant,
+                        state,
+                    ),
+                    &state.current_stream_message_id,
                 )
             }
         }
-        Some("content_block_stop") | Some("message_start") | Some("message_stop") => {
+        Some("message_start") => {
+            // `message_start` carries the Anthropic API message id; capture it
+            // so the streamed chunks that follow are tagged with the same id
+            // (`acp-agent.js:2889`). Also ends the input stream on this lane
+            // (drops leftover partial input).
+            state.current_stream_message_id =
+                event["message"]["id"].as_str().unwrap_or("").to_string();
+            state
+                .streamed_inputs
+                .retain(|(key, _), _| *key != stream_key);
+            Vec::new()
+        }
+        Some("content_block_stop") | Some("message_stop") => {
             // A message boundary ends the input stream on this lane; drop any
             // leftover partial input so the next message starts clean.
             state
@@ -446,6 +469,32 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
         // `ping` and `message_delta` are keep-alive/boundary no-ops.
         _ => Vec::new(),
     }
+}
+
+/// Stamp `message_id` onto the chunk updates a stream-event block produced
+/// (agent/user message and thought chunks only — never tool/plan updates),
+/// mirroring the Node adapter's `applyMessageId` (`acp-agent.js:6211`). A
+/// no-op when the id is empty (e.g. a stream with no `message_start`).
+fn apply_stream_message_id(updates: Vec<SessionUpdate>, message_id: &str) -> Vec<SessionUpdate> {
+    if message_id.is_empty() {
+        return updates;
+    }
+    let message_id = MessageId::new(message_id.to_string());
+    updates
+        .into_iter()
+        .map(|u| match u {
+            SessionUpdate::AgentMessageChunk(c) => {
+                SessionUpdate::AgentMessageChunk(c.message_id(message_id.clone()))
+            }
+            SessionUpdate::AgentThoughtChunk(c) => {
+                SessionUpdate::AgentThoughtChunk(c.message_id(message_id.clone()))
+            }
+            SessionUpdate::UserMessageChunk(c) => {
+                SessionUpdate::UserMessageChunk(c.message_id(message_id.clone()))
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// Whether a `content_block_start` block is a tool_use block to track.

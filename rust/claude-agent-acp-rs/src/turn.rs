@@ -261,6 +261,13 @@ pub struct TurnMachine {
     /// a live turn (INV-30). Decremented before the queue-head promotion
     /// (`ADP:1439-1442`).
     pending_orphan_results: usize,
+    /// The uuids of the turns swept by [`Self::cancel`]'s queue sweep — the
+    /// orphaned turns whose late results may still arrive (upstream's
+    /// `orphanedTurns`). Consumed by [`Self::reconcile_orphan_receipt`] to drop
+    /// the orphan credits of turns the interrupt's receipt shows as dropped
+    /// (`still_queued` absent), so a stale credit can't swallow a later
+    /// echo-less result (INV-23, `acp-agent.js:3608-3648`).
+    orphaned_uuids: Vec<String>,
     /// Number of trailing `idle` frames still owed by settled/autonomous/
     /// cancelled turns (`owedTrailingIdles`) — absorbed by `on_idle` so a
     /// lagging idle can't false-fail the next live turn (#825).
@@ -312,6 +319,7 @@ impl TurnMachine {
                 remaining.push_back(turn);
             } else {
                 self.pending_orphan_results += 1;
+                self.orphaned_uuids.push(turn.prompt_uuid.clone());
                 events.push(TurnEvent::Settled {
                     prompt_uuid: turn.prompt_uuid,
                     stop_reason: StopReason::Cancelled,
@@ -371,6 +379,45 @@ impl TurnMachine {
         }
         self.active = None;
         events
+    }
+
+    /// Reconcile the orphan-credit count against the `interrupt` receipt's
+    /// `still_queued` list (phase 11, INV-23, `acp-agent.js:3608-3648`).
+    ///
+    /// On CLIs advertising `interrupt_receipt_v1`, `still_queued` lists exactly
+    /// which queued messages survive the interrupt and will still run. An
+    /// orphaned turn whose uuid is absent was dropped by the interrupt and will
+    /// never emit a result — uncount it now instead of leaving a stale skip that
+    /// `activateTurn`'s reset only clears once a later live ECHO arrives (an
+    /// echo-less result in between would be wrongly swallowed by the leftover
+    /// count).
+    ///
+    /// This is the **legacy count lane** — the Rust port does not carry the
+    /// `msg_lifecycle_v1` per-uuid `orphanCommands` map (deferred, review 04
+    /// #14), so reconciliation subtracts a count, not uuids.
+    ///
+    /// Field guard (11.4): `still_queued` is `None` for a bare `{}` success
+    /// receipt (or a CLI that resolves `undefined`), which must NOT read as
+    /// "everything was dropped" — count-everything behaviour is kept and the
+    /// activation-time self-heal bounds the damage.
+    pub fn reconcile_orphan_receipt(&mut self, still_queued: Option<&[String]>) {
+        // Field guard: guard the FIELD, not just the receipt — a bare `{}`
+        // (no `still_queued` array) falls back to count-everything.
+        let Some(still_queued) = still_queued else {
+            return;
+        };
+        if self.orphaned_uuids.is_empty() {
+            return;
+        }
+        let dropped = self
+            .orphaned_uuids
+            .iter()
+            .filter(|uuid| !still_queued.contains(uuid))
+            .count();
+        if dropped > 0 {
+            self.pending_orphan_results = self.pending_orphan_results.saturating_sub(dropped);
+        }
+        self.orphaned_uuids.clear();
     }
 
     /// A subagent task started (`task_started`, `subagent_type` set): record it
@@ -899,6 +946,7 @@ impl TurnMachine {
     fn activate(&mut self, queued: Turn, events: &mut Vec<TurnEvent>) {
         self.cancelled = false;
         self.pending_orphan_results = 0;
+        self.orphaned_uuids.clear();
         self.accumulated_usage = Usage::default();
         let prompt_uuid = queued.prompt_uuid.clone();
         self.active = Some(queued);

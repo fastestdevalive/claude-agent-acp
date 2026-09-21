@@ -1048,3 +1048,82 @@ async fn held_cancel_reports_deferred_usage() {
         "a held turn's cancel must report the deferred usage snapshot"
     );
 }
+
+/// Set up the orphan-reconciliation base state for INV-23: p1 active, p2
+/// queued, then `cancel()` sweeps p2 into an orphan credit (`orphaned_uuids =
+/// ["p2"]`) and p1 settles `cancelled` at idle. Returns the machine with no
+/// active turn, one pending orphan credit, and p2's late result still expected.
+fn orphan_base() -> TurnMachine {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.enqueue(Turn::new("p2".into(), false));
+    let events = machine.cancel();
+    assert!(
+        settled_events(&events).contains(&("p2", StopReason::Cancelled)),
+        "cancel must sweep the queued turn p2"
+    );
+    let _ = machine.on_idle(); // p1 settles cancelled
+    assert!(!machine.has_active(), "no active turn after the idle");
+    machine
+}
+
+/// 11.T3 (INV-23) — a `still_queued` receipt reconciles the orphan count: a
+/// swept turn absent from `still_queued` was dropped by the interrupt and never
+/// emits a result, so its orphan credit is removed (an echo-less next turn's
+/// result is then NOT swallowed). A bare `{}` receipt (field absent) falls back
+/// to count-everything: the credit is retained and the late result is still
+/// absorbed (INV-23, `acp-agent.js:3608-3648`).
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_23_receipt_field_guard() {
+    // --- still_queued present, p2 dropped -> credit reconciled away ---
+    {
+        let mut machine = orphan_base();
+        machine.enqueue(Turn::new("p3".into(), true)); // echo-less next prompt
+                                                       // The interrupt receipt lists only p1 as still queued; p2 is absent,
+                                                       // so it was dropped and will never run.
+        machine.reconcile_orphan_receipt(Some(&["p1".to_string()]));
+        // p2's late result must now promote p3 (the credit is gone) rather than
+        // being absorbed by a stale skip.
+        let events = machine.on_result(&result_frame("success", false), false);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Activated { prompt_uuid } if prompt_uuid == "p3")),
+            "a reconciled (dropped) orphan must not swallow the next result"
+        );
+    }
+
+    // --- still_queued present, p2 STILL queued -> no drop, credit retained ---
+    {
+        let mut machine = orphan_base();
+        machine.enqueue(Turn::new("p3".into(), true));
+        machine.reconcile_orphan_receipt(Some(&["p1".to_string(), "p2".to_string()]));
+        // p2 is still queued and will run: the credit stays, so p2's late
+        // result is absorbed (p3 NOT activated).
+        let events = machine.on_result(&result_frame("success", false), false);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Activated { prompt_uuid } if prompt_uuid == "p3")),
+            "an orphan still queued must keep its credit (late result absorbed)"
+        );
+    }
+
+    // --- bare `{}` receipt (no still_queued field) -> count-everything ---
+    {
+        let mut machine = orphan_base();
+        machine.enqueue(Turn::new("p3".into(), true));
+        // `None` models a bare `{}` success (or a CLI resolving `undefined`):
+        // the field guard keeps count-everything, so the credit is retained and
+        // p2's late result is absorbed, never misread as "everything dropped".
+        machine.reconcile_orphan_receipt(None);
+        let events = machine.on_result(&result_frame("success", false), false);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Activated { prompt_uuid } if prompt_uuid == "p3")),
+            "a bare {{}} receipt must NOT read as all-dropped (credit retained)"
+        );
+    }
+}

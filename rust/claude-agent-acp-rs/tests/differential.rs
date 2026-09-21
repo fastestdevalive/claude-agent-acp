@@ -352,6 +352,14 @@ fn inv_24_cancel_queued_echo_less() {
     run_and_diff("cancel-queued-echo-less");
 }
 
+/// 11.T4 — cancel mid-turn (a `session/cancel` sent while a prompt is actively
+/// streaming) diffs clean against the Node fixture. The agent must interrupt
+/// the CLI and settle the prompt `cancelled` (INV-17 / INV-24).
+#[test]
+fn inv_24_cancel() {
+    run_and_diff("cancel-mid-turn");
+}
+
 /// 8.T11 — EOF mid-turn settles the active turn and rejects queued prompts
 /// with SESSION_ENDED_MESSAGE, then a later prompt rejects up front.
 #[test]
