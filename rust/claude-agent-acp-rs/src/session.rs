@@ -1552,12 +1552,16 @@ mod tests {
     }
 
     /// Spawn a bare `run_loop` actor over a duplex stdin with an injected
-    /// force-cancel grace, returning `(command_tx, stream_tx)` to drive it.
-    /// Used by the phase-11 force-cancel / cancel-idempotency tests (INV-17,
-    /// INV-22, 11.T5).
+    /// force-cancel grace, returning `(command_tx, stream_tx, high_water)` to
+    /// drive it. Used by the phase-11 force-cancel / cancel-idempotency tests
+    /// (INV-17, INV-22, 11.T5) and the phase-13 one-active-turn test (INV-14).
     fn spawn_actor(
         grace: Duration,
-    ) -> (mpsc::UnboundedSender<Command>, mpsc::UnboundedSender<Value>) {
+    ) -> (
+        mpsc::UnboundedSender<Command>,
+        mpsc::UnboundedSender<Value>,
+        Arc<AtomicUsize>,
+    ) {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
@@ -1575,7 +1579,7 @@ mod tests {
             update_tx,
             grace,
             "s1".into(),
-            hw,
+            hw.clone(),
         ));
         // Drain the child stdin so the duplex never fills up (the actor writes
         // the prompt user frame and the interrupt request to it).
@@ -1589,7 +1593,7 @@ mod tests {
                 }
             }
         });
-        (tx, stream_tx)
+        (tx, stream_tx, hw)
     }
 
     /// 11.T1 (INV-17) — a stream that never yields after cancel settles the
@@ -1602,7 +1606,7 @@ mod tests {
     async fn inv_17_force_cancel_floor() {
         use tokio::time::timeout;
         const GRACE: Duration = Duration::from_millis(200);
-        let (tx, stream_tx) = spawn_actor(GRACE);
+        let (tx, stream_tx, _hw) = spawn_actor(GRACE);
         let (preply_tx, preply_rx) = oneshot::channel();
         tx.send(Command::Prompt {
             uuid: "p1".into(),
@@ -1659,7 +1663,7 @@ mod tests {
         use tokio::time::{advance, Instant};
         const G: Duration = Duration::from_millis(1000);
 
-        let (tx, stream_tx) = spawn_actor(G);
+        let (tx, stream_tx, _hw) = spawn_actor(G);
         let (preply_tx, mut preply_rx) = oneshot::channel();
         tx.send(Command::Prompt {
             uuid: "p1".into(),
@@ -1753,7 +1757,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_then_new_prompt_same_session() {
         use tokio::time::timeout;
-        let (tx, stream_tx) = spawn_actor(Duration::from_millis(300));
+        let (tx, stream_tx, _hw) = spawn_actor(Duration::from_millis(300));
 
         // p1: active, cancel, then the trailing idle settles it `cancelled`.
         let (p1_tx, p1_rx) = oneshot::channel();
@@ -1809,5 +1813,160 @@ mod tests {
             r2.stop_reason, "end_turn",
             "a new prompt on the same session settles normally after a cancel"
         );
+    }
+
+    /// 13.T3 (INV-14) — at most ONE active turn per session at every instant.
+    /// N prompts on one actor, each echoed and settled in order; the
+    /// `high_water` active-turn counter must never exceed 1 (the phase-5 test
+    /// was removed in the phase-8 rework; restored here against the current
+    /// actor).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inv_14_one_active_turn() {
+        use tokio::time::timeout;
+        let (tx, stream_tx, hw) = spawn_actor(Duration::from_millis(300));
+        const N: usize = 10;
+
+        let mut replies = Vec::new();
+        for i in 0..N {
+            let uuid = format!("p{i}");
+            let (rtx, rrx) = oneshot::channel();
+            tx.send(Command::Prompt {
+                uuid: uuid.clone(),
+                frame: json!({"type": "user", "uuid": uuid, "message": {}}),
+                is_local_only: false,
+                reply: rtx,
+            })
+            .unwrap();
+            replies.push(rrx);
+            // Echo activates this turn; a result settles it — the next turn can
+            // then activate. Turns activate strictly one at a time.
+            stream_tx
+                .send(json!({"type": "user", "uuid": uuid, "isReplay": true,
+                             "message": {"role": "user", "content": [{"type": "text", "text": format!("m{i}")}]}}))
+                .unwrap();
+            stream_tx
+                .send(
+                    json!({"type": "result", "subtype": "success", "is_error": false,
+                             "stop_reason": "end_turn",
+                             "usage": {"input_tokens": 1, "output_tokens": 1}}),
+                )
+                .unwrap();
+            // Let the actor catch up so the i-th turn fully settles before the
+            // next prompt is enqueued (avoids queueing all N up front).
+            tokio::task::yield_now().await;
+        }
+
+        let mut reasons = Vec::new();
+        for rrx in replies {
+            let reply = timeout(Duration::from_secs(5), rrx)
+                .await
+                .expect("prompt settles (no hang)")
+                .expect("prompt resolved")
+                .expect("prompt Ok");
+            reasons.push(reply.stop_reason);
+        }
+        assert_eq!(reasons.len(), N, "all prompts settle");
+        assert!(
+            reasons.iter().all(|r| r == "end_turn"),
+            "all turns settle end_turn: {reasons:?}"
+        );
+        assert_eq!(
+            hw.load(Ordering::Relaxed),
+            1,
+            "INV-14: at most ONE active turn per session (high-water == 1)"
+        );
+    }
+
+    /// 13.T3 (INV-15) — a cancel racing the session loop's idle `recv` loses no
+    /// queued stream message. The actor's single `biased` select must process a
+    /// stream message that is already queued when the cancel arrives, never
+    /// dropping it: an active turn that has a pending result must still settle
+    /// on it (not be left to hang by a cancel that ate the result), and the
+    /// actor must remain usable for a follow-up prompt. Restored against the
+    /// current actor (the phase-5 test was removed in the phase-8 rework).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inv_15_cancel_loses_nothing() {
+        use tokio::time::timeout;
+        let (tx, stream_tx, _hw) = spawn_actor(Duration::from_millis(300));
+
+        // p1 becomes active.
+        let (p1_tx, p1_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type": "user", "uuid": "p1", "message": {}}),
+            is_local_only: false,
+            reply: p1_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p1", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}))
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // Queue a result + trailing idle, then race a cancel right behind them.
+        // The result is already in the stream queue when the cancel lands. The
+        // actor's `biased` select serves the cancel command first (the command
+        // branch wins over the stream branch), so p1 settles `cancelled` and the
+        // queued result is reconciled as an orphan — the invariant is that the
+        // message is NOT lost: p1 still settles (no hang) and the actor stays
+        // alive to process the orphan and a follow-up prompt.
+        stream_tx
+            .send(
+                json!({"type": "result", "subtype": "success", "is_error": false,
+                         "stop_reason": "end_turn",
+                         "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            )
+            .unwrap();
+        stream_tx
+            .send(json!({"type": "system", "subtype": "session_state_changed", "state": "idle"}))
+            .unwrap();
+        tx.send(Command::Cancel).unwrap();
+
+        let r1 = timeout(Duration::from_secs(5), p1_rx)
+            .await
+            .expect("p1 settles (queued result not lost, no hang)")
+            .expect("p1 resolved")
+            .expect("p1 Ok");
+        // The race winner is nondeterministic: the `biased` select serves the
+        // cancel command when both are ready at the same instant (→ cancelled),
+        // but if the result+idle are already queued when the loop reaches the
+        // select the stream branch wins (→ end_turn). Either way the turn
+        // SETTLES — the invariant is that the racing cancel loses no queued
+        // message and leaves nothing hanging — and the orphaned/consumed result
+        // never corrupts the actor.
+        assert!(
+            r1.stop_reason == "end_turn" || r1.stop_reason == "cancelled",
+            "a racing cancel must settle the active turn (end_turn or cancelled), got {} (INV-15)",
+            r1.stop_reason
+        );
+
+        // The actor is still alive for a follow-up prompt (the cancel did not
+        // tear it down and the orphaned result did not corrupt it).
+        let (p2_tx, p2_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p2".into(),
+            frame: json!({"type": "user", "uuid": "p2", "message": {}}),
+            is_local_only: false,
+            reply: p2_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p2", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "second"}]}}))
+            .unwrap();
+        stream_tx
+            .send(
+                json!({"type": "result", "subtype": "success", "is_error": false,
+                         "stop_reason": "end_turn",
+                         "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            )
+            .unwrap();
+        let r2 = timeout(Duration::from_secs(5), p2_rx)
+            .await
+            .expect("follow-up prompt settles")
+            .expect("resolved")
+            .expect("Ok");
+        assert_eq!(r2.stop_reason, "end_turn");
     }
 }

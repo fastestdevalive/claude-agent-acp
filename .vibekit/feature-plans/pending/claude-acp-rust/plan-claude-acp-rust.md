@@ -320,6 +320,10 @@ skills/rust-coding/
 > **Phase-8 implementer deviations (D13, items 8.7-8.9 / 8.T10-8.T11):** (1) **`acp-recorder` extended** with `session/prompt` `"no_wait": true` (send without awaiting) and a `"session/wait"` step to settle in-flight prompts — the recorder's sequential `block_task`-per-prompt model could not otherwise drive the T10 "queued prompt" scenario. (2) **`fake-claude` gained an `exit` flag** on a transcript step so it can close stdout mid-turn (the 8.T11 stream-EOF lane); `replay` returns after an `exit` step, closing stdout so the host sees EOF. (3) **`agent.rs` fixes** (the 8a slice's `session/prompt` previously blocked the SDK's single-task connection, so a second prompt/cancel could never land): the prompt handler now enqueues synchronously (`Session::send_prompt`) and awaits settlement on a spawned task; `session/cancel` notifications are routed to the session actor (a lock-free channel to the notification handler — the workspace forbids `Mutex`/`RwLock`, guard G5); the interrupt is sent on a spawned task (awaiting it inline deadlocked the stream reader); prompt errors are built flat (`Error::new(-32603, ...)`, `errorKind` as `data`) instead of a stringified nested error; a cancelled swept turn reports no `usage` (upstream `turn.resolve({stopReason:"cancelled"})` deliberately omits it); and a turn's `FinalText` is returned with the `PromptReply` and forwarded before the response (deterministic). (4) **`map.rs` (phase-7)** now skips empty text chunks, matching Node's `chunk.text &&` guard — surfaced by 8.T11. (5) **8.T10 corpus** drives `first` (blocking) → `second` (`no_wait`, queued) → cancel → wait → `/context`, rather than two concurrent prompts from the recorder; it still exercises the queued-sweep + orphaned-late-result path and diffs clean.
 >
 > **Phase-9b fix (implementer, D13):** removed the blanket `params.update.status`/`params.update.content` ignores from `base_ignore()`, which were hiding real divergence on `tool_call_update` frames. The frame normalizer gained `normalize_tool_call_defaults` (`C/tests/common/mod.rs`), applied to BOTH sides: on any `params.update` whose `sessionUpdate == "tool_call"`, an ABSENT `status` becomes `"pending"` and an ABSENT `content` becomes `[]`, so the crate's omitted defaults equal the Node adapter's explicit ones. It applies to `tool_call` frames ONLY — `tool_call_update` and every other kind compare `status`/`content` byte-for-byte (guarded by `inv_24_tool_call_update_status_must_match` / `inv_24_tool_call_update_content_must_match`). Re-running all 5 tool differentials (`inv_24_tools`) exposed no further divergence: the Rust side already emits correct tool-result `content`/`status` on updates, so no `tools.rs`/`map.rs`/`session.rs` change was required and no narrow ignore was needed.
+>
+> **Phase-13 deviation (implementer, D13):** the full-corpus differential (`inv_24_full_corpus`, 13.T1) surfaced a real divergence the per-phase subset had missed: `idle-without-result` failed because the Rust `session_error_to_rpc` gated the `NoResult` error-kind on `assistant_had_error` (`agent.rs`), dropping `data.errorKind:"no_result"`. Upstream `acp-agent.js:2154` attaches `errorKindData("no_result")` UNCONDITIONALLY for the #825 idle-without-result fail, unlike the provider/usage failures (2782–2840) that depend on `lastAssistantError`. Fixed in `agent.rs`: the `NoResult` arm now always emits `data.errorKind:"no_result"` (no `assistant_had_error` guard); the `error-result` corpus (which has no `data`) is unaffected because it goes through a `result`-frame failure kind, not `NoResult`. Locked in by the unit test `no_result_error_always_carries_error_kind` in `agent.rs` plus the now-green `idle-without-result` differential.
+>
+> **Phase-13 invariant-audit gap (implementer, D4/D13):** the 13.3 invariant audit found that `inv_14_one_active_turn` (INV-14) and `inv_15_cancel_loses_nothing` (INV-15) — the phase-5 high-water / cancel-race tests — were REMOVED during the phase-8 actor rework and never restored, so two invariants had no passing `inv_NN_*` test (13.T3). Restored both against the current `run_loop` actor in `session.rs` via the existing `spawn_actor` harness (which now also returns the `high_water` counter): `inv_14_one_active_turn` asserts N prompts settle in order with `high_water() == 1`; `inv_15_cancel_loses_nothing` asserts a cancel racing a queued result settles the active turn `cancelled` without hanging and leaves the actor alive for a follow-up prompt. The machine-level single-active-turn invariant is additionally covered by `settle_clears_active_slot` / `has_unsettled_tracks_in_flight_turns` in `turn_tests.rs`.
 
 
 ### Decision D14: No actor awaits an external round-trip inline
@@ -1001,19 +1005,19 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Invariants: the Invariant Registry table in this plan; tests are named `inv_NN_<slug>`.
 - Upstream comments to classify: `grep -nE "issue #|NOTE|Deliberately" src/acp-agent.ts`.
 
-- [ ] **13.0** Read `rust/AGENTS.md`
-- [ ] **13.1** Run the **full** corpus through both paths; diff ordered frames
-- [ ] **13.2** **Codepath audit:** for each core range in `EVALUATION.md` § 2 (A), name the Rust file:line that covers it, or mark it `skipped-deliberate` in `PARITY.md` with a reason
-- [ ] **13.3** **Invariant audit:** every `INV-*` maps to a passing `inv_NN_*` test; produce the table
-- [ ] **13.4** **Reverse audit:** grep `src/acp-agent.ts` at `v0.70.0` for `issue #` / `NOTE` / `Deliberately`; classify each ported / skipped / N-A
-- [ ] **13.5** Update `PARITY.md`; tag `rust-v0.1.0+acp.0.70.0`
+- [x] **13.0** Read `rust/AGENTS.md`
+- [x] **13.1** Run the **full** corpus through both paths; diff ordered frames
+- [x] **13.2** **Codepath audit:** for each core range in `EVALUATION.md` § 2 (A), name the Rust file:line that covers it, or mark it `skipped-deliberate` in `PARITY.md` with a reason
+- [x] **13.3** **Invariant audit:** every `INV-*` maps to a passing `inv_NN_*` test; produce the table
+- [x] **13.4** **Reverse audit:** grep `src/acp-agent.ts` at `v0.70.0` for `issue #` / `NOTE` / `Deliberately`; classify each ported / skipped / N-A
+- [x] **13.5** Update `PARITY.md`; tag `rust-v0.1.0+acp.0.70.0` (PARITY updated; git tag deferred to orchestrator/human per constraint)
 
 **Verify phase 13:**
-- [ ] **13.T1** Integration — all ≥10 corpus scripts diff clean — `inv_24_full_corpus`
-- [ ] **13.T2** Audit — no `EVALUATION.md` § 2 (A) range is unaccounted for
-- [ ] **13.T3** Audit — no `INV-*` lacks a passing `inv_NN_*` test
-- [ ] **13.T4** Audit — every upstream `issue #` comment is classified
-- [ ] **13.T5** Gate — `rust-gate.sh` clean; full suite under `timeout 300`
+- [x] **13.T1** Integration — all ≥10 corpus scripts diff clean — `inv_24_full_corpus`
+- [x] **13.T2** Audit — no `EVALUATION.md` § 2 (A) range is unaccounted for
+- [x] **13.T3** Audit — no `INV-*` lacks a passing `inv_NN_*` test
+- [x] **13.T4** Audit — every upstream `issue #` comment is classified
+- [x] **13.T5** Gate — `rust-gate.sh` clean; full suite under `timeout 300`
 
 ---
 

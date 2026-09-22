@@ -339,7 +339,12 @@ fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
                 ContextExhausted if *assistant_had_error => {
                     Some(json!({"errorKind": "context_exhausted"}))
                 }
-                NoResult if *assistant_had_error => Some(json!({"errorKind": "no_result"})),
+                // `NoResult` is the idle-without-result #825 fail
+                // (acp-agent.js:2154), which attaches `errorKindData("no_result")`
+                // UNCONDITIONALLY — unlike the provider/usage failures above it
+                // does not depend on `lastAssistantError` (phase-13 audit of
+                // `idle-without-result`).
+                NoResult => Some(json!({"errorKind": "no_result"})),
                 _ => None,
             };
             let message = if *kind == AuthRequired {
@@ -818,6 +823,31 @@ mod tests {
         let argv = crate::process::build_argv(&spawn);
         assert_eq!(resume_from_argv(&argv), Some("sess-id"));
         assert!(session_id_from_argv(&argv).is_none());
+    }
+
+    /// 13.T1 companion — the idle-without-result (`NoResult`) failure always
+    /// carries `data.errorKind:"no_result"` on the wire, regardless of whether
+    /// the assistant frame carried an `error` (acp-agent.js:2154 attaches
+    /// `errorKindData("no_result")` unconditionally). Phase-13 audit found the
+    /// old `NoResult if assistant_had_error` guard dropped it.
+    #[test]
+    fn no_result_error_always_carries_error_kind() {
+        use crate::turn::FailureKind;
+        let err = SessionError::PromptFailed {
+            kind: FailureKind::NoResult,
+            message: crate::turn::TURN_NO_RESULT_MESSAGE.to_string(),
+            assistant_had_error: false,
+        };
+        let (_msg, data) = session_error_to_rpc(&err);
+        let kind = data
+            .as_ref()
+            .and_then(|d| d.get("errorKind"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(
+            kind,
+            Some("no_result"),
+            "idle-without-result must attach errorKind no_result even with no assistant error: {data:?}"
+        );
     }
 
     /// 12.T1 — `_session/steering` outcome decisions (R32 / B1):

@@ -276,6 +276,39 @@ fn inv_24_tools() {
     }
 }
 
+/// The full corpus: every `.acp.json` script under `porting/corpus/`. Phase 13
+/// (13.T1) requires ALL of them to diff clean against the committed Node
+/// fixtures, not just the subset each earlier phase exercised.
+fn all_corpus_names() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(repo_root().join("porting/corpus"))
+        .expect("read corpus dir")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".acp.json").map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    assert!(
+        names.len() >= 10,
+        "corpus must have at least 10 scripts, found {}",
+        names.len()
+    );
+    names
+}
+
+/// 13.T1 — the FULL corpus diffs clean: every script in `porting/corpus/` is
+/// run through the Rust binary against the fake-claude transcript and its
+/// ordered frames are diffed against the committed Node fixture (which is the
+/// Node path's output). This is the whole-corpus, both-paths frame-equality
+/// check (INV-24, REQ-2).
+#[test]
+fn inv_24_full_corpus() {
+    for name in all_corpus_names() {
+        run_and_diff(&name);
+    }
+}
+
 /// Run the Rust binary against `name`'s corpus script via the recorder +
 /// fake-claude, and diff the captured frames against the committed Node
 /// fixture. Missing binaries fail loudly (8.6). `#[ignore]`-able per-corpus.
