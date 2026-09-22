@@ -12,6 +12,14 @@ use common::{
 };
 use serde_json::json;
 
+/// Per-call unique temp-dir suffix. `inv_24_full_corpus` and the per-corpus
+/// `inv_24_*` tests share the same `{name}` (e.g. `text-only`, `resume-load`)
+/// and the same process id, so `{pid}`-only temp dirs collide when those tests
+/// run concurrently in one binary — one test's `remove_dir_all` deletes another's
+/// `out.jsonl` mid-read (flaky NotFound). A monotonic per-binary counter keeps
+/// each `run_and_diff` call's scratch dir disjoint.
+static NEXT_DIFF_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 1.T1 — the differ is order-sensitive: two frames swapped fails; the same
 /// set in order passes.
 #[test]
@@ -328,7 +336,11 @@ fn run_and_diff_with(name: &str, ignore: &[JsonPath]) {
     assert!(transcript.exists(), "missing transcript {transcript:?}");
     assert!(fixture.exists(), "missing fixture {fixture:?}");
 
-    let tmp = std::env::temp_dir().join(format!("acp-diff-{name}-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!(
+        "acp-diff-{name}-{}-{}",
+        std::process::id(),
+        NEXT_DIFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp dir");
     let out = tmp.join("out.jsonl");

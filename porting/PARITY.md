@@ -57,7 +57,7 @@ the upstream range, or `pending`/`skipped-deliberate`. `C` = `rust/claude-agent-
 | Discarded `SessionUpdate` variants (`SessionInfoUpdate`, `ConfigOptionUpdate`, `UsageUpdate`) | skipped-deliberate | ignored in the differential; vibe-station discards them (`normalize.rs:471-473`) |
 | `session/load` history replay via SDK `getSessionMessages` | skipped-deliberate | D15 — resume only via `--resume=<id>`; vibe-station backfills history itself |
 | `suppressControlResponse` (SDK-internal JS symbol) | skipped-deliberate | D6 — the port has no handler that declines to answer |
-| `cwd` validation on `session/new`/`load` (issue #749, `dist:4676-4702`) | pending | not ported — the crate uses the request `cwd` as-is without the absolute-path/existence check |
+| `cwd` validation on `session/new`/`load` (issue #749, `dist:4676-4702`) | ported | `C/agent.rs` `validate_cwd` (+ `session/new`/`session/load` calls); `inv_validate_cwd_*` (`C/agent.rs`), `inv_cwd_validation_on_session_new_wire` (`C/tests/agent.rs`) |
 
 ## Phase 13 — pending omissions (recorded honestly, per orchestrator)
 
@@ -74,7 +74,7 @@ none is exercised by the synthetic corpus:
 | `suppressControlResponse` | SDK JS symbol | pending (skipped-deliberate by D6) | no handler that declines to answer |
 | Grandchildren of a SIGKILLed host | Risk 17 | pending | INV-28 covers `claude` only; MCP/Bash children share the process group, out of scope for v0.1 |
 | 150 ms `sleep_ms` pacing | fixture transcripts | pending | timing-based stabiliser for the permission fixtures, not an ordering step (`fake-claude`) |
-| `cwd` validation (issue #749) | `dist:4676-4702` | pending | absolute-path/existence check not ported (above) |
+| `cwd` validation (issue #749) | `dist:4676-4702` | ported | `validate_cwd` in `C/agent.rs` (see above) |
 | fs passthrough (`fs/*` agent→client) | `dist:4002-4016` | pending | not ported (above) |
 
 ## Phase 13 — corpus provenance (13.1)
@@ -93,7 +93,7 @@ This is a known open item (2.3 / orchestrator constraint), not a failure of 13.T
 | issue #453 (result-text fallback) | 694, 2474, 3950 | ported — `inv_29_result_text_fallback` (`C/turn/turn_tests.rs:103`) |
 | issue #596 (usage-window cache across restart) | 6714 | skipped-deliberate — model/usage resolution (B section) |
 | issue #680 (wedged-consumer force-cancel) | 566, 2217, 2755, 4858 | ported — `inv_17_force_cancel_floor` (`C/session.rs:1606`) |
-| issue #749 (cwd validation) | 6192 | pending — not ported (above) |
+| issue #749 (cwd validation) | 6192 | ported — `validate_cwd` (`C/agent.rs`) |
 | issue #773 (result settles non-subagent turn) | 3143 | ported — `settle_clears_active_slot`, `result_for_active_turn_while_queued_settles_active` (`C/turn/turn_tests.rs`) |
 | issue #825 (idle without result) | 2141–2153 etc. (10 refs) | ported — `inv_31_idle_without_result_fails` (`C/turn/turn_tests.rs:203`); NoResult `errorKind` fixed in 13.1 |
 | issue #844 (cancelled-turn usage) | 3169, 4805 | ported — `held_cancel_reports_deferred_usage` (`C/turn/turn_tests.rs:1018`) |
@@ -110,3 +110,22 @@ This is a known open item (2.3 / orchestrator constraint), not a failure of 13.T
 | Deliberately (does NOT abort `session.abortController`) | 4935 | ported — teardown via transport EOF / runtime drop (12.2) |
 | Deliberately (non-subagent background → false) | 655 | ported — subagent attribution `C/session.rs:461, 873-950` |
 | Deliberately (NOT reset on turn activation) / (user wants to know) | 705, 7116 | skipped-deliberate — model/context resolution (B section) |
+
+## Verification pass (verify-01, sonnet, 2026-09-22) — findings recorded, not fixed
+
+| # | Finding | Evidence | Disposition |
+|---|---------|----------|-------------|
+| 1 | On a client-side malformed JSON-RPC line (ACP client → our binary's stdin — NOT the `claude` child's stdout, which INV-1 already covers silently), the response echoes the raw offending line in `error.data.line` | `agent-client-protocol-2.1.0/src/util.rs:18-24,66-67` (pinned third-party crate, not our code) | Accepted — behavior of the pinned `agent-client-protocol` dependency (D9's exact-version pin), out of scope to patch; not part of the Node-adapter wire-parity contract (that covers only the `claude` subprocess protocol) |
+| 2 | The public API has no explicit `shutdown()`/`dispose()` — closing/dropping the caller's `Channel::duplex()` end is the documented-in-comments-only shutdown signal for `serve()` | `C/src/agent.rs:376` | Accepted for v0.1; flag for the vibe-station-side follow-up plan (`acp_connection.rs` integration) so the "drop the Channel end to stop" contract is stated in that plan too |
+| 3 | `text-only`, `single-tool`, `cancel-mid-turn` fixtures were re-captured against a freshly built real Node adapter and diff byte-identical to the committed fixtures | verify-01-report.md item 4 | 3 of 16 corpus scripts are now confirmed real-Node-recorded, not merely hand-authored; the other 13 still need `porting/record-real.sh` before a full parity claim |
+| 4 | Full-parent-env inheritance to the spawned `claude` (matching Node's `{ ...process.env, ...providerEnv }`, `acp-agent.js:4851`) is empirically confirmed, not just inferred from the absence of `.env_clear()` | `process.rs:440-447`; verify-01-report.md item 6 (custom env var observed reaching the child) | Confirmed working — no action |
+
+## Phase 14 — ported + investigated-not-ported (orchestrator-verified items 1-5)
+
+| Item | Upstream | Status | Evidence / reason |
+| --- | --- | --- | --- |
+| `cwd` validation (#749) | `dist:4676-4702` | **ported** | `validate_cwd` + `session/new`/`session/load` calls (`C/agent.rs`); `inv_validate_cwd_rejects_relative_and_missing`, `inv_validate_cwd_accepts_absent_and_existing_dir` (`C/agent.rs`), `inv_cwd_validation_on_session_new_wire` (`C/tests/agent.rs`) |
+| fs passthrough (`readTextFile`/`writeTextFile`) | `dist:4002-4016` | not ported — **upstream unwired dead code** | agent methods forward `fs/read_text_file`/`fs/write_text_file` to the client, but have ZERO call sites and are never registered as ACP request handlers (`runAcp` has no `agent/fs` method; ACP protocol has no `agent/fs/*` namespace). `canUseTool` never invokes them — file tools run natively in the `claude` CLI; the adapter only forwards the permission ask (`session/request_permission`). The crate's permission-only handling already matches the live adapter; porting would invent an un-triggered feature |
+| `msg_lifecycle_v1` / command-lifecycle orphan map | `acp-agent.js:2499` NOTE | not ported — **STOP per plan (risky)** | replacing the coarse `pending_orphan_results` count with the per-uuid `orphanCommands` map requires (a) processing `command_lifecycle` stream frames (CLI 2.1.206+), which neither the crate nor its synthetic corpus produces, and (b) rewriting the review-04/05-verified orphan/reconcile/activate semantics (INV-23/30). Marked not done per plan's explicit "STOP rather than guess" instruction |
+| `endedPerLevel` sweep at activation | `acp-agent.js:1366-1390` | not ported — **STOP per plan (risky)** | requires (a) processing `background_tasks_changed` frames the crate/corpus never produce and (b) an `ended_per_level` field + two-phase sweep inside `activate`, touching the phase-6/04-05-verified live_subagents semantics. Same risk class as item 3 |
+| Steering settlement lanes (`steeredEchoes`/`steeredSettle`) | `acp-agent.js` steering | not ported — **not additive** | investigation shows the lanes are NOT additive: they thread through the core turn machine at 5 interleaved points (result settle `settleOrDefer`, idle settle 2120-2140, move-on hand-off, trailing-idle `owedTrailingIdles` exclusions, cancel orphan-seeding). Porting means the same core-machine surgery the plan cautions against; deferred |

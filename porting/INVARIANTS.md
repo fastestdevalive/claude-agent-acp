@@ -12,10 +12,10 @@ tests (see "Evidence" below). `C` = `rust/claude-agent-acp-rs`.
 
 ```
 timeout 300 cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs   # lib + all integration binaries
-  -> test result: ok. 77 passed   (lib, includes the inv_* unit tests)
+  -> test result: ok. 79 passed   (lib, includes the inv_* unit tests)
   -> test result: ok. 17 passed   (tests/differential.rs, incl. inv_24_full_corpus)
   -> test result: ok.  5 passed   (tests/process_transport.rs)
-  -> test result: ok.  5 passed   (tests/agent.rs)
+  -> test result: ok.  6 passed   (tests/agent.rs)
   -> test result: ok.  3 passed   (tests/control_transport.rs, transport_parity.rs, shutdown.rs, recorder.rs)
 timeout 800 bash rust/scripts/rust-gate.sh                                        # full gate (13.T5)
   -> gate OK (fmt, clippy, build, test, cross-target x86_64-pc-windows-gnu + aarch64-apple-darwin, G9, G10)
@@ -58,6 +58,7 @@ timeout 800 bash rust/scripts/rust-gate.sh                                      
 | INV-31 | #825: `session_state_changed` idle without a `result` fails the active turn instead of hanging | `inv_31_idle_without_result_fails` | `C/src/turn/turn_tests.rs:203` | PASS |
 | INV-32 | Codec cancel-safety: `select!` only awaits `recv()` on an `mpsc` fed by the codec task | `inv_32_codec_cancel_safe` | `C/src/codec.rs:204` | PASS |
 | INV-33 | `tokio::sync::broadcast` is not used in `src/` (clippy ban, G5) | gate-proven by 0.T4 selftest-gate (no test fn) | `rust/clippy.toml`, `rust/scripts/selftest-gate.sh` | PASS (G5/0.T4) |
+| INV-34 | #749: a relative / nonexistent / non-directory `cwd` on `session/new`/`session/load` returns `invalidParams` (-32602) with the adapter's message + `data:{cwd}`, before any spawn; an absent `cwd` (or an existing absolute dir) is accepted | `inv_validate_cwd_rejects_relative_and_missing`, `inv_validate_cwd_accepts_absent_and_existing_dir` | `C/src/agent.rs` | PASS |
 
 ## Findings resolved in phase 13
 

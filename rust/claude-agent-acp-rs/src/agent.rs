@@ -439,6 +439,41 @@ struct Registry {
     session_tx: mpsc::UnboundedSender<(String, Session)>,
 }
 
+/// Validate a `session/new` / `session/load` `cwd` exactly as the adapter's
+/// `validateCwd` (`acp-agent.js:4681-4695`, issue #749): it must be an absolute
+/// path to an existing directory, else `invalidParams` (-32602) with the
+/// adapter's message and `data:{cwd}` so a client can surface it instead of
+/// failing later with an opaque SDK launch error. A `cwd` absent from the
+/// request is accepted — the crate falls back to `default_cwd`/process cwd, as
+/// the adapter's `createSession` does with `serve.options.default_cwd`.
+fn validate_cwd(cwd: Option<&str>) -> Result<(), Error> {
+    let Some(cwd) = cwd else { return Ok(()) };
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() {
+        return Err(Error::new(
+            -32602,
+            format!("`cwd` must be an absolute path, but received: {cwd}"),
+        )
+        .data(json!({ "cwd": cwd })));
+    }
+    // A single `stat` is a fast syscall, not "large-file I/O"; inline is fine
+    // (rust-coding §4 concerns whole-file blocking reads).
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Err(Error::new(
+            -32602,
+            format!("`cwd` does not exist on the machine running the agent: {cwd}"),
+        )
+        .data(json!({ "cwd": cwd })));
+    };
+    if !meta.is_dir() {
+        return Err(
+            Error::new(-32602, format!("`cwd` is not a directory: {cwd}"))
+                .data(json!({ "cwd": cwd })),
+        );
+    }
+    Ok(())
+}
+
 /// Register a new session: keep its handle in the registry, publish it to the
 /// notification handler (lock-free), and spawn a task that forwards its updates
 /// to the client as they arrive. The actor emits a `FinalText` chunk before
@@ -513,8 +548,12 @@ async fn handle_request(
             responder.respond(initialize_response())
         }
         "session/new" => {
+            let cwd_str = params.get("cwd").and_then(Value::as_str);
+            if let Err(e) = validate_cwd(cwd_str) {
+                return responder.respond_with_error(e);
+            }
             let session_id = uuid_v4();
-            let cwd = params.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+            let cwd = cwd_str.map(PathBuf::from);
             let (model, permission_mode) = options_from_meta(&params);
             let spawn =
                 session_spawn_options(opts, cwd, session_id.clone(), model, permission_mode);
@@ -539,7 +578,11 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let cwd = params.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+            let cwd_str = params.get("cwd").and_then(Value::as_str);
+            if let Err(e) = validate_cwd(cwd_str) {
+                return responder.respond_with_error(e);
+            }
+            let cwd = cwd_str.map(PathBuf::from);
             let (model, permission_mode) = options_from_meta(&params);
             let mut spawn =
                 session_spawn_options(opts, cwd, session_id.clone(), model, permission_mode);
@@ -825,7 +868,50 @@ mod tests {
         assert!(session_id_from_argv(&argv).is_none());
     }
 
-    /// 13.T1 companion — the idle-without-result (`NoResult`) failure always
+    /// Phase 14 — `validate_cwd` (issue #749, `acp-agent.js:4681-4695`): a
+    /// relative path, a nonexistent path, and a non-directory all yield
+    /// `invalidParams` (-32602) with the adapter's message and `data:{cwd}`.
+    #[test]
+    fn inv_validate_cwd_rejects_relative_and_missing() {
+        let err = validate_cwd(Some("relative/dir")).expect_err("relative must be rejected");
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["code"], -32602);
+        assert_eq!(
+            v["message"],
+            "`cwd` must be an absolute path, but received: relative/dir"
+        );
+        assert_eq!(v["data"]["cwd"], "relative/dir");
+
+        let missing =
+            std::env::temp_dir().join(format!("definitely-missing-cwd-{}", std::process::id()));
+        let missing_str = missing.to_string_lossy().into_owned();
+        let err = validate_cwd(Some(&missing_str)).expect_err("missing must be rejected");
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["code"], -32602);
+        assert!(v["message"].as_str().unwrap().contains("does not exist"));
+        assert_eq!(v["data"]["cwd"], missing_str);
+
+        // A non-directory (a file) must be rejected as "not a directory".
+        let file = std::env::temp_dir().join(format!("cwd-file-{}.txt", std::process::id()));
+        std::fs::write(&file, "x").expect("write temp file");
+        let file_str = file.to_string_lossy().into_owned();
+        let err = validate_cwd(Some(&file_str)).expect_err("a file is not a directory");
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["code"], -32602);
+        assert!(v["message"].as_str().unwrap().contains("not a directory"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn inv_validate_cwd_accepts_absent_and_existing_dir() {
+        // Absent cwd is accepted (the crate falls back to default_cwd/process cwd).
+        assert!(validate_cwd(None).is_ok());
+        // An existing absolute directory is accepted.
+        let dir = std::env::current_dir().unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        assert!(validate_cwd(Some(&dir_str)).is_ok());
+    }
+
     /// carries `data.errorKind:"no_result"` on the wire, regardless of whether
     /// the assistant frame carried an `error` (acp-agent.js:2154 attaches
     /// `errorKindData("no_result")` unconditionally). Phase-13 audit found the

@@ -371,6 +371,60 @@ async fn inv_steering_end_to_end() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Phase 14 — `session/new` with a relative `cwd` and with a nonexistent `cwd`
+/// returns `invalidParams` (-32602) on the wire with the adapter's message and
+/// `data:{cwd}`, before any spawn happens (issue #749).
+#[tokio::test]
+async fn inv_cwd_validation_on_session_new_wire() {
+    let opts = ServeOptions::default();
+    let (agent_channel, client_channel) = Channel::duplex();
+    let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
+    let missing = std::env::temp_dir().join(format!("cwd-missing-{}", std::process::id()));
+    let missing_str = missing.to_string_lossy().into_owned();
+    let result = Client
+        .builder()
+        .connect_with(
+            client_channel,
+            move |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                // Relative cwd -> invalidParams with the absolute-path message.
+                let resp = connection
+                    .send_request(UntypedMessage::new(
+                        "session/new",
+                        json!({ "cwd": "relative/dir" }),
+                    )?)
+                    .block_task()
+                    .await;
+                let err = resp.expect_err("relative cwd must be rejected");
+                let v = serde_json::to_value(&err).unwrap();
+                assert_eq!(v["code"], -32602);
+                assert_eq!(
+                    v["message"],
+                    "`cwd` must be an absolute path, but received: relative/dir"
+                );
+                assert_eq!(v["data"]["cwd"], "relative/dir");
+
+                // Nonexistent absolute cwd -> invalidParams with the not-exist message.
+                let resp = connection
+                    .send_request(UntypedMessage::new(
+                        "session/new",
+                        json!({ "cwd": missing_str }),
+                    )?)
+                    .block_task()
+                    .await;
+                let err = resp.expect_err("missing cwd must be rejected");
+                let v = serde_json::to_value(&err).unwrap();
+                assert_eq!(v["code"], -32602);
+                assert!(v["message"].as_str().unwrap().contains("does not exist"));
+                assert_eq!(v["data"]["cwd"], missing_str);
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "cwd-validation drive resolves");
+    drop(result);
+    let _ = timeout(Duration::from_secs(5), serve_task).await;
+}
+
 /// 8.T4 — nothing but JSON-RPC frames ever reaches stdout: a stray `println!`
 /// on the binary's stdout would surface as a non-JSON line. Spawn the real
 /// binary over stdio, send an `initialize` request, close stdin, and assert
