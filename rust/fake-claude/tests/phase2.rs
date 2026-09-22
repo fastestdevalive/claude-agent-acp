@@ -16,33 +16,65 @@ fn repo_root() -> PathBuf {
         .expect("repo root resolves")
 }
 
+/// A fresh temp output dir for one capture run (never the committed fixtures dir).
+fn tmp_capture_dir(run: u32) -> PathBuf {
+    let tmp = std::env::temp_dir().join(format!(
+        "acp-capture-determinism-{run}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp capture dir");
+    tmp
+}
+
 /// 2.T1 — `capture.sh` run twice yields byte-identical `text-only.frames.jsonl`.
 ///
 /// The normalised frames carry no volatile data (ids/uuids/timestamps are
 /// replaced by placeholders), so a second capture must be byte-for-byte equal.
+/// Each run captures into a FRESH temp dir (never the committed `porting/fixtures`)
+/// so the test cannot clobber fixtures another test binary is reading in parallel;
+/// the two fresh outputs are compared to each other AND to the committed fixture,
+/// which is read only.
 #[test]
 fn capture_is_deterministic_across_runs() {
     let root = repo_root();
-    let fixture = root.join("porting/fixtures/text-only.frames.jsonl");
+    let committed = root.join("porting/fixtures/text-only.frames.jsonl");
+    let committed_text =
+        std::fs::read_to_string(&committed).expect("committed text-only fixture exists");
 
-    let first = std::fs::read_to_string(&fixture).expect("first text-only fixture exists");
+    let first_dir = tmp_capture_dir(1);
+    let second_dir = tmp_capture_dir(2);
 
-    let status = Command::new("bash")
-        .arg("porting/capture.sh")
-        .arg("text-only")
-        .current_dir(&root)
-        .status()
-        .expect("spawn capture.sh");
-    assert!(
-        status.success(),
-        "capture.sh text-only must exit 0 (is Node + the fake built?)"
-    );
+    for dir in [&first_dir, &second_dir] {
+        let status = Command::new("bash")
+            .arg("porting/capture.sh")
+            .arg("text-only")
+            .env("CAPTURE_OUT_DIR", dir)
+            .current_dir(&root)
+            .status()
+            .expect("spawn capture.sh");
+        assert!(
+            status.success(),
+            "capture.sh text-only must exit 0 (is Node + the fake built?)"
+        );
+    }
 
-    let second = std::fs::read_to_string(&fixture).expect("second text-only fixture exists");
+    let first_text =
+        std::fs::read_to_string(first_dir.join("text-only.frames.jsonl")).expect("first capture");
+    let second_text =
+        std::fs::read_to_string(second_dir.join("text-only.frames.jsonl")).expect("second capture");
+
     assert_eq!(
-        first, second,
-        "capture.sh run twice must yield byte-identical normalised frames (2.T1)"
+        first_text, second_text,
+        "capture.sh run twice into fresh dirs must be byte-identical (2.T1)"
     );
+    assert_eq!(
+        first_text, committed_text,
+        "captured text-only.frames.jsonl must equal the committed fixture (read-only) (2.T1)"
+    );
+
+    let _ = std::fs::remove_dir_all(&first_dir);
+    let _ = std::fs::remove_dir_all(&second_dir);
 }
 
 /// 2.T4 — the union of `porting/fixtures/*.argv.json` covers every exercised

@@ -20,10 +20,20 @@
 #   so the committed fixtures are byte-stable across machines (2.T1).
 #
 # Usage: capture.sh [name ...]   — names default to every corpus transcript.
+#
+# Output directory override: every file this script writes (*.frames.jsonl,
+# *.argv.json, initialize.json, and the intermediate/temp *.raw files) goes to
+# $CAPTURE_OUT_DIR when set, otherwise to porting/fixtures. This lets tests
+# capture into a fresh temp dir without ever writing to the committed fixture
+# directory (2.T1). The default (unset) output directory is byte-identical to
+# the pre-override behaviour.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+OUT_DIR="${CAPTURE_OUT_DIR:-$ROOT/porting/fixtures}"
+mkdir -p "$OUT_DIR"
 
 FAKE="$ROOT/rust/target/debug/fake-claude"
 RECORDER="$ROOT/rust/target/debug/acp-recorder"
@@ -148,9 +158,9 @@ normalize_object() {
 for name in "${names[@]}"; do
   transcript="$ROOT/porting/corpus/$name.transcript.jsonl"
   script="$ROOT/porting/corpus/$name.acp.json"
-  frames="$ROOT/porting/fixtures/$name.frames.jsonl"
-  argv="$ROOT/porting/fixtures/$name.argv.json"
-  init="$ROOT/porting/fixtures/initialize.json"
+  frames="$OUT_DIR/$name.frames.jsonl"
+  argv="$OUT_DIR/$name.argv.json"
+  init="$OUT_DIR/initialize.json"
   raw="$frames.raw"
   argv_raw="$argv.raw"
   init_raw="$init.raw"
