@@ -16,14 +16,13 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_client_protocol::schema::v1::{
-    AvailableCommandsUpdate, SessionNotification, SessionUpdate, StopReason,
-};
+use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, StopReason};
 use agent_client_protocol::{Agent, ConnectTo, ConnectionTo, Error, Result, UntypedMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::control::InitializeOptions;
+use crate::map;
 use crate::process::{SpawnOptions, Timings};
 use crate::session::{Session, SessionError, SessionOptions, SessionOutbound};
 
@@ -561,12 +560,22 @@ async fn handle_request(
                 SessionOptions::new(spawn, opts.timings.clone(), InitializeOptions::default());
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
+                    // Phase 15 (Item 1): upstream sends a proactive
+                    // `available_commands_update` with the REAL command list right
+                    // after session/new / session/load
+                    // (`sendAvailableCommandsUpdate` → `supportedCommands()`),
+                    // because a plain session may never emit a `commands_changed`
+                    // system frame. Build it from the initialize handshake's
+                    // `commands` (a fresh session has no terminal slash commands).
+                    let commands = session.commands().to_vec();
                     register_session(registry, &session_id, session, update_rx, &connection);
                     responder.respond(session_response(&session_id))?;
-                    // Upstream emits an empty available_commands_update right
-                    // after session/new / session/load via setTimeout (parity);
-                    // it lands after the response.
-                    let _ = connection.send_notification(empty_commands_update(&session_id));
+                    let update = map::map_commands_changed(&json!(commands), &json!([]));
+                    let notif = SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AvailableCommandsUpdate(update),
+                    );
+                    let _ = connection.send_notification(notif);
                     Ok(())
                 }
                 Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
@@ -592,12 +601,22 @@ async fn handle_request(
                 SessionOptions::new(spawn, opts.timings.clone(), InitializeOptions::default());
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
+                    // Phase 15 (Item 1): upstream sends a proactive
+                    // `available_commands_update` with the REAL command list right
+                    // after session/new / session/load
+                    // (`sendAvailableCommandsUpdate` → `supportedCommands()`),
+                    // because a plain session may never emit a `commands_changed`
+                    // system frame. Build it from the initialize handshake's
+                    // `commands` (a fresh session has no terminal slash commands).
+                    let commands = session.commands().to_vec();
                     register_session(registry, &session_id, session, update_rx, &connection);
                     responder.respond(session_response(&session_id))?;
-                    // Upstream emits an empty available_commands_update right
-                    // after session/new / session/load via setTimeout (parity);
-                    // it lands after the response.
-                    let _ = connection.send_notification(empty_commands_update(&session_id));
+                    let update = map::map_commands_changed(&json!(commands), &json!([]));
+                    let notif = SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AvailableCommandsUpdate(update),
+                    );
+                    let _ = connection.send_notification(notif);
                     Ok(())
                 }
                 Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
@@ -746,14 +765,6 @@ async fn handle_request(
     }
 }
 
-/// An empty `available_commands_update` notification (upstream emits one after
-/// `session/new` / `session/load`).
-fn empty_commands_update(session_id: &str) -> SessionNotification {
-    SessionNotification::new(
-        session_id.to_string(),
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![])),
-    )
-}
 /// A `--session-id`/`--resume` argv assertion helper (unit tests).
 pub fn session_id_from_argv(argv: &[String]) -> Option<&str> {
     argv.iter().find_map(|a| a.strip_prefix("--session-id="))

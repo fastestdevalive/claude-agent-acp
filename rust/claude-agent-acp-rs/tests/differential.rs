@@ -369,6 +369,59 @@ fn inv_24_text_only() {
     run_and_diff("resume-load");
 }
 
+/// Phase 15 (Item 1) — a `session/new` against fake-claude emits a PROACTIVE
+/// `available_commands_update` carrying the REAL command list (from the
+/// initialize response's `commands`) right after session/new, WITHOUT any
+/// `commands_changed` frame. Diffs the Rust output against the Node fixture
+/// (Node's `sendAvailableCommandsUpdate` reads the same initialize `commands`
+/// via `supportedCommands()`), and additionally asserts the update is non-empty
+/// on the wire.
+#[test]
+fn inv_24_commands_proactive() {
+    let root = repo_root();
+    let script = root.join("porting/corpus/commands-proactive.acp.json");
+    let transcript = root.join("porting/corpus/commands-proactive.transcript.jsonl");
+    let fixture = root.join("porting/fixtures/commands-proactive.frames.jsonl");
+    let tmp = std::env::temp_dir().join(format!(
+        "acp-diff-commands-proactive-{}-{}",
+        std::process::id(),
+        NEXT_DIFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let out = tmp.join("out.jsonl");
+
+    let agent_cmd = rust_agent_binary();
+    let frames = run_recorder(&agent_cmd.to_string_lossy(), &script, &transcript, &out);
+    let frames = normalize_root_paths(frames, &root);
+    let expected = parse_fixture_frames(&fixture);
+    if let Err(diff) = diff_frames(&frames, &expected, &differential_ignore()) {
+        panic!("commands-proactive differential failed:\n{diff}");
+    }
+
+    // The wire must carry a non-empty available_commands_update emitted
+    // proactively after session/new, without a commands_changed frame.
+    let mut saw_non_empty = false;
+    for frame in &frames {
+        if frame.json["method"] == "session/update" {
+            let u = &frame.json["params"]["update"];
+            if u["sessionUpdate"] == "available_commands_update" {
+                let cmds = u["availableCommands"].as_array().expect("array");
+                assert!(
+                    !cmds.is_empty(),
+                    "available_commands_update must carry a non-empty availableCommands"
+                );
+                saw_non_empty = true;
+            }
+        }
+    }
+    assert!(
+        saw_non_empty,
+        "a proactive non-empty available_commands_update must be emitted after session/new"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// 8.T7 — lagging trailing idle after the next echo is absorbed, not a false
 /// #825 fail.
 #[test]

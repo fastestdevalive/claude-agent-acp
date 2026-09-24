@@ -1049,6 +1049,61 @@ async fn held_cancel_reports_deferred_usage() {
     );
 }
 
+/// Phase 15 (Item 2) — an ACTIVE turn cancelled before any tokens accumulate
+/// still reports a zero `usage` object (`had_usage: true`): upstream always
+/// settles an active turn via `settleActive({ ..., usage: sessionUsage(session)
+/// })`, present even when genuinely all-zero. The origin is the settle PATH,
+/// not the numeric usage value.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_active_turn_with_no_tokens_reports_zero_usage() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    // Cancel while active with NO accumulated tokens (no result was ever
+    // recorded); the turn settles `cancelled` at the trailing idle.
+    machine.cancel();
+    let events = machine.on_idle();
+    let settled = events.iter().find_map(|e| match e {
+        TurnEvent::Settled {
+            prompt_uuid,
+            usage,
+            had_usage,
+            ..
+        } if prompt_uuid == "pA" => Some((*usage, *had_usage)),
+        _ => None,
+    });
+    assert_eq!(
+        settled,
+        Some((Usage::default(), true)),
+        "an active turn cancelled before any tokens accumulate must still report an (all-zero) usage object"
+    );
+}
+
+/// Phase 15 (Item 2) — a turn swept from the QUEUE by `cancel()` never ran, so
+/// it reports no `usage` (`had_usage: false`), matching upstream
+/// `turn.resolve({ stopReason: "cancelled" })`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_queued_sweep_reports_no_usage() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    machine.enqueue(Turn::new("pB".into(), false));
+    let events = machine.cancel();
+    let settled = events.iter().find_map(|e| match e {
+        TurnEvent::Settled {
+            prompt_uuid,
+            had_usage,
+            ..
+        } if prompt_uuid == "pB" => Some(*had_usage),
+        _ => None,
+    });
+    assert_eq!(
+        settled,
+        Some(false),
+        "a queued turn swept by cancel never ran, so it must report no usage"
+    );
+}
+
 /// Set up the orphan-reconciliation base state for INV-23: p1 active, p2
 /// queued, then `cancel()` sweeps p2 into an orphan credit (`orphaned_uuids =
 /// ["p2"]`) and p1 settles `cancelled` at idle. Returns the machine with no

@@ -176,10 +176,21 @@ struct DeferredSettle {
 pub enum TurnEvent {
     /// A turn settled. The actor resolves that prompt's oneshot with this stop
     /// reason and usage.
+    ///
+    /// `had_usage` distinguishes the two structurally-different upstream cancel
+    /// settlements (phase 15, Item 2): a turn **swept from the queue** by
+    /// `cancel()` never activated, so upstream reports NO `usage` field
+    /// (`turn.resolve({ stopReason: "cancelled" })`); every other settlement —
+    /// an active/held turn's cancel (`settleActive({ ..., usage:
+    /// sessionUsage(session) })`) — reports `usage` even when it is genuinely
+    /// all-zero. `session.rs` keys off this origin flag, never the numeric
+    /// `usage` value, so a real cancel that lands before any tokens accumulate
+    /// still reports an all-zero `usage` object.
     Settled {
         prompt_uuid: String,
         stop_reason: StopReason,
         usage: Usage,
+        had_usage: bool,
     },
     /// A turn failed. The actor rejects that prompt's oneshot with the mapped
     /// JSON-RPC error.
@@ -332,6 +343,7 @@ impl TurnMachine {
                     prompt_uuid: turn.prompt_uuid,
                     stop_reason: StopReason::Cancelled,
                     usage: Usage::default(),
+                    had_usage: false,
                 });
             }
         }
@@ -360,6 +372,7 @@ impl TurnMachine {
                         prompt_uuid,
                         stop_reason: StopReason::Cancelled,
                         usage,
+                        had_usage: true,
                     });
                 }
             }
@@ -382,6 +395,7 @@ impl TurnMachine {
                     prompt_uuid: active.prompt_uuid.clone(),
                     stop_reason: StopReason::Cancelled,
                     usage: self.accumulated_usage,
+                    had_usage: true,
                 });
             }
         }
@@ -493,6 +507,7 @@ impl TurnMachine {
                     prompt_uuid,
                     stop_reason: outcome,
                     usage,
+                    had_usage: true,
                 });
             }
         }
@@ -757,6 +772,7 @@ impl TurnMachine {
                     prompt_uuid,
                     stop_reason: outcome,
                     usage,
+                    had_usage: true,
                 });
             }
         }
@@ -786,6 +802,7 @@ impl TurnMachine {
                         prompt_uuid,
                         stop_reason: deferred.stop_reason,
                         usage,
+                        had_usage: true,
                     });
                 } else {
                     events.push(TurnEvent::Failed {
@@ -927,6 +944,7 @@ impl TurnMachine {
             prompt_uuid,
             stop_reason: outcome,
             usage,
+            had_usage: true,
         });
     }
 

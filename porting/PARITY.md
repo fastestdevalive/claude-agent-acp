@@ -79,7 +79,7 @@ none is exercised by the synthetic corpus:
 
 ## Phase 13 — corpus provenance (13.1)
 
-All 16 corpus transcripts under `porting/corpus/` are **synthetic (hand-authored)** and their Node
+All 17 corpus transcripts under `porting/corpus/` are **synthetic (hand-authored)** and their Node
 fixtures were recorded against `fake-claude`, NOT a real `claude`. They must be re-recorded from the
 real CLI via `porting/record-real.sh` before any parity claim against real `claude` is relied on.
 This is a known open item (2.3 / orchestrator constraint), not a failure of 13.T1.
@@ -129,3 +129,26 @@ This is a known open item (2.3 / orchestrator constraint), not a failure of 13.T
 | `msg_lifecycle_v1` / command-lifecycle orphan map | `acp-agent.js:2499` NOTE | not ported — **STOP per plan (risky)** | replacing the coarse `pending_orphan_results` count with the per-uuid `orphanCommands` map requires (a) processing `command_lifecycle` stream frames (CLI 2.1.206+), which neither the crate nor its synthetic corpus produces, and (b) rewriting the review-04/05-verified orphan/reconcile/activate semantics (INV-23/30). Marked not done per plan's explicit "STOP rather than guess" instruction |
 | `endedPerLevel` sweep at activation | `acp-agent.js:1366-1390` | not ported — **STOP per plan (risky)** | requires (a) processing `background_tasks_changed` frames the crate/corpus never produce and (b) an `ended_per_level` field + two-phase sweep inside `activate`, touching the phase-6/04-05-verified live_subagents semantics. Same risk class as item 3 |
 | Steering settlement lanes (`steeredEchoes`/`steeredSettle`) | `acp-agent.js` steering | not ported — **not additive** | investigation shows the lanes are NOT additive: they thread through the core turn machine at 5 interleaved points (result settle `settleOrDefer`, idle settle 2120-2140, move-on hand-off, trailing-idle `owedTrailingIdles` exclusions, cancel orphan-seeding). Porting means the same core-machine surgery the plan cautions against; deferred |
+
+## Phase 15 — post-tag real-`claude` parity fixes (verify-03 findings, done)
+
+Closing the three real, reproducible divergences found by the verify-03 real-`claude` pass
+(`verify-03-real-claude.md`). The two non-bugs it also flagged — `usage_update`/`session_info_update`
+(`skipped-deliberate`, row above) and the permission request-id int-vs-UUID difference — are left
+untouched, as instructed.
+
+| Item | Upstream | Status | Evidence |
+| --- | --- | --- | --- |
+| Proactive `available_commands_update` after `session/new`/`session/load` (real commands, no `commands_changed` needed) | `sendAvailableCommandsUpdate` `dist:4375-4387` → `supportedCommands()` reads `initialization.commands` | **ported** | `Session` now stores the initialize handshake's `commands` (`C/session.rs` `Session.commands`, `Session::start`); `agent.rs` builds the update via the existing `map::map_commands_changed(commands, [])` right after `session/new`/`session/load` (replacing the old empty update). `inv_24_commands_proactive` differential (`C/tests/differential.rs`) + new `commands-proactive` corpus/fixture assert a non-empty `availableCommands` on the wire without any `commands_changed` frame |
+| Active-turn cancel reports `usage` even when all-zero; queued-sweep reports no `usage` | `settleActive({..., usage: sessionUsage(session)})` vs `turn.resolve({stopReason:"cancelled"})` | **ported** | added `had_usage: bool` to `TurnEvent::Settled` (`C/turn.rs`): `false` only for the pure queued-sweep, `true` for every active/held settle path; `session.rs` keys off it instead of `total_tokens == 0`. Tests: `cancelled_active_turn_with_no_tokens_reports_zero_usage`, `cancelled_queued_sweep_reports_no_usage` (`C/turn/turn_tests.rs`), `item2_cancel_usage_keys_off_had_usage_origin` (`C/session.rs`) |
+| Terminal `tool_call_update{status:"completed"}` (+ tool output content) for a plain top-level tool call | `toAcpNotifications` on the `user` `tool_result` message (`dist:3264-3283`) | **ported** | the `"user"` arm of `handle_session_frame` now maps the user message's `tool_result` content via `map::map_consolidated` (mirroring upstream's echo-skip, `dist:3165-3171`), so the completing update reaches the client. `item3_read_tool_turn_ends_with_completed_tool_call_update` (`C/session.rs`) |
+
+Phase-15 notes:
+- The `_meta.claudeCode.toolResponse` refinement frame (`dist:2194`/`toolResponse:`) that Node emits
+  for the tool result is **not** reproduced — the phase-15 scope is the `status:"completed"` + content
+  update the regression test requires; the `toolResponse` frame is a separate refinement and remains
+  a known, non-blocking gap.
+- The differential's `availableCommands` `input` field is normalised (Rust omits `input:null` because
+  the pinned schema's `AvailableCommand` is `#[skip_serializing_none]`; Node emits it explicitly) —
+  same class of crate-inherent serialization default as the `tool_call` `status`/`content` handling
+  (`C/tests/common/mod.rs` `normalize_available_commands_input`).
