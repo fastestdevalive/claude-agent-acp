@@ -1,0 +1,13 @@
+feature: rust-parity-tests
+worktree: /home/gb/.vibe-station/projects/claude-acp-rust-eval/worktrees/care-1
+master:
+  prd: skip
+  plan: complete
+current_subfeature: root
+subfeatures:
+  - id: root
+    origin: planned
+    mode: implementing
+    last_completed: null
+    awaiting_phase: plan
+    awaiting_artifact: .vibekit/feature-plans/pending/rust-parity-tests/plan-rust-parity-tests.md

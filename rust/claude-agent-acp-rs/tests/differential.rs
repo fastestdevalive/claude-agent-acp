@@ -422,6 +422,26 @@ fn inv_24_commands_proactive() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// rust-parity-tests Phase 1 — the full tool loop including the return `user`
+/// frame carrying `tool_result` content blocks (emitted by fake-claude as part
+/// of the prompt step's emit array, with a distinct literal uuid and no
+/// `isReplay`). Diffs the Rust output against the Node fixture; this is the
+/// regression guard for the phase 15 `map_consolidated(MsgRole::User, ...)`
+/// fix in `session.rs` `handle_session_frame`.
+#[test]
+fn inv_24_tool_result_echo() {
+    run_and_diff("tool-result-echo");
+}
+
+/// rust-parity-tests Phase 2 — two sequential prompts where the first turn uses
+/// a tool (distinct from `lagging-idle` which is text→text). The second prompt
+/// re-enters the activation path after the tool-using turn settles; also covers
+/// the lagging `session_state_changed` idle emit inside the second prompt step.
+#[test]
+fn inv_24_tool_then_text() {
+    run_and_diff("tool-then-text");
+}
+
 /// 8.T7 — lagging trailing idle after the next echo is absorbed, not a false
 /// #825 fail.
 #[test]
