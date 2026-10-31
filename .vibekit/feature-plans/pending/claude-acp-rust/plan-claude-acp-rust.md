@@ -192,11 +192,28 @@ skills/rust-coding/
 - **Rationale:** JS run-to-completion atomicity is implicit upstream; a line-by-line port onto shared locks imports races upstream never had (R16 shows the lock failure mode). House pattern: `vst-agents/src/acp_connection.rs:1-25`.
 - **Where:** `C/src/session.rs`. Enforced by `rust-coding` §3, §4, §10 and guard G5.
 
+> **Phase-5 deviations (implementer, D4):** (1) The actor's read loop (5.3) is one `tokio::select!` (`biased`) multiplexing the `Command` channel, the codec stream, an injected turn-completion lane and the cancel token; on cancel it drains any remaining queued stream messages via `try_recv()` before exiting (INV-15). `run_dispatch` is kept as the reusable stream-only sequential pump in `dispatch.rs` (used by 5.T1); the actor reuses the shared `dispatch::route()` classification rather than `run_dispatch` itself, because it must multiplex four inputs. (2) Phase-5 turn completion is an **injected** `mpsc::UnboundedReceiver<()>` completion lane (`Session::spawn` param) — phase 6 replaces it with `result`-frame handling; a prompt's `oneshot` reply resolves on that lane. (3) Outbound user frames go to an `Option<Control>` (D6); `None` in actor-only unit tests. (4) The one-active-turn high-water counter is an `Arc<AtomicUsize>` (fetch_max) exposed via `Session::high_water()` — an atomic, not a Mutex/RwLock, so G5 stays clean. (5) `Command::Cancel` is a placeholder variant (real behaviour is phase 11).
+
+> **Phase-6 deviation (implementer, D4):** `turn.rs` is delivered as a **self-contained, actor-driven state machine** (`Turn`, `TurnMachine`, `StopReason`, `TurnEvent`) with its own unit tests — the phase-6 file impact lists only `C/src/turn.rs`, and the session actor (`session.rs`) is **not** in that phase's file set. The actor's phase-5 injected `completions` lane therefore remains in place; the phase-6 items 6.1–6.6 (activate/settle/defer, echo, settle-or-defer with the live-subagent set, idle lane, stop-reason table + #453 fallback, orphan accounting) are all implemented and unit-tested on the machine directly. The actor rewiring to drive `TurnMachine` from `result`/`idle`/`task_*` frames happens when `session.rs` enters the file impact (a later phase). The pre-echo abandonment hole (`acp-agent.js:2141-2153`) is documented in `turn.rs` module docs, not fixed, per 6.2.
+
+> **Phase-6 REWORK (implementer, D4, review 04):** an independent Opus review (`review-04-turn.md`) found the phase-6 machine did not reproduce upstream; findings #1–#15 are fixed per that spec. `turn.rs` now ports: the held-idle drain emitting `Settled` (#1); `ensure_active_turn` with the `ADP:1453` orphan-before-head order (#2); `owed_trailing_idles` (#3); the autonomous-origin lane (#4); `active = None` on settle/fail (#5); the `ADP:2771-2848` subtype table (max_tokens before is_error for success/error_during_execution, /login on success regardless of is_error, errors joined with `", "`) (#6); `Failed{kind, message}` with `FailureKind` + verbatim `TURN_NO_RESULT_MESSAGE`/`SESSION_ENDED_MESSAGE` (#7); `on_task_ended` removing only the live entry (#8); real `cancel()` (queued sweep + orphan credits + held inline-settle) with `abandon_active` kept as `force_cancel()` (#9); `on_stream_end()`/`fail_all(kind)` (#10); `prompt_uuid` on `Settled`/`Failed`/`Activated` (#11); echo hand-off cancelled-before-held (#12); the #453 fallback confined to the success arm (#13); and the per-turn `usage` accumulator reset at activation and reported on `Settled` (#14). The phase-8 wiring instructions (uuid stamping, uuid→oneshot map, `dispatch_stream` frame routing, `FinalText` before `Settled`, cancel→`machine.cancel()`, EOF→`on_stream_end()`/`fail_all`) are captured as items 8.7–8.9 and tests 8.T7–8.T11 above. **Known omissions (deferred, documented in `turn.rs` module docs, review 04 #14):** the steering lane (`steeredEchoes`/`steeredSettle`), the `msg_lifecycle_v1` per-uuid orphan map, and the two-phase `endedPerLevel` sweep — all recorded as `pending` for their own phases.
+
+> **Phase-6c (implementer, D4, review 05):** `ensure_active_turn` regains upstream's early return — a user-turn result for a normal (non-held) active turn returns immediately, never consuming an orphan credit or promoting the queue head (`ADP:1408-1412`), fixing the echoed-then-queued misattribution/hang and the INV-30 orphan reuse; a held turn still settles with its deferred outcome and promotes the head. `on_session_state(state)` records `last_session_state` for EVERY state (`ADP:2050`) and `on_idle` only runs for `"idle"`, wired so every `session_state_changed` frame reaches it — the held-cancel trailer-debt rule (`ADP:3571`) now sees a real `"running"` and owes the interrupt's trailer. Minors: a held turn's cancel reports `deferredSettle.usage` (the usage its result recorded), and `on_idle` no longer clears `cancelled` (it stays set until `activateTurn`), so an orphan's late result after a cancelled idle emits no stray `FinalText`.
+
+> **Phase-9 deviations (implementer, D4):** (1) `session.rs`/`agent.rs` gained two phase-9-required wirings beyond the plan's literal file impact (`tools.rs`, `map.rs`, differential): a `SessionOutbound::Flush` barrier (agent forwarding task resolves a `oneshot` only after every prior `Update` is sent) that the prompt task awaits before writing its response, keeping a `tool_call` ahead of the `result` on the wire (`inv_24_tools` exposed this race); and an `assistant_had_error` flag threaded through `handle_events` → `PromptFailed`, mirroring upstream `lastAssistantError`/`errorKindData` (`acp-agent.js:5282`) so `data.errorKind` is attached only when the assistant frame carried an `error` — the `error-result` fixture's error has no `data`, which the pre-phase-9 mapper got wrong. (2) The `inv_24_tools` differential (and all tool-bearing differentials) compares `params.update.status` and `params.update.content` byte-for-byte against the fixture on EVERY frame kind — no ignore path. The one crate-inherent serialization difference, that the pinned `agent-client-protocol` crate omits `status` (the `pending` default) and empty `content` on a `tool_call` which the Node adapter always emits, is reconciled by the frame normalizer materialising those defaults on both sides (phase 9b; see the D13 bullet), never by an ignore path. (3) The tools unit tests are `inv_24_*` (not `inv_30_*`): INV-30 is already the orphan-coalescing invariant (`inv_30_orphan_result_not_reused`), so tool shapes live under the INV-24 frame-equality umbrella alongside `inv_24_tools`.
+
+> **Phase-12 deviations (implementer, D4 / 12.1 / 12.2):** (1) `_session/steering` (12.1) is delivered as a **new `Command::Steer` actor wiring in `session.rs`** plus a pure decision fn `agent::steer_outcome(turn_in_flight, idleBehavior)` (validates idleBehavior → `invalidParams`, then maps to `injected` / `promptRequired` / `startedNewTurn`). The actor decides `turn_in_flight` via a new `TurnMachine::has_unsettled()` accessor (active or queued-unsettled, mirroring `acp-agent.js:1141`); on `injected` it pushes the user frame with `"priority":"now"` through the control writer (D6) and returns `{outcome:"injected"}`; idle + `promptRequired` → `{outcome:"promptRequired", reason:"noRunningTurn"}`; idle no-opt-in starts a detached turn (like `session/prompt`) and returns `{outcome:"startedNewTurn"}`. The `steeredEchoes`/`steeredSettle` settlement lanes remain the documented `pending` omission (turn.rs module docs, review-04 #14) — 12.T1/12.T3 exercise only the idle/validation outcomes and the `now`-injection path's frame emission, not the steered-settlement lane. (2) **Shutdown (12.2):** the stdio binary now `select!`s `serve` against `process::wait_for_shutdown_signal()` (SIGTERM on unix, all `cfg` in `process.rs` for guard G9). On stdin EOF `serve` returns and the session actors/`Process` are dropped (children killed via `kill_on_drop`); on SIGTERM the `serve` future is dropped and the runtime tears down the spawned actors, so no `claude` outlives the host and the process exits 0 within a bounded deadline — the tests (12.T2/12.T5) assert no-orphan + exit-0, which is the observable contract; a literal "drain the in-flight turn then dispose" is effectively immediate here because teardown is driven by transport EOF / runtime drop. (3) **`fake-claude` (test-only, beyond the phase file impact):** gained an optional `FAKE_CLAUDE_PID_OUT` env (its pid written at startup) so the orphan tests (12.T2/12.T5) can record the exact child pid and assert it is gone (`ESRCH`, INV-6); additive, no behavior change.
+>
+> **Phase-11 deviations (implementer, D4):** (1) The force-cancel backstop and the interrupt-receipt reconciliation are **actor wirings in `session.rs`** beyond the plan's literal phase-11 file impact (`turn.rs`): `run_loop` gains a `force_cancel_grace` param and a `force_cancel_deadline` state, armed at most once per cancel sequence when an active turn remains and cleared whenever `!machine.has_active()` (upstream `disarmForceCancel`); the spawned `interrupt` task reports its receipt back as `Command::InterruptReceipt` so the actor calls `machine.reconcile_orphan_receipt`. The orphan reconciliation itself lives in `turn.rs` (11.3/11.4). (2) `map.rs` gains `messageId` stamping on stream-event chunk updates (`message_start`'s `message.id` → subsequent chunks, `acp-agent.js:2889`/`6211`) — a message-mapping gap surfaced by the `cancel-mid-turn` differential (its fake-claude uses `stream_event` frames, the first corpus to do so), required for `inv_24_cancel` (11.T4). (3) `agent.rs` `from_env` reads `CLAUDE_ACP_FORCE_CANCEL_GRACE_MS` so the differential harness can shorten the wedged-cancel settle; `common/mod.rs` sets it to 1000 ms. (4) `cancel-mid-turn` settles `cancelled` via the force-cancel backstop (the fake-claude emits a `cancelled` `result` but no trailing idle), matching the Node fixture captured at the default 30 s grace — the 1000 ms harness grace produces the same frames (the result arrives well within it). (5) **Test-fix (11b):** `inv_22_cancel_idempotent` is rewritten to make re-arming observable — it now runs under `#[tokio::test(start_paused = true)]` (which required adding `tokio`'s `test-util` feature to the crate's `[dev-dependencies]`, test-only), sends 5 cancels **spaced** at `t0, t0+0.2G, t0+0.4G, t0+0.6G, t0+0.8G`, and asserts the wedged turn settles at ~`t0+G` (not before, and strictly before `t0+1.8G`, where a re-arm-at-last-cancel would fire) with exactly one reply. Mutation-checked: removing the `is_none()` guard (re-arm every cancel) makes it fail at `session.rs:1651` (`settled at 1.8s, expected ~1s`). `inv_17_force_cancel_floor` is strengthened to assert the settle does NOT happen immediately (an elapsed floor ~the grace), which exposed that the old test let p1 settle as a *queued* sweep instead of the backstop — the echo is now yielded before cancel so p1 is truly active. The implementation itself was already correct (armed once via `force_cancel_deadline.is_none()`); no `session.rs` behavior change was needed. `cancel_then_new_prompt_same_session` needs no strengthening (it asserts concrete `cancelled`/`end_turn` and is a different invariant).
+
+
 ### Decision D5: Dispatch is a public, injectable unit from day one
 
 - **Decision:** `pub fn route(msg: &StreamMsg, view: &TurnView) -> Route` plus a runner `pub async fn run_dispatch(rx, handler: impl Handler)` in its own file.
 - **Rationale:** R12 — the prior port's untested ordering layer was rewritten three times because it was private.
 - **Where:** `C/src/dispatch.rs`; ordering test INV-13.
+
+> **Phase-5 deviation (implementer, D5):** `run_dispatch(rx, handler)` matches the plan signature exactly — a stream-only sequential pump with no `tokio::spawn` (R13); the cancel token lives in the session actor's own `select!` loop (5.3), not in `run_dispatch`. `route(&StreamMsg, &TurnView) -> Route` classifies purely by frame `type` in phase 5; `TurnView` is accepted (`_view`) as the phase-6 seam. The `Handler` trait is the injected sink (a recording handler in 5.T1).
 
 ### Decision D6: One writer owns child stdin — user messages and control traffic alike
 
@@ -205,6 +222,8 @@ skills/rust-coding/
 - **Where:** `C/src/control.rs`.
 - **Inbound handling:** `keep_alive` (R6) dropped; inbound `control_request` handled in a spawned task (D14); inbound `control_cancel_request` aborts that task's handler (INV-10).
 - **`suppressControlResponse`:** an SDK-internal JS symbol (`sdk.mjs:118:19850`); the port has no handler that declines to answer, so it is `skipped-deliberate` in `PARITY.md`.
+
+> **Phase-4 deviations (implementer, D6):** (1) `Control::spawn` takes the child stdin as an `impl AsyncWrite` plus a **control-traffic-only** inbound `mpsc::UnboundedReceiver<Value>` — control.rs does not consume the codec's full frame stream; the phase-5 dispatch routes only `keep_alive`/`control_response`/`control_request`/`control_cancel_request` frames here and session frames to the session actor. (2) The inbound `control_request` handler is injected as `ControlOptions.on_request: Option<Arc<RequestHandler>>` where `RequestHandler = Box<dyn Fn(Value) -> BoxFuture<Value> + Send + Sync>` (a boxed future, no `futures` crate); the default (`None`) answers `{subtype:"error"}`. (3) The `initialize` request is built from `InitializeOptions` via `build_request()`, which always emits `forwardSubagentText` (the fixture carries `false`); optional `systemPrompt`/`agents`/`skills`/`toolAliases`/`hooks` are emitted only when set (matching the adapter dropping `undefined`). (4) `request_id` is a 13-char base36 string seeded from `SystemTime` nanos XOR a per-process `AtomicU64` counter (no `rand` dep). (5) The `pending_permission_requests` replay (4.5) routes each entry through the same spawned-task inbound handler via a new `Outbound::Replay` command (mirroring the SDK's `processPendingPermissionRequests`). (6) 4.T7/4.T8/4.T9 are not invariant-tied (INV-7..12 map to 4.T1..4.T6), so they use descriptive test names (`slow_outbound_does_not_block_inbound`, `pending_permission_replayed`, `unknown_subtype_errors`) rather than `inv_NN_` slugs. (7) Supporting change: `Process::take_stdin()` added in `process.rs` so the session actor can hand child stdin to `Control::spawn` (D6); the kill-ladder's `close_stdin`/`dispose` paths are unaffected (stdin is already `None` once taken).
 
 ### Decision D7: stdin stays open for the whole session
 
@@ -234,6 +253,8 @@ skills/rust-coding/
 - **vibe-station consumes:** `claude-agent-acp-rs = { git = "…/claude-agent-acp", tag = "rust-v0.1.0+acp.0.70.0" }`.
 - **Follow-up touch points (vibe-station repo, not this plan):** build the `Channel` transport in `acp_connection.rs`; pass `ServeOptions` (binary path, env, cwd) in place of the `AcpAgentConfig` spawn spec (`acp_connection.rs:19-20`, `:384-385`); let the crate own child teardown; remove the Node spawn in `claude.rs:414-424`.
 - **Where:** supersedes the `EVALUATION.md` target diagram.
+
+> **Phase-8 implementer deviations (D9):** (1) 8.T5 is delivered as a **full `Channel::duplex()` integration test** (`inv_session_new_model_permission_and_uuid`): it drives `session/new` over the channel against fake-claude and asserts `--model` / `--permission-mode` / `--session-id=<uuid>` all appear in the recorded argv and that the returned `sessionId` equals that uuid — stronger than the "unit-test `session_spawn_options` only" fallback the retry brief allowed; no `Meta` construction was needed (the requests are sent untyped). (2) The agent-level tests (8.T2/T5/T6/T4) send requests as `UntypedMessage`s and read the raw JSON-RPC `result`/error values rather than typed schema structs, sidestepping the generated `schema::v1` response-field surface; 8.T6 asserts the real SDK form `--resume=<id>` (with `=`) per the phase-2 finding. (3) 8.T4 is a raw-`std::process` regression that feeds an `initialize` request to the real binary over stdio and asserts every non-empty stdout line parses as a JSON-RPC frame (the recorder silently drops non-JSON lines, so the differential alone cannot catch a stray `println!`).
 
 ### Decision D10: Rust work has its own `rust/AGENTS.md`; upstream CI stays off
 
@@ -268,6 +289,7 @@ skills/rust-coding/
 - **Guard G8:** `cargo check --target x86_64-pc-windows-gnu` and `--target aarch64-apple-darwin` pass every phase (verified for the ACP crate in a scratch build).
 - **Runtime tests:** Linux only here; Windows/macOS runtime = own `rust-ci.yml` matrix, a follow-up (why D10 keeps Actions on).
 - **If a dependency blocks cross-`check`:** record it here, don't silently drop the target.
+- **Phase-3 deviation (implementer):** the Windows job object is provided by tokio's `kill_on_drop(true)` (which assigns the child to a job object on Windows and kills it on drop/close) rather than a separate `win32job` crate; no extra crate was needed and G8 still passes. The `CLAUDE_CODE_ENTRYPOINT` value captured into `porting/fixtures/*.argv.json` is environment/version-dependent (`sdk-cli` vs `cli`); 3.T1 asserts presence only, never the value.
 
 ### Decision D13: Differential harness runs both sides against a fake `claude`
 
@@ -289,11 +311,72 @@ skills/rust-coding/
 - Why: the Node adapter activates a turn only when the echoed `user` frame's `uuid` equals the `promptUuid` it wrote (`acp-agent.js:990-991`, `1517`, `3018-3022`); without the echo uuid every prompt hangs until the force-cancel floor.
 - `expect` = subset match on the next stdin frame; steps run in order; an unmatched frame fails the run loudly.
 
+> **Phase-1 deviations (implementer, D13):** (1) `diff_frames`/`Frame`/`JsonPath` live in `C/tests/common/mod.rs`; `acp-recorder` cannot share them because it depends on `claude-agent-acp-rs` (a `C/tests`→`acp-recorder` dep would be a crate cycle), so the recorder's `Frame`/`Direction` are a small duplicate in `acp-recorder/src/frames.rs`. (2) The 1.T4 integration test therefore lives in `acp-recorder/tests/recorder.rs` (not `C/tests/differential.rs`). (3) The "session/cancel after N updates" call is encoded as a `cancel_after_updates: <n>` field on the `session/prompt` step (script JSON), not a separate step. (4) `thiserror` added to `acp-recorder`'s `[dependencies]` (already in the lock via `claude-agent-acp-rs`, so no new crate/version drift).
+
+> **Phase-2 deviations (implementer, D13):** (1) `fake-claude` records the received argv/env to `$FAKE_CLAUDE_ARGV_OUT` and the received `initialize` control_request to a new `$FAKE_CLAUDE_INIT_OUT` (the plan's "captured stdin" wording maps to that file). (2) The `acp-recorder` script format gained a `session/load` step (`call:"session/load"`, `session_id`, `cwd`) — a phase-1 file was touched to support the resume/load corpus script. (3) `acp-recorder::record` now returns the captured frames even when the script's final step errors (e.g. the `error-result` / `idle-without-result` corpora whose `session/prompt` legitimately returns a JSON-RPC error); a hard error is only returned when no frame was exchanged. (4) `run_script` inserts a 75 ms settle after `session/new`/`session/load` so the adapter's `setTimeout(0)` `available_commands_update` lands deterministically before the next step (2.T1 requires byte-identical captures). (5) The real SDK emits `--resume=<id>` (with `=`), not the plan's `--resume <id>`; the resume-load argv confirms it. (6) B2 rows `--model <m>` and `--mcp-config <json>` are conditional/`skipped-deliberate` and are not exercised by any corpus script; 2.T4 asserts every row the corpus does exercise (flags + `CLAUDE_CODE_ENTRYPOINT` / `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` / `NODE_OPTIONS` absent). (7) All 11 corpus transcripts are hand-authored (not yet re-recorded from real `claude`); each must be re-recorded via `record-real.sh` before phase 13 (2.3 rule). (8) **Env allow-list (security):** `fake-claude` dumps `{"argv":[...],"env":{...},"node_options_present":bool}` where `env` is restricted to exactly `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` (the two vars the B2 table requires the port to set); `node_options_present` is a boolean for the `NODE_OPTIONS`-deleted check. No other process env var (tokens, sockets, paths) is ever persisted — verified by 2.T7. (9) **Portability:** `capture.sh` runs the Node adapter under a fresh `HOME`/`CLAUDE_CONFIG_DIR` so local skills/commands/settings cannot leak into frames, and normalises the worktree root → `$ROOT` and the fake-claude binary → `$FAKE_CLAUDE` in frames and argv (2.T1 requires byte-stable fixtures across machines).
+
+> **Phase-5 fix (implementer, D13):** the phase-2 test `capture_is_deterministic_across_runs` re-runs `capture.sh`, which rewrote the committed `*.argv.json` because `fake-claude` persisted the **raw** `CLAUDE_CODE_ENTRYPOINT` value (`sdk-cli` vs `cli`, environment-dependent). A test must never mutate committed fixtures. `fake-claude::record_argv_env` now records only the **presence** of `CLAUDE_CODE_ENTRYPOINT`, normalising its value to `"$ENTRYPOINT"` in `*.argv.json` (the raw value never reaches a fixture); `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` stays raw (`"1"`). The 11 `*.argv.json` fixtures were regenerated once. 2.T1 (byte-identical across runs) and 2.T4 (presence-only) stay green; `git status --short porting` is empty after repeated gate/capture runs. **Separately observed (pre-existing, NOT fixed here — out of phase-5 scope):** `permission-deny.frames.jsonl` is nondeterministic across **full** `capture.sh` (all-corpora) runs — a `tool_call_update` frame (Bash tool-result echo, `content:[]`) races the `session/request_permission` frame in the Node adapter and flips present/absent. Confirmed with HEAD (unmodified) `fake-claude`, so it is independent of the entrypoint fix. The gate does not hit it (its phase-2 capture re-runs only `text-only`, which is deterministic); it surfaces only when a full `capture.sh` is run and should be addressed as a phase-2 corpus/recorder determinism fix (a settle or transcript reorder) before phase 13.
+>
+> **Phase-8 implementer deviations (D13, items 8.7-8.9 / 8.T10-8.T11):** (1) **`acp-recorder` extended** with `session/prompt` `"no_wait": true` (send without awaiting) and a `"session/wait"` step to settle in-flight prompts — the recorder's sequential `block_task`-per-prompt model could not otherwise drive the T10 "queued prompt" scenario. (2) **`fake-claude` gained an `exit` flag** on a transcript step so it can close stdout mid-turn (the 8.T11 stream-EOF lane); `replay` returns after an `exit` step, closing stdout so the host sees EOF. (3) **`agent.rs` fixes** (the 8a slice's `session/prompt` previously blocked the SDK's single-task connection, so a second prompt/cancel could never land): the prompt handler now enqueues synchronously (`Session::send_prompt`) and awaits settlement on a spawned task; `session/cancel` notifications are routed to the session actor (a lock-free channel to the notification handler — the workspace forbids `Mutex`/`RwLock`, guard G5); the interrupt is sent on a spawned task (awaiting it inline deadlocked the stream reader); prompt errors are built flat (`Error::new(-32603, ...)`, `errorKind` as `data`) instead of a stringified nested error; a cancelled swept turn reports no `usage` (upstream `turn.resolve({stopReason:"cancelled"})` deliberately omits it); and a turn's `FinalText` is returned with the `PromptReply` and forwarded before the response (deterministic). (4) **`map.rs` (phase-7)** now skips empty text chunks, matching Node's `chunk.text &&` guard — surfaced by 8.T11. (5) **8.T10 corpus** drives `first` (blocking) → `second` (`no_wait`, queued) → cancel → wait → `/context`, rather than two concurrent prompts from the recorder; it still exercises the queued-sweep + orphaned-late-result path and diffs clean.
+>
+> **Phase-9b fix (implementer, D13):** removed the blanket `params.update.status`/`params.update.content` ignores from `base_ignore()`, which were hiding real divergence on `tool_call_update` frames. The frame normalizer gained `normalize_tool_call_defaults` (`C/tests/common/mod.rs`), applied to BOTH sides: on any `params.update` whose `sessionUpdate == "tool_call"`, an ABSENT `status` becomes `"pending"` and an ABSENT `content` becomes `[]`, so the crate's omitted defaults equal the Node adapter's explicit ones. It applies to `tool_call` frames ONLY — `tool_call_update` and every other kind compare `status`/`content` byte-for-byte (guarded by `inv_24_tool_call_update_status_must_match` / `inv_24_tool_call_update_content_must_match`). Re-running all 5 tool differentials (`inv_24_tools`) exposed no further divergence: the Rust side already emits correct tool-result `content`/`status` on updates, so no `tools.rs`/`map.rs`/`session.rs` change was required and no narrow ignore was needed.
+>
+> **Phase-13 deviation (implementer, D13):** the full-corpus differential (`inv_24_full_corpus`, 13.T1) surfaced a real divergence the per-phase subset had missed: `idle-without-result` failed because the Rust `session_error_to_rpc` gated the `NoResult` error-kind on `assistant_had_error` (`agent.rs`), dropping `data.errorKind:"no_result"`. Upstream `acp-agent.js:2154` attaches `errorKindData("no_result")` UNCONDITIONALLY for the #825 idle-without-result fail, unlike the provider/usage failures (2782–2840) that depend on `lastAssistantError`. Fixed in `agent.rs`: the `NoResult` arm now always emits `data.errorKind:"no_result"` (no `assistant_had_error` guard); the `error-result` corpus (which has no `data`) is unaffected because it goes through a `result`-frame failure kind, not `NoResult`. Locked in by the unit test `no_result_error_always_carries_error_kind` in `agent.rs` plus the now-green `idle-without-result` differential.
+>
+> **Phase-13 invariant-audit gap (implementer, D4/D13):** the 13.3 invariant audit found that `inv_14_one_active_turn` (INV-14) and `inv_15_cancel_loses_nothing` (INV-15) — the phase-5 high-water / cancel-race tests — were REMOVED during the phase-8 actor rework and never restored, so two invariants had no passing `inv_NN_*` test (13.T3). Restored both against the current `run_loop` actor in `session.rs` via the existing `spawn_actor` harness (which now also returns the `high_water` counter): `inv_14_one_active_turn` asserts N prompts settle in order with `high_water() == 1`; `inv_15_cancel_loses_nothing` asserts a cancel racing a queued result settles the active turn `cancelled` without hanging and leaves the actor alive for a follow-up prompt. The machine-level single-active-turn invariant is additionally covered by `settle_clears_active_slot` / `has_unsettled_tracks_in_flight_turns` in `turn_tests.rs`.
+>
+> **Phase-13b fix (implementer, D13):** test-isolation flake removed — `capture_is_deterministic_across_runs` (2.T1) used to re-run `capture.sh` directly into the committed `porting/fixtures/`, overwriting those files while other test binaries (`inv_24_*`, `transport_parity.rs`) read the same fixtures in parallel under `cargo test --workspace` (~1-in-10 gate failure). `capture.sh` now honours a `CAPTURE_OUT_DIR` env override (default `porting/fixtures`), routing every file it writes — `*.frames.jsonl`, `*.argv.json`, `initialize.json`, and the intermediate `.raw` temp files — to that dir; the default (unset) behaviour is byte-identical to before. 2.T1 now captures `text-only` TWICE into two fresh temp dirs and asserts the two outputs are byte-identical to each other AND to the committed `text-only.frames.jsonl` (read-only), so no test ever writes into `porting/fixtures/` or `porting/corpus/`. Proven by 5 consecutive `bash rust/scripts/rust-gate.sh` runs with `porting` fixtures' `sha256sum` unchanged and `git status --short porting` clean after each.
+
+
 ### Decision D14: No actor awaits an external round-trip inline
 
 - **Decision:** permission prompts, inbound control requests and any client round-trip run in spawned tasks that send their result back to the session actor as a `Command`; the actor and the stdout reader never `.await` a client reply.
 - **Rationale:** if either awaits `session/request_permission` inline, stream parsing and `session/cancel` stall — a deadlock of the same class as #866.
 - **Where:** `C/src/permission.rs`, `C/src/session.rs`; INV-27.
+
+> **Phase-10 deviations (implementer, D14):** (1) The inbound `can_use_tool`
+> control_request is routed to the session actor via a new `Command::Permission`
+> (the actor owns the `MapState` needed for `ensureToolCallEmitted`, INV-20);
+> the actor spawns the `session/request_permission` round-trip (D14) and resolves
+> the reply with the `control_response`, which the `control.rs` on-request task
+> writes (single-writer-to-stdin, D6 — the round-trip task never writes stdin
+> directly). (2) A `Cancelled` outcome (or a dropped/errored round-trip, e.g. the
+> client closes during a pending permission, INV-27) maps to the R28 deny payload
+> so the turn continues and settles on the next `result` (INV-21). (3)
+> `session_spawn_options` now sets `permission_prompt_tool: true` (B2): the Node
+> always passes `--permission-prompt-tool stdio`, and without it a real `claude`
+> never emits `can_use_tool`, so phase 10's translation would never trigger.
+> (4) The pinned `agent-client-protocol` crate assigns a fresh uuid to every
+> outgoing request id while the Node sends `session/request_permission` with a
+> fixed `id:0`; the differential normalises that request id (and its echoed
+> response id) to a fixed `$PERM_REQ` token — a volatile correlation id, like the
+> uuid/timestamp normalisation, not a frame reorder or ignore (see D13).
+> (5) Deterministic-capture fix (extra task): the Node's `tool_call_update`
+> (refine) vs `session/request_permission` ordering was nondeterministic
+> (flipped in ~1/8 captures) because the SDK's `canUseTool` races the assistant
+> message processing. A `{"sleep_ms":150}` pacing marker was added to the
+> fake-claude permission transcripts between the `assistant` tool_use and the
+> `can_use_tool`, forcing the stable single-`tool_call` order (State B), verified
+> 6/6 byte-identical.
+> (6) **Phase 10b (targeted fix, orchestrator review):** `inv_27_no_inline_await`
+> was rewritten to drive the REAL actor path — it runs `run_loop` (factored out
+> of `run`, which only holds the `Process` for lifetime) plus a real `Control`
+> over a duplex stdin whose on-request handler routes `can_use_tool` to the
+> actor; it starts a `can_use_tool` permission the client never answers, delivers
+> `Command::Cancel` while it is pending, and asserts the pending permission
+> resolves `Cancelled` (the R28 deny payload is written back to the control
+> writer) and the prompt turn settles `cancelled`. This exposed a real gap: the
+> actor spawned the `session/request_permission` round-trip (D14) but nothing
+> aborted or withdrew it on cancel — the spawned task could await a never-answered
+> client reply forever and no deny payload was written. Fixed in `session.rs`:
+> the actor now keeps a `pending_permissions: HashMap<request_id, JoinHandle>`
+> registry (pruned each `Command::Permission`), and `Command::Cancel` aborts every
+> pending permission round-trip — dropping its `reply` oneshot makes control.rs's
+> on-request handler resolve with the R28 deny payload (INV-21 semantics), so the
+> pending permission settles `Cancelled` while the actor stays free (CUJ 2).
+> `turn.rs` was not changed. Mutation-checked: removing the cancel-abort makes
+> the rewritten test FAIL (no deny `control_response` written → `find_deny_response`
+> times out), confirming it would have caught a broken/awaited-inline cancel path.
 
 ### Decision D15: `session/load` resumes but does not replay history in v0.1
 
@@ -595,19 +678,19 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - `porting/SYNC.md` content: the 5 steps of the Sync workflow section in this plan — (1) take the next upstream tag only, never `upstream/main`; (2) `git diff vOLD..vNEW -- src/`; (3) if it touches a `ported` row of `PARITY.md`, port the delta; (4) re-capture fixtures and run the differential; (5) merge the tag into `parity`, bump `+acp.0.N`, update `PARITY.md`, tag `rust-vX+acp.0.N`. First run: `v0.70.0 → v0.79.0`.
 - Phase-0 stub crates need one trivial `#[test]` so G6 and `cargo test` are meaningful.
 
-- [ ] **0.0** Read `skills/rust-coding/SKILL.md`, `coding-agent-guardrails`, `coding`
-- [ ] **0.1** `rust/Cargo.toml` workspace + crate manifest; `rust/.gitignore` (`target/`); `#![forbid(unsafe_code)]` + D8 lints in `lib.rs`
-- [ ] **0.2** `rust/AGENTS.md` — overrides root for `rust/**`; implementer protocol; `rust-coding` section mapping (D10)
-- [ ] **0.3** `rust/scripts/rust-gate.sh` — one canonical invocation incl. `cargo build --workspace --bins` before tests, and the G8, G9, G10 checks
-- [ ] **0.4** `rust/clippy.toml` — G5 `disallowed-types` list
-- [ ] **0.5** Generate + commit `rust/Cargo.lock` with `agent-client-protocol` `=2.1.0` and its schema crate pinned (D9)
-- [ ] **0.6** `porting/PARITY.md` seeded from `porting/EVALUATION.md` § 2 (A)/(B); `porting/SYNC.md` from the content given in this phase's Context
+- [x] **0.0** Read `skills/rust-coding/SKILL.md`, `coding-agent-guardrails`, `coding`
+- [x] **0.1** `rust/Cargo.toml` workspace + crate manifest; `rust/.gitignore` (`target/`); `#![forbid(unsafe_code)]` + D8 lints in `lib.rs`
+- [x] **0.2** `rust/AGENTS.md` — overrides root for `rust/**`; implementer protocol; `rust-coding` section mapping (D10)
+- [x] **0.3** `rust/scripts/rust-gate.sh` — one canonical invocation incl. `cargo build --workspace --bins` before tests, and the G8, G9, G10 checks
+- [x] **0.4** `rust/clippy.toml` — G5 `disallowed-types` list
+- [x] **0.5** Generate + commit `rust/Cargo.lock` with `agent-client-protocol` `=2.1.0` and its schema crate pinned (D9)
+- [x] **0.6** `porting/PARITY.md` seeded from `porting/EVALUATION.md` § 2 (A)/(B); `porting/SYNC.md` from the content given in this phase's Context
 
 **Verify phase 0:**
-- [ ] **0.T1** Gate — `bash rust/scripts/rust-gate.sh` exits 0 on the empty crate
-- [ ] **0.T2** Gate — `rust/scripts/selftest-gate.sh` mutates a temp copy (`cargo update -p agent-client-protocol --precise 2.2.0`) and G10 fails; skipped with a notice when offline; always restores
-- [ ] **0.T3** Regression — G7 command prints nothing (upstream untouched)
-- [ ] **0.T4** Gate — `selftest-gate.sh` in a temp copy: a scratch `.unwrap()` in `src/` fails clippy (D8), and a scratch `tokio::sync::broadcast::channel` fails clippy (INV-33/G5)
+- [x] **0.T1** Gate — `bash rust/scripts/rust-gate.sh` exits 0 on the empty crate
+- [x] **0.T2** Gate — `rust/scripts/selftest-gate.sh` mutates a temp copy (`cargo update -p agent-client-protocol --precise 2.2.0`) and G10 fails; skipped with a notice when offline; always restores
+- [x] **0.T3** Regression — G7 command prints nothing (upstream untouched)
+- [x] **0.T4** Gate — `selftest-gate.sh` in a temp copy: a scratch `.unwrap()` in `src/` fails clippy (D8), and a scratch `tokio::sync::broadcast::channel` fails clippy (INV-33/G5)
 
 ---
 
@@ -618,18 +701,18 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Client side uses `Client::builder()` from `agent-client-protocol` 2.1 (R21).
 - The differ normalizes ids/uuids/timestamps to first-appearance placeholders (D13) and compares in order; the ignore-list is **JSON-path based** (e.g. `result.configOptions`, `result.modes`, `result.models`, `result.authMethods`, `params.update[sessionUpdate=usage_update]`) because Node's `initialize` / `session/new` / `session/load` responses carry fields the Rust side skips on purpose (`acp-agent.js:727`, `4641`, `4652-4653`, `4671-4672`).
 
-- [ ] **1.0** Read `rust/AGENTS.md`
-- [ ] **1.1** `rust/acp-recorder/` — binary + library; args: agent command, script path, output path
-- [ ] **1.2** Script format: ordered ACP calls (`initialize`, `session/new`, `session/prompt` with text, `session/cancel` after N updates, permission reply policy allow/deny)
-- [ ] **1.3** `C/tests/differential.rs` — `diff_frames(a, b, ignore: &[JsonPath]) -> Result<(), FrameDiff>` in `C/tests/common/mod.rs` (shared by `differential.rs`; never `pub` in `src/`); normalization; path-based ignore-list
-- [ ] **1.4** Unit tests use synthetic frame lists only (no agent needed)
-- [ ] **1.5** `rust/acp-recorder/examples/echo_agent.rs` — trivial in-repo ACP agent for 1.T4
+- [x] **1.0** Read `rust/AGENTS.md`
+- [x] **1.1** `rust/acp-recorder/` — binary + library; args: agent command, script path, output path
+- [x] **1.2** Script format: ordered ACP calls (`initialize`, `session/new`, `session/prompt` with text, `session/cancel` after N updates, permission reply policy allow/deny)
+- [x] **1.3** `C/tests/differential.rs` — `diff_frames(a, b, ignore: &[JsonPath]) -> Result<(), FrameDiff>` in `C/tests/common/mod.rs` (shared by `differential.rs`; never `pub` in `src/`); normalization; path-based ignore-list
+- [x] **1.4** Unit tests use synthetic frame lists only (no agent needed)
+- [x] **1.5** `rust/acp-recorder/examples/echo_agent.rs` — trivial in-repo ACP agent for 1.T4
 
 **Verify phase 1:**
-- [ ] **1.T1** Unit — `diff_frames`: a stream with two frames swapped **fails**; the same set in order passes — `inv_24_order_sensitive`
-- [ ] **1.T2** Unit — `diff_frames`: differing uuids/timestamps only → pass; differing text → fail
-- [ ] **1.T3** Unit — `diff_frames`: a differing field on an ignored JSON path passes; the same difference on a non-ignored path fails; an ignored whole frame (`usage_update`) missing on one side passes
-- [ ] **1.T4** Integration — `acp-recorder` against a trivial in-repo echo agent records `initialize` request + response in order
+- [x] **1.T1** Unit — `diff_frames`: a stream with two frames swapped **fails**; the same set in order passes — `inv_24_order_sensitive`
+- [x] **1.T2** Unit — `diff_frames`: differing uuids/timestamps only → pass; differing text → fail
+- [x] **1.T3** Unit — `diff_frames`: a differing field on an ignored JSON path passes; the same difference on a non-ignored path fails; an ignored whole frame (`usage_update`) missing on one side passes
+- [x] **1.T4** Integration — `acp-recorder` against a trivial in-repo echo agent records `initialize` request + response in order
 
 ---
 
@@ -640,20 +723,21 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - The Node adapter runs at `v0.70.0` via `npm ci && npm run build` then `node dist/index.js`, with `CLAUDE_CODE_EXECUTABLE=<fake-claude path>` (R30).
 - Corpus scripts live in `porting/corpus/<name>.transcript.jsonl` + `<name>.acp.json` (the ACP-side script for the recorder); fixtures in `porting/fixtures/<name>.frames.jsonl`.
 
-- [ ] **2.0** Read `rust/AGENTS.md`; `npm ci` needs network or a warm npm cache — if unavailable, stop and write `BLOCKED.md`
-- [ ] **2.1** `rust/fake-claude/` — replay engine per D13 (`expect` subset match, `$REQ` substitution, loud failure on mismatch, `keep_alive` injection option)
-- [ ] **2.2** `porting/capture.sh` — builds Node adapter, runs `acp-recorder` against it with fake-claude, writes the fixture; also dumps `<name>.argv.json` and `initialize.json` from the fake's captured stdin
-- [ ] **2.3** Corpus ≥ 10 transcripts (real recordings preferred; a hand-authored one is named `*.synthetic.transcript.jsonl` and must be re-recorded via 2.4 before phase 13): text-only · single tool · multi-tool · streamed partial tool input · permission-allow · permission-deny · cancel-mid-turn · subagent/Task with drain · error-result · idle-without-result (#825) · resume/load
-- [ ] **2.4** `porting/record-real.sh` — human-run one-time recording from real `claude` into a transcript ; not run by the gate
-- [ ] **2.5** Capture and commit fixtures for every corpus script
+- [x] **2.0** Read `rust/AGENTS.md`; `npm ci` needs network or a warm npm cache — if unavailable, stop and write `BLOCKED.md`
+- [x] **2.1** `rust/fake-claude/` — replay engine per D13 (`expect` subset match, `$REQ` substitution, loud failure on mismatch, `keep_alive` injection option)
+- [x] **2.2** `porting/capture.sh` — builds Node adapter, runs `acp-recorder` against it with fake-claude, writes the fixture; also dumps `<name>.argv.json` and `initialize.json` from the fake's captured stdin
+- [x] **2.3** Corpus ≥ 10 transcripts (real recordings preferred; a hand-authored one is named `*.synthetic.transcript.jsonl` and must be re-recorded via 2.4 before phase 13): text-only · single tool · multi-tool · streamed partial tool input · permission-allow · permission-deny · cancel-mid-turn · subagent/Task with drain · error-result · idle-without-result (#825) · resume/load
+- [x] **2.4** `porting/record-real.sh` — human-run one-time recording from real `claude` into a transcript ; not run by the gate
+- [x] **2.5** Capture and commit fixtures for every corpus script
 
 **Verify phase 2:**
-- [ ] **2.T1** Integration — `capture.sh` run twice yields byte-identical fixtures (post-normalization)
-- [ ] **2.T2** Unit — `fake-claude`: an unexpected stdin frame exits non-zero with the frame in stderr
-- [ ] **2.T3** Unit — `fake-claude`: `$MATCH.request_id` and `$MATCH.uuid` are substituted from the matched frame
-- [ ] **2.T4** Integration — the union of `porting/fixtures/*.argv.json` covers every B2 row (`--replay-user-messages`, `--include-partial-messages`, `--permission-prompt-tool`, `--session-id`, …)
-- [ ] **2.T5** Integration — Node's text-only capture ends with `stopReason: end_turn`, not a force-cancel timeout
-- [ ] **2.T6** Regression — G7 command prints nothing
+- [x] **2.T1** Integration — `capture.sh` run twice yields byte-identical fixtures (post-normalization)
+- [x] **2.T2** Unit — `fake-claude`: an unexpected stdin frame exits non-zero with the frame in stderr
+- [x] **2.T3** Unit — `fake-claude`: `$MATCH.request_id` and `$MATCH.uuid` are substituted from the matched frame
+- [x] **2.T4** Integration — the union of `porting/fixtures/*.argv.json` covers every B2 row (`--replay-user-messages`, `--include-partial-messages`, `--permission-prompt-tool`, `--session-id`, …)
+- [x] **2.T5** Integration — Node's text-only capture ends with `stopReason: end_turn`, not a force-cancel timeout
+- [x] **2.T6** Regression — G7 command prints nothing
+- [x] **2.T7** Integration — `fixtures_are_portable_and_secret_free`: no file under `porting/fixtures/` contains `/home/`, `TOKEN`, `SECRET`, `AUTH_SOCK`, or any value of a current-process env var whose name matches `TOKEN|KEY|SECRET|PASS`
 
 ---
 
@@ -665,26 +749,26 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - stderr: keep a 2 KB rolling tail; on exit drain up to `stderr_drain_cap` (200 ms) before reporting.
 - Host-death guarantee: `claude` exits when its stdin reaches EOF (INV-28); `kill_on_drop(true)` + group kill on `dispose()`.
 
-- [ ] **3.0** Read `rust/AGENTS.md`
-- [ ] **3.1** `process.rs` — spawn with the full B2 argv/env; `NODE_OPTIONS` removed
-- [ ] **3.2** Binary resolution: `ServeOptions.claude_path` → `CLAUDE_CODE_EXECUTABLE` → PATH; typed error on miss; pure fn taking an injected `Os` enum (`claude` / `claude.exe`)
-- [ ] **3.3** `codec.rs` — newline-delimited JSON, partial-line buffer, UTF-8 carry, own task → `mpsc`
-- [ ] **3.4** stderr tail + drain-before-exit
-- [ ] **3.5** Kill ladder per D12 with `Timings`; user abort goes through a **separate** forwarded token, never straight to `kill`
-- [ ] **3.6** Process group (`process_group(0)`, `nix::killpg`) on unix; job object + `CREATE_NO_WINDOW` on windows
+- [x] **3.0** Read `rust/AGENTS.md`
+- [x] **3.1** `process.rs` — spawn with the full B2 argv/env; `NODE_OPTIONS` removed
+- [x] **3.2** Binary resolution: `ServeOptions.claude_path` → `CLAUDE_CODE_EXECUTABLE` → PATH; typed error on miss; pure fn taking an injected `Os` enum (`claude` / `claude.exe`)
+- [x] **3.3** `codec.rs` — newline-delimited JSON, partial-line buffer, UTF-8 carry, own task → `mpsc`
+- [x] **3.4** stderr tail + drain-before-exit
+- [x] **3.5** Kill ladder per D12 with `Timings`; user abort goes through a **separate** forwarded token, never straight to `kill`
+- [x] **3.6** Process group (`process_group(0)`, `nix::killpg`) on unix; job object + `CREATE_NO_WINDOW` on windows
 
 **Verify phase 3:**
-- [ ] **3.T1** Integration — spawn `fake-claude` for the text-only script; its captured argv equals `porting/fixtures/text-only.argv.json` after uuid normalization, and its env has `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` set and `NODE_OPTIONS` absent (other env vars are not compared)
-- [ ] **3.T2** Unit — `codec`: a garbage line is skipped, the next valid line parses — `inv_01_garbage_line_skipped`
-- [ ] **3.T3** Unit — `codec`: a 10 MB single line parses; a message split across 3 reads reassembles — `inv_02_partial_and_huge_lines`
-- [ ] **3.T4** Unit — `codec`: a 4-byte UTF-8 char split across reads decodes intact — `inv_03_utf8_split`
-- [ ] **3.T5** Integration — fake child writes to stderr then exits → full tail in the error, within the cap — `inv_04_stderr_drained`
-- [ ] **3.T6** Integration — fake child ignoring stdin close: SIGTERM only after `stdin_close_wait`, SIGKILL only after `term_to_kill_wait` (durations shrunk via `Timings`) — `inv_05_kill_ladder` (also asserts a user abort goes through the ladder, never straight to SIGKILL)
-- [ ] **3.T7** Integration — after `dispose()`, `kill(pid,0)` returns `ESRCH` for the recorded child pid — `inv_06_no_orphan_after_dispose`
-- [ ] **3.T8** Integration — a helper binary spawns a child via the crate then is SIGKILLed; the child is gone within 5 s — `inv_28_host_sigkill_no_orphan`
-- [ ] **3.T9** Unit — `codec`: cancelling the consumer's `select!` mid-stream loses no line — `inv_32_codec_cancel_safe`
-- [ ] **3.T10** Unit — `process`: `resolve_binary(Os::Windows)` returns `claude.exe`; unix returns `claude`
-- [ ] **3.T11** Gate — G8 cross-target `check` passes — `INV-25`
+- [x] **3.T1** Integration — spawn `fake-claude` for the text-only script; its captured argv equals `porting/fixtures/text-only.argv.json` after uuid normalization, and its env has `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` set and `NODE_OPTIONS` absent (other env vars are not compared)
+- [x] **3.T2** Unit — `codec`: a garbage line is skipped, the next valid line parses — `inv_01_garbage_line_skipped`
+- [x] **3.T3** Unit — `codec`: a 10 MB single line parses; a message split across 3 reads reassembles — `inv_02_partial_and_huge_lines`
+- [x] **3.T4** Unit — `codec`: a 4-byte UTF-8 char split across reads decodes intact — `inv_03_utf8_split`
+- [x] **3.T5** Integration — fake child writes to stderr then exits → full tail in the error, within the cap — `inv_04_stderr_drained`
+- [x] **3.T6** Integration — fake child ignoring stdin close: SIGTERM only after `stdin_close_wait`, SIGKILL only after `term_to_kill_wait` (durations shrunk via `Timings`) — `inv_05_kill_ladder` (also asserts a user abort goes through the ladder, never straight to SIGKILL)
+- [x] **3.T7** Integration — after `dispose()`, `kill(pid,0)` returns `ESRCH` for the recorded child pid — `inv_06_no_orphan_after_dispose`
+- [x] **3.T8** Integration — a helper binary spawns a child via the crate then is SIGKILLed; the child is gone within 5 s — `inv_28_host_sigkill_no_orphan`
+- [x] **3.T9** Unit — `codec`: cancelling the consumer's `select!` mid-stream loses no line — `inv_32_codec_cancel_safe`
+- [x] **3.T10** Unit — `process`: `resolve_binary(Os::Windows)` returns `claude.exe`; unix returns `claude`
+- [x] **3.T11** Gate — G8 cross-target `check` passes — `INV-25`
 
 ---
 
@@ -696,24 +780,24 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - `initialize` request field set = exactly what `porting/fixtures/initialize.json` shows (phase 2; includes `systemPrompt`, `agents`, `hooks`, `skills`, `toolAliases`, and the rest); response parsed for `commands`, `models`, `account`, `pending_permission_requests`.
 - stdin is never closed after a turn (D7).
 
-- [ ] **4.0** Read `rust/AGENTS.md`
-- [ ] **4.1** `control.rs` — single writer task; `send_user`, `send_request`, `send_response`, `send_cancel`
-- [ ] **4.2** `request_id` generation; correlation map; unknown-id drop
-- [ ] **4.3** Inbound router: `control_response` · `control_request` · `control_cancel_request` · `keep_alive`
-- [ ] **4.4** `initialize` handshake matching `initialize.json`; parse the response
-- [ ] **4.5** `pending_permission_requests` replay from the initialize response
-- [ ] **4.6** Unknown inbound subtype → `{subtype:"error"}` response
+- [x] **4.0** Read `rust/AGENTS.md`
+- [x] **4.1** `control.rs` — single writer task; `send_user`, `send_request`, `send_response`, `send_cancel`
+- [x] **4.2** `request_id` generation; correlation map; unknown-id drop
+- [x] **4.3** Inbound router: `control_response` · `control_request` · `control_cancel_request` · `keep_alive`
+- [x] **4.4** `initialize` handshake matching `initialize.json`; parse the response
+- [x] **4.5** `pending_permission_requests` replay from the initialize response
+- [x] **4.6** Unknown inbound subtype → `{subtype:"error"}` response
 
 **Verify phase 4:**
-- [ ] **4.T1** Unit — `control`: `keep_alive` is consumed, the caller sees nothing — `inv_07_keep_alive_consumed`
-- [ ] **4.T2** Unit — `control`: 100 concurrent frames of mixed kinds → exactly 100 whole lines on stdin — `inv_08_single_stdin_writer`
-- [ ] **4.T3** Unit — `control`: a response for an unknown `request_id` is dropped, no panic — `inv_09_unknown_id_dropped`
-- [ ] **4.T4** Unit — `control`: an inbound `control_cancel_request` aborts the pending handler and writes no response — `inv_10_inbound_cancel_aborts_handler`
-- [ ] **4.T5** Unit — `control`: the emitted `initialize` frame equals `porting/fixtures/initialize.json` (after id normalization) — `inv_11_initialize_matches_adapter`
-- [ ] **4.T6** Integration — vs `fake-claude`: after a `result` frame, a second `user` frame is written to the same stdin and the fake answers it — `inv_12_stdin_stays_open`
-- [ ] **4.T7** Regression — a slow outbound control request does not block inbound stream parsing (R5 is outbound only)
-- [ ] **4.T8** Unit — `control`: a `pending_permission_requests` entry in the initialize response is replayed to the handler
-- [ ] **4.T9** Unit — `control`: an inbound control request with an unknown subtype gets `{subtype:"error"}` written back
+- [x] **4.T1** Unit — `control`: `keep_alive` is consumed, the caller sees nothing — `inv_07_keep_alive_consumed`
+- [x] **4.T2** Unit — `control`: 100 concurrent frames of mixed kinds → exactly 100 whole lines on stdin — `inv_08_single_stdin_writer`
+- [x] **4.T3** Unit — `control`: a response for an unknown `request_id` is dropped, no panic — `inv_09_unknown_id_dropped`
+- [x] **4.T4** Unit — `control`: an inbound `control_cancel_request` aborts the pending handler and writes no response — `inv_10_inbound_cancel_aborts_handler`
+- [x] **4.T5** Unit — `control`: the emitted `initialize` frame equals `porting/fixtures/initialize.json` (after id normalization) — `inv_11_initialize_matches_adapter`
+- [x] **4.T6** Integration — vs `fake-claude`: after a `result` frame, a second `user` frame is written to the same stdin and the fake answers it — `inv_12_stdin_stays_open`
+- [x] **4.T7** Regression — a slow outbound control request does not block inbound stream parsing (R5 is outbound only)
+- [x] **4.T8** Unit — `control`: a `pending_permission_requests` entry in the initialize response is replayed to the handler
+- [x] **4.T9** Unit — `control`: an inbound control request with an unknown subtype gets `{subtype:"error"}` written back
 
 ---
 
@@ -724,18 +808,18 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - The actor's read loop is `tokio::select!` between a cancel token and `rx.recv()` on the codec's `mpsc` (R8) — never a stored `next()` future.
 - `tokio::spawn` per message is banned in the dispatch path (R13).
 
-- [ ] **5.0** Read `rust/AGENTS.md`
-- [ ] **5.1** `session.rs` — actor, `Command` enum, reply oneshots
-- [ ] **5.2** `dispatch.rs` — `route` + `run_dispatch`, sequential, order-preserving
-- [ ] **5.3** Read loop: `select!` on cancel token vs `recv()`
-- [ ] **5.4** One-active-turn enforcement + a test-visible high-water counter
+- [x] **5.0** Read `rust/AGENTS.md`
+- [x] **5.1** `session.rs` — actor, `Command` enum, reply oneshots
+- [x] **5.2** `dispatch.rs` — `route` + `run_dispatch`, sequential, order-preserving
+- [x] **5.3** Read loop: `select!` on cancel token vs `recv()`
+- [x] **5.4** One-active-turn enforcement + a test-visible high-water counter
 
 **Verify phase 5:**
-- [ ] **5.T1** Unit — `dispatch`: 1000 messages through an injected handler arrive in send order, under `#[tokio::test(flavor = "multi_thread")]` — `inv_13_dispatch_order`
-- [ ] **5.T2** Unit — `session`: 25 concurrent `Command::Prompt` on one session with an injected fake turn-completion → high-water active turns == 1, all 25 resolve in order — `inv_14_one_active_turn`
-- [ ] **5.T3** Unit — `session`: a cancel racing the loop's idle `recv` loses no queued message — `inv_15_cancel_loses_nothing`
-- [ ] **5.T4** Regression — G5 clean: the gate's clippy run has no `disallowed-types` hit in `src/`
-- [ ] **5.T5** Regression — `timeout 120`; no test hangs
+- [x] **5.T1** Unit — `dispatch`: 1000 messages through an injected handler arrive in send order, under `#[tokio::test(flavor = "multi_thread")]` — `inv_13_dispatch_order`
+- [x] **5.T2** Unit — `session`: 25 concurrent `Command::Prompt` on one session with an injected fake turn-completion → high-water active turns == 1, all 25 resolve in order — `inv_14_one_active_turn`
+- [x] **5.T3** Unit — `session`: a cancel racing the loop's idle `recv` loses no queued message — `inv_15_cancel_loses_nothing`
+- [x] **5.T4** Regression — G5 clean: the gate's clippy run has no `disallowed-types` hit in `src/`
+- [x] **5.T5** Regression — `timeout 120`; no test hangs
 
 ---
 
@@ -749,21 +833,21 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Every settle path routes through `settle_or_defer` when subagents are live (#866).
 - `result.subtype` → `StopReason` table is read from `acp-agent.js:2532-2884` and copied into `turn.rs` as a table-driven fn.
 
-- [ ] **6.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **6.1** `turn.rs` — `Turn` struct; `activate` (on echo), `settle`, `defer`
-- [ ] **6.2** Echo tracking; abandonment documented as a known hole (#825)
-- [ ] **6.3** `settle_or_defer` with a live-subagent set fed by `task_started` / `task_notification` frames (#866)
-- [ ] **6.4** Idle lane: `session_state_changed` = idle settles the turn, or fails it if no `result` arrived (#825)
-- [ ] **6.5** `result` → stop-reason table; `is_error` results become errors; #453 result-text fallback
-- [ ] **6.6** Orphan accounting: dead turns' late `result` coalesced in the documented order (`1453`)
+- [x] **6.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **6.1** `turn.rs` — `Turn` struct; `activate` (on echo), `settle`, `defer`
+- [x] **6.2** Echo tracking; abandonment documented as a known hole (#825)
+- [x] **6.3** `settle_or_defer` with a live-subagent set fed by `task_started` / `task_notification` frames (#866)
+- [x] **6.4** Idle lane: `session_state_changed` = idle settles the turn, or fails it if no `result` arrived (#825)
+- [x] **6.5** `result` → stop-reason table; `is_error` results become errors; #453 result-text fallback
+- [x] **6.6** Orphan accounting: dead turns' late `result` coalesced in the documented order (`1453`)
 
 **Verify phase 6:**
-- [ ] **6.T1** Unit — `turn`: a turn with 2 live subagents does not settle until both drain — `inv_16_subagents_hold_settle`
-- [ ] **6.T2** Unit — `turn`: result text present only in the `result` frame yields a `TurnEvent::FinalText` (internal event; ACP emission is phase 7) — `inv_29_result_text_fallback`
-- [ ] **6.T3** Unit — `turn`: a dead turn's late `result` is not consumed by the next turn — `inv_30_orphan_result_not_reused`
-- [ ] **6.T4** Unit — `turn`: idle without a `result` fails the active turn — `inv_31_idle_without_result_fails`
-- [ ] **6.T5** Unit — `turn`: table test, one case per `result.subtype` → expected `StopReason`
-- [ ] **6.T6** Regression — `#[tokio::test(flavor = "multi_thread")]` on 6.T1–6.T4; `timeout 120`
+- [x] **6.T1** Unit — `turn`: a turn with 2 live subagents does not settle until both drain — `inv_16_subagents_hold_settle`
+- [x] **6.T2** Unit — `turn`: result text present only in the `result` frame yields a `TurnEvent::FinalText` (internal event; ACP emission is phase 7) — `inv_29_result_text_fallback`
+- [x] **6.T3** Unit — `turn`: a dead turn's late `result` is not consumed by the next turn — `inv_30_orphan_result_not_reused`
+- [x] **6.T4** Unit — `turn`: idle without a `result` fails the active turn — `inv_31_idle_without_result_fails`
+- [x] **6.T5** Unit — `turn`: table test, one case per `result.subtype` → expected `StopReason`
+- [x] **6.T6** Regression — `#[tokio::test(flavor = "multi_thread")]` on 6.T1–6.T4; `timeout 120`
 
 ---
 
@@ -773,19 +857,19 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Emitted variants and discards: B1. Source ranges: `ADP` `6383–6759`, `6760–6864`, `6303–6382`; partial-JSON lexer at `acp-agent.js:179-232` (closes a partial object at a top-level comma).
 - `stream_event` frames exist only because argv has `--include-partial-messages` (B2).
 
-- [ ] **7.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **7.1** `map.rs` — `assistant`/`user` consolidated → `AgentMessageChunk` / `AgentThoughtChunk` / `UserMessageChunk`
-- [ ] **7.2** `stream_event` deltas → chunk updates
-- [ ] **7.3** `tool_use` → `ToolCall`; `tool_result` → `ToolCallUpdate` (generic shape; per-tool shapes come in phase 9)
-- [ ] **7.4** Streamed partial tool input: incremental JSON-prefix lexer; refine, don't duplicate
-- [ ] **7.5** `TodoWrite` → `Plan`; `commands_changed` → `AvailableCommandsUpdate`; mode → `CurrentModeUpdate`
-- [ ] **7.6** Explicitly drop `SessionInfoUpdate` / `ConfigOptionUpdate` / `UsageUpdate`
-- [ ] **7.7** Dedupe: a block present in both `stream_event` and the consolidated message emits once
+- [x] **7.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **7.1** `map.rs` — `assistant`/`user` consolidated → `AgentMessageChunk` / `AgentThoughtChunk` / `UserMessageChunk`
+- [x] **7.2** `stream_event` deltas → chunk updates
+- [x] **7.3** `tool_use` → `ToolCall`; `tool_result` → `ToolCallUpdate` (generic shape; per-tool shapes come in phase 9)
+- [x] **7.4** Streamed partial tool input: incremental JSON-prefix lexer; refine, don't duplicate
+- [x] **7.5** `TodoWrite` → `Plan`; `commands_changed` → `AvailableCommandsUpdate`; mode → `CurrentModeUpdate`
+- [x] **7.6** Explicitly drop `SessionInfoUpdate` / `ConfigOptionUpdate` / `UsageUpdate`
+- [x] **7.7** Dedupe: a block present in both `stream_event` and the consolidated message emits once
 
 **Verify phase 7:**
-- [ ] **7.T1** Unit — `map`: table-driven, one case per emitted variant; the 3 discarded produce `None` — `inv_18_variant_mapping`
-- [ ] **7.T2** Unit — `map`: a tool input streamed in 5 fragments yields 1 `ToolCall` + N `ToolCallUpdate`, never 2 `ToolCall` — `inv_19_partial_input_refines`
-- [ ] **7.T3** Unit — `map`: dedupe case from 7.7
+- [x] **7.T1** Unit — `map`: table-driven, one case per emitted variant; the 3 discarded produce `None` — `inv_18_variant_mapping`
+- [x] **7.T2** Unit — `map`: a tool input streamed in 5 fragments yields 1 `ToolCall` + N `ToolCallUpdate`, never 2 `ToolCall` — `inv_19_partial_input_refines`
+- [x] **7.T3** Unit — `map`: dedupe case from 7.7
 
 ---
 
@@ -795,22 +879,35 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - B1 defines `serve`, `ServeOptions`, `Timings`, and the method table; unhandled methods return `-32601`.
 - `session/new` starts the child (phase 3), does the `initialize` handshake (phase 4), returns `sessionId`; `session/prompt` maps content blocks (text, image, resource, resource_link) to a Claude user message (`ADP` `6101–6193`).
 - stdout of the binary is ACP-only; logs go to stderr.
+- **Phase-6 rework (review 04) — the `TurnMachine` is ready to wire.** Its public drive methods are `enqueue`, `on_echo(uuid)`, `on_result(result, emitted_assistant_text)` (reads `origin.kind` itself), `on_task_started(task_id, is_subagent)`, `on_task_ended(task_id)`, `on_idle()` (records `last_session_state` internally), `cancel()`, `force_cancel()`, `on_stream_end()` and `fail_all(kind)`. It returns `TurnEvent`s: `Settled{prompt_uuid, stop_reason, usage}`, `Failed{prompt_uuid, kind, message}`, `Activated{prompt_uuid}`, `FinalText{text}`. `FailureKind` is `AuthRequired|ProviderError|BudgetExhausted|ContextExhausted|NoResult|SessionEnded`; the actor maps `AuthRequired` → `authRequired`, else `internalError` with `errorKind` data (review 04 § Phase 8 wiring instructions).
+- **Prompt push is immediate, not gated.** Upstream pushes every prompt to `claude` at once; the echo/hand-off/`ensureActiveTurn`/cancel-orphan logic assumes the queued turns' user messages are already in the SDK. The phase-5 injected `completions` lane and the `active`/`queue`/`completions` fake in `session.rs:177-230` are removed; the one-active-turn high-water counter (5.4, INV-14) is keyed on `Activated` / `Settled` events instead.
+- **Turn identity maps to the reply.** A fresh uuid per `Command::Prompt` is stamped into the outbound `user` frame's `uuid` field and kept in a `HashMap<uuid, oneshot>`; every `Settled{uuid, stop_reason, usage}` resolves it, every `Failed{uuid, kind, message}` rejects it (review 04 § Phase 8 wiring).
+- **`dispatch_stream` (`session.rs:280`) routes frames in stream order** (review 04 § Phase 8 wiring): `user`+`uuid` → `on_echo(uuid)` (an `isReplay` frame with no match is dropped; the turn's own echo is not forwarded to the client); `result` → `on_result(frame, emitted_assistant_text)` then clear the flag for non-autonomous results; `system/task_started` → `on_task_started(task_id, subagent_type.is_some())`; `system/task_notification` and terminal `system/task_updated` → `on_task_ended(task_id)`; `system/session_state_changed` → record `last_session_state`, and `idle` → `on_idle()`; `stream_event`/`assistant` → the phase-7 mapper, setting `emitted_assistant_text = true` when top-level text is emitted (subagent chunks with `parent_tool_use_id` excluded).
+- **`FinalText{text}`** is emitted as an `agent_message_chunk` (phase-7 mapper) *before* the same batch's `Settled` resolves the prompt (review 04 § Phase 8 wiring).
 
-- [ ] **8.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **8.1** `agent.rs` — `pub async fn serve(transport, opts)` with `Agent::builder()` handlers: `initialize`, `session/new`, `session/load` (`--resume`, D15), `session/prompt`; unhandled → `-32601`
-- [ ] **8.2** `ServeOptions` + `Timings` as typed in B1, with `from_env()`
-- [ ] **8.3** Prompt content-block mapping
-- [ ] **8.4** `session/new` option mapping: `cwd`, model, permission mode → argv (B2); generate a uuid, pass `--session-id=<uuid>`, return it as `sessionId`
-- [ ] **8.5** `bin/claude-agent-acp-rs.rs` — `serve(Stdio::new(), ServeOptions::from_env())`; no `println!`
-- [ ] **8.6** Wire `differential.rs` to run recorder → Rust binary + fake-claude, diff vs fixture; binaries are found at `target/<profile>/{fake-claude,acp-recorder}` (the gate builds them first) and a missing binary fails loudly
+- [x] **8.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **8.1** `agent.rs` — `pub async fn serve(transport, opts)` with `Agent::builder()` handlers: `initialize`, `session/new`, `session/load` (`--resume`, D15), `session/prompt`; unhandled → `-32601`
+- [x] **8.2** `ServeOptions` + `Timings` as typed in B1, with `from_env()`
+- [x] **8.3** Prompt content-block mapping
+- [x] **8.4** `session/new` option mapping: `cwd`, model, permission mode → argv (B2); generate a uuid, pass `--session-id=<uuid>`, return it as `sessionId`
+- [x] **8.5** `bin/claude-agent-acp-rs.rs` — `serve(Stdio::new(), ServeOptions::from_env())`; no `println!`
+- [x] **8.6** Wire `differential.rs` to run recorder → Rust binary + fake-claude, diff vs fixture; binaries are found at `target/<profile>/{fake-claude,acp-recorder}` (the gate builds them first) and a missing binary fails loudly
+^- [x] **8.7** Prompt lane: stamp a fresh uuid per `Command::Prompt`, write it into the outbound `user` frame's `uuid`, `enqueue(Turn::new(uuid, is_local_only))`, push to `claude` immediately; keep a `HashMap<uuid, oneshot>` resolving on `Settled{uuid, stop_reason, usage}` and rejecting on `Failed{uuid, kind, message}`; remove the phase-5 `active`/`queue`/`completions` fake from `session.rs:177-230`; key the one-active-turn high-water counter on `Activated`/`Settled`
+^- [x] **8.8** Route session frames in `dispatch_stream` (`session.rs:280`) into `TurnMachine` in stream order: `user`+`uuid` → `on_echo(uuid)`; `result` → `on_result(frame, emitted_assistant_text)` then clear the flag (non-autonomous); `task_started`/`task_notification`/terminal `task_updated` → `on_task_started`/`on_task_ended`; `session_state_changed` → record state, `idle` → `on_idle()`; `stream_event`/`assistant` → phase-7 mapper + set `emitted_assistant_text` on top-level text; emit `FinalText{text}` as `agent_message_chunk` before the batch's `Settled`
+^- [x] **8.9** Cancel / teardown: `Command::Cancel` → `machine.cancel()` (resolve swept queued turns, inline-held) then `interrupt` via `control.rs` (phase 11 arms the `force_cancel()` floor); stream EOF / codec error → `machine.on_stream_end()` / `fail_all(...)`, resolve/reject every returned turn, then mark the session closed so later prompts reject up front
 
 **Verify phase 8:**
-- [ ] **8.T1** Integration — `differential`: text-only and resume/load corpus scripts diff clean — `inv_24_text_only`
-- [ ] **8.T2** Unit — `agent`: an unhandled method returns `-32601`, never hangs or panics
-- [ ] **8.T3** Unit — `agent`: prompt blocks table (text/image/resource/resource_link) → expected Claude content
-- [ ] **8.T4** Regression — nothing but JSON-RPC frames ever reaches stdout (a stray `println!` fails)
-- [ ] **8.T5** Unit — `agent`: `session/new` with a model and permission mode yields `--model` / `--permission-mode` / `--session-id=<uuid>` in the spawned argv, and the returned `sessionId` equals that uuid
-- [ ] **8.T6** Unit — `agent`: `session/load` with an id this process never minted spawns `--resume <id>` and returns ok (terminal → Rich Chat)
+- [x] **8.T1** Integration — `differential`: text-only and resume/load corpus scripts diff clean — `inv_24_text_only`
+- [x] **8.T2** Unit — `agent`: an unhandled method returns `-32601`, never hangs or panics
+- [x] **8.T3** Unit — `agent`: prompt blocks table (text/image/resource/resource_link) → expected Claude content
+- [x] **8.T4** Regression — nothing but JSON-RPC frames ever reaches stdout (a stray `println!` fails)
+- [x] **8.T5** Unit — `agent`: `session/new` with a model and permission mode yields `--model` / `--permission-mode` / `--session-id=<uuid>` in the spawned argv, and the returned `sessionId` equals that uuid
+- [x] **8.T6** Unit — `agent`: `session/load` with an id this process never minted spawns `--resume <id>` and returns ok (terminal → Rich Chat)
+^- [x] **8.T7** Integration — `differential`: lagging trailing idle after the next echo is absorbed, not a false #825 fail — `inv_24_lagging_idle`
+^- [x] **8.T8** Integration — `differential`: `/context` (echo-less local-only) promotes and settles at its own result — `inv_24_context_echo_less`
+^- [x] **8.T9** Integration — `differential`: subagent hold → followup result settles the held turn inside the turn — `inv_24_subagent_followup`
+^- [x] **8.T10** Integration — `differential`: cancel with a queued prompt, then an echo-less next prompt — the queued prompt's late result is orphaned, never activates/settles the next prompt — `inv_24_cancel_queued_echo_less`
+^- [x] **8.T11** Integration — `differential`: EOF mid-turn settles the active turn and rejects queued prompts with `SESSION_ENDED_MESSAGE`, then a later prompt rejects up front — `inv_24_eof_mid_turn`
 
 ---
 
@@ -822,15 +919,15 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - `MultiEdit` and `NotebookEdit` have no case upstream — do **not** invent shapes; they take the fallback.
 - Tool-result shaping (`toolUpdateFromToolResult`) covers `Read`, `Bash`, `Agent`, `Task`, `Skill`, `Edit`, `Write`, `ExitPlanMode`, `WebSearch` plus result block types; anything else → generic.
 
-- [ ] **9.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **9.1** `tools.rs` — `tool_shape(name, input) -> ToolShape` for each tool above
-- [ ] **9.2** Tool-result → `ToolCallUpdate` content (diff for edits, text for output)
-- [ ] **9.3** Plug into `map.rs` (7.3)
+- [x] **9.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **9.1** `tools.rs` — `tool_shape(name, input) -> ToolShape` for each tool above
+- [x] **9.2** Tool-result → `ToolCallUpdate` content (diff for edits, text for output)
+- [x] **9.3** Plug into `map.rs` (7.3)
 
 **Verify phase 9:**
-- [ ] **9.T1** Unit — `tools`: table-driven, one case per tool asserting `kind`, `title`, `locations`
-- [ ] **9.T2** Unit — `tools`: an unknown tool falls back to the generic shape, never panics
-- [ ] **9.T3** Integration — `differential`: single-tool, multi-tool, streamed-partial-input, subagent, error-result scripts diff clean — `inv_24_tools`
+- [x] **9.T1** Unit — `tools`: table-driven, one case per tool asserting `kind`, `title`, `locations`
+- [x] **9.T2** Unit — `tools`: an unknown tool falls back to the generic shape, never panics
+- [x] **9.T3** Integration — `differential`: single-tool, multi-tool, streamed-partial-input, subagent, error-result scripts diff clean — `inv_24_tools`
 
 ---
 
@@ -842,20 +939,20 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Allow-always adds `_meta.permission` rule updates; source `ADP` `4069–4275`, `4017–4068`, `447–541`.
 - Subagent attribution: `task_started.task_id === can_use_tool.agentID` (`acp-agent.js:4109-4113`).
 
-- [ ] **10.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **10.1** `permission.rs` — spawned task per request → ACP `session/request_permission`
-- [ ] **10.2** `ensure_tool_call_emitted` before any permission request (#851)
-- [ ] **10.3** Outcome mapping: allow / allow-always (rule additions) / deny / client-cancelled
-- [ ] **10.4** Deny sends the R28 payload; the turn continues
-- [ ] **10.5** Subagent permission attributed to its parent tool call
+- [x] **10.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **10.1** `permission.rs` — spawned task per request → ACP `session/request_permission`
+- [x] **10.2** `ensure_tool_call_emitted` before any permission request (#851)
+- [x] **10.3** Outcome mapping: allow / allow-always (rule additions) / deny / client-cancelled
+- [x] **10.4** Deny sends the R28 payload; the turn continues
+- [x] **10.5** Subagent permission attributed to its parent tool call
 
 **Verify phase 10:**
-- [ ] **10.T1** Unit — `permission`: a request for an unseen tool id first emits the `ToolCall` — `inv_20_permission_after_toolcall`
-- [ ] **10.T2** Unit — `permission`: deny → exact R28 payload written; turn settles on the next `result` — `inv_21_deny_payload_and_continue`
-- [ ] **10.T3** Unit — `session`: a `session/cancel` during a pending permission resolves it as cancelled within the timeout — `inv_27_no_inline_await`
-- [ ] **10.T4** Integration — `differential`: permission-allow and permission-deny scripts diff clean — `inv_24_permissions`
-- [ ] **10.T5** Regression — a subagent's permission request is attributed to its parent tool call
-- [ ] **10.T6** Unit — `permission`: allow-always emits the `_meta.permission` rule additions
+- [x] **10.T1** Unit — `permission`: a request for an unseen tool id first emits the `ToolCall` — `inv_20_permission_after_toolcall`
+- [x] **10.T2** Unit — `permission`: deny → exact R28 payload written; turn settles on the next `result` — `inv_21_deny_payload_and_continue`
+- [x] **10.T3** Unit — `session`: a `session/cancel` during a pending permission resolves it as cancelled within the timeout — `inv_27_no_inline_await`
+- [x] **10.T4** Integration — `differential`: permission-allow and permission-deny scripts diff clean — `inv_24_permissions`
+- [x] **10.T5** Regression — a subagent's permission request is attributed to its parent tool call
+- [x] **10.T6** Unit — `permission`: allow-always emits the `_meta.permission` rule additions
 
 ---
 
@@ -865,18 +962,18 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - `session/cancel` → control `interrupt`; upstream arms the force-cancel timer inside `cancel()` (`acp-agent.js:3593-3605`), default 30 s, injectable via `Timings.force_cancel_grace` (R29).
 - Reconciliation: with `interrupt_receipt_v1`, use the `still_queued` lane; otherwise the legacy count lane; guard the **field**, not the receipt (`acp-agent.js:3608-3648`).
 
-- [ ] **11.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
-- [ ] **11.1** `cancel_active_prompt` → control `interrupt`
-- [ ] **11.2** Force-cancel deadline armed once per cancel sequence (wedged stream settles `cancelled`) (#680)
-- [ ] **11.3** Orphan reconciliation: `still_queued` lane + legacy count lane
-- [ ] **11.4** Field guard: a bare `{}` receipt falls back to count-everything
+- [x] **11.0** Read `rust/AGENTS.md`; if `dist/acp-agent.js` is absent run `npm ci && npm run build` (line refs below are dist lines)
+- [x] **11.1** `cancel_active_prompt` → control `interrupt`
+- [x] **11.2** Force-cancel deadline armed once per cancel sequence (wedged stream settles `cancelled`) (#680)
+- [x] **11.3** Orphan reconciliation: `still_queued` lane + legacy count lane
+- [x] **11.4** Field guard: a bare `{}` receipt falls back to count-everything
 
 **Verify phase 11:**
-- [ ] **11.T1** Unit — `cancel`: a stream that never yields settles `cancelled` at the injected grace — `inv_17_force_cancel_floor`
-- [ ] **11.T2** Unit — `cancel`: 5 rapid cancels arm the deadline once — `inv_22_cancel_idempotent`
-- [ ] **11.T3** Unit — `cancel`: receipt with `still_queued` reconciles; a bare `{}` falls back to count-everything — `inv_23_receipt_field_guard`
-- [ ] **11.T4** Integration — `differential`: cancel-mid-turn script diffs clean — `inv_24_cancel`
-- [ ] **11.T5** Regression — cancel then a new prompt on the same session works
+- [x] **11.T1** Unit — `cancel`: a stream that never yields settles `cancelled` at the injected grace — `inv_17_force_cancel_floor`
+- [x] **11.T2** Unit — `cancel`: 5 rapid cancels arm the deadline once — `inv_22_cancel_idempotent`
+- [x] **11.T3** Unit — `cancel`: receipt with `still_queued` reconciles; a bare `{}` falls back to count-everything — `inv_23_receipt_field_guard`
+- [x] **11.T4** Integration — `differential`: cancel-mid-turn script diffs clean — `inv_24_cancel`
+- [x] **11.T5** Regression — cancel then a new prompt on the same session works
 
 ---
 
@@ -886,18 +983,18 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Steering rules: R32 (B1 table row). Shutdown: on stdin EOF or SIGTERM of the binary, drain in-flight work, then teardown (D12 ladder) within a bounded deadline.
 - `examples/in_process.rs` mirrors vibe-station's future use: `Channel::duplex()` gives two ends; the agent takes one via `serve`, a `Client::builder().connect_with(other_end, …)` takes the other (R23).
 
-- [ ] **12.0** Read `rust/AGENTS.md`
-- [ ] **12.1** `_session/steering` — `"now"` injection via the control writer; idle + `promptRequired` outcome; bad `idleBehavior` → `invalidParams`
-- [ ] **12.2** Shutdown on stdin EOF / SIGTERM: drain then teardown, bounded deadline
-- [ ] **12.3** `examples/in_process.rs` — `Channel::duplex()` wiring
-- [ ] **12.4** Run the corpus over `Channel::duplex()` as well as stdio
+- [x] **12.0** Read `rust/AGENTS.md`
+- [x] **12.1** `_session/steering` — `"now"` injection via the control writer; idle + `promptRequired` outcome; bad `idleBehavior` → `invalidParams`
+- [x] **12.2** Shutdown on stdin EOF / SIGTERM: drain then teardown, bounded deadline
+- [x] **12.3** `examples/in_process.rs` — `Channel::duplex()` wiring
+- [x] **12.4** Run the corpus over `Channel::duplex()` as well as stdio
 
 **Verify phase 12:**
-- [ ] **12.T1** Unit — `agent`: steering idle + `promptRequired` → `{outcome:"promptRequired", reason:"noRunningTurn"}`; `idleBehavior:"x"` → `invalidParams`
-- [ ] **12.T2** Integration — stdin EOF mid-turn leaves no orphan `claude` and the binary exits 0 — `inv_06_eof_no_orphan`
-- [ ] **12.T3** Integration — text-only + single-tool + cancel scripts over `Channel::duplex()` and over stdio yield identical ordered frames — `inv_26_transport_parity`
-- [ ] **12.T4** Integration — `cargo run --example in_process` exits 0
-- [ ] **12.T5** Integration — SIGTERM to the binary mid-turn leaves no orphan `claude` and it exits 0 within the bounded deadline
+- [x] **12.T1** Unit — `agent`: steering idle + `promptRequired` → `{outcome:"promptRequired", reason:"noRunningTurn"}`; `idleBehavior:"x"` → `invalidParams`
+- [x] **12.T2** Integration — stdin EOF mid-turn leaves no orphan `claude` and the binary exits 0 — `inv_06_eof_no_orphan`
+- [x] **12.T3** Integration — text-only + single-tool + cancel scripts over `Channel::duplex()` and over stdio yield identical ordered frames — `inv_26_transport_parity`
+- [x] **12.T4** Integration — `cargo run --example in_process` exits 0
+- [x] **12.T5** Integration — SIGTERM to the binary mid-turn leaves no orphan `claude` and it exits 0 within the bounded deadline
 
 ---
 
@@ -910,19 +1007,19 @@ cargo tree --manifest-path rust/Cargo.toml -d | grep -c '^agent-client-protocol 
 - Invariants: the Invariant Registry table in this plan; tests are named `inv_NN_<slug>`.
 - Upstream comments to classify: `grep -nE "issue #|NOTE|Deliberately" src/acp-agent.ts`.
 
-- [ ] **13.0** Read `rust/AGENTS.md`
-- [ ] **13.1** Run the **full** corpus through both paths; diff ordered frames
-- [ ] **13.2** **Codepath audit:** for each core range in `EVALUATION.md` § 2 (A), name the Rust file:line that covers it, or mark it `skipped-deliberate` in `PARITY.md` with a reason
-- [ ] **13.3** **Invariant audit:** every `INV-*` maps to a passing `inv_NN_*` test; produce the table
-- [ ] **13.4** **Reverse audit:** grep `src/acp-agent.ts` at `v0.70.0` for `issue #` / `NOTE` / `Deliberately`; classify each ported / skipped / N-A
-- [ ] **13.5** Update `PARITY.md`; tag `rust-v0.1.0+acp.0.70.0`
+- [x] **13.0** Read `rust/AGENTS.md`
+- [x] **13.1** Run the **full** corpus through both paths; diff ordered frames
+- [x] **13.2** **Codepath audit:** for each core range in `EVALUATION.md` § 2 (A), name the Rust file:line that covers it, or mark it `skipped-deliberate` in `PARITY.md` with a reason
+- [x] **13.3** **Invariant audit:** every `INV-*` maps to a passing `inv_NN_*` test; produce the table
+- [x] **13.4** **Reverse audit:** grep `src/acp-agent.ts` at `v0.70.0` for `issue #` / `NOTE` / `Deliberately`; classify each ported / skipped / N-A
+- [x] **13.5** Update `PARITY.md`; tag `rust-v0.1.0+acp.0.70.0` (PARITY updated; git tag deferred to orchestrator/human per constraint)
 
 **Verify phase 13:**
-- [ ] **13.T1** Integration — all ≥10 corpus scripts diff clean — `inv_24_full_corpus`
-- [ ] **13.T2** Audit — no `EVALUATION.md` § 2 (A) range is unaccounted for
-- [ ] **13.T3** Audit — no `INV-*` lacks a passing `inv_NN_*` test
-- [ ] **13.T4** Audit — every upstream `issue #` comment is classified
-- [ ] **13.T5** Gate — `rust-gate.sh` clean; full suite under `timeout 300`
+- [x] **13.T1** Integration — all ≥10 corpus scripts diff clean — `inv_24_full_corpus`
+- [x] **13.T2** Audit — no `EVALUATION.md` § 2 (A) range is unaccounted for
+- [x] **13.T3** Audit — no `INV-*` lacks a passing `inv_NN_*` test
+- [x] **13.T4** Audit — every upstream `issue #` comment is classified
+- [x] **13.T5** Gate — `rust-gate.sh` clean; full suite under `timeout 300`
 
 ---
 

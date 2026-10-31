@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "long running", "cancel_after_updates": 1}
+  ]
+}

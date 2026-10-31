@@ -1,0 +1,28 @@
+{
+  "argv": [
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--input-format",
+    "stream-json",
+    "--permission-prompt-tool",
+    "stdio",
+    "--disallowedTools",
+    "AskUserQuestion",
+    "--tools",
+    "default",
+    "--setting-sources=user,project,local",
+    "--permission-mode",
+    "default",
+    "--allow-dangerously-skip-permissions",
+    "--include-partial-messages",
+    "--session-id=$0",
+    "--replay-user-messages",
+    ""
+  ],
+  "env": {
+    "CLAUDE_CODE_ENTRYPOINT": "$ENTRYPOINT",
+    "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"
+  },
+  "node_options_present": false
+}

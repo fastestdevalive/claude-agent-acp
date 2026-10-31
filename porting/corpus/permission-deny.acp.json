@@ -1,0 +1,8 @@
+{
+  "permission": "deny",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "use a tool"}
+  ]
+}

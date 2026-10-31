@@ -1,0 +1,12 @@
+disallowed-types = [
+    "std::sync::Mutex",
+    "std::sync::RwLock",
+    "tokio::sync::Mutex",
+    "tokio::sync::RwLock",
+    "tokio::sync::broadcast::Sender",
+    "tokio::sync::broadcast::Receiver",
+]
+
+disallowed-methods = [
+    "tokio::sync::broadcast::channel",
+]

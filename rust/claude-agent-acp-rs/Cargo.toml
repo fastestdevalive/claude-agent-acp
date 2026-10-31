@@ -1,0 +1,21 @@
+[package]
+name = "claude-agent-acp-rs"
+version = "0.1.0+acp.0.70.0"
+edition = "2021"
+description = "Native Rust driver for the Claude ACP agent protocol, at parity with @agentclientprotocol/claude-agent-acp v0.70.0"
+
+[dependencies]
+agent-client-protocol = "2.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` / `tokio::time::advance`
+# used by the paused-time tests (inv_17/inv_22). Test-only, never affects the
+# library build.
+tokio = { version = "1", features = ["test-util"] }
