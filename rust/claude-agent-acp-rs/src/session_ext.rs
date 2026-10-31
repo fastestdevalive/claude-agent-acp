@@ -34,6 +34,9 @@ pub struct SessionExt {
     pub auto_mode_fallback_warning_shown: bool,
     /// Environment snapshot for hermetic reads.
     pub env: crate::env_snapshot::EnvSnapshot,
+    /// The root session's latest PostCompact `compact_summary` (acp-agent.ts:11350-11360
+    /// `contextCompaction.recordSummary`); consumed by the compaction update path (F20).
+    pub last_compaction_summary: Option<String>,
 }
 
 impl SessionExt {
@@ -53,6 +56,7 @@ impl SessionExt {
             last_published_task_plan: None,
             auto_mode_fallback_warning_shown: false,
             env,
+            last_compaction_summary: None,
         }
     }
 

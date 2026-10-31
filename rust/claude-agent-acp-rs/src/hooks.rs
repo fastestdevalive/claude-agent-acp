@@ -13,6 +13,8 @@ use agent_client_protocol::schema::v1::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::session_config::{ConfigOption, ModesState, MODE_CONFIG_ID};
+
 pub const POST_TOOL_USE_HOOK_ID: &str = "hook_0";
 pub const POST_MODEL_SWITCH_HOOK_ID: &str = "hook_1";
 pub const POST_COMPACT_HOOK_ID: &str = "hook_2";
@@ -44,15 +46,29 @@ pub fn hook_control_response_success(request_id: &str) -> Value {
     })
 }
 
-/// An error control_response when a hook callback is unknown or cannot be processed.
-pub fn hook_control_response_error(request_id: &str) -> Value {
+fn hook_error_response(request_id: &str, error: &str) -> Value {
     json!({
         "type": "control_response",
         "response": {
             "subtype": "error",
-            "request_id": request_id
+            "request_id": request_id,
+            "error": error
         }
     })
+}
+
+/// The error control_response for a `hook_callback` whose callback id has no handler
+/// (the SDK's own message: `No hook callback found for ID: <id>`).
+pub fn unknown_hook_callback_response(request_id: &str, callback_id: &str) -> Value {
+    hook_error_response(
+        request_id,
+        &format!("No hook callback found for ID: {callback_id}"),
+    )
+}
+
+/// An error control_response when a hook callback cannot be processed.
+pub fn hook_control_response_error(request_id: &str) -> Value {
+    hook_error_response(request_id, "Hook callback failed")
 }
 
 /// Registered callback entry for an active tool use.
@@ -74,16 +90,16 @@ impl HookRegistry {
         Self::default()
     }
 
-    /// Register a hook callback for `tool_use_id` once. Returns false if already registered.
+    /// Register a hook callback for `tool_use_id`, replacing any callback already
+    /// registered for it (Node `registerHookCallback` unregisters first). Returns the
+    /// replaced entry, which has left the registry and must be released by the caller
+    /// (Node `onRelease`).
     pub fn register_once(
         &mut self,
         tool_use_id: String,
         tool_name: String,
         parent_tool_use_id: Option<String>,
-    ) -> bool {
-        if self.callbacks.contains_key(&tool_use_id) {
-            return false;
-        }
+    ) -> Option<HookEntry> {
         self.callbacks.insert(
             tool_use_id,
             HookEntry {
@@ -91,8 +107,7 @@ impl HookRegistry {
                 parent_tool_use_id,
                 completed_at: None,
             },
-        );
-        true
+        )
     }
 
     /// Whether a callback is registered for `tool_use_id`.
@@ -115,20 +130,23 @@ impl HookRegistry {
         self.callbacks.remove(tool_use_id)
     }
 
-    /// Lazily prune callbacks whose completed_at is older than 30 seconds.
-    pub fn prune_expired(&mut self, now: Instant) {
-        self.callbacks.retain(|_, entry| {
-            if let Some(completed) = entry.completed_at {
-                now.duration_since(completed) < Duration::from_secs(30)
-            } else {
-                true
-            }
-        });
-    }
-
-    /// Clear all registered callbacks.
-    pub fn clear(&mut self) {
-        self.callbacks.clear();
+    /// Lazily prune callbacks whose completed_at is 30 seconds or older. Returns the
+    /// released entries, which the caller must release (Node `onRelease`).
+    pub fn prune_expired(&mut self, now: Instant) -> Vec<(String, HookEntry)> {
+        let expired: Vec<String> = self
+            .callbacks
+            .iter()
+            .filter(|(_, entry)| {
+                entry.completed_at.is_some_and(|completed| {
+                    now.duration_since(completed) >= Duration::from_secs(30)
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|id| self.callbacks.remove(&id).map(|entry| (id, entry)))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -175,7 +193,8 @@ pub fn tool_update_from_diff_tool_response(
                             old_lines.push(rest);
                             new_lines.push(rest);
                         } else {
-                            let rest = if line.len() > 1 { &line[1..] } else { "" };
+                            // Drop the first character, not the first byte (Node slices one unit).
+                            let rest = line.chars().next().map_or("", |c| &line[c.len_utf8()..]);
                             old_lines.push(rest);
                             new_lines.push(rest);
                         }
@@ -332,16 +351,129 @@ pub fn apply_task_create(
     }
 }
 
-/// Applies a TaskUpdate tool call to the task state.
+/// The structured result of a TaskUpdate call (Node `TaskUpdateOutput`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskUpdateOutput {
+    pub success: bool,
+    pub task_id: String,
+    pub updated_fields: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// The text blocks of a tool result (Node `toolOutputTexts`).
+fn tool_output_texts(content: &Value) -> Vec<&str> {
+    if let Some(s) = content.as_str() {
+        return vec![s];
+    }
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+/// Candidate JSON objects in a tool result (Node `parseJsonToolOutput` before its validator):
+/// an object as-is, a JSON string, or the JSON carried by each text block.
+fn json_candidates(content: &Value) -> Vec<Value> {
+    match content {
+        Value::Object(_) => vec![content.clone()],
+        Value::String(s) => serde_json::from_str(s).ok().into_iter().collect(),
+        Value::Array(_) => tool_output_texts(content)
+            .into_iter()
+            .filter_map(|t| serde_json::from_str(t).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn structured_task_update(value: &Value) -> Option<TaskUpdateOutput> {
+    Some(TaskUpdateOutput {
+        success: value.get("success")?.as_bool()?,
+        task_id: value.get("taskId")?.as_str()?.to_string(),
+        updated_fields: value
+            .get("updatedFields")?
+            .as_array()?
+            .iter()
+            .map(|f| f.as_str().map(String::from))
+            .collect::<Option<Vec<_>>>()?,
+        error: value.get("error").and_then(Value::as_str).map(String::from),
+    })
+}
+
+/// Parses one TaskUpdate text result: a "not found" or failed delete is an unsuccessful update.
+fn task_update_text(text: &str, expected_task_id: Option<&str>) -> Option<TaskUpdateOutput> {
+    let text = text.trim();
+    let not_found = text
+        .strip_prefix("Task #")
+        .and_then(|rest| rest.strip_suffix(" not found"))
+        .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace));
+    let task_id = not_found.or(expected_task_id)?;
+    if not_found.is_some() || text == "Failed to delete task" {
+        return Some(TaskUpdateOutput {
+            success: false,
+            task_id: task_id.to_string(),
+            updated_fields: Vec::new(),
+            error: Some(text.to_string()),
+        });
+    }
+    None
+}
+
+/// Parses TaskUpdate output from one tool result (Node `parseTaskUpdateOutput`).
+fn parse_task_update_one(
+    content: &Value,
+    expected_task_id: Option<&str>,
+) -> Option<TaskUpdateOutput> {
+    json_candidates(content)
+        .iter()
+        .find_map(structured_task_update)
+        .or_else(|| {
+            tool_output_texts(content)
+                .into_iter()
+                .find_map(|text| task_update_text(text, expected_task_id))
+        })
+}
+
+/// Parses TaskUpdate output, preferring the SDK's message-level `tool_use_result` over the
+/// tool_result `content` (Node `parseTaskUpdateOutput(toolUseResult) ?? parseTaskUpdateOutput(content)`).
+pub fn parse_task_update_output(
+    tool_use_result: &Value,
+    content: &Value,
+    expected_task_id: Option<&str>,
+) -> Option<TaskUpdateOutput> {
+    parse_task_update_one(tool_use_result, expected_task_id)
+        .or_else(|| parse_task_update_one(content, expected_task_id))
+}
+
+/// Applies a TaskUpdate tool result (Node acp-agent TaskUpdate branch). The update is applied
+/// unless its output reports a failure or names another task; with no output it falls back to
+/// the input. Returns true when the update was applied, i.e. when the plan should be published.
+pub fn apply_task_update_output(
+    state: &mut Vec<(String, TaskStateEntry)>,
+    input: &Value,
+    tool_use_result: &Value,
+    content: &Value,
+) -> bool {
+    let task_id = input.get("taskId").and_then(Value::as_str);
+    if let Some(output) = parse_task_update_output(tool_use_result, content, task_id) {
+        if !(output.success && Some(output.task_id.as_str()) == task_id) {
+            return false;
+        }
+    }
+    apply_task_update(state, input);
+    true
+}
+
+/// Applies a TaskUpdate tool call to the task state. A missing `status` keeps the existing one
+/// (Node `input.status ?? existing?.status ?? "pending"`).
 pub fn apply_task_update(state: &mut Vec<(String, TaskStateEntry)>, input: &Value) {
     let Some(task_id) = input.get("taskId").and_then(Value::as_str) else {
         return;
     };
-    let status = input
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("pending");
-    if status == "deleted" {
+    if input.get("status").and_then(Value::as_str) == Some("deleted") {
         state.retain(|(k, _)| k != task_id);
         return;
     }
@@ -349,6 +481,12 @@ pub fn apply_task_update(state: &mut Vec<(String, TaskStateEntry)>, input: &Valu
         .iter()
         .find(|(k, _)| k == task_id)
         .map(|(_, v)| v.clone());
+    let status = input
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| existing_entry.as_ref().map(|e| e.status.as_str()))
+        .unwrap_or("pending")
+        .to_string();
     let subject = input
         .get("subject")
         .and_then(Value::as_str)
@@ -379,44 +517,128 @@ pub fn apply_task_update(state: &mut Vec<(String, TaskStateEntry)>, input: &Valu
     }
 }
 
-/// Parses task list entries from TaskList tool output.
-pub fn parse_task_list_output(content: &Value) -> Vec<(String, String, String)> {
-    if let Some(tasks) = content.get("tasks").and_then(Value::as_array) {
-        return tasks
-            .iter()
-            .filter_map(|t| {
-                let id = t.get("id").and_then(Value::as_str)?.to_string();
-                let subject = t.get("subject").and_then(Value::as_str)?.to_string();
-                let status = t.get("status").and_then(Value::as_str)?.to_string();
-                Some((id, subject, status))
-            })
-            .collect();
+const TASK_STATUSES: [&str; 3] = ["pending", "in_progress", "completed"];
+
+/// A TaskList entry: (id, subject, status).
+type TaskListEntry = (String, String, String);
+
+fn structured_task_list(value: &Value) -> Option<Vec<TaskListEntry>> {
+    value
+        .get("tasks")?
+        .as_array()?
+        .iter()
+        .map(|t| {
+            let id = t.get("id")?.as_str()?;
+            let subject = t.get("subject")?.as_str()?;
+            let status = t.get("status")?.as_str()?;
+            TASK_STATUSES
+                .contains(&status)
+                .then(|| (id.to_string(), subject.to_string(), status.to_string()))
+        })
+        .collect()
+}
+
+/// Parses one TaskList text line `#<id> [<status>] <subject>` (Node `parseTaskListOutput`),
+/// stripping the trailing ` [blocked by #a, #b]` and ` (owner)` suffixes from the subject.
+fn parse_task_line(line: &str) -> Option<TaskListEntry> {
+    let rest = line.strip_prefix('#')?;
+    let (id, after_id) = rest.split_once(' ')?;
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        return None;
     }
-    let text = if let Some(s) = content.as_str() {
-        s
-    } else if let Some(arr) = content.as_array() {
-        arr.iter()
-            .find_map(|b| b.get("text").and_then(Value::as_str))
-            .unwrap_or("")
-    } else {
-        ""
-    };
-    let mut out = Vec::new();
-    for line in text.trim().split('\n') {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix('#') {
-            if let Some(bracket_open) = rest.find(" [") {
-                let id = rest[..bracket_open].trim();
-                let after_id = &rest[bracket_open + 2..];
-                if let Some(bracket_close) = after_id.find(']') {
-                    let status = &after_id[..bracket_close];
-                    let subject = after_id[bracket_close + 1..].trim();
-                    out.push((id.to_string(), subject.to_string(), status.to_string()));
-                }
+    let after_bracket = after_id.strip_prefix('[')?;
+    let status = TASK_STATUSES.iter().find(|s| {
+        after_bracket
+            .strip_prefix(**s)
+            .is_some_and(|tail| tail.starts_with("] "))
+    })?;
+    let subject = after_bracket.get(status.len() + 2..)?;
+    if subject.is_empty() {
+        return None;
+    }
+    let mut subject = subject.to_string();
+
+    const BLOCKED_MARKER: &str = " [blocked by ";
+    if let Some(start) = subject.rfind(BLOCKED_MARKER).filter(|&i| i > 0) {
+        if subject.ends_with(']') {
+            let deps = &subject[start + BLOCKED_MARKER.len()..subject.len() - 1];
+            let valid = deps
+                .split(", ")
+                .all(|d| d.len() > 1 && d.starts_with('#') && !d.contains(',') && !d.contains(']'));
+            if valid {
+                subject.truncate(start);
             }
         }
     }
-    out
+
+    if let Some(start) = subject.rfind(" (").filter(|&i| i > 0) {
+        if subject.ends_with(')') {
+            let owner = &subject[start + 2..subject.len() - 1];
+            if !owner.contains('(') && !owner.contains(')') {
+                subject.truncate(start);
+            }
+        }
+    }
+
+    Some((id.to_string(), subject, (*status).to_string()))
+}
+
+fn text_task_list(text: &str) -> Option<Vec<TaskListEntry>> {
+    if text.trim() == "No tasks found" {
+        return Some(Vec::new());
+    }
+    let mut tasks = Vec::new();
+    for line in text.trim().split('\n') {
+        match parse_task_line(line) {
+            Some(entry) => tasks.push(entry),
+            // One unmatched line voids the whole text (Node clears and stops).
+            None => {
+                tasks.clear();
+                break;
+            }
+        }
+    }
+    (!tasks.is_empty()).then_some(tasks)
+}
+
+fn parse_task_list_one(content: &Value) -> Option<Vec<TaskListEntry>> {
+    json_candidates(content)
+        .iter()
+        .find_map(structured_task_list)
+        .or_else(|| {
+            tool_output_texts(content)
+                .into_iter()
+                .find_map(text_task_list)
+        })
+}
+
+/// Parses TaskList output strictly (Node `parseTaskListOutput`), preferring the message-level
+/// `tool_use_result` over the tool_result `content`. Returns None when neither is a task list,
+/// so the caller must keep the current state.
+pub fn parse_task_list(tool_use_result: &Value, content: &Value) -> Option<Vec<TaskListEntry>> {
+    parse_task_list_one(tool_use_result).or_else(|| parse_task_list_one(content))
+}
+
+/// Parses task list entries from TaskList tool output. Unparseable output yields no entries;
+/// use `parse_task_list` to tell that apart from an empty list.
+pub fn parse_task_list_output(content: &Value) -> Vec<TaskListEntry> {
+    parse_task_list(&Value::Null, content).unwrap_or_default()
+}
+
+/// Reconciles task state from a TaskList tool result. Unparseable output leaves the state
+/// unchanged. Returns true when the state was reconciled.
+pub fn apply_task_list_output(
+    state: &mut Vec<(String, TaskStateEntry)>,
+    tool_use_result: &Value,
+    content: &Value,
+) -> bool {
+    match parse_task_list(tool_use_result, content) {
+        Some(tasks) => {
+            apply_task_list(state, tasks);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Reconciles task state from a TaskList tool output.
@@ -458,6 +680,46 @@ pub fn task_state_to_plan_entries(state: &[(String, TaskStateEntry)]) -> Vec<Val
         .collect()
 }
 
+pub const ENTER_PLAN_MODE_TOOL: &str = "EnterPlanMode";
+pub const PLAN_MODE_ID: &str = "plan";
+
+/// Handles a PostToolUse hook for EnterPlanMode (Node `createPostToolUseHook`'s
+/// `onEnterPlanMode`): moves the session to plan mode in place and returns the
+/// `current_mode_update` and `config_option_update` payloads to publish, in that order.
+/// Returns an empty list for any other hook.
+pub fn enter_plan_mode_updates(
+    input: &Value,
+    session_id: &str,
+    modes: &mut ModesState,
+    config_options: &mut [ConfigOption],
+) -> Vec<Value> {
+    if input.get("hook_event_name").and_then(Value::as_str) != Some("PostToolUse")
+        || input.get("tool_name").and_then(Value::as_str) != Some(ENTER_PLAN_MODE_TOOL)
+    {
+        return Vec::new();
+    }
+    modes.current_mode_id = PLAN_MODE_ID.to_string();
+    if let Some(opt) = config_options.iter_mut().find(|o| o.id == MODE_CONFIG_ID) {
+        opt.current_value = PLAN_MODE_ID.to_string();
+    }
+    vec![
+        json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": PLAN_MODE_ID
+            }
+        }),
+        json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": serde_json::to_value(&*config_options).unwrap_or(Value::Null)
+            }
+        }),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,13 +727,33 @@ mod tests {
     #[test]
     fn inv_64_registry_register_once() {
         let mut reg = HookRegistry::new();
-        assert!(reg.register_once("toolu_1".into(), "Bash".into(), None));
-        // Second registration for the same ID is rejected
-        assert!(!reg.register_once("toolu_1".into(), "Edit".into(), Some("p1".into())));
+        assert!(reg
+            .register_once("toolu_1".into(), "Bash".into(), None)
+            .is_none());
+        // Re-registering the same ID replaces the entry and returns the one it displaced
+        let replaced = reg
+            .register_once("toolu_1".into(), "Edit".into(), Some("p1".into()))
+            .expect("replaced entry");
+        assert_eq!(replaced.tool_name, "Bash");
         assert_eq!(reg.len(), 1);
         let entry = reg.unregister("toolu_1").expect("present");
-        assert_eq!(entry.tool_name, "Bash");
-        assert_eq!(entry.parent_tool_use_id, None);
+        assert_eq!(entry.tool_name, "Edit");
+        assert_eq!(entry.parent_tool_use_id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn pc1_2_prune_expired_returns_released_entries() {
+        let mut reg = HookRegistry::new();
+        reg.register_once("toolu_1".into(), "Bash".into(), None);
+        reg.register_once("toolu_2".into(), "Read".into(), None);
+        reg.complete("toolu_1");
+        let later = Instant::now() + Duration::from_secs(60);
+        let released = reg.prune_expired(later);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].0, "toolu_1");
+        assert_eq!(released[0].1.tool_name, "Bash");
+        assert!(reg.has("toolu_2"));
+        assert_eq!(reg.len(), 1);
     }
 
     #[test]
@@ -497,18 +779,71 @@ mod tests {
     }
 
     #[test]
+    fn pc1_2_register_once_replaces_existing_entry() {
+        let mut reg = HookRegistry::new();
+        reg.register_once("toolu_1".into(), "Bash".into(), None);
+        reg.register_once("toolu_1".into(), "Edit".into(), Some("p1".into()));
+        let entry = reg.unregister("toolu_1").expect("present");
+        assert_eq!(entry.tool_name, "Edit");
+        assert_eq!(entry.parent_tool_use_id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn pc1_4_diff_line_with_multibyte_first_char_does_not_panic() {
+        let resp = json!({
+            "filePath": "/src/x.rs",
+            "structuredPatch": [{"newStart": 1, "lines": ["é tail"]}]
+        });
+        let (content, _) = tool_update_from_diff_tool_response(&resp);
+        assert_eq!(
+            content[0],
+            ToolCallContent::Diff(Diff::new("/src/x.rs", " tail").old_text(" tail"))
+        );
+    }
+
+    #[test]
+    fn pc1_5_task_update_without_status_keeps_progress() {
+        let mut state = vec![(
+            "1".to_string(),
+            TaskStateEntry {
+                subject: "Build".into(),
+                status: "in_progress".into(),
+                active_form: None,
+                description: None,
+            },
+        )];
+        apply_task_update(
+            &mut state,
+            &json!({"taskId": "1", "description": "new details"}),
+        );
+        assert_eq!(state[0].1.status, "in_progress");
+        assert_eq!(state[0].1.description.as_deref(), Some("new details"));
+    }
+
+    #[test]
     fn inv_64_unknown_callback_error() {
-        let resp = hook_control_response_error("req_unknown");
+        let resp = unknown_hook_callback_response("req_unknown", "hook_9");
         assert_eq!(
             resp,
             json!({
                 "type": "control_response",
                 "response": {
                     "subtype": "error",
-                    "request_id": "req_unknown"
+                    "request_id": "req_unknown",
+                    "error": "No hook callback found for ID: hook_9"
                 }
             })
         );
+    }
+
+    #[test]
+    fn pc1_4_hook_error_reply_carries_error_string() {
+        let resp = hook_control_response_error("req_1");
+        assert_eq!(resp["response"]["subtype"], "error");
+        assert_eq!(resp["response"]["request_id"], "req_1");
+        assert!(resp["response"]["error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()));
     }
 
     #[test]
@@ -607,19 +942,74 @@ mod tests {
         );
     }
 
+    fn mode_option(current: &str) -> ConfigOption {
+        ConfigOption {
+            id: MODE_CONFIG_ID.into(),
+            name: "Mode".into(),
+            description: String::new(),
+            category: "mode".into(),
+            option_type: "select".into(),
+            current_value: current.into(),
+            options: Vec::new(),
+            _meta: None,
+        }
+    }
+
     #[test]
     fn inv_64_enter_plan_mode_publishes_mode() {
-        // Test that EnterPlanMode tool hook triggers plan mode transition payload
+        let mut modes = ModesState {
+            current_mode_id: "default".into(),
+            available_modes: Vec::new(),
+        };
+        let mut options = vec![mode_option("default")];
         let input = json!({
             "hook_event_name": "PostToolUse",
             "tool_name": "EnterPlanMode",
             "tool_input": {},
             "tool_response": {"status": "ok"}
         });
+
+        let updates = enter_plan_mode_updates(&input, "sess_1", &mut modes, &mut options);
+
+        assert_eq!(modes.current_mode_id, "plan");
+        assert_eq!(options[0].current_value, "plan");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0]["sessionId"], "sess_1");
+        assert_eq!(updates[0]["update"]["sessionUpdate"], "current_mode_update");
+        assert_eq!(updates[0]["update"]["currentModeId"], "plan");
         assert_eq!(
-            input.get("tool_name").and_then(Value::as_str),
-            Some("EnterPlanMode")
+            updates[1]["update"]["sessionUpdate"],
+            "config_option_update"
         );
+        assert_eq!(
+            updates[1]["update"]["configOptions"][0]["id"],
+            MODE_CONFIG_ID
+        );
+        assert_eq!(
+            updates[1]["update"]["configOptions"][0]["currentValue"],
+            "plan"
+        );
+    }
+
+    #[test]
+    fn pc1_3_other_post_tool_use_hooks_publish_nothing() {
+        let mut modes = ModesState {
+            current_mode_id: "default".into(),
+            available_modes: Vec::new(),
+        };
+        let mut options = vec![mode_option("default")];
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {},
+            "tool_response": {"stdout": ""}
+        });
+
+        let updates = enter_plan_mode_updates(&input, "sess_1", &mut modes, &mut options);
+
+        assert!(updates.is_empty());
+        assert_eq!(modes.current_mode_id, "default");
+        assert_eq!(options[0].current_value, "default");
     }
 
     #[test]
@@ -714,5 +1104,153 @@ mod tests {
         assert_eq!(entries[0]["priority"], "medium");
         assert_eq!(entries[1]["content"], "Task 2");
         assert_eq!(entries[1]["status"], "completed");
+    }
+
+    fn one_task(status: &str) -> Vec<(String, TaskStateEntry)> {
+        vec![(
+            "1".to_string(),
+            TaskStateEntry {
+                subject: "Build".into(),
+                status: status.into(),
+                active_form: None,
+                description: None,
+            },
+        )]
+    }
+
+    #[test]
+    fn pc1_5_failed_task_update_output_is_not_applied() {
+        let mut state = one_task("pending");
+        let input = json!({"taskId": "1", "status": "completed"});
+        let tool_use_result =
+            json!({"success": false, "taskId": "1", "updatedFields": [], "error": "nope"});
+        assert!(!apply_task_update_output(
+            &mut state,
+            &input,
+            &tool_use_result,
+            &Value::Null
+        ));
+        assert_eq!(state[0].1.status, "pending");
+    }
+
+    #[test]
+    fn pc1_5_task_update_output_for_another_task_is_not_applied() {
+        let mut state = one_task("pending");
+        let input = json!({"taskId": "1", "status": "completed"});
+        let tool_use_result = json!({"success": true, "taskId": "2", "updatedFields": ["status"]});
+        assert!(!apply_task_update_output(
+            &mut state,
+            &input,
+            &tool_use_result,
+            &Value::Null
+        ));
+        assert_eq!(state[0].1.status, "pending");
+    }
+
+    #[test]
+    fn pc1_5_not_found_text_output_is_not_applied() {
+        let mut state = one_task("pending");
+        let input = json!({"taskId": "1", "status": "completed"});
+        let content = json!("Task #1 not found");
+        assert!(!apply_task_update_output(
+            &mut state,
+            &input,
+            &Value::Null,
+            &content
+        ));
+        assert_eq!(state[0].1.status, "pending");
+    }
+
+    #[test]
+    fn pc1_5_confirmed_task_update_output_is_applied() {
+        let mut state = one_task("pending");
+        let input = json!({"taskId": "1", "status": "completed"});
+        let tool_use_result = json!({"success": true, "taskId": "1", "updatedFields": ["status"]});
+        assert!(apply_task_update_output(
+            &mut state,
+            &input,
+            &tool_use_result,
+            &Value::Null
+        ));
+        assert_eq!(state[0].1.status, "completed");
+    }
+
+    #[test]
+    fn pc1_5_task_update_without_output_falls_back_to_input() {
+        let mut state = one_task("pending");
+        let input = json!({"taskId": "1", "status": "in_progress"});
+        assert!(apply_task_update_output(
+            &mut state,
+            &input,
+            &Value::Null,
+            &Value::Null
+        ));
+        assert_eq!(state[0].1.status, "in_progress");
+    }
+
+    #[test]
+    fn pc1_5_task_list_unparseable_output_keeps_state() {
+        let mut state = one_task("in_progress");
+        assert!(!apply_task_list_output(
+            &mut state,
+            &Value::Null,
+            &json!("garbage")
+        ));
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].1.status, "in_progress");
+    }
+
+    #[test]
+    fn pc1_5_task_list_no_tasks_clears_state() {
+        let mut state = one_task("in_progress");
+        assert!(apply_task_list_output(
+            &mut state,
+            &Value::Null,
+            &json!("No tasks found")
+        ));
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn pc1_5_task_list_strips_owner_and_blocked_by_suffixes() {
+        let mut state = Vec::new();
+        let content =
+            json!("#1 [pending] Write docs (alice) [blocked by #2, #3]\n#2 [completed] Plan");
+        assert!(apply_task_list_output(&mut state, &Value::Null, &content));
+        assert_eq!(state[0].0, "1");
+        assert_eq!(state[0].1.subject, "Write docs");
+        assert_eq!(state[1].1.subject, "Plan");
+    }
+
+    #[test]
+    fn pc1_5_task_list_one_malformed_line_voids_text() {
+        let mut state = one_task("pending");
+        let content = json!("#1 [pending] A\nnot a task line");
+        assert!(!apply_task_list_output(&mut state, &Value::Null, &content));
+        assert_eq!(state[0].1.subject, "Build");
+    }
+
+    #[test]
+    fn pc1_5_task_list_rejects_unknown_status() {
+        let mut state = one_task("pending");
+        let content = json!({"tasks": [{"id": "1", "subject": "A", "status": "deleted"}]});
+        assert!(!apply_task_list_output(&mut state, &Value::Null, &content));
+        assert_eq!(state[0].1.subject, "Build");
+        let text = json!("#1 [deleted] A");
+        assert!(parse_task_list(&Value::Null, &text).is_none());
+    }
+
+    #[test]
+    fn pc1_5_task_list_prefers_tool_use_result() {
+        let mut state = one_task("pending");
+        let tool_use_result =
+            json!({"tasks": [{"id": "9", "subject": "Nine", "status": "pending"}]});
+        assert!(apply_task_list_output(
+            &mut state,
+            &tool_use_result,
+            &json!("garbage")
+        ));
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].0, "9");
     }
 }

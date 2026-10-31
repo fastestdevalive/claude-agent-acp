@@ -253,11 +253,14 @@ pub(crate) enum Command {
         result: Result<(), String>,
         reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
     },
-    /// Re-entry after `set_model` control request.
+    /// Re-entry after `set_model` control request. `notify_client` publishes
+    /// `config_option_update` after the bookkeeping (PostModelSwitch sync, which has
+    /// no caller to return the options to); the user path returns them in `reply`.
     ModelApplied {
         model_val: String,
         result: Result<(), String>,
         reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+        notify_client: bool,
     },
     /// Re-entry after `apply_flag_settings` control request.
     EffortApplied {
@@ -1051,16 +1054,7 @@ async fn run_loop(
                                 .send_request(json!({"subtype": "interrupt"}))
                                 .await
                             {
-                                let still_queued = receipt
-                                    .get("response")
-                                    .and_then(|r| r.get("still_queued"))
-                                    .and_then(Value::as_array)
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(Value::as_str)
-                                            .map(String::from)
-                                            .collect()
-                                    });
+                                let still_queued = crate::control::still_queued_of(&receipt);
                                 let _ = command_tx
                                     .send(Command::InterruptReceipt { still_queued });
                             }
@@ -1559,6 +1553,7 @@ async fn run_loop(
                                     model_val,
                                     result: model_result,
                                     reply,
+                                    notify_client: false,
                                 });
                             });
                         } else if config_id == crate::session_config::EFFORT_CONFIG_ID {
@@ -1644,6 +1639,7 @@ async fn run_loop(
                         model_val,
                         result,
                         reply,
+                        notify_client,
                     } => {
                         match result {
                             Err(e) => {
@@ -1657,26 +1653,17 @@ async fn run_loop(
                                     // MAJOR 1 / P4: re-seed the context window on a model
                                     // switch (acp-agent.js:7917-7919) — sized from the new
                                     // model's row heuristic unless already authoritative.
-                                    let seed = new_model_info.as_ref().and_then(|m| {
-                                        let texts = [
-                                            m.resolved_model.as_deref(),
-                                            Some(m.value.as_str()),
-                                            Some(m.display_name.as_str()),
-                                            Some(m.description.as_str()),
-                                        ];
-                                        crate::usage::infer_context_window_from_model(
-                                            &texts.into_iter().flatten().collect::<Vec<_>>(),
-                                        )
-                                    });
+                                    let seed = context_window_seed(new_model_info.as_ref(), &model_val);
                                     ext.usage.context_window =
                                         seed.unwrap_or(crate::usage::DEFAULT_CONTEXT_WINDOW);
                                     ext.usage.authoritative = false;
                                 }
                                 let new_model_info = ext.config.model_infos.iter().find(|m| m.value == model_val).cloned();
                                 let mut mode_downgraded = false;
-                                if ext.config.modes.current_mode_id == "auto" {
-                                    let auto_ok = new_model_info.as_ref().and_then(|m| m.supports_auto_mode) == Some(true);
-                                    if !auto_ok {
+                                if ext.config.modes.current_mode_id == "auto"
+                                    && auto_mode_downgrade_needed(new_model_info.as_ref())
+                                {
+                                    {
                                         ext.config.modes.current_mode_id = crate::session_config::AUTO_MODE_FALLBACK.to_string();
                                         let fallback = crate::session_config::AUTO_MODE_FALLBACK.to_string();
                                         let control = control.clone();
@@ -1744,27 +1731,20 @@ async fn run_loop(
                                     });
                                     ext.config.effort_pinned = if effort_pinned_for_new { pinned_effort } else { None };
                                 }
-                                if mode_downgraded {
-                                    let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
-                                        "sessionId": session_id,
-                                        "update": {
-                                            "sessionUpdate": "current_mode_update",
-                                            "currentModeId": crate::session_config::AUTO_MODE_FALLBACK,
-                                        }
-                                    })));
-                                    if !ext.auto_mode_fallback_warning_shown {
-                                        ext.auto_mode_fallback_warning_shown = true;
-                                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
-                                            "sessionId": session_id,
-                                            "update": {
-                                                "sessionUpdate": "agent_message_chunk",
-                                                "content": {
-                                                    "type": "text",
-                                                    "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
-                                                }
-                                            }
-                                        })));
-                                    }
+                                // Review PC-1 (3): the fallback updates, then config_option_update for
+                                // an external switch; a user-driven change returns its options in `reply`.
+                                let warn = mode_downgraded && !ext.auto_mode_fallback_warning_shown;
+                                if warn {
+                                    ext.auto_mode_fallback_warning_shown = true;
+                                }
+                                let downgraded_to = mode_downgraded.then_some(crate::session_config::AUTO_MODE_FALLBACK);
+                                let updates = if notify_client {
+                                    external_switch_updates(&session_id, &ext.config.config_options, downgraded_to, warn)
+                                } else {
+                                    fallback_updates(&session_id, downgraded_to, warn)
+                                };
+                                for update in updates {
+                                    let _ = update_tx.send(SessionOutbound::RawUpdate(update));
                                 }
                                 if model_changed {
                                     let control = control.clone();
@@ -1774,7 +1754,7 @@ async fn run_loop(
                                             .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
                                             .await
                                         {
-                                            if let Some(raw) = res.get("rawMaxTokens").and_then(serde_json::Value::as_u64) {
+                                            if let Some(raw) = crate::control::raw_max_tokens(&res) {
                                                 if raw > 0 {
                                                     let _ = tx.send(Command::UpdateContextWindow { size: raw });
                                                 }
@@ -1834,14 +1814,19 @@ async fn run_loop(
                         reply,
                     } => {
                         handle_hook_callback(
-                            &request_id,
-                            &callback_id,
-                            &input,
-                            tool_use_id.as_deref(),
+                            HookCall {
+                                request_id: &request_id,
+                                callback_id: &callback_id,
+                                input: &input,
+                                tool_use_id: tool_use_id.as_deref(),
+                            },
                             &mut map_state,
                             &mut ext,
-                            &update_tx,
-                            &session_id,
+                            HookIo {
+                                update_tx: &update_tx,
+                                command_tx: &command_tx,
+                                session_id: &session_id,
+                            },
                             reply,
                         );
                     }
@@ -1917,44 +1902,169 @@ fn publish_task_plan(
     })));
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Review PC-1 (8): register a PostToolUse callback on first encounter only (Node `!alreadyCached`,
+/// acp-agent.ts:13101). Returns whether the callback was registered now.
+fn register_hook_first_encounter(
+    hooks: &mut crate::hooks::HookRegistry,
+    id: &str,
+    name: &str,
+    parent: Option<String>,
+) -> bool {
+    if hooks.has(id) {
+        return false;
+    }
+    hooks.register_once(id.to_string(), name.to_string(), parent);
+    true
+}
+
+/// Review PC-1 (4): a model switch downgrades auto mode only when the model is listed and
+/// does not support it; an unlisted model keeps auto (session-mode.ts:225-232).
+fn auto_mode_downgrade_needed(info: Option<&crate::session_config::ModelInfo>) -> bool {
+    info.is_some_and(|m| m.supports_auto_mode != Some(true))
+}
+
+/// Review PC-1 (5): the context-window seed for a switched-to model. A listed model is read from
+/// its fields; an unlisted id is inferred from the id itself (acp-agent.ts:13729-13747).
+fn context_window_seed(
+    info: Option<&crate::session_config::ModelInfo>,
+    model_val: &str,
+) -> Option<u64> {
+    match info {
+        Some(m) => {
+            let texts = [
+                m.resolved_model.as_deref(),
+                Some(m.value.as_str()),
+                Some(m.display_name.as_str()),
+                Some(m.description.as_str()),
+            ];
+            crate::usage::infer_context_window_from_model(
+                &texts.into_iter().flatten().collect::<Vec<_>>(),
+            )
+        }
+        None => crate::usage::infer_context_window_from_model(&[model_val]),
+    }
+}
+
+/// The current_mode_update and fallback warning of a model-driven auto-mode downgrade.
+fn fallback_updates(session_id: &str, downgraded_to: Option<&str>, warn: bool) -> Vec<Value> {
+    let Some(mode) = downgraded_to else {
+        return Vec::new();
+    };
+    let mut out = vec![json!({
+        "sessionId": session_id,
+        "update": {"sessionUpdate": "current_mode_update", "currentModeId": mode},
+    })];
+    if warn {
+        out.push(json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
+                }
+            }
+        }));
+    }
+    out
+}
+
+/// Review PC-1 (3): the updates of an external model switch. The fallback updates come first and
+/// config_option_update last (Node publishFallbackState runs inside applyConfigOptionValue, then
+/// updateConfigOption sends config_option_update: acp-agent.ts:10449, 10683).
+fn external_switch_updates(
+    session_id: &str,
+    config_options: &[crate::session_config::ConfigOption],
+    downgraded_to: Option<&str>,
+    warn: bool,
+) -> Vec<Value> {
+    let mut out = fallback_updates(session_id, downgraded_to, warn);
+    out.push(json!({
+        "sessionId": session_id,
+        "update": {"sessionUpdate": "config_option_update", "configOptions": config_options},
+    }));
+    out
+}
+
+/// PC-1.1 (acp-agent.ts:10724 syncModelAfterExternalSwitch): the model value a
+/// PostModelSwitch hook must sync to, or `None` when the adapter already tracks it.
+/// The SDK-reported model maps to an option value (display names resolve); an
+/// unlisted id is tracked raw.
+fn external_switch_target(
+    model_infos: &[crate::session_config::ModelInfo],
+    current_model_id: &str,
+    to_model: &str,
+) -> Option<String> {
+    let value = crate::session_config::resolve_model_preference(model_infos, to_model)
+        .map_or_else(|| to_model.to_string(), |m| m.value);
+    (value != current_model_id).then_some(value)
+}
+
+/// PC-1.5 (acp-agent.ts:13226-13245): the tool_call_update that resolves a Task* call a
+/// permission prompt surfaced. Its status follows the result; its rawOutput is the result content.
+fn task_permission_resolution(
+    tool_use_id: &str,
+    name: &str,
+    is_error: bool,
+    content: &Value,
+    parent_tool_use_id: Option<&str>,
+) -> Value {
+    let mut claude_code = json!({"toolName": name});
+    if let Some(parent) = parent_tool_use_id {
+        claude_code["parentToolUseId"] = json!(parent);
+    }
+    json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_use_id,
+        "status": if is_error { "failed" } else { "completed" },
+        "rawOutput": content,
+        "_meta": {"claudeCode": claude_code},
+    })
+}
+
+/// One inbound `hook_callback` request's fields.
+struct HookCall<'a> {
+    request_id: &'a str,
+    callback_id: &'a str,
+    input: &'a Value,
+    tool_use_id: Option<&'a str>,
+}
+
+/// The channels a hook callback may use: session output, the actor's own command
+/// queue (re-entry, e.g. PostModelSwitch), and the session id.
+struct HookIo<'a> {
+    update_tx: &'a mpsc::UnboundedSender<SessionOutbound>,
+    command_tx: &'a mpsc::UnboundedSender<Command>,
+    session_id: &'a str,
+}
+
 fn handle_hook_callback(
-    request_id: &str,
-    callback_id: &str,
-    input: &Value,
-    tool_use_id: Option<&str>,
+    call: HookCall<'_>,
     map_state: &mut MapState,
     ext: &mut SessionExt,
-    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
-    session_id: &str,
+    io: HookIo<'_>,
     reply: oneshot::Sender<Value>,
 ) {
+    let HookCall {
+        request_id,
+        callback_id,
+        input,
+        tool_use_id,
+    } = call;
+    let HookIo {
+        update_tx,
+        command_tx,
+        session_id,
+    } = io;
     match callback_id {
         crate::hooks::POST_TOOL_USE_HOOK_ID => {
-            if input.get("tool_name").and_then(Value::as_str) == Some("EnterPlanMode") {
-                ext.config.modes.current_mode_id = "plan".to_string();
-                if let Some(opt) = ext
-                    .config
-                    .config_options
-                    .iter_mut()
-                    .find(|o| o.id == crate::session_config::MODE_CONFIG_ID)
-                {
-                    opt.current_value = "plan".to_string();
-                }
-                let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "current_mode_update",
-                        "currentModeId": "plan"
-                    }
-                })));
-                let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "config_option_update",
-                        "configOptions": ext.config.config_options
-                    }
-                })));
+            for update in crate::hooks::enter_plan_mode_updates(
+                input,
+                session_id,
+                &mut ext.config.modes,
+                &mut ext.config.config_options,
+            ) {
+                let _ = update_tx.send(SessionOutbound::RawUpdate(update));
             }
 
             if let Some(id) = tool_use_id {
@@ -1983,26 +2093,35 @@ fn handle_hook_callback(
                 && input.get("source").and_then(Value::as_str) != Some("resume")
             {
                 if let Some(to_model) = input.get("to_model").and_then(Value::as_str) {
-                    if let Some(opt) = ext
-                        .config
-                        .config_options
-                        .iter_mut()
-                        .find(|o| o.id == crate::session_config::MODEL_CONFIG_ID)
-                    {
-                        opt.current_value = to_model.to_string();
-                        let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "config_option_update",
-                                "configOptions": ext.config.config_options
-                            }
-                        })));
+                    if let Some(target) = external_switch_target(
+                        &ext.config.model_infos,
+                        &ext.config.current_model_id,
+                        to_model,
+                    ) {
+                        // The same bookkeeping a user-driven change takes (context
+                        // window, auto-mode clamp, effort sync) runs in the actor's
+                        // ModelApplied handler; no SDK set_model is sent (the SDK
+                        // already switched). The reply receiver is discarded.
+                        let (no_reply, _no_reply_rx) = oneshot::channel();
+                        let _ = command_tx.send(Command::ModelApplied {
+                            model_val: target,
+                            result: Ok(()),
+                            reply: no_reply,
+                            notify_client: true,
+                        });
                     }
                 }
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
         crate::hooks::POST_COMPACT_HOOK_ID => {
+            // PC-1.1 (acp-agent.ts:11350-11360): a root-session PostCompact records the
+            // compaction summary; subagent compactions (with agent_id) do not.
+            if input.get("agent_id").is_none() {
+                if let Some(summary) = input.get("compact_summary").and_then(Value::as_str) {
+                    ext.last_compaction_summary = Some(summary.to_string());
+                }
+            }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
         crate::hooks::TASK_CREATED_HOOK_ID => {
@@ -2039,7 +2158,10 @@ fn handle_hook_callback(
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
         _ => {
-            let _ = reply.send(crate::hooks::hook_control_response_error(request_id));
+            let _ = reply.send(crate::hooks::unknown_hook_callback_response(
+                request_id,
+                callback_id,
+            ));
         }
     }
 }
@@ -2165,13 +2287,31 @@ fn handle_session_frame(
                 };
             if !is_echo {
                 if let Value::Array(blocks) = &content {
+                    // PC-1.5: the frame's `tool_use_result` belongs to a single tool result;
+                    // with several results it cannot be attributed, so it is null.
+                    let tool_result_count = blocks
+                        .iter()
+                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                        .count();
+                    let message_tool_use_result = if tool_result_count == 1 {
+                        line.get("tool_use_result").cloned().unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
                     for block in blocks {
                         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
                             if let Some(tool_use_id) =
                                 block.get("tool_use_id").and_then(Value::as_str)
                             {
                                 ext.hooks.complete(tool_use_id);
-                                ext.hooks.prune_expired(std::time::Instant::now());
+                                // PC-1.2 (Node onRelease, tools.ts:401-426): an entry released by the
+                                // 30 s expiry also finishes its hook tool tracker.
+                                for (released_id, _) in
+                                    ext.hooks.prune_expired(std::time::Instant::now())
+                                {
+                                    map_state.finish_hook_tool_tracker(&released_id);
+                                    map_state.pending_hooks.remove(&released_id);
+                                }
 
                                 if let Some(tool_use) = map_state.tool_use_from_cache(tool_use_id) {
                                     let name =
@@ -2180,6 +2320,22 @@ fn handle_session_frame(
                                         .get("is_error")
                                         .and_then(Value::as_bool)
                                         .unwrap_or(false);
+                                    // PC-1.5: a Task* call a permission prompt surfaced is resolved here
+                                    // (the Task branches below never emit a tool_call_update).
+                                    if map_state.has_emitted(tool_use_id)
+                                        && crate::tools::is_task_tool(name)
+                                    {
+                                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                            "sessionId": session_id,
+                                            "update": task_permission_resolution(
+                                                tool_use_id,
+                                                name,
+                                                is_err,
+                                                &block["content"],
+                                                line.get("parent_tool_use_id").and_then(Value::as_str),
+                                            ),
+                                        })));
+                                    }
                                     if !is_err {
                                         let input = tool_use.get("input").unwrap_or(&Value::Null);
                                         if name == "TaskCreate" {
@@ -2193,20 +2349,24 @@ fn handle_session_frame(
                                             );
                                             publish_task_plan(session_id, ext, update_tx);
                                         } else if name == "TaskUpdate" {
-                                            crate::hooks::apply_task_update(
+                                            // PC-1.5: the success gate and status fallback live in hooks.rs.
+                                            if crate::hooks::apply_task_update_output(
                                                 &mut ext.task_state,
                                                 input,
-                                            );
-                                            publish_task_plan(session_id, ext, update_tx);
-                                        } else if name == "TaskList" {
-                                            let parsed_tasks = crate::hooks::parse_task_list_output(
+                                                &message_tool_use_result,
                                                 &block["content"],
-                                            );
-                                            crate::hooks::apply_task_list(
+                                            ) {
+                                                publish_task_plan(session_id, ext, update_tx);
+                                            }
+                                        } else if name == "TaskList" {
+                                            // PC-1.5: unparseable output leaves the state untouched.
+                                            if crate::hooks::apply_task_list_output(
                                                 &mut ext.task_state,
-                                                parsed_tasks,
-                                            );
-                                            publish_task_plan(session_id, ext, update_tx);
+                                                &message_tool_use_result,
+                                                &block["content"],
+                                            ) {
+                                                publish_task_plan(session_id, ext, update_tx);
+                                            }
                                         }
                                     }
                                 }
@@ -2565,9 +2725,10 @@ fn handle_session_frame(
                                             .get("parent_tool_use_id")
                                             .and_then(Value::as_str)
                                             .map(String::from);
-                                        ext.hooks.register_once(
-                                            id.to_string(),
-                                            name.to_string(),
+                                        register_hook_first_encounter(
+                                            &mut ext.hooks,
+                                            id,
+                                            name,
                                             parent,
                                         );
                                     }
@@ -2589,8 +2750,7 @@ fn handle_session_frame(
                                     .get("parent_tool_use_id")
                                     .and_then(Value::as_str)
                                     .map(String::from);
-                                ext.hooks
-                                    .register_once(id.to_string(), name.to_string(), parent);
+                                register_hook_first_encounter(&mut ext.hooks, id, name, parent);
                             }
                         }
                     }
@@ -3060,6 +3220,170 @@ fn emit_raw_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Review PC-1 (8): a PostToolUse callback is registered on first encounter only
+    // (acp-agent.ts:13101 !alreadyCached); a later frame for the same id does not re-register.
+    #[test]
+    fn hook_registration_is_first_encounter_only() {
+        let mut hooks = crate::hooks::HookRegistry::new();
+        assert!(register_hook_first_encounter(
+            &mut hooks, "toolu_F1", "Bash", None
+        ));
+        assert!(!register_hook_first_encounter(
+            &mut hooks,
+            "toolu_F1",
+            "Bash",
+            Some("p".to_string())
+        ));
+        assert!(hooks.has("toolu_F1"));
+    }
+
+    // Review PC-1 (2): a subagent's permission-surfaced Task* resolution carries parentToolUseId
+    // (acp-agent.ts:13233-13238).
+    #[test]
+    fn task_permission_resolution_carries_parent_tool_use_id() {
+        let sub = task_permission_resolution(
+            "toolu_TK3",
+            "TaskCreate",
+            false,
+            &json!("ok"),
+            Some("toolu_PARENT"),
+        );
+        assert_eq!(
+            sub["_meta"]["claudeCode"]["parentToolUseId"],
+            "toolu_PARENT"
+        );
+        let root = task_permission_resolution("toolu_TK4", "TaskCreate", false, &json!("ok"), None);
+        assert!(root["_meta"]["claudeCode"].get("parentToolUseId").is_none());
+    }
+
+    // Review PC-1 (4): an unlisted model keeps auto mode (session-mode.ts:225-232); only a listed
+    // model that does not support auto is downgraded.
+    #[test]
+    fn auto_mode_is_kept_for_an_unlisted_model() {
+        assert!(!auto_mode_downgrade_needed(None));
+        let no_auto = crate::session_config::ModelInfo {
+            value: "m".into(),
+            supports_auto_mode: Some(false),
+            ..Default::default()
+        };
+        assert!(auto_mode_downgrade_needed(Some(&no_auto)));
+        let auto = crate::session_config::ModelInfo {
+            value: "m".into(),
+            supports_auto_mode: Some(true),
+            ..Default::default()
+        };
+        assert!(!auto_mode_downgrade_needed(Some(&auto)));
+    }
+
+    // Review PC-1 (5): an unlisted id's context window is inferred from the id itself
+    // (acp-agent.ts:13729-13747).
+    #[test]
+    fn context_window_seed_reads_the_unlisted_id() {
+        assert_eq!(
+            context_window_seed(None, "claude-opus-4-7[1m]"),
+            Some(1_000_000)
+        );
+        assert_eq!(context_window_seed(None, "claude-opus-4-7"), None);
+    }
+
+    // Review PC-1 (3): on an external switch the mode update and warning come before the
+    // config_option_update (Node publishFallbackState runs inside applyConfigOptionValue).
+    #[test]
+    fn external_switch_updates_publish_config_last() {
+        let opts: Vec<crate::session_config::ConfigOption> = Vec::new();
+        let updates = external_switch_updates("s", &opts, Some("acceptEdits"), true);
+        let kinds: Vec<&str> = updates
+            .iter()
+            .filter_map(|u| u["update"]["sessionUpdate"].as_str())
+            .collect();
+        assert_eq!(kinds.first(), Some(&"current_mode_update"));
+        assert_eq!(kinds.last(), Some(&"config_option_update"));
+    }
+
+    // PC-1.5 (acp-agent.ts:13226-13245): a Task* call a permission prompt surfaced is resolved
+    // by a tool_call_update, since the Task branches never emit one.
+    #[test]
+    fn task_permission_resolution_reports_status_and_tool_name() {
+        let ok = task_permission_resolution("toolu_TK1", "TaskCreate", false, &json!("done"), None);
+        assert_eq!(ok["toolCallId"], "toolu_TK1");
+        assert_eq!(ok["status"], "completed");
+        assert_eq!(ok["rawOutput"], "done");
+        assert_eq!(ok["_meta"]["claudeCode"]["toolName"], "TaskCreate");
+        let failed =
+            task_permission_resolution("toolu_TK2", "TaskUpdate", true, &json!("boom"), None);
+        assert_eq!(failed["status"], "failed");
+    }
+
+    // PC-1.1 (acp-agent.ts:10724 syncModelAfterExternalSwitch): a PostModelSwitch hook
+    // reports the SDK-switched model; the adapter tracks the option value it maps to,
+    // or the raw id when none matches, and does nothing when already tracked.
+    #[test]
+    fn external_switch_target_maps_to_option_value_and_skips_tracked_model() {
+        let models = vec![
+            crate::session_config::ModelInfo {
+                value: "claude-opus-4-6".into(),
+                display_name: "Opus".into(),
+                ..Default::default()
+            },
+            crate::session_config::ModelInfo {
+                value: "claude-sonnet-4-5".into(),
+                display_name: "Sonnet".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            external_switch_target(&models, "claude-sonnet-4-5", "claude-opus-4-6"),
+            Some("claude-opus-4-6".to_string())
+        );
+        assert_eq!(
+            external_switch_target(&models, "claude-opus-4-6", "claude-opus-4-6"),
+            None
+        );
+        assert_eq!(
+            external_switch_target(&models, "claude-opus-4-6", "custom-unlisted"),
+            Some("custom-unlisted".to_string())
+        );
+    }
+
+    // PC-1.1: a root-session PostCompact records its summary; a subagent one (agent_id) does not.
+    #[test]
+    fn post_compact_hook_records_root_summary_only() {
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        let mut map_state = MapState::default();
+        let (update_tx, _update_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let mut run = |input: Value, ext: &mut SessionExt| {
+            let (reply, _reply_rx) = oneshot::channel();
+            handle_hook_callback(
+                HookCall {
+                    request_id: "r",
+                    callback_id: crate::hooks::POST_COMPACT_HOOK_ID,
+                    input: &input,
+                    tool_use_id: None,
+                },
+                &mut map_state,
+                ext,
+                HookIo {
+                    update_tx: &update_tx,
+                    command_tx: &command_tx,
+                    session_id: "s",
+                },
+                reply,
+            );
+        };
+        run(json!({"compact_summary": "root summary"}), &mut ext);
+        assert_eq!(ext.last_compaction_summary.as_deref(), Some("root summary"));
+        run(
+            json!({"agent_id": "sub", "compact_summary": "sub summary"}),
+            &mut ext,
+        );
+        assert_eq!(ext.last_compaction_summary.as_deref(), Some("root summary"));
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn test_handle_frame(

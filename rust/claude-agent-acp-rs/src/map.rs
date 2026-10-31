@@ -205,6 +205,12 @@ impl MapState {
     /// Mark a tool-call id as surfaced (and cache its tool_use block) so a
     /// later `tool_use` refines rather than emits a duplicate (INV-20).
     pub(crate) fn mark_emitted(&mut self, id: String, block: Value) {
+        // PC-1.2: the PostToolUse hook is pending for every non-TodoWrite, non-Task call,
+        // including one surfaced by a permission prompt (Node registers it per tool_use).
+        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+        if name != "TodoWrite" && !tools::is_task_tool(name) {
+            self.pending_hooks.insert(id.clone());
+        }
         self.emitted.insert(id.clone());
         self.tool_use_cache.insert(id, block);
     }
@@ -676,6 +682,12 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
                 // the plan update is published by the actor at tool_result time
                 // (X12/Decision 12).
                 state.tool_use_cache.remove(id);
+                // PC-1.5: a permission-surfaced Task* call is resolved by a raw update the
+                // unfinished-tool books never see. Node clears the emitted marker on every
+                // tool_result (acp-agent.ts:13171) and forgets the call on a final status
+                // (acp-agent.ts:4592-4603), so the turn must not report it as stuck.
+                state.emitted.remove(id);
+                state.books.forget(id);
             } else {
                 if let Some(update) = tool_update_from_result(block, state) {
                     out.push(update);
@@ -1351,6 +1363,20 @@ fn is_task_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PC-1.2 (acp-agent.ts ensureToolCallEmitted, 9799-9811; tools.ts hasHookCallback): a call
+    // first surfaced by a permission prompt still has its PostToolUse hook pending, except
+    // TodoWrite and Task* (which have no hook).
+    #[test]
+    fn permission_surfaced_write_keeps_hook_pending() {
+        let mut state = MapState::default();
+        let write = json!({"type": "tool_use", "id": "toolu_PW1", "name": "Write", "input": {}});
+        state.mark_emitted("toolu_PW1".to_string(), write);
+        assert!(state.pending_hooks.contains("toolu_PW1"));
+        let todo = json!({"type": "tool_use", "id": "toolu_PT1", "name": "TodoWrite", "input": {}});
+        state.mark_emitted("toolu_PT1".to_string(), todo);
+        assert!(!state.pending_hooks.contains("toolu_PT1"));
+    }
     use serde_json::json;
 
     /// The `sessionUpdate` discriminant of an update, for assertions.

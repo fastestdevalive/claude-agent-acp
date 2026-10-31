@@ -31,3 +31,21 @@ nothing here blocks work.
   only occasionally or after two failed deepseek respawns; every substitution logged in `STATUS.md`.
   The parity program text says "stop and ask after two failed respawns"; the standing-goal text says
   "use agy-medium and note it" and "never stop to ask" — the later, more specific standing-goal rule is applied.
+
+## D4 — FEATURES.md routine decisions (claude-master FEAT-2 and round-2 audit corrections)
+
+- **What:** (a) B-117 (load/resume fingerprint recreate) is owned by F19, the card that describes it; the independent audit suggested F31. (b) Q-01 (module-level acp-agent.ts) is owned by F2a as a placeholder; its behaviour is owned per row. (c) Duplicate rows merged to one kept row with cross-references, status taken conservatively. (d) O-128 split owners for keys with no ROADMAP card (`forkSession`, `resumeSessionAt`, `skills`, `sessionMirror`) are the nearest card, not card-owned; FX-1 owns the keys with no card.
+- **Why:** F19's card matches the behaviour exactly; a module-level row cannot have one behavioural owner; conservative status avoids overstating parity.
+- **Alternatives:** B-117 to F31 (follow the audit); keep duplicate rows separate. Both are one-line changes if the user prefers.
+
+## D5 — FEATURES.md round-3 routine decisions (second independent audit of d226db6)
+
+- **What:** (a) An advertisement row (capability in `initialize`) is DONE when the advertisement matches upstream, and its behaviour is a separate row (MISSING or PARTIAL) that carries the gap; the advertisement rows C-05, C-06, C-09 are DONE on that basis. A capability that advertises more than is served (C-12) stays PARTIAL. (b) Q-01 (module-level acp-agent.ts) is a roll-up row owned by INFRA-3, closed by the final flip; it is not owned by F2a. (c) WB-05 follows M-52 (F2c) and WB-07 follows the AIR builders (F35b).
+- **Why:** an advertised capability whose behaviour is missing is one gap, reported once, in the behaviour row; a module-level row cannot be owned by one behaviour package.
+- **Alternatives:** make C-05, C-06, C-09 PARTIAL (count the gap twice); give Q-01 a roll-up status computed from sections 1-8.
+
+## D6 — FEATURES.md round-4 routine decisions (third independent audit of b010c1d)
+
+- **What:** (a) Amends D5: an advertisement row whose methods are unserved is PARTIAL (C-14 goal, C-49 providers); an advertisement whose behaviour is served or separately tracked is DONE (C-05, C-06, C-09). (b) U-26 and P-10 were downgraded to PARTIAL as the round-3 audit asked. The round-3 flips of O-10 and O-20 to DONE were refuted by verification against upstream and Rust, so they stay PARTIAL with the verified gap. (c) FX-6 is removed: B-20 is DONE and no row remains for it. (d) Module rows are PARTIAL where a behaviour row they cite is PARTIAL (14 rows), so module status and behaviour status agree.
+- **Why:** an unserved advertisement is a live wire gap and must not read as DONE; a refuted DONE claim must not be published; a module row cannot be DONE while its behaviour is MISSING or PARTIAL.
+- **Alternatives:** keep C-49 as DONE with the gap only in M-128 (one gap, reported once); keep module rows MISSING and add a note.

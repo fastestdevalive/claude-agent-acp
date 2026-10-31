@@ -727,10 +727,7 @@ fn register_session(
             .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
             .await
         {
-            let raw_max = res
-                .pointer("/response/rawMaxTokens")
-                .or_else(|| res.get("rawMaxTokens"))
-                .and_then(Value::as_u64);
+            let raw_max = crate::control::raw_max_tokens(&res);
             if let Some(tokens) = raw_max {
                 if tokens > 0 {
                     let _ =

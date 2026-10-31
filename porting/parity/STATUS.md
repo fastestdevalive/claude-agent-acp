@@ -84,7 +84,26 @@ feature packages F1..Fn (derived from MODULE-MAP), audit rounds.
 
 ## Current work package
 
-`rust-parity-fixes` Phase 3 (hooks + PostToolUse/toolResponse, Task plan, `session/load` replay,
+PAUSED (user request). Last commit: 5c977c3 (HAZARD-IMPL PC-1.5-settle, Opus ACCEPT).
+Stage 2, PC-1 (closeout hooks): PC-1.1, 1.3, 1.4, 1.6, 1.7, 1.8 done; PC-1.2 open (teardown clear not wired); PC-1.5 done (settle fix in 5c977c3).
+Uncommitted WIP (not gated, not committed):
+- map.rs: Task* tool_result branch calls `finish_result_tool_tracker(id, false)` (review PC-1 (c)), with unit test `task_tool_result_releases_the_field_tracker` (red, then green).
+- tests/differential.rs: `inv_24_todo_perm_settle` (ignored, HAZARD-IMPL T-21-todowrite) and `todo-perm-settle` excluded from the whole-corpus check via HAZARD_PENDING.
+- porting/corpus/todo-perm-settle.{acp.json,transcript.jsonl} and porting/fixtures/todo-perm-settle.{argv.json,frames.jsonl} (Node-captured with capture.sh).
+Not yet done: FEATURES T-22 wording (settle now clean for Task*, TodoWrite still T-21), plan-parity-closeout.md:31 (PC-1.5 OPEN line), PC-1 checkpoint gate.
+Next, on resume: gate the WIP (map.rs fix + repro), commit as two commits (fix; then HAZARD-IMPL T-21-todowrite repro), update T-22/plan, print CHECKPOINT: PC-1 and CHECKPOINT: HAZARD-IMPL:T-21-todowrite. Then PC-2.
+Lessons kept: gate from a non-UUID path without CARGO_TARGET_DIR; inline env prefixes only.
+
+`claude-master` (plan `.vibekit/feature-plans/pending/claude-master/plan-claude-master.md`), stage 1: FEAT-1 done (12 read-only audits, in-harness). FEAT-2 done: `porting/parity/FEATURES.md` has 10 sections, 912 audit rows (274 DONE, 235 PARTIAL, 403 MISSING incl. 91 module rows; round 6), 20 dedupe pairs merged, every non-DONE row tagged `[pkg:]`, 5 FX packages (K6) and 13 numbered wire bugs (WB-01..WB-14, no WB-06; WB-08 has sub-items a-g) with owners and acceptance tests. The FEATURES-AUDIT checkpoint runs in rounds (round 6 pending the next Opus audit).
+Open-item count: 649 non-DONE rows in FEATURES.md (247 PARTIAL + 402 MISSING), counting the 91 module rows (round 9: A-21, B-33 implemented in round 8; T-24 DONE and R-03 PARTIAL in PC-1; the checklist is accepted, so further changes go with the row they touch).
+
+Gate lessons (kept as gate rules):
+- `acp-recorder/tests/recorder.rs` hardcodes `../target/debug/examples/echo_agent`: a custom `CARGO_TARGET_DIR` breaks `inv_24_recorder_initialize_order` (ENOENT). Detached and lead gates must NOT set `CARGO_TARGET_DIR`; they use the worktree's own `rust/target`.
+- Detached gates must run from a path with no UUID-like segment (e.g. `/private/tmp/claude-501/gate-<name>`), else `inv_57` and `inv_24` fail spuriously.
+- Gate env prefixes must be written inline (`env VAR=... cargo test ...`), never via a shell variable: zsh does not word-split `$P`, so the polluted run silently never executes.
+Baseline (B0, plain + polluted gate green): 398 workspace tests passed, 0 failed.
+
+Previous work package (superseded): `rust-parity-fixes` Phase 3 (hooks + PostToolUse/toolResponse, Task plan, `session/load` replay,
 `allow_always` permission options, docs) → then `parity-infra` (committed plan 3f33c41: TEST-MAP,
 MODULE-MAP, check scripts, bump workflow) → then the feature packages of
 `.vibekit/feature-plans/pending/parity-roadmap/ROADMAP.md` (62 packages F1..F46 + sub-packages; honest
@@ -124,3 +143,5 @@ orchestrator runs the gate before each commit. Turns done by haiku-terminal are 
 
 | Turn | Model |
 |---|---|
+| claude-master B0 (baseline gate) | haiku-terminal lead (Haiku 5.5, master run), 0 subagents |
+| claude-master FEAT-1 (12 read-only FEATURES audit groups G1..G11, G2a/G2b) | haiku-terminal lead; first attempt on 12 vst haiku-terminal subagents (`mode-1789474690627-p55ag`) terminated on user request; re-run as 12 in-harness general-purpose subagents |

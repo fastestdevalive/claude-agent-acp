@@ -969,6 +969,22 @@ fn inv_24_hook_scenarios() {
     run_and_diff("hook-write-existing");
 }
 
+/// claude-master PC-1.6: the tool_result arrives BEFORE the PostToolUse hook (Node tools.js ~278
+/// says the hook normally follows the result); the hook-first order is `hook-bash`.
+#[test]
+fn inv_24_hook_result_first() {
+    run_and_diff("hook-result-first");
+}
+
+/// claude-master PC-1 review finding 1 (HAZARD-IMPL PC-1.5-settle): a Task* call surfaced by a
+/// permission prompt is resolved by a raw update, so the tool_result branch must clear the call's
+/// emitted marker and books or end_turn fails with -32603 incomplete_tool_call where Node
+/// completes the turn. The reproduction is the Node-captured `task-perm-settle` scenario.
+#[test]
+fn inv_24_task_perm_settle() {
+    run_and_diff("task-perm-settle");
+}
+
 /// rust-parity-fixes Phase 3 (item 3.4, X12/Decision 12): the Task* plan. Both
 /// the TaskCreated/TaskCompleted hooks (`task-plan-hooks`) and the task
 /// tool_result path (`task-plan-no-hook`) accumulate task state and publish a

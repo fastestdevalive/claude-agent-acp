@@ -287,6 +287,33 @@ impl Control {
     }
 }
 
+/// The payload of a control reply: `frame.response.response`. The SDK's
+/// `request()` resolves with `e.response` (the `{subtype, request_id, response}`
+/// object), and each typed method reads `.response` of that.
+fn reply_payload(frame: &Value) -> Option<&Value> {
+    frame.get("response").and_then(|r| r.get("response"))
+}
+
+/// `rawMaxTokens` from a `get_context_usage` reply (A-21). `None` if absent.
+pub fn raw_max_tokens(frame: &Value) -> Option<u64> {
+    reply_payload(frame)?
+        .get("rawMaxTokens")
+        .and_then(Value::as_u64)
+}
+
+/// `still_queued` from an `interrupt` reply (B-33). `None` when the field is absent.
+pub fn still_queued_of(frame: &Value) -> Option<Vec<String>> {
+    reply_payload(frame)?
+        .get("still_queued")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+}
+
 /// Parse the `initialize` control_response frame for the fields the client
 /// needs (4.4). Non-fatal: missing fields become empty.
 pub fn parse_initialize_response(frame: &Value) -> InitializeInfo {
@@ -498,6 +525,34 @@ mod tests {
     use tokio::io::AsyncBufReadExt;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
+
+    // A-21 / B-33: the CLI reply payload sits at `frame.response.response`
+    // (SDK `request()` resolves with `e.response`; `getContextUsage` returns
+    // `.response` of that). Readers must not look at the frame's top level.
+    #[test]
+    fn raw_max_tokens_reads_the_nested_reply_payload() {
+        let frame = json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "r1",
+            "response": {"rawMaxTokens": 200000}}});
+        assert_eq!(raw_max_tokens(&frame), Some(200000));
+        // The frame's top level is not the payload level.
+        let top_level_only = json!({"type": "control_response", "rawMaxTokens": 5});
+        assert_eq!(raw_max_tokens(&top_level_only), None);
+    }
+
+    #[test]
+    fn still_queued_reads_the_nested_reply_payload() {
+        let frame = json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "r2",
+            "response": {"still_queued": ["u1", "u2"]}}});
+        assert_eq!(
+            still_queued_of(&frame),
+            Some(vec!["u1".to_string(), "u2".to_string()])
+        );
+        let top_level_only = json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "r2", "still_queued": ["u1"]}});
+        assert_eq!(still_queued_of(&top_level_only), None);
+    }
 
     /// A test harness: builds a [`Control`] over an in-memory duplex stdin and
     /// returns:

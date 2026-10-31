@@ -1,0 +1,1158 @@
+# Feature checklist — claude port vs @agentclientprotocol/claude-agent-acp 0.94.0
+
+Baseline: commit 9f3bcd8 (claude-master B0). Pinned upstream: tag v0.94.0 (7bcbfc7a). Round 7 (after the sixth independent Opus FEATURES audit of bb56241).
+
+Status: DONE | PARTIAL | MISSING. Every non-DONE row ends with `[pkg:<id>]` naming the master-plan sub-package (or FX package) that owns it. Row IDs are stable across rounds: merged rows leave gaps; the merge history is at the end of this file.
+Row format: `ID | feature | upstream file(s) | status | Rust evidence | note`.
+
+Counts (913 rows incl. 91 module rows): DONE 264, PARTIAL 246, MISSING 403.
+Per section: 1 M 102 · 2 U 97 · 3 C 40 · 4 O 139 · 5 S 23 · 6 A 27 / R 9 / N 74 / B 122 · 7 T 104 / P 62 · 8 V 20 · 9 Q 91 · 10 D 3.
+
+## Round-9 changes (PC-1, closeout hooks; stage 2 in progress)
+
+- T-24 DONE (applyTaskUpdate keeps status; hooks.rs test pc1_5_task_update_without_status_keeps_progress). R-03 MISSING (review PC-1: the recorded PostCompact summary has no reader). R-01 PARTIAL: the PostModelSwitch sync shares the model bookkeeping; fast mode missing. A-12 PARTIAL: expiry release done; teardown clear pending.
+
+## Round-8 changes (implementation, claude-master stage 5 first package)
+
+- A-21 and B-33 are DONE: the get_context_usage rawMaxTokens and interrupt still_queued replies are read at the payload level (control.rs reply_payload, raw_max_tokens, still_queued_of). Tests: control::tests::raw_max_tokens_reads_the_nested_reply_payload, still_queued_reads_the_nested_reply_payload. The per-uuid map gap stays in B-32; the model guard stays in A-10.
+
+## Round-7 changes (sixth audit, 13 items plus 3 optional edge cases)
+
+- Verified against upstream and Rust (verifier, 14 claims: 8 confirmed, 6 refuted in part). Refined, as the verifier found: O-41 gap holds for ids starting with a non-numeric word (4-6-opus is fine); O-36 gap applies only when the list is not gateway-narrowed (session-model.ts:498-501); T-107 is PARTIAL because the error text reaches the client as raw output; T-47 and T-77 gaps are real even though the audit misdescribed the upstream side.
+- Status flips to PARTIAL [owner]: O-41, O-39, O-36, O-34 (F5b); O-20 note now says Rust reports models[0]; P-32 (F10); T-74 (F6a); M-32 (F29); B-66 (F17); B-86 (F34); B-108 (F15). Optional edge cases flipped: T-47 (F6a), T-77 (PC-1), O-40 (F5b).
+- New row T-107 PARTIAL [F6a]: failed Edit, Write, Skill and non-AIR ExitPlanMode results; T-56 and T-68 cross-reference it.
+- M-13: stale M-97 reference removed.
+
+## How this file was built
+
+- Round 1: 12 audit groups classified by section, owner and dedupe key; dedupe, sectioning and tagging.
+- Round 2: explicit corrections by row ID, owner mapping and splits by a read-only subagent, rendering by script.
+- Round 3: explicit corrections by row ID (ops file), group merges with the more conservative status unless overridden, stale-reference remap, rendering by script. Source scripts and inputs are in the scratch directory, not the repo.
+- Limits: dedupe is still key-based for near-duplicates; several statuses rest on grep and reading, not a run. The round-3 Opus audit checks the final shape.
+
+## WIRE BUGS (each has an owner package and an acceptance test)
+
+| WB | Observed wire behaviour | Owner | Acceptance test (runnable) |
+|----|-------------------------|-------|----------------------------|
+| WB-01 | `providers` advertised in capabilities but `providers/list\|set\|disable` return -32601 (agent.rs:158; 1404-1408) | F32 | corpus `providers-*` + unit: exact -32602 messages |
+| WB-02 | AIR `session/delete` returns -32601 where upstream archives (agent.rs:1177-1178; connection.ts:376-380) | F27b | corpus `session-delete-air-archive` |
+| WB-03 | orphan `tool_call_update` frames for TodoWrite and untracked tool results; upstream drops them (map.rs:639-642, 670-683, 752-818), and streamed TodoWrite and Task* refinements also emit (T-14, N-47) | F6b | corpus `todo-write-result` + unit: no update for an unseen tool id |
+| WB-04 | `initialize` returns `authMethods: []` (agent.rs:163); diverges only for clients declaring `auth.terminal`, `_meta.terminal-auth` or `auth._meta.gateway` (acp-agent.ts:2845-2947) | F2a | corpus `initialize-capabilities` auth variants |
+| WB-05 | `$/cancel_request` not handled (inbound; see M-52) | F2c | unit `inv_NN_cancel_request_handled` |
+| WB-07 | `nativeSubagentSessions` advertised to AIR clients (agent.rs:102, 128-131) with no child-session runtime behind it | F35b (advertisement stays off until served) | corpus `subagent-native-sessions` |
+| WB-08a | frame dropped in dispatch: top-level `tool_progress` (acp-agent.ts:8125-8176; dispatch.rs:76-79) | F7a | corpus `frame-tool-progress` |
+| WB-08b | system subtype `local_command_output` dropped (N-10) | F24 | corpus `local-command-usage` |
+| WB-08c | top-level `auth_status` frame dropped; upstream clears `auth_required` failures on it (acp-agent.ts:8228-8232) | F25 | unit: `auth_status` frame clears an `auth_required` failure |
+| WB-08d | top-level `conversation_reset` dropped (acp-agent.ts:8191; dispatch.rs:80); system `api_retry` and `model_refusal_*` have no handler | F7b | corpus `frame-api-retry`, `frame-refusal-fallback`, `conversation-reset` |
+| WB-08e | system subtype `background_tasks_changed` unhandled | F14 | corpus `background-tasks-changed` |
+| WB-08f | system subtype `elicitation_complete` unhandled | F23b | corpus `elicitation-complete` |
+| WB-08g | system subtype `worker_shutting_down` unhandled | F25 | corpus `session-failure-worker-shutdown` |
+| WB-09 | cancel leaves open tool calls open; no interrupted tool_results (B-08, B-09) | F17 | corpus `cancel-open-tool-closed` |
+| WB-10 | `commands_changed` reads terminal commands from the frame, not the latched init list (U-09) | LD-1 (D5) | corpus `terminal-commands` |
+| WB-11 | `session/fork` with an AIR fork point always returns -32602 (agent.rs:1036-1050) | F29 | corpus `session-fork-at-message` |
+| WB-12 | `session/load` of an unknown id has no resourceNotFound; resume without a transcript returns an empty tail | F31 | unit `resume_missing_transcript` + corpus `session-load-replay` |
+| WB-13 | ACP `mcpServers` silently dropped (sdk_options.rs:10) although http/sse are advertised (agent.rs:156) | F4a | corpus `mcp_stdio` (shared name) + `mcp-config-http`; unit: mcpServers reach SDK options and `--mcp-config` |
+| WB-14 | `_session/goal` advertised to AIR clients (agent.rs:142, controlMethod) but the method returns -32601 (agent.rs:1403-1410) | AG-1 | corpus `goal-set-clear` |
+
+## FX packages (rows with no existing card; appended to the master table, K6)
+
+| Package | Rows | Scope | Acceptance |
+|---------|------|-------|------------|
+| FX-1 | O-108, O-119, O-120, O-121, O-126, O-127, O-132 (argv: `--continue`, `--task-budget`, `--json-schema`, `--debug`/`--debug-file`, `--session-mirror`, `--channels`, `--permission-prompts`) | emit the remaining SDK argv flags from sdk.mjs | `cargo test ... --lib sdk_options` ok, argv golden per flag from Node dist |
+| FX-2 | P-18, P-20, P-23, P-24, P-25, Q-27, Q-28, Q-30, Q-31 (permission option builders and their modules) | permission option builders | `cargo test ... --lib permission_options` ok N cases; goldens from compiled `dist/permissions/options` |
+| FX-3 | M-51, N-48 (user chunk message-id grouping; `content_block_stop` drops the whole lane's inputs) | stream bookkeeping | corpus `stream-user-chunks`; unit `content_block_stop_drops_only_its_block` |
+| FX-4 | O-83, Q-19 (public library exports), O-138 (readTextFile / writeTextFile passthrough) | `lib.rs` export surface and library agent | `cargo test ... --test parity_maps` export check; unit for passthrough |
+| FX-5 | O-37 (versioned model display names) | model display names | `cargo test ... --lib model_presentation` goldens from `dist` |
+
+
+## 1. ACP agent methods (inbound)
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| M-01 | session/new: validate cwd, validate systemPrompt, start session, respond | src/acp-agent.ts:3036-3044 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:660-680 | error text lacks the "Invalid params: " prefix (acp-agent.ts:10925-10927; ACP SDK jsonrpc.js:1032-1033) [pkg:F2c] |
+| M-02 | session/new: _meta.claudeCode.options.resume honored | src/acp-agent.ts:3039-3041 | DONE | rust/claude-agent-acp-rs/src/agent.rs:904-930 |  |
+| M-03 | session/new: available_commands_update sent after the response | src/acp-agent.ts:3042 | DONE | rust/claude-agent-acp-rs/src/agent.rs:918-935 |  |
+| M-04 | session/resume: same start path without history replay | src/acp-agent.ts:3144-3150 | DONE | rust/claude-agent-acp-rs/src/agent.rs:962-1000 |  |
+| M-05 | session/fork: copy transcript, start the forked session, reuse it for later load or resume | src/acp-agent.ts:3113-3135 | DONE | rust/claude-agent-acp-rs/src/agent.rs:1028-1068; rust/claude-agent-acp-rs/src/session_methods.rs:77-91 |  |
+| M-06 | session/list: one page of 1000, offset cursor, nextCursor, cwd filter | src/acp-agent.ts:1920-1930, 3177-3201 | DONE | rust/claude-agent-acp-rs/src/session_methods.rs:27-50; rust/claude-agent-acp-rs/src/session_store.rs:467-474 |  |
+| M-07 | session/list: AIR index-backed list and archived-session hiding | src/acp-agent.ts:3178-3187 | MISSING | none |  [pkg:F26b] |
+| M-12 | authenticate: validate gateway payload (baseUrl, headers), store gateway auth, bump auth epoch, push gateway status; no-payload call is a no-op; any other methodId throws "Method not implemented." (acp-agent.ts:3266) | src/acp-agent.ts:3239-3267 | MISSING | none (no authenticate arm; default arm at agent.rs:1404-1408) | (dedupe) [pkg:F32] |
+| M-13 | logout: clear gateway and provider routing, bump auth epoch, clear context-window cache, claude auth logout, fresh probe, notLoggedIn fallback | src/acp-agent.ts:3660-3716 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:1203-1235; rust/claude-agent-acp-rs/src/auth_status.rs:399-427 | CLI logout, epoch bump and fresh probe done (M-95, M-96); gateway and provider routing clear and context-window cache clear missing (acp-agent.ts:3666-3679) [pkg:F32] |
+| M-15 | providers/list | src/acp-agent.ts:3503-3515 | MISSING | none | returns the provider list; no handler, falls to -32601 (agent.rs:1404-1408) [pkg:F32] |
+| M-18 | Gateway model listing before providers/set (anthropic, bedrock) | src/acp-agent.ts:3595-3628 | MISSING | none |  [pkg:F33] |
+| M-19 | session/prompt: v1 response resolves at turn end | src/acp-agent.ts:3765-3772 | DONE | rust/claude-agent-acp-rs/src/agent.rs:1237-1282 |  |
+| M-20 | _session/steering: injected, startedNewTurn and promptRequired outcomes; idleBehavior validation | src/acp-agent.ts:702-738, 4315-4356 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:1336-1353, 1344-1347 | error shape: upstream sends "Invalid params: <text>" with no data (acp-agent.ts:719-733); Rust puts the text in data; non-string idleBehavior accepted [pkg:F2c] |
+| M-21 | _session/steering: priority now, or later while a permission or elicitation is open | src/acp-agent.ts:4366-4369 | DONE | rust/claude-agent-acp-rs/src/session.rs:1215, 4099 |  |
+| M-22 | _session/async_task/stop: claim, stop task, report stopped | src/acp-agent.ts:4391-4404 | DONE | rust/claude-agent-acp-rs/src/agent.rs:1381-1400; rust/claude-agent-acp-rs/src/session.rs:686-700 |  |
+| M-24 | session/cancel notification handled for the owning session | src/acp-agent.ts:8383-8388 | DONE | rust/claude-agent-acp-rs/src/agent.rs:567-580 |  |
+| M-25 | closeSession: idempotent, answers {} for unknown session | src/acp-agent.ts:8923-8929 | DONE | rust/claude-agent-acp-rs/src/agent.rs:1070-1085 |  |
+| M-26 | closeSession: answer sent after the session has ended | src/acp-agent.ts:8847-8914, 8923-8929 | DONE | rust/claude-agent-acp-rs/src/agent.rs:1070-1085 | spawned task responds after session.close() |
+| M-27 | deleteSession delegates to session index and removes sidecar | src/acp-agent.ts:8932-8934 | DONE | rust/claude-agent-acp-rs/src/session_store.rs:561; rust/claude-agent-acp-rs/src/session_methods.rs (delete) |  |
+| M-29 | session/resume and session/fork do not replay history | acp-agent.ts:3144-3170 | DONE | rust/claude-agent-acp-rs/src/agent.rs:962-968, 1055-1066 |  |
+| M-30 | session/load on live session replays history and re-sends commands | acp-agent.ts:3144-3170 | DONE | rust/claude-agent-acp-rs/src/agent.rs:972-998 |  |
+| M-31 | resume/load of unknown session: resourceNotFound | tests/session-load.test.ts:68-100 | MISSING | none (start_resumed does no transcript existence check: agent.rs:790-830) | live CLI behaviour unverified [pkg:F31] |
+| M-32 | fork without fork point: copy latest transcript into new session | src/fork-session.ts:187-192 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:594-640 | fork copy keeps only message types and content-replacement; the history-suppression (fork_inherit), atis-latch and relocated records are not written (SDK forkSession); see M-90 [pkg:F29] |
+| M-33 | fork: fork-point request resolved and forked up to message | src/fork-session.ts:194-237 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:1036-1050 | any valid fork point returns -32602 "not found" (error where Node succeeds) (dedupe) [pkg:F29] |
+| M-34 | fork point parse: version 1, messageId, fingerprint, occurrence | src/fork-session.ts:17-64 | PARTIAL | rust/claude-agent-acp-rs/src/session_methods.rs:66-74 | messageId only; fingerprint and occurrence ignored [pkg:F29] |
+| M-36 | fork point: strip :segment:N suffix candidate | src/fork-session.ts:66-70 | MISSING | none |  [pkg:F29] |
+| M-37 | set_config_option fast: boolean or "on"/"off" value, invalid value error | src/acp-agent.ts:8963-8967; src/acp-agent.ts:12464-12478 | MISSING | rust/claude-agent-acp-rs/src/session.rs:1477-1490 (non-string value rejected, no fast branch) |  [pkg:F11] |
+| M-38 | session/set_config_option mode branch: validate value, alias via options/currentValue, Auto clamp, current_mode_update, no config_option_update | src/acp-agent.ts:8940-9030; src/session-mode.ts:246-278 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1467-1640 | a CLI error control_response is treated as success; see A-44 [pkg:F3a] |
+| M-39 | session/set_mode: parse, availability, Auto clamp, current_mode_update when clamped, config_option_update | src/session-mode.ts:246-278; src/acp-agent.ts:10441-10457 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1355-1364 | set_mode treats an error reply as success (session.rs:1362) and replaces every error with "Invalid Mode" (session.rs:1363); upstream keeps a non-empty message (session-mode.ts:254-263); see A-44 [pkg:F3a] |
+| M-40 | invalid mode id rejected with "Invalid Mode" | src/session-mode.ts:336-348 | DONE | rust/claude-agent-acp-rs/src/session.rs:1337-1341 |  |
+| M-41 | "Mode X is not available in this session" error | src/session-mode.ts:249-251 | DONE | rust/claude-agent-acp-rs/src/session.rs:1342-1345 |  |
+| M-42 | set_config_option effort: apply flag first, default un-pins, other values pin, no config_option_update | src/acp-agent.ts:10689-10716; src/acp-agent.ts:8940-9030 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1566-1586; rust/claude-agent-acp-rs/src/session.rs:1575-1578 | a CLI error control_response is treated as success; see A-44 [pkg:F3a] |
+| M-43 | config/mode changes rejected once query stream closed (husk session) | src/acp-agent.ts:8948-8953; src/session-mode.ts:315-322 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:735-760 ("Session ended" text, not SESSION_ENDED_MESSAGE) |  [pkg:F11] |
+| M-44 | unknown config option error | src/acp-agent.ts:8948-8953 | DONE | rust/claude-agent-acp-rs/src/session.rs:1477-1487 |  |
+| M-45 | promptToClaude: text chunk pass-through | acp-agent.ts:12674-12686 | DONE | rust/claude-agent-acp-rs/src/agent.rs:233-235 |  |
+| M-46 | promptToClaude: resource_link and resource text as link via formatUriAsLink | acp-agent.ts:12653-12668, 12690-12707 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:237-249, 290-296 | Rust always emits `[name](uri)`; upstream `[@name](uri)` for file:// and zed://, raw uri otherwise [pkg:F6a] |
+| M-47 | promptToClaude: resource text appended as `<context ref>` block | acp-agent.ts:12700-12707, 12735-12737 | DONE | rust/claude-agent-acp-rs/src/agent.rs:241-249, 279 |  |
+| M-48 | promptToClaude: blob resources, audio and other chunks ignored | acp-agent.ts:12707-12710, 12742-12745 | DONE | rust/claude-agent-acp-rs/src/agent.rs:250-272 |  |
+| M-49 | promptToClaude: image chunk as base64 data or http(s) url source | acp-agent.ts:12711-12732 | DONE | rust/claude-agent-acp-rs/src/agent.rs:253-270 |  |
+| M-50 | promptToClaude: user frame stamped origin {kind:"human"} | acp-agent.ts:12760-12764 | DONE | rust/claude-agent-acp-rs/src/agent.rs:285 |  |
+| M-51 | messageIdForGrouping: assistant keyed by API message.id, else uuid | acp-agent.ts:12766-12787 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:546-557 | user chunks from session.rs map_consolidated(User) get no message id; upstream keys them by uuid [pkg:FX-3] |
+| M-52 | $/cancel_request for a prompt routes to cancel | acp-agent.ts:13528-13552 | MISSING | none (rust/claude-agent-acp-rs/src/agent.rs:573 handles session/cancel only) |  [pkg:F2c] |
+| M-53 | v1 session routes: initialize, new, load, resume, fork, list, delete, close, setMode, setConfigOption, prompt, cancel | acp-agent.ts:13566-13593 | DONE | rust/claude-agent-acp-rs/src/agent.rs:573, 882, 904, 962, 1028, 1070, 1089, 1122, 1163, 1179, 1237 | (dedupe) |
+| M-58 | session/list AIR options `_meta.jetbrains.air.list` (limit default 50 max 200, archived filter, includeWorktrees) | src/session-index/service.ts:103-153; src/session-index/session-index.ts:58-59 | MISSING | none (rust/claude-agent-acp-rs/src/session_methods.rs:27-50 reads only cwd and cursor) |  [pkg:F26b] |
+| M-59 | session/list opaque cursor v5 bound to cwd/archived/worktrees scope, -32602 on foreign cursor | src/session-index/service.ts:155-204 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:467-474 (offset:N cursor, -32602 on bad format only, no scope binding) |  [pkg:F26b] |
+| M-60 | session/list row order: min(lastPromptAt, updatedAt) descending, ties by sessionId | src/session-index/session-index.ts:236-250 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:479-508 (sorts by file mtime desc, then id) | order key differs from upstream [pkg:F26b] |
+| M-61 | session/list page size 50 by default for sessionIndex clients | src/session-index/session-index.ts:58-59 | MISSING | rust/claude-agent-acp-rs/src/session_store.rs:25 (SESSION_LIST_PAGE_SIZE = 1000, no limit param) |  [pkg:F26b] |
+| M-62 | archive state as `[archived] ` title prefix, normalised and capped at 200 | src/session-index/archive-title.ts:22-96 | MISSING | none |  [pkg:F26a] |
+| M-63 | archived filter unarchived (default) / archived / all on list | src/session-index/session-index.ts:77-84; src/session-index/service.ts:112-122 | MISSING | none |  [pkg:F26b] |
+| M-64 | list row `_meta.jetbrains.air` fields archived, lastPromptAt, model, forkedFrom, agentWorktree, state, lastTurnEndedAt, cost | src/session-index/session-info.ts:19-56 | MISSING | rust/claude-agent-acp-rs/src/session_store.rs:358-372 (SessionRow has only sessionId, cwd, title, updatedAt) |  [pkg:F26b] |
+| M-65 | session activity state running/idle/requires_action/error from own query, live registry and transcript tail | src/session-index/activity.ts:52-124 | MISSING | none |  [pkg:F26b] |
+| M-66 | session cost from total_cost_usd of the last result, positive only | src/session-index/activity.ts:127-130 | MISSING | none |  [pkg:F26b] |
+| M-67 | git worktree listing without spawning git, and includeWorktrees sibling projects in session/list | src/session-index/worktrees.ts:1-147; src/session-index/session-index.ts:437-474 | MISSING | rust/claude-agent-acp-rs/src/session_store.rs:1-12 (header: worktree sibling projects not ported) |  [pkg:F26a] |
+| M-68 | agentWorktree marking of rows whose transcript says Claude Code made the worktree | src/session-index/transcript-scan.ts:277-292; src/session-index/session-index.ts:261-270 | MISSING | none |  [pkg:F26a] |
+| M-69 | session title precedence: last agent-name record, then custom title, then SDK summary | src/session-index/archive-title.ts:74-86; src/session-index/service.ts:287-303 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:414-432 (customTitle, aiTitle, lastPrompt, summary, firstPrompt; no agent-name record) |  [pkg:F30] |
+| M-70 | custom-title sidecar <projectDir>/<sessionId>/custom-title.json read and written (0600/0700, atomic) | src/session-index/session-index.ts:282-304; src/session-index/service.ts:206-232 | MISSING | none (session_store.rs:1-12 header: sidecar title store not ported) |  [pkg:F27a] |
+| M-71 | first prompt: skip meta, compact-summary, tool_result; expand pasted_content; slash-command fallback; bash-input as "! x"; skip tag-led and interrupt text; 200-char cut | src/session-index/first-prompt.ts:19-172 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:251-300 (meta/compact/tool_result skip and 200-char cut only; no pasted, bash, command fallback or skip-tag rules) |  [pkg:F26a] |
+| M-72 | Image / Document title when a first user record has no text | src/session-index/first-prompt.ts:161-172 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:428-439 | no isMeta skip (session-index/first-prompt.ts:165); only compact JSON spellings match [pkg:F26a] |
+| M-73 | sanitizeTitle: newline and whitespace collapse, 256-unit cap with ellipsis, 4096 scan prefix | src/session-titles.ts:46-71 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:304-321 | counts Unicode code points, upstream counts UTF-16 units; differs for astral characters [pkg:F30] |
+| M-74 | project directory encoding, long-name prefix match, case-insensitive match on darwin/win32, on-disk check | src/session-index/project-dirs.ts:26-120; src/session-index/session-index.ts:305-360 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:77-160 (encoding and prefix match; no case-insensitive or on-disk check) |  [pkg:F26a] |
+| M-75 | sidechain transcripts excluded from the list | src/session-index/transcript-scan.ts:530-535 | DONE | rust/claude-agent-acp-rs/src/session_store.rs:414-418 | none |
+| M-76 | relocated cwd record preferred for the row cwd | src/session-index/transcript-scan.ts:244-276 | DONE | rust/claude-agent-acp-rs/src/session_store.rs:428-434 | none |
+| M-77 | session/list cwd filter by canonical project path | src/session-index/session-index.ts:366-437 | PARTIAL | rust/claude-agent-acp-rs/src/session_store.rs:479-500 (canonicalize plus project_dirs_for; no worktree or case rules) |  [pkg:F26b] |
+| M-78 | _session/list/subscribe (cwd, at most 128 subscriptions, subscriptionId) | src/session-index/list-subscriptions.ts:56-99, 295-336, 1-1333 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:1403 (falls to -32601) | (dedupe) [pkg:F28] |
+| M-79 | _session/list/unsubscribe, idempotent | src/session-index/connection.ts:222-224; src/session-index/list-subscriptions.ts:57, 91, 376-388 | MISSING | none (falls to -32601) | restored (round 6) [pkg:F28] |
+| M-81 | _session/rename writes custom-title and agent-name records and sidecar, keeps archive state, retitles a running CLI via renameSession; sanitised title, -32602 "title must be a non-empty string" (service.ts:94-100) | src/session-index/service.ts:216-285, 328-331, 549-623; src/session-index/connection.ts:313-357 | MISSING | none | (dedupe) [pkg:F27a] |
+| M-82 | _session/archive: prefix the title, interrupt and tear down a loaded session, idempotent, session_info_update archived | src/session-index/connection.ts:259-293, 433-446; src/session-index/service.ts:335-340 | MISSING | none | (dedupe) [pkg:F27b] |
+| M-83 | _session/unarchive: removes the archive prefix, idempotent, does not load the session | src/session-index/connection.ts:295-305 | MISSING | none (falls to -32601) | restored (round 6) [pkg:F27b] |
+| M-84 | sessionId param check for archive and unarchive: -32602 "params require a non-empty sessionId" | src/session-index/service.ts:74-93 | MISSING | none |  [pkg:F27b] |
+| M-85 | unknown session on title or archive change: -32002 "Session not found" | src/session-index/service.ts:77-79, 556-568 | MISSING | none |  [pkg:F27a] |
+| M-86 | session/delete for a sessionIndex client: scans every transcript copy and session dir, one SDK delete per non-empty copy, removes empty copies, not-found unless loaded | src/session-index/connection.ts:376-377; src/session-index/service.ts:658-700 | MISSING | rust/claude-agent-acp-rs/src/session_store.rs:561-573 (single-copy delete only) | restored (round 6) [pkg:F27b] |
+| M-87 | session/delete for an AIR client without sessionIndex: archive instead of delete | src/session-index/connection.ts:376-380; src/session-index/service.ts:409-423 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:1177-1178 (keeps -32601 per Decision 22) | wire divergence (dedupe) [pkg:F27b] |
+| M-88 | session/delete for other clients: SDK delete, unknown or invalid id succeeds, loaded session torn down first | src/session-index/service.ts:387-407; src/session-index/connection.ts:370-381 | DONE | rust/claude-agent-acp-rs/src/session_methods.rs:52-62; rust/claude-agent-acp-rs/src/session_store.rs:561-574; rust/claude-agent-acp-rs/src/agent.rs:1179-1187 | none |
+| M-89 | AIR list hides archived sessions from the old list (session/delete of AIR client) | src/session-index/connection.ts:233-239 | MISSING | none |  [pkg:F26b] |
+| M-90 | session/fork copies the latest transcript into a new session under the cwd project with (fork) title | src/session-index/connection.ts:192-215 (wrapper only; copy is SDK forkSession) | PARTIAL | rust/claude-agent-acp-rs/src/session_methods.rs:74-85; rust/claude-agent-acp-rs/src/session_store.rs:594-600, 741-742 (no upToMessageId, compactMetadata or attachment uuid remap) |  [pkg:F29] |
+| M-92 | dir-listing caches: bounded stat concurrency (512), reused directory listings (30 s, 8 entries), 50k metadata cache | src/session-index/dir-listing.ts:1-133; src/session-index/session-index.ts:63-72 | MISSING | none (session_store.rs reads each directory per call) | performance only [pkg:F26a] |
+| M-93 | _session/goal control method: set (non-empty objective) and clear, -32602 messages | src/goal-extension.ts:31-34, 52-69 | MISSING | none (agent.rs:1403 -32601) | (dedupe) [pkg:AG-1] |
+| M-94 | agentFileChangeReportRequest parsing (version 1, exactly two keys, requestId pattern, dedupe) | src/file-change-audit.ts:12, 72-89, 236-240 | MISSING | none |  [pkg:AG-3] |
+| M-95 | logout: claude auth logout; failure is -32603 with data.stderr | src/acp-agent.ts:3684-3695 | DONE | rust/claude-agent-acp-rs/src/agent.rs:1203-1222, rust/claude-agent-acp-rs/src/auth_status.rs:409-445 | (dedupe) |
+| M-96 | logout: fresh post-logout read; unreadable store gives not logged in; timeout keeps state | src/acp-agent.ts:3708-3715 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:560-600, rust/claude-agent-acp-rs/src/agent.rs:1208-1215 | response ordered after status push |
+| M-100 | Refusal errors: authRequired with data.reason claude_subscription_not_supported; plain login-required error | src/hide-claude-auth.ts:49-59,132-143 | MISSING | none |  [pkg:F34] |
+| M-101 | Session-creation guard: refuse subscription or signed-out account, report refused account first | src/hide-claude-auth.ts:26-29, src/tests/authorization.test.ts:441-660 | MISSING | none |  [pkg:F34] |
+| M-103 | providers/set lists gateway models before responding; same-gateway listing reuse; order of set and disable | src/acp-agent.ts:3595-3628,11727-11743 | MISSING | none |  [pkg:F33] |
+| M-104 | AIR request key _meta.jetbrains.air.fork on session/fork | docs/air-extensions.md:171-199 | DONE | rust/claude-agent-acp-rs/src/session_methods.rs:67 |  |
+| M-105 | clientSystemPrompt validation: mode append/override, text-only blocks (-32602); non-iterable content gives -32603 | src/client-system-prompt.ts:36-58 | DONE | rust/claude-agent-acp-rs/src/system_prompt.rs:52-100 |  |
+| M-106 | Protocol router: negotiate v1 or v2 from `initialize` | src/serve.ts:37-51 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:149 (protocolVersion always 1), agent.rs:883-886 (requested version read into unused `_version`) |  [pkg:F38a] |
+| M-108 | v2 session/new: optional mcpServers and systemPrompt, response adds configOptions and availableCommands, no modes | src/v2/agent.ts:77-83; src/v2/session.ts:25-96, 94-103 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:904 (v1 session/new) |  [pkg:F38b] |
+| M-109 | v2 session/resume with replayFrom: `start` replays via load, other cursors -32602; state snapshot sent after replay | src/v2/agent.ts:85-102; src/v2/session.ts:44-67 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:962-968 (v1 resume/load, replay chosen by method) |  [pkg:F38b] |
+| M-110 | v2 session/fork returns a promptable session with its config options | src/v2/agent.ts:103-113 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:1028 (v1 fork) |  [pkg:F38b] |
+| M-111 | v2 session/list, session/close (forgets terminals and tool-call meta), session/delete | src/v2/agent.ts:84, 114-120 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:1163 (list), 1070 (close), 1179 (delete, non-AIR only) | v1 handlers exist; no v2 wire [pkg:F38b] |
+| M-112 | v2 session/set_config_option: configId, boolean values, unsupported value type -> -32602 | src/v2/agent.ts:121-126; src/v2/session.ts:105-124 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:1122 (v1 handler) |  [pkg:F38b] |
+| M-113 | v2 session/prompt answers at intake with messageId and echoes user_message; -32800 when cancelled before intake; internal error when turn ends before intake | src/v2/prompt.ts:30-67 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:1237 (v1 prompt returns stop reason only) |  [pkg:F39] |
+| M-114 | v2 prompt content: unknown block kinds rejected; annotation audience narrowed to user/assistant, unknown-only audience kept as empty | src/v2/prompt.ts:148-183 | MISSING | none |  [pkg:F39] |
+| M-115 | Providers over v2: providers/list, providers/set, providers/disable; providers {} advertised | src/v2/agent.ts:70-76; src/v2/initialize.ts:86-87 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:158 advertises `"providers": {}`; no providers/ handler in rust/*/src | advertised but unserved [pkg:F32] |
+| M-116 | Auth over v2: auth/login and auth/logout methods | src/v2/agent.ts:68-69 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:157 (auth.logout capability), agent.rs:1203 (v1 `logout` arm only); no authenticate handler |  [pkg:F32] |
+| M-117 | session/cancel as a notification on the v2 connection | src/v2/agent.ts:132 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:573 (v1 cancel notification), agent.rs:1404-1408 (-32601 for unknown methods) | v1 semantics exist; no v2 router [pkg:F38b] |
+| M-118 | Extension methods on v2 must start with "_" (others rejected) | src/v2/agent.ts:245-250 | MISSING | none |  [pkg:F38a] |
+| M-125 | PromptResponse usage plus _meta.quota {token_count, model_usage} | acp-agent.ts:11931-11999; air-extensions.md:212 | DONE | session.rs:2820-2846 |  |
+| M-126 | ACP ndJson codec (parse-error shape, id types) | acp-agent.ts:13532-13550 | MISSING | none |  [pkg:F2c] |
+| M-127 | new/load/resume wait for an in-flight providers/set | acp-agent.ts:3145, 3153 | MISSING | none |  [pkg:F32] |
+| M-128 | providers/set: validate providerId, apiType, baseUrl and vertex meta (four exact -32602 messages); apply to later sessions | acp-agent.ts:3523-3573; tests/providers.test.ts:97-131 | MISSING | none | split from M-15 [pkg:F32] |
+| M-129 | providers/disable | acp-agent.ts:3579-3586 | MISSING | none | split from M-15 [pkg:F32] |
+
+## 2. Agent-to-client calls and notifications
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| U-01 | CLI auth identity probed in background after initialize; _auth/status_update pushed after the response | src/acp-agent.ts:2836-2841 | DONE | rust/claude-agent-acp-rs/src/agent.rs:894-901 | probe() called after respond |
+| U-02 | Session notices: notice session update when clientCapabilities.session.notices is an object | src/session-notices.ts:18-33, 44-50 | MISSING | none | (dedupe) [pkg:F2a] |
+| U-03 | Notice fallback for clients without the capability: bold-label agent_message_chunk with _meta | src/session-notices.ts:35-56 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1268-1280 | the task-stopped acknowledgement is always a plain agent_message_chunk; no bold label, no _meta, no capability branch (dedupe) [pkg:F2a] |
+| U-04 | Notice text shaping: plain-text strip, title/description split, 256-char title cap, sentence case, whitespace normalization | src/session-notices.ts:58-96 | MISSING | none |  [pkg:F2a] |
+| U-05 | _auth/status_update pushed only when the status changed | src/acp-agent.ts:3282-3297 | DONE | rust/claude-agent-acp-rs/src/agent.rs:601-616 | (dedupe) |
+| U-06 | CLI auth probe: timeout keeps last status, epoch discards stale probe, merge with session identity | src/acp-agent.ts:3375-3466 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:536-600 | verified: epoch discard, in-flight sharing, merge, timeout keeps state; gaps tracked as B-82, O-66, O-67 |
+| U-07 | AIR goal publish as session_info_update (jetbrains.air.goal) with optimistic pending update and rollback | src/acp-agent.ts:4199-4283 | MISSING | none |  [pkg:AG-1] |
+| U-08 | AIR prompt_suggestion publish as session_info_update | src/acp-agent.ts:4220-4238 | MISSING | rust/claude-agent-acp-rs/src/session.rs:2618-2620 | frame consumed; publish skipped, comment says AIR-only and skipped (dedupe) [pkg:F24] |
+| U-09 | commands_changed: replace available commands, terminal filter from init, reset skillPaths | src/acp-agent.ts:6266-6288 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2424-2426, 2997-3015; rust/claude-agent-acp-rs/src/map.rs:952 | terminal list read from frame field terminal_commands, not session.terminalSlashCommands; skillPaths reset missing [pkg:LD-1] |
+| U-10 | Raw SDK message forwarding as _claude/sdkMessage when emitRawSDKMessages | src/acp-agent.ts:5820-5826 | MISSING | none (grep for sdkMessage/emitRaw empty) | (dedupe) [pkg:F4b] |
+| U-11 | sendUpdate choke point: subagent routing, tool-call parent tracking, emitted-tool dedupe, final-status cleanup | src/acp-agent.ts:4551-4639 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2292-2312 (live_background parent map); rust/claude-agent-acp-rs/src/map.rs:304 | no NativeSubagentRuntime routing or per-call parent map equivalent [pkg:F35b] |
+| U-12 | Nested (subagent) text/thinking gating by client capability (forwardsSubagentText) | src/acp-agent.ts:7682-7690, 7994, 8005-8011 | PARTIAL | map.rs:537-547 drops nested text in consolidated path unconditionally; session.rs:2480-2600 passes nested stream_event deltas to map_stream_event ungated; agent.rs:699 has forward_subagent_text config | inconsistent gating between stream and consolidated paths [pkg:F4b] |
+| U-13 | Refusal explanation streamed as agent_message_chunk (stop_details, model_refusal_no_fallback backup) | src/acp-agent.ts:7254-7263, 6725-6727, 7873-7881 | MISSING | no stop_details / refusal explanation handling anywhere (grep 0); turn.rs:852-855 settles without text |  [pkg:F7b] |
+| U-14 | rate_limit_event -> usage_update carrying _claude/rateLimit when a total exists | src/acp-agent.ts:8177-8190 | DONE | session.rs:2430-2443; usage.rs:248-260 | none |
+| U-15 | sessionUpdate kinds emitted for this range: agent_message_chunk, agent_thought_chunk, user_message_chunk, tool_call, tool_call_update, plan, usage_update | src/acp-agent.ts:7009-7023, 7258-7262, 7579-7586, 8173 | DONE | map.rs:529-560, 855-911, 921-950; session.rs:2243-2255, 2579-2595 | current_mode_update, available_commands_update outside this range |
+| U-16 | Auto fallback warning as a notice when the client supports notices | src/session-mode.ts:287-308 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1402, 1616, 1760 (agent_message_chunk only) | no notice contract branch [pkg:F2a] |
+| U-17 | context window seeded from text heuristic on model switch | src/acp-agent.ts:10517-10530 | DONE | rust/claude-agent-acp-rs/src/session.rs:1660-1672; rust/claude-agent-acp-rs/src/usage.rs:93-121 |  |
+| U-18 | authoritative window carried across switches (cross-session contextWindowCache) | src/acp-agent.ts:13729-13768; src/acp-agent.ts:1196-1211 | MISSING | rust/claude-agent-acp-rs/src/session.rs:1316-1322 (cache noted as pending) |  [pkg:F5b] |
+| U-19 | applyMessageId: stamped only on message and thought chunks | acp-agent.ts:12789-12803 | DONE | rust/claude-agent-acp-rs/src/map.rs:1161-1186 |  |
+| U-20 | string content becomes agent/user message chunk; empty string yields nothing | acp-agent.ts:12946-12966 | DONE | rust/claude-agent-acp-rs/src/map.rs:503-507 |  |
+| U-21 | text, text_delta and thinking chunks; empty text and empty thinking dropped | acp-agent.ts:12996-13026 | DONE | rust/claude-agent-acp-rs/src/map.rs:855-877 |  |
+| U-22 | image chunk mapped by role (agent or user message) | acp-agent.ts:13028-13038 | DONE | rust/claude-agent-acp-rs/src/map.rs:878-909 |  |
+| U-23 | tool_call emitted once; refinement on repeat; rawInput is a JSON copy of input | acp-agent.ts:13128-13155 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:702-706 | no alreadyEmitted and inputComplete===false skip (acp-agent.ts:13162); Rust refines an emitted id with the empty stream-start input [pkg:F6b] |
+| U-24 | non-Task tool_result: ExitPlanMode approved plan published as markdown plan update | acp-agent.ts:13307-13324 | MISSING | none (tools.rs:841 returns None for ExitPlanMode) |  [pkg:F21] |
+| U-25 | changed-field filter on tool_call_update (value compare, drop unchanged) | field-tracker.ts:63-107 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:227-245, 357-417 | value compare present; _meta merge tracking absent (tracker ignores meta; non-AIR meta always whole) [pkg:F9] |
+| U-26 | AIR plan dedupe: changedTaskPlanEntries skips unchanged plan | tools.ts:330-352 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1896-1918 | gate requires version>=1 and an air entry in the capabilities list (session.rs:1903; air.rs:80-87); upstream gates on _meta.jetbrains.air alone (client-capabilities.ts:49; air-extension.ts:119-121) [pkg:PC-1] |
+| U-27 | planEntries and taskStateToPlanEntries: activeForm shown for in_progress | tools.ts:65-77, 322-328 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:926-931; rust/claude-agent-acp-rs/src/hooks.rs:313-316, 447 | an empty activeForm is shown: upstream uses a truthiness check (tools.ts:324) so an empty value falls back to subject; Rust stores "" and shows it [pkg:F6b] |
+| U-28 | EnterPlanMode PostToolUse notifies the mode change | tools.ts:433-436 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1933-1958 | EnterPlanMode path sets the mode only; pre_plan_mode not recorded (upstream syncConfig sets prePlanMode, session-mode.ts:171-176; acp-agent.ts:10441-10449) [pkg:F21] |
+| U-29 | tool use _meta: claudeCode.toolName; AIR jetbrains.air version, commandTitle, subagent, skill, mcp | renderer.ts:765-791; air-extension.ts | DONE | rust/claude-agent-acp-rs/src/tools.rs:90-101, 140-188; rust/claude-agent-acp-rs/src/map.rs:168-174, 734-736 |  |
+| U-30 | refinement report once input complete (title, kind, content, locations, rawInput) | renderer.ts:267-279 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:840-841 | refinement rawInput unchanged; upstream strips AIR file text and plan text via renderer.rawInput (tool-calls/renderer.ts:273, 729-743); see T-85 [pkg:F9] |
+| U-31 | tool completion _meta: claudeCode.toolName | renderer.ts:488-491 | DONE | rust/claude-agent-acp-rs/src/map.rs:816-818; rust/claude-agent-acp-rs/src/tools.rs:90-101 |  |
+| U-32 | PostToolUse hook _meta: full toolResponse (non-AIR); status and isAsync markers only (AIR) | renderer.ts:542-572; content.ts:282-293 | PARTIAL | rust/claude-agent-acp-rs/src/hooks.rs:236-260 | non-AIR shape present; AIR markers-only path absent [pkg:F9] |
+| U-33 | hook update: unchanged content and locations dropped | field-tracker.ts:63-107 | DONE | rust/claude-agent-acp-rs/src/map.rs:271-299 |  |
+| U-35 | field tracker: entry ends after tool_result and PostToolUse hook | field-tracker.ts:127-140 | DONE | rust/claude-agent-acp-rs/src/map.rs:249-267 |  |
+| U-36 | field tracker: approval content pinned until the final result | field-tracker.ts:88-96, 116-121 | MISSING | none |  [pkg:F9] |
+| U-37 | AIR changed-_meta filter: claudeCode and jetbrains.air keys, is_mcp_tool_call and terminal_info flags, 2048 limit | changed-meta-filter.ts:1-108 | DONE | rust/claude-agent-acp-rs/src/meta_filter.rs:20-82, 84-108 |  |
+| U-38 | Approved plan publish: plan_update (planId plan-mode) after restart, plus current_mode_update and config_option_update | src/exit-plan.ts:154-159, 208-222 | MISSING | rust/claude-agent-acp-rs/src/session.rs:1436-1460 (mode and config only) | No plan_update anywhere in Rust (dedupe) [pkg:F21] |
+| U-39 | ExitPlanMode allow effect publishes current_mode_update and config_option_update | src/acp-agent.ts:7665-7677 (per Rust comment); src/exit-plan.ts:208-216 | DONE | rust/claude-agent-acp-rs/src/session.rs:1436-1460, 2738-2757 |  |
+| U-40 | Elicitation: MCP onElicitation form and url mapping to session/create_elicitation | src/elicitation.ts:47-75 | MISSING | none (session.rs:799-843 handles can_use_tool and hook_callback only) |  [pkg:F23b] |
+| U-41 | Elicitation response mapping (accept content, decline, cancel) to ElicitResult | src/elicitation.ts:85-107 | MISSING | none |  [pkg:F23b] |
+| U-42 | AskUserQuestion form elicitation (questions, custom Other field, answers and annotations) | src/elicitation.ts:122-352 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:322-323 (AskUserQuestion always disallowed) | Decision 4 disables the tool; no elicitation bridge exists [pkg:F23a] |
+| U-43 | refusal_fallback_prompt dialog: payload validation, consent form, retry or keep result | src/elicitation.ts:376-476 | MISSING | none (session_store.rs:690 only reads a transcript subtype) | No supportedDialogKinds opt-in in Rust [pkg:F23b] |
+| U-44 | _session/list/changes pushes of changed rows, debounced (150 ms, max wait 1 s, rescan 10 s, settle 1 s, 1 s per-session interval) | src/session-index/list-subscriptions.ts:56-68, 697-805, 1270-1327 | MISSING | none |  [pkg:F28] |
+| U-45 | session_info_update {title, updatedAt} published on turn end and when the title changes | src/session-titles.ts:284-298, 161-221 | MISSING | rust/claude-agent-acp-rs/src/map.rs:1368 (variant name only); LIVE-FINDINGS D6 confirms never emitted | (dedupe) [pkg:F30] |
+| U-47 | promptSuggestionText trims and maps empty to null; promptSuggestionsMeta builds {suggestions:[{text}]}, empty list clears | src/prompt-suggestions.ts:26-44 | MISSING | none |  [pkg:F24] |
+| U-48 | report path normalisation: workspace roots, realpath, 1024 paths, 256 KiB cap, control-character and out-of-root rejection, truncated flag | src/file-change-audit.ts:8-11, 250-392 | MISSING | none |  [pkg:AG-3] |
+| U-49 | sessionFailure meta published on session_info_update (id, revision, category, severity, title, details, reason, actions) | src/session-failure-extension.ts:168-178, 291-313, 357-418 | MISSING | none |  [pkg:AG-2] |
+| U-50 | _auth/status_update push with {authStatus} payload | src/auth-status.ts:46-48 | DONE | rust/claude-agent-acp-rs/src/agent.rs:602-620 | sent as ext notification (dedupe) |
+| U-51 | AuthStatus kinds none/account/api_key/gateway/external | src/auth-status.ts:54,101-104,243-280 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:83-86,199-225 |  |
+| U-52 | Labels: Anthropic API key, Custom model gateway, external provider names | src/auth-status.ts:115-122,141,247-266 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:88-103 |  |
+| U-53 | API key source detail map (apiKeyHelper, env, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN) | src/auth-status.ts:106-111 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:105-114 |  |
+| U-54 | planLabel: exactly one "Claude" prefix, word title-casing | src/auth-status.ts:283-289 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:117-143 |  |
+| U-55 | AIR Gateway display from apiKeyHelper (central + proxy start) | src/auth-status.ts:253-260, docs/air-extensions.md:216-228 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:169-188,207-209 |  |
+| U-56 | fromAccountInfo mapping; no identity signal gives undefined | src/auth-status.ts:160-187 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:227-248 |  |
+| U-57 | fromCliStatus parsing; non-JSON or non-boolean loggedIn gives unknown; logged-out shortcut | src/auth-status.ts:192-221 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:251-271 |  |
+| U-58 | mapAuthFields precedence: gateway, external, API key, subscription, none | src/auth-status.ts:233-281 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:199-225 |  |
+| U-59 | sameIdentity and mergeAuthStatus (richer read of same login keeps missing fields) | src/auth-status.ts:296-332 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:274-314 | vendor merge is covered by U-61 |
+| U-61 | vendor bag on AuthStatus ({claudeCode: ...}) | src/auth-status.ts:72-73,328-329,353-356 | MISSING | none | no producer in v0.94.0 src, type and merge/compare only [pkg:F34] |
+| U-62 | Session account publish at session/new, load, resume, fork | src/acp-agent.ts:3345-3368 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:640-646,827,932 | account published and cwd re-probe run; skip branches for gateway auth and providers/set override absent because those features are missing [pkg:F34] |
+| U-63 | AIR customAnswer companion field, plus legacy root _askUserQuestionCustomAnswer | src/air-extension.ts:63,71, docs/air-extensions.md:1563-1581 | MISSING | none |  [pkg:F23a] |
+| U-65 | AIR contextCompaction key on compaction tool call and compaction_update | src/air-extension.ts:57, docs/air-extensions.md:171-199 | MISSING | none | may be owned by the context-compaction group [pkg:F20] |
+| U-66 | AIR `subagent_spawned` announce of a child session (name, task, prompt, capabilities) | src/native-subagents.ts:1169-1223; src/acp-subagents.ts:43-56 | MISSING | none |  [pkg:F35b] |
+| U-67 | RFD `subagent_update` / `session_message` child lifecycle | src/native-subagents.ts:1169-1260; src/acp-subagents.ts:14-20 | MISSING | none |  [pkg:F36] |
+| U-68 | Route child-owned tool calls to the child session (`route`, `childByToolCall`, `parentToolUseId` lookup) | src/native-subagents.ts:191-302,1004-1011 | MISSING | rust/claude-agent-acp-rs/src/session.rs:2650-2654 (permission attribution only); permission.rs:287-328 (meta only) | Child tool calls stay in the root session [pkg:F35b] |
+| U-69 | Subagent prompt in spawn: exact task_started prompt, fallback to Agent input, omitted when absent | src/native-subagents.ts:375,1592-1599; src/tests/native-subagents.test.ts:437-496 | MISSING | none |  [pkg:F35a] |
+| U-70 | Child display labels: name / role title fallbacks (subagentDisplayName, subagentDescription, rfdLabels) | src/native-subagents.ts:1326-1348,1520-1539; src/tests/native-subagents.test.ts:862-867 | MISSING | none |  [pkg:F35a] |
+| U-71 | Nested child: announced under live parent only; never under root while parent unknown | src/native-subagents.ts:236-247,1237-1344 | MISSING | none |  [pkg:F35b] |
+| U-72 | Spawn payload: name, taskType, description, showInTranscript, canStop, outputFilePath, toolCallId | src/async-tasks.ts:618-655 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:579-629 |  |
+| U-74 | Per-task route to the session of its starting tool call (`routeOf`, `task.route`) | src/async-tasks.ts:632,749-754 | MISSING | none |  [pkg:F35c] |
+| U-75 | changedFields dedupe; fields recorded only after a successful send (retry carries them) | src/async-tasks.ts:757-778 | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:554, 574, 606-613 | fields recorded while building the update, not after a successful send (async-tasks.ts:721-746) [pkg:F14] |
+| U-76 | publishMetadata: output path / tool call id published after announce when they change | src/async-tasks.ts:691-702 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:519-537 |  |
+| U-77 | `compaction_update` presentation: ID-addressed in_progress then terminal (completed / failed / cancelled) | src/context-compaction.ts:238-266,315-374; src/tests/context-compaction.test.ts:185-238 | MISSING | none |  [pkg:F20] |
+| U-78 | compaction_summary_chunk streaming of API compaction text and heartbeat | src/context-compaction.ts:268-298 | MISSING | none |  [pkg:F20] |
+| U-79 | Pending summary carried onto the next terminal update (survives reset) | src/context-compaction.ts:150-155,378-389 | MISSING | none |  [pkg:F20] |
+| U-80 | AIR `_meta.jetbrains.air.contextCompaction` (version 1 + facts) on compaction reports | src/context-compaction-meta.ts:3-30; src/context-compaction.ts:250,358-360 | MISSING | none (no contextCompaction key in rust/claude-agent-acp-rs/src) |  [pkg:F20] |
+| U-81 | v2 state_update stream: running, requires_action, idle with stopReason/usage/_meta, idle error with JSON-RPC error | src/v2/prompt.ts:69-141 | MISSING | none (state_update appears only in rust/claude-agent-acp-rs/src/async_tasks.rs) |  [pkg:F39] |
+| U-82 | v2 chunks require messageId on user and agent messages (throws without) | src/v2/session-update.ts:38-47 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:544 (v1 message-id grouping), rust/claude-agent-acp-rs/src/map.rs test near 1584 (messageId asserted) | no v2 check or v2 chunk shape [pkg:F39] |
+| U-83 | v2 session update translation: pass-through of session_info, usage, notice, compaction, session_message; throws on untranslated kinds | src/v2/session-update.ts:24-83 | MISSING | none for compaction_update, compaction_summary_chunk, session_message in rust/*/src |  [pkg:F40] |
+| U-84 | plan -> plan_update with planId "plan"; plan_update and plan_removed pass-through | src/v2/session-update.ts:51-61 | MISSING | none (no plan_update in rust/*/src) |  [pkg:F40] |
+| U-85 | current_mode_update dropped on v2 (mode is the mode config option) | src/v2/session-update.ts:73-77 | MISSING | none |  [pkg:F40] |
+| U-86 | subagent_update: v2 state validation (RFD states and stop reasons only) and child-stream state_update mirror | src/v2/session-update.ts:62-68, 85-149; src/v2/agent.ts:252-286 | MISSING | none |  [pkg:F36] |
+| U-87 | Elicitation create and complete over v2 (params cast, relayed unchanged) | src/v2/agent.ts:353-369 | MISSING | none (elicitation skipped-deliberate per porting/PARITY.md) |  [pkg:F23a] |
+| U-88 | Auth status pushed to the connection after initialize | src/tests/acp-v2.test.ts:5399-5414 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:894-899 (probe after response), agent.rs:614 (_auth/status_update) | v1 push exists; no v2 wire [pkg:F34] |
+| U-89 | sessionUpdate agent_message_chunk | src/acp-agent.ts:3986, 13008 | DONE | rust/claude-agent-acp-rs/src/map.rs:1-12 (emitted variant list) |  |
+| U-90 | sessionUpdate agent_thought_chunk | src/acp-agent.ts:13074 | DONE | rust/claude-agent-acp-rs/src/map.rs:1-12 |  |
+| U-91 | sessionUpdate user_message_chunk | src/acp-agent.ts:13008 | DONE | rust/claude-agent-acp-rs/src/map.rs:1-12 |  |
+| U-92 | sessionUpdate tool_call / tool_call_update | src/acp-agent.ts:10016, 13208 | DONE | rust/claude-agent-acp-rs/src/map.rs:1-12; rust/claude-agent-acp-rs/src/session.rs:2939-2947 |  |
+| U-93 | sessionUpdate plan | src/acp-agent.ts:4245, 13092 | DONE | rust/claude-agent-acp-rs/src/map.rs:1-12 |  |
+| U-95 | sessionUpdate current_mode_update | src/session-mode.ts:283 | DONE | rust/claude-agent-acp-rs/src/session.rs:1413, 1451, 1947 |  |
+| U-96 | sessionUpdate config_option_update | src/acp-agent.ts:10451-10454, 10850-10853 | DONE | rust/claude-agent-acp-rs/src/session.rs:1421, 1458, 1954, 1996 |  |
+| U-97 | sessionUpdate available_commands_update | src/acp-agent.ts:10420-10423 | DONE | rust/claude-agent-acp-rs/src/agent.rs:826-840; rust/claude-agent-acp-rs/src/session.rs:2997-3002 |  |
+| U-98 | sessionUpdate usage_update | src/acp-agent.ts:4727, 6063, 7012, 8182 | DONE | rust/claude-agent-acp-rs/src/session.rs:2400-2406 (post-compact usage); rust/claude-agent-acp-rs/src/usage.rs |  |
+| U-100 | sessionUpdate async_task_spawned / async_task_progress / async_task_state_update | src/async-tasks.ts:634, 722, 740 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:19, 565 |  |
+| U-101 | sessionUpdate subagent_spawned / subagent_state_update / subagent_update / session_message | src/native-subagents.ts:703, 1182, 1206, 1274; src/subagent-replay.ts:120, 280 | MISSING | none (Rust nests subagent work under tool calls; agent.rs:130 advertises subagents capability) |  [pkg:F35b] |
+| U-102 | sessionUpdate compaction_update / compaction_summary_chunk | src/context-compaction.ts:194, 247, 274, 348 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2347-2395 (compact_boundary emitted as a "Compact conversation" tool_call, no compaction_update kind) |  [pkg:F20] |
+| U-104 | v2 sessionUpdate kinds state_update, user_message, terminal_update, terminal_output_chunk, session_message_chunk | src/v2/prompt.ts:40, 94-140; src/v2/terminal.ts:66, 82; src/v2/session-update.ts:34-106 | MISSING | none (v2 subtree not ported) |  [pkg:F40] |
+| U-107 | outbound $/cancel_request to the client when an in-flight permission or elicitation request is aborted | acp-agent.ts:2374-2390, 9783-9830 | MISSING | none: session.rs:982-990 aborts the local handle only |  [pkg:F3b] |
+
+## 3. Capabilities and _meta
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| C-01 | initialize: protocolVersion 1, agentInfo name/title/version | src/acp-agent.ts:2963-2998 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:149-150 | agentInfo.version is <crate>+upstream.0.94.0 (build.rs:17, agent.rs:39), not 0.94.0 (dedupe) [pkg:F2b] |
+| C-02 | agentCapabilities._meta.claudeCode.promptQueueing and _meta.authStatus marker | src/acp-agent.ts:2966-2969 | DONE | rust/claude-agent-acp-rs/src/agent.rs:152-153 | (dedupe) |
+| C-04 | promptCapabilities image and embeddedContext | src/acp-agent.ts:2976-2979 | DONE | rust/claude-agent-acp-rs/src/agent.rs:155 | (dedupe) |
+| C-05 | mcpCapabilities http and sse | src/acp-agent.ts:2980-2983 | DONE | rust/claude-agent-acp-rs/src/agent.rs:156 | (dedupe) |
+| C-06 | agentCapabilities.auth.logout | src/acp-agent.ts:2984-2986 | DONE | rust/claude-agent-acp-rs/src/agent.rs:157 | (dedupe) (dedupe) |
+| C-08 | agentCapabilities.loadSession true | src/acp-agent.ts:2991 | DONE | rust/claude-agent-acp-rs/src/agent.rs:159 | (dedupe) |
+| C-09 | sessionCapabilities base set (additionalDirectories, close, delete, fork, list, resume, systemPrompt) | src/acp-agent.ts:2952-2959 | DONE | rust/claude-agent-acp-rs/src/agent.rs:121-128 | (dedupe) |
+| C-10 | sessionCapabilities.subagents only for AIR clients | src/acp-agent.ts:2960 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:129-131 | (dedupe) (dedupe) [pkg:F35b] |
+| C-11 | top-level _meta.steering.supported | src/acp-agent.ts:3029-3031 | DONE | rust/claude-agent-acp-rs/src/agent.rs:134 | (dedupe) |
+| C-12 | _meta.jetbrains.air for AIR clients: version 1 and the 8-entry capability list | src/acp-agent.ts:3008-3020; src/tests/acp-agent.test.ts:12973-13024 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:98-107, 136-141 | matches upstream list when no session index is negotiated (dedupe) (dedupe) [pkg:AG-3] |
+| C-13 | AIR session-index capabilities (sessionIndex, sessionArchive, sessionRename, sessionListSubscribe, sessionWorktrees) advertised after negotiation | src/air-extension.ts:19-42; src/session-index/connection.ts:121-157 | MISSING | none | (dedupe) (dedupe) [pkg:F26b] |
+| C-14 | AIR goal capability in _meta.jetbrains.air.goal {version, controlMethod, actions} | src/acp-agent.ts:3021-3026 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:142 | advertised controlMethod _session/goal is not served (M-93, WB-14) [pkg:AG-1] |
+| C-15 | authMethods: Claude subscription and Console terminal login (non-remote), gated on auth.terminal or _meta terminal-auth and not hidden | src/acp-agent.ts:2883-2888, 2908-2947 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:163 (authMethods always []) | (dedupe) (dedupe) [pkg:F2a] |
+| C-16 | authMethods: remote "claude-login" terminal method when NO_BROWSER, SSH_* or CLAUDE_CODE_REMOTE is set | src/acp-agent.ts:2869-2882, 2885-2906 | MISSING | none |  [pkg:F2a] |
+| C-17 | _meta["terminal-auth"] command, args and label on login methods | src/acp-agent.ts:2894-2901, 2924-2939 | MISSING | none |  [pkg:F2a] |
+| C-18 | gateway and gateway-bedrock authMethods, gated on auth._meta.gateway | src/acp-agent.ts:2844-2867, 3001 | MISSING | none | (dedupe) [pkg:F2a] |
+| C-19 | initialize rebuilds tool-call capability choices from clientCapabilities | src/acp-agent.ts:2829-2834 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:887-895 | only the AIR client declaration is parsed; terminal, diffPatch, planFile and v2 choices absent [pkg:F2a] |
+| C-20 | AIR client detection: _meta.jetbrains.air present as an object | src/air-extension.ts:119-121 | DONE | rust/claude-agent-acp-rs/src/air.rs:30-60 | (dedupe) |
+| C-21 | Boolean config option capability detection (session.configOptions.boolean) | src/acp-agent.ts:12406-12413 | MISSING | none |  [pkg:F2a] |
+| C-22 | AIR recommendedValue capability detection | src/acp-agent.ts:12411-12418 | DONE | rust/claude-agent-acp-rs/src/session.rs:496-500; rust/claude-agent-acp-rs/src/session.rs:1719-1723 |  |
+| C-23 | command display terminal for terminal-capable clients (terminal_info, output, exit) | renderer.ts:173-175, 391-418; client-capabilities.ts:38-58 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:9-13 | terminal capability never negotiated [pkg:F2a] |
+| C-24 | v2 surface: cancelled status, v2 diffs and meta, ClientCapabilities.v2 | renderer.ts:32-42, 201, 661; client-capabilities.ts:29-35 | MISSING | none |  [pkg:F38a] |
+| C-25 | AIR client flags from _meta.jetbrains.air: client, rawInputRendering, planFile, diffPatch | client-capabilities.ts:38-87 | PARTIAL | rust/claude-agent-acp-rs/src/air.rs:1-184; rust/claude-agent-acp-rs/src/agent.rs:106-107 | client detection and asyncTasks parse exist; rawInputRendering and planFile are not consumed by any renderer [pkg:F9] |
+| C-27 | initialize promptSuggestions option forwarded to the CLI, default true | src/prompt-suggestions.ts:19 (key); src/acp-agent.ts:4220-4240 (outside G7) | DONE | rust/claude-agent-acp-rs/src/agent.rs:693-698; rust/claude-agent-acp-rs/src/control.rs:149-153; rust/claude-agent-acp-rs/src/sdk_options.rs:158 | none |
+| C-29 | agentFileChangeReport capability advertised for AIR clients | src/file-change-audit.ts:6, 91-93 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:99-107 (advert only; report never produced) |  [pkg:AG-3] |
+| C-30 | sessionFailure capability advertised for AIR clients | src/session-failure-extension.ts:15-17, 237-239 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:99-107 (advert only; no failure published) |  [pkg:AG-2] |
+| C-34 | clientSupportsAirCapability: version integer >= 1 and capabilities array includes cap | src/air-extension.ts:150-162 | PARTIAL | rust/claude-agent-acp-rs/src/air.rs:53,80-87 | version read with as_u64, so a JSON float such as 1.0 is rejected while Number.isInteger accepts it [pkg:F2a] |
+| C-35 | AIR payload stamp version: 1 in _meta.jetbrains.air | src/air-extension.ts:75-77,91-109 | DONE | rust/claude-agent-acp-rs/src/agent.rs:136-143, rust/claude-agent-acp-rs/src/session_config.rs:118-131 |  |
+| C-37 | AIR planFile capability advertised | src/acp-agent.ts:3018, src/air-extension.ts:13 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:107 | advertised verbatim; no planFilePath handling anywhere in crate (exit-plan group) [pkg:F9] |
+| C-38 | sessionCapabilities.systemPrompt advertised as mode override | src/client-system-prompt.ts:24-26 | DONE | rust/claude-agent-acp-rs/src/agent.rs:128 |  |
+| C-40 | `clientSupportsAsyncTasks` gate (AIR `asyncTasks` capability) | src/async-tasks.ts:105-107 | DONE | rust/claude-agent-acp-rs/src/agent.rs:103; rust/claude-agent-acp-rs/src/air.rs:106; rust/claude-agent-acp-rs/src/async_tasks.rs:28,94-99 |  |
+| C-41 | `clientSupportsCompactionUpdates` (v1 `session.compaction` capability object) | src/context-compaction.ts:47-50 | MISSING | none (client capabilities do not parse session.compaction; ROADMAP section 1 client-capabilities row) |  [pkg:F2a] |
+| C-42 | `_meta["subagent-transcript"]` capability keeps flattened child transcript | README.md:38-94 | MISSING | none |  [pkg:F6b] |
+| C-43 | AIR `nativeSubagentSessions` capability (subagent_spawned / subagent_state_update) | README.md:38-94 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:102 (name listed in AIR_CAPABILITIES); no subagent_spawned emission in src | advertised but inert [pkg:F35b] |
+| C-44 | v2 initialize request mapping: protocol v1 constant, fs and terminal off, session.configOptions.boolean / notices / compaction, plan, subagents, auth flags | src/v2/initialize.ts:20-55 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:883-886 (v1 initialize only) |  [pkg:F38a] |
+| C-45 | v2 initialize response: protocolVersion v2, info, session caps, providers {}, authMethods as methodId/type/env pairs, `steering` stripped from _meta | src/v2/initialize.ts:70-129 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:149-163 (v1 shape, `authMethods: []`) |  [pkg:F38a] |
+| C-46 | v2 session capability set (prompt image + embeddedContext, mcp stdio + http, delete, fork, additionalDirectories, systemPrompt) | src/v2/initialize.ts:95-115 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:121-137 (v1 capability object only) |  [pkg:F38a] |
+| C-47 | v2 client has no file system: readTextFile and writeTextFile reject; fs capability advertised off | src/v2/agent.ts:371-379; src/v2/initialize.ts:26-28 | MISSING | none on a v2 surface |  [pkg:F38a] |
+| C-48 | removed legacy keys never sent (_meta.goal, _meta.kind, contextCompaction, claudeCode.title/subagent/skill/skillPath, diffStats) | air-extensions.md:1657-1669 | DONE | no emitter found by grep |  |
+| C-49 | agentCapabilities.providers advertised (restored; methods unserved) | acp-agent.ts:2987-2990 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:158 | advertised but providers/list, set, disable are not served (WB-01) [pkg:F32] |
+
+## 4. Config options, env vars, CLI, argv
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| O-01 | CLI flags --version, -v, -V print version | src/index.ts:43-45 | PARTIAL | rust/claude-agent-acp-rs/src/bin/claude-agent-acp-rs.rs:19-27 | -V/--version print the composed version string (see C-01) (dedupe) [pkg:F2b] |
+| O-02 | --cli delegates argv to the native claude CLI, relays signals, mirrors exit code | src/index.ts:13-42 | MISSING | none | (dedupe) [pkg:F2b] |
+| O-03 | Managed-policy env applied to process.env before any SDK call (resolveSettings, settingSources []) | src/index.ts:51; src/managed-policy.ts:19-34 | MISSING | none (rust/claude-agent-acp-rs/src/settings.rs reads the managed file only) |  [pkg:F2b] |
+| O-04 | Diagnostics kept off the ACP stdout stream | src/index.ts:53-58 | DONE | rust/claude-agent-acp-rs/src/bin/claude-agent-acp-rs.rs:1-3 | by design (no println); no console redirect needed |
+| O-05 | CLAUDE_AGENT_LOGS writes agent.log with pid and timestamp | src/index.ts:64-84 | MISSING | none | (dedupe) [pkg:F2b] |
+| O-06 | CLAUDE_AGENT_ACP_EXPERIMENTAL_V2 opt-in v2 agent surface | src/index.ts:86-89; src/acp-agent.ts:2735, 2772 | MISSING | none | (dedupe) [pkg:F38a] |
+| O-07 | --hide-claude-auth argv flag hides the Claude login methods | src/hide-claude-auth.ts:38-40; src/acp-agent.ts:2904, 2942 | MISSING | none | (dedupe) [pkg:F34] |
+| O-08 | additionalDirectories merge order: claudeCode options, then official ACP field, else _meta.additionalRoots fallback, no normalization | src/tests/additional-roots.test.ts:63-107; src/acp-agent.ts createSession option merge | DONE | rust/claude-agent-acp-rs/src/sdk_options.rs:100-115 |  |
+| O-09 | Provider defaults from CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX, ANTHROPIC_BASE_URL and related vars | src/acp-agent.ts:3634-3658 | MISSING | none | (dedupe) [pkg:F32] |
+| O-10 | setSessionConfigOption: model alias resolution and currentValue acceptance (fast-mode boolean is M-37) | src/acp-agent.ts:8976-9015 | DONE | rust/claude-agent-acp-rs/src/session.rs:1480-1494; session_config.rs:415 | alias and currentValue match; the fast-mode gap is tracked in M-37 |
+| O-11 | resumedModelFromTranscript: last real assistant model, skips synthetic and nested | src/resumed-session.ts:24-47 | DONE | rust/claude-agent-acp-rs/src/resumed_session.rs:25-35, 136-160 | tail path only |
+| O-12 | readResumedTail: backward chunked scan until model and mode are known | src/resumed-session.ts:90-111, 136-160 | DONE | rust/claude-agent-acp-rs/src/resumed_session.rs:56-125 |  |
+| O-13 | readResumedTail: fallback to full-transcript read when no file | src/resumed-session.ts:97-110 | MISSING | rust/claude-agent-acp-rs/src/resumed_session.rs:56-66 | returns empty tail; (dedupe) [pkg:F31] |
+| O-14 | findTranscript: search all project directories | src/resumed-session.ts:114-132 | DONE | rust/claude-agent-acp-rs/src/resumed_session.rs:37-55 |  |
+| O-15 | TailScan: permissionMode from user records, ignores CLI metadata block | src/resumed-session.ts:162-230 | DONE | rust/claude-agent-acp-rs/src/resumed_session.rs:136-215; resumed_session.rs:273 (test) |  |
+| O-16 | TailScan: plan_mode_exit clears a later plan mode | src/resumed-session.ts:223-224 | DONE | rust/claude-agent-acp-rs/src/resumed_session.rs:211-220, 273 |  |
+| O-17 | TailScan: stop mode search at last human prompt without mode | src/resumed-session.ts:227-228 | DONE | rust/claude-agent-acp-rs/src/resumed_session.rs:203-214 |  |
+| O-18 | TailScan: withModel=false reads mode only | src/resumed-session.ts:93, 207-208 | DONE | rust/claude-agent-acp-rs/src/resumed_session.rs:56-60, 77 |  |
+| O-19 | resume: initial permission mode from transcript tail | src/resumed-session.ts:78-88 (caller outside range) | DONE | rust/claude-agent-acp-rs/src/agent.rs:392-401 |  |
+| O-20 | resumed session reports the model it actually runs | tests/session-load.test.ts:344; src/acp-agent.ts (resume path) | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:756-769 | resumed session reports the model it actually runs; Rust reports models[0] for an unlisted transcript model (session_config.rs:798-805); the gateway-narrowing branch (session-model.ts:528-537) needs O-68 [pkg:F5b] |
+| O-21 | mode config option build (id mode, name, select values) | src/session-mode.ts:154-168 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:174-194 |  |
+| O-22 | mode catalog: Manual/Accept edits/Plan/Auto, Bypass only when allowed, AIR _meta kind | src/session-mode.ts:350-391 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:118-171 |  |
+| O-23 | model option build: default row described by resolved model, recommended concrete row when AIR, default omitted | src/session-model.ts:188-246 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:520-610 |  |
+| O-24 | model option AIR _meta.recommendedValue advertisement | src/session-model.ts:225-239 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:520-610 (`_meta: None` always) | recommendation computed but not advertised [pkg:F11] |
+| O-25 | effort option build: levels, capitalized names, medium recommended, Default entry when not AIR | src/session-effort.ts:82-129 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:663-748 |  |
+| O-26 | effort option AIR _meta.recommendedValue advertisement | src/session-effort.ts:117-126 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:663-748 (`_meta: None`) |  [pkg:F11] |
+| O-27 | config option composition: mode, model (only if allowlist non-empty), effort | src/acp-agent.ts:12496-12520 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:850-870 | fast and agent options are separate rows |
+| O-28 | Fast mode option definition (id fast, boolean toggle or on/off select, description with blocking reason) | src/acp-agent.ts:12431-12461 | MISSING | none | no "fast" option anywhere in Rust [pkg:F11] |
+| O-29 | Fast mode option surfaced only when current model supportsFastMode | src/acp-agent.ts:12520-12534 | MISSING | none |  [pkg:F11] |
+| O-30 | Fast mode disabled-reason explanations and normalization | src/acp-agent.ts:12382-12406 | MISSING | none |  [pkg:F11] |
+| O-31 | Fast mode intent retained across model switch (option added/removed by model support) | src/acp-agent.ts:10575-10600 | MISSING | none |  [pkg:F11] |
+| O-32 | agent config option (id agent, Default sentinel, custom agents) | src/acp-agent.ts:12520-12560; src/acp-agent.ts:10676-10688 | MISSING | none |  [pkg:F11] |
+| O-33 | startup agent passthrough from _meta.claudeCode.options.agent | rust/claude-agent-acp-rs/src/sdk_options.rs:144 (Rust); src/acp-agent.ts:11214 (upstream spread) | DONE | rust/claude-agent-acp-rs/src/sdk_options.rs:144 |  |
+| O-34 | model priority: ANTHROPIC_MODEL > settings.model > resumed model > models[0] | src/session-model.ts:450-480 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:750-810 | empty ANTHROPIC_MODEL masks settings.model: Rust enters the env branch for an empty value (session_config.rs:778-787); upstream tests truthiness (session-model.ts:480) [pkg:F5b] |
+| O-35 | settings.model non-string: logged error and ignored | src/session-model.ts:248-262 | PARTIAL | rust/claude-agent-acp-rs/src/settings.rs:181-184 (silently ignored, no log) |  [pkg:F5b] |
+| O-36 | resumed-session model hint via matchResumedModel | src/session-model.ts:161-186 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:483-518, 798-805 | unmatched transcript model: upstream keeps it as currentModel when the list is not gateway-narrowed (session-model.ts:498-501); Rust reports models[0] and sends no set_model [pkg:F5b] |
+| O-37 | versioned model display names (family + version, context suffix placement) | src/session-model.ts:54-85 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:291-367 (no description-keeps-context branch, loose family match) | model-presentation.test.ts [pkg:FX-5] |
+| O-38 | display-name collision fallback to raw displayName | src/session-model.ts:593-606 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:819-833 |  |
+| O-39 | resolveModelPreference tiers: direct, resolvedModel, includes, token scoring, opusplan | src/session-model.ts:116-159 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:415-481 | consequence of O-41 (incompatible versions still match); and -1m is tokenised as a hint via context_hint_of (session_config.rs:371) where upstream reads only a literal [1m] (session-model.ts:89) [pkg:F5b] |
+| O-40 | canonicalize and context-hint helpers ([1m] vs -1m) | src/session-model.ts:19-36 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:245-257 | context_hint_of accepts [Nm] anywhere in the id; upstream requires it at the end (session-model.ts:19, 33-36) [pkg:F5b] |
+| O-41 | model family version compatibility guard | src/session-model.ts:38-52 | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:258-290 | ids starting with a non-numeric word (claude-opus-4-6) yield no version in Rust (upstream 4.6, session-model.ts:21, 38-42); the hyphenated-preference shortcut then accepts any candidate (session_config.rs:278-289) [pkg:F5b] |
+| O-42 | normalizeModelId (provider prefix, :variant, dotted version, -fast, date suffix) | src/session-model.ts:272-290 | MISSING | none | needed by deniedModels and gateway narrowing [pkg:F5b] |
+| O-43 | settings availableModels allowlist (exact IDs, union across tiers, [] keeps Default only, absent means no filter) | src/session-model.ts:331-384; src/acp-agent.ts:11471-11482; src/tests/settings.test.ts:69-120 | MISSING | rust/claude-agent-acp-rs/src/settings.rs:23-38 (no availableModels field) |  [pkg:F5b] |
+| O-44 | modelOverrides (allowlist alias mapped to provider ID, surfaced value and setModel target) | src/session-model.ts:331-384; src/acp-agent.ts:11476 | MISSING | none |  [pkg:F5b] |
+| O-45 | ANTHROPIC_CUSTOM_MODEL_OPTION appended, exempt from allowlist, not duplicated | src/session-model.ts:387-398 | MISSING | none | (dedupe) [pkg:F5b] |
+| O-46 | managed-only deniedModels filters allowlist and picker rows | src/session-model.ts:302-318; src/settings.ts:107-125, 200-202 | MISSING | rust/claude-agent-acp-rs/src/settings.rs:23-38 (no managed deniedModels) |  [pkg:F5b] |
+| O-47 | gateway model narrowing (narrowToGatewayModels, Bedrock regionPrefix, empty when none listed) | src/session-model.ts:418-443 | MISSING | none | may belong to a gateway group; [pkg:F5b] |
+| O-48 | CLAUDE_MODEL_CONFIG env as settings tier (modelOverrides, availableModels); invalid JSON throws | src/acp-agent.ts:13769-13780; src/acp-agent.ts:11110 | MISSING | none | (dedupe) [pkg:F4a] |
+| O-49 | _meta.claudeCode.options.settings (object or file path) merged over settings files as programmatic tier | src/acp-agent.ts:11175-11205; src/settings.ts:94-115 | MISSING | rust/claude-agent-acp-rs/src/sdk_options.rs:1-12 (doc: settings key ignored) | (dedupe) [pkg:F4a] |
+| O-50 | programmatic effort settings merge (mergeEffortSettings, per-model keys shadowing) | src/session-effort.ts:62-80 | MISSING | none |  [pkg:F11] |
+| O-51 | settingsEffortForModel: per-model entry by resolved/value/id, canonical keys, top-level fallback | src/session-effort.ts:37-60 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:632-661 |  |
+| O-52 | effort seed on model switch: pinned if valid for new model, else per-model settings | src/acp-agent.ts:10560-10572 | DONE | rust/claude-agent-acp-rs/src/session.rs:1700-1716 |  |
+| O-53 | toSdkEffortLevel: undefined and "default" map to null | src/session-effort.ts:11-13 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:611-616 |  |
+| O-54 | effortFlagSettings carries ultracode:true when settings request it | src/session-effort.ts:19-29 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:618-630; rust/claude-agent-acp-rs/src/settings.rs:190-194 |  |
+| O-55 | appliedEffortLevel bookkeeping | src/acp-agent.ts:10606-10716 | MISSING | rust/claude-agent-acp-rs/src/session_config.rs:101 (field declared, never written; session.rs:580 init only) |  [pkg:F11] |
+| O-56 | effort option at session creation for AIR clients (flag applied at creation) | src/acp-agent.ts:11594-11609 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:553-568 | creation seed sends a hand-built effortLevel without ultracode; upstream effortFlagSettings adds ultracode: true (acp-agent.ts:11607-11609; session-effort.ts:19-25); apply paths already use the helper (session.rs:1568, 1737) [pkg:F11] |
+| O-57 | settings tiers user/project/local/managed, deep merge, later wins, malformed file skipped | src/settings.ts:94-115 (SDK resolveSettings) | PARTIAL | rust/claude-agent-acp-rs/src/settings.rs:83 | arrays replaced, not concatenated and deduped (SDK settings merge); fallbackModel exception [pkg:F5a] |
+| O-58 | user tier path from CLAUDE_CONFIG_DIR else HOME/.claude | src/settings.ts:94-101 | DONE | rust/claude-agent-acp-rs/src/settings.rs:146-148; rust/claude-agent-acp-rs/src/settings.rs:199-203 |  |
+| O-59 | managed settings path per platform | src/settings.ts:31-40 | DONE | rust/claude-agent-acp-rs/src/process.rs:621-636; rust/claude-agent-acp-rs/src/settings.rs:202 | managed-settings path per platform matches (settings.ts:31-40) |
+| O-60 | settings file watching with debounced reload and onChange | src/settings.ts:130-190 | MISSING | rust/claude-agent-acp-rs/src/settings.rs:15 (documented: not ported; resolved once per spawn) |  [pkg:F5a] |
+| O-61 | apiKeyHelper precedence: managed > --settings override > user/project/local | src/settings.ts:190-196; src/tests/settings-api-key-helper.test.ts:20-40 | PARTIAL | rust/claude-agent-acp-rs/src/auth_status.rs:322-347 (user/project/local last-wins; no managed tier, no override) |  [pkg:F5a] |
+| O-62 | resolveThinkingConfig: MAX_THINKING_TOKENS mapped to thinking option | acp-agent.ts:13756-13768 | MISSING | rust/claude-agent-acp-rs/src/sdk_options.rs:11 (documented as ignored PARITY) | (dedupe) (dedupe) [pkg:F4a] |
+| O-64 | Invalid or unknown permission mode is logged as an error | src/permissions/modes.ts:31-44 | PARTIAL | rust/claude-agent-acp-rs/src/permission_mode.rs:29-61 | Rust falls back silently; no logger call (dedupe) [pkg:F2b] |
+| O-65 | bypassPermissions clamp when root without IS_SANDBOX (ALLOW_BYPASS) | src/permissions/modes.ts:9, 46-52 | DONE | rust/claude-agent-acp-rs/src/permission_mode.rs:13-16; rust/claude-agent-acp-rs/src/agent.rs:390-391 |  |
+| O-66 | Probe context: --settings override argument and session cwd/env | src/acp-agent.ts:3324-3343,3405-3414 | PARTIAL | rust/claude-agent-acp-rs/src/auth_status.rs:366-374 | cwd and launch env only; no --settings override argument [pkg:F34] |
+| O-67 | apiKeyHelper source: effective settings incl. session override and resolveSettings fallback | src/acp-agent.ts:3396,3440-3448, docs/air-extensions.md:216-220 | PARTIAL | rust/claude-agent-acp-rs/src/auth_status.rs:327-349 | reads user/project/local settings.json only, last wins [pkg:F5a] |
+| O-68 | Anthropic gateway model listing: GET /v1/models, has_more/last_id pagination, limit 1000, max 20 pages | src/gateway-models.ts:13-15,56-78,169-223, docs/model-configuration.md:58-67 | MISSING | none |  [pkg:F33] |
+| O-69 | Bedrock gateway listing: GET /foundation-models, anthropic. ids only | src/gateway-models.ts:87-104 | MISSING | none |  [pkg:F33] |
+| O-70 | Bedrock region prefix choice (global first, else first prefixed id); other prefixes dropped | src/gateway-models.ts:34,107-133 | MISSING | none |  [pkg:F33] |
+| O-71 | Listing headers: acp-proxy bearer placeholder; provider headers override case-insensitively; invalid header named without value | src/gateway-models.ts:19-25,137-155 | MISSING | none |  [pkg:F33] |
+| O-72 | Listing error policy: 4xx gives no listing; other failures fail providers/set; 10 s timeout; base URL with credentials refused | src/gateway-models.ts:45-47,169-223 | MISSING | none |  [pkg:F33] |
+| O-73 | Provider routing env for the CLI (base URL, acp-proxy token, Bedrock region prefix, Vertex) | src/gateway-models.ts:19-25,34, src/acp-agent.ts:12293 | MISSING | none | no CLAUDE_CODE_USE_* or ANTHROPIC_BASE_URL routing in Rust [pkg:F32] |
+| O-74 | Model picker narrowed to gateway-listed models | docs/model-configuration.md:58-67, src/gateway-models.ts:8-9 | MISSING | none | lives in session-model.ts, outside G8 files; PARITY pending [pkg:F5b] |
+| O-75 | AIR customInstructions (ungated) joins client text for appendSystemPrompt | src/air-extension.ts:164-169, src/client-system-prompt.ts:60-74 | DONE | rust/claude-agent-acp-rs/src/system_prompt.rs:115-124,132-150 |  |
+| O-76 | AIR presentation hints: mode and config value kind (standard, plan, auto_review, full_access) | docs/air-extensions.md:1643-1655 | DONE | rust/claude-agent-acp-rs/src/session_config.rs:118-131 |  |
+| O-77 | sdkSystemPrompt: append as claude_code preset, override as custom text; applied on session/new, load, resume, fork | src/client-system-prompt.ts:60-74 | DONE | rust/claude-agent-acp-rs/src/system_prompt.rs:132-150, rust/claude-agent-acp-rs/src/agent.rs:687-692,803,909,1031 | override is sent as initialize systemPrompt [text] (fixture-verified per PARITY), not a plain string |
+| O-78 | v1-only stdio serve (serveAcp with experimentalV2 off) | src/serve.ts:14-35 | DONE | rust/claude-agent-acp-rs/src/bin/claude-agent-acp-rs.rs:24-31 | v1 path only, stdout carries ACP frames |
+| O-83 | lib.ts public exports (ClaudeAcpAgent, runAcp, toAcpNotifications, SettingsManager, AUTH_STATUS_UPDATE_METHOD, ...) | src/lib.ts:1-32 | PARTIAL | rust/claude-agent-acp-rs/src/lib.rs:1-29 (modules only); rust/claude-agent-acp-rs/src/agent.rs:527 (serve), agent.rs:45 (ServeOptions) | no Node-named exports; Rust library surface is the module tree [pkg:FX-4] |
+| O-84 | `perTaskStopAffordance` SDK option, client-tunable via `_meta.claudeCode.options` | README.md:38-94 | MISSING | none |  [pkg:F4b] |
+| O-85 | `forwardSubagentText` session option (flattened child transcript) | README.md:38-94 | PARTIAL | rust/claude-agent-acp-rs/src/control.rs:134, 177, 725 (field serialized, defaults false, never set from a client) |  [pkg:F4b] |
+| O-86 | v2 config shape: option id -> configId, select group -> groupId, command input tagged type "text" | src/v2/session.ts:126-152 | MISSING | none |  [pkg:F38a] |
+| O-87 | env ANTHROPIC_MODEL selects initial model | src/session-model.ts:480-484 | DONE | rust/claude-agent-acp-rs/src/session.rs:459 |  |
+| O-89 | env CLAUDE_CODE_EXECUTABLE selects claude binary | src/acp-agent.ts:2037-2038, 11273 | DONE | rust/claude-agent-acp-rs/src/agent.rs:71; rust/claude-agent-acp-rs/src/process.rs:643-667 |  |
+| O-90 | env NO_BROWSER/SSH_CONNECTION/SSH_CLIENT/SSH_TTY/CLAUDE_CODE_REMOTE gate remote login method | src/acp-agent.ts:2877-2881 | MISSING | none (agent.rs:163 authMethods is always []) |  [pkg:F2a] |
+| O-96 | env CLAUDE_CONFIG_DIR config root | src/paths.ts:6 | DONE | rust/claude-agent-acp-rs/src/session_store.rs:59; settings.rs:200; auth_status.rs:332; transcript.rs:578 |  |
+| O-99 | env IS_SANDBOX allows bypass permissions under root | src/permissions/modes.ts:9 | DONE | rust/claude-agent-acp-rs/src/permission_mode.rs:13-19; agent.rs:387-390 |  |
+| O-100 | argv base: --output-format stream-json, --verbose, --input-format stream-json | sdk.mjs@1195190 | DONE | rust/claude-agent-acp-rs/src/process.rs:216-219 |  |
+| O-101 | argv --model | sdk.mjs@1195605 | DONE | rust/claude-agent-acp-rs/src/process.rs:236 |  |
+| O-102 | argv --effort | sdk.mjs@1195605 | DONE | rust/claude-agent-acp-rs/src/process.rs:224 |  |
+| O-103 | argv --max-turns, --max-budget-usd | sdk.mjs@1195605 | DONE | rust/claude-agent-acp-rs/src/process.rs:228, 232 |  |
+| O-104 | argv --agent | sdk.mjs@1196428 | DONE | rust/claude-agent-acp-rs/src/process.rs:240 |  |
+| O-105 | argv --betas | sdk.mjs@1195605 | DONE | rust/claude-agent-acp-rs/src/process.rs:244 |  |
+| O-106 | argv --fallback-model | sdk.mjs@1197000 | DONE | rust/claude-agent-acp-rs/src/process.rs:296 |  |
+| O-107 | argv --resume and --session-id | sdk.mjs@1196428 | DONE | rust/claude-agent-acp-rs/src/process.rs:252, 316 |  |
+| O-108 | argv --continue | sdk.mjs@1196428 | MISSING | none (no --continue emitted) |  [pkg:FX-1] |
+| O-109 | argv --allowedTools, --disallowedTools, --tools | sdk.mjs@1196428 | DONE | rust/claude-agent-acp-rs/src/process.rs:256-274 |  |
+| O-110 | argv --setting-sources, --strict-mcp-config | sdk.mjs@1197000 | DONE | rust/claude-agent-acp-rs/src/process.rs:279, 284 |  |
+| O-111 | argv --permission-mode, --allow-dangerously-skip-permissions | sdk.mjs@1196428 | DONE | rust/claude-agent-acp-rs/src/process.rs:288, 292 |  |
+| O-112 | argv --permission-prompt-tool stdio | sdk.mjs@1196428 | DONE | rust/claude-agent-acp-rs/src/process.rs:248 |  |
+| O-113 | argv --include-hook-events, --include-partial-messages | sdk.mjs@1197247 | DONE | rust/claude-agent-acp-rs/src/process.rs:300, 304 |  |
+| O-114 | argv --add-dir | sdk.mjs@1197247 | DONE | rust/claude-agent-acp-rs/src/process.rs:312 |  |
+| O-115 | argv --replay-user-messages (plus trailing empty value) | sdk.mjs@1197247 | DONE | rust/claude-agent-acp-rs/src/process.rs:331-333 |  |
+| O-116 | extraArgs passthrough with bare/dash/value encoding | sdk.mjs@1196428 | DONE | rust/claude-agent-acp-rs/src/process.rs:320-330; rust/claude-agent-acp-rs/src/sdk_options.rs:23, 245-276 |  |
+| O-117 | argv --thinking=adaptive/disabled and --max-thinking-tokens | sdk.mjs@1195218 | MISSING | none | (dedupe) [pkg:F4a] |
+| O-118 | argv --thinking-display | sdk.mjs@1195411 | MISSING | none |  [pkg:F4a] |
+| O-119 | argv --task-budget | sdk.mjs@1195605 | MISSING | none | (dedupe) [pkg:FX-1] |
+| O-120 | argv --json-schema (outputFormat) | sdk.mjs@1195755 | MISSING | none | (dedupe) [pkg:FX-1] |
+| O-121 | argv --debug, --debug-file (debugFile) | sdk.mjs@1195755+ (debugFile emit); parse at sdk.mjs@321830 | MISSING | none | (dedupe) [pkg:FX-1] |
+| O-122 | argv --managed-settings | sdk.mjs@1198044 | MISSING | none (managed-settings.json paths only, process.rs:623-635) | (dedupe) [pkg:F5a] |
+| O-123 | argv --plugin-dir, --plugin-dir-no-mcp, --await-initialize | sdk.mjs@1197374-1197519 | MISSING | none | (dedupe) [pkg:F4a] |
+| O-124 | argv --no-session-persistence when persistSession=false | sdk.mjs@1198044 | PARTIAL | rust/claude-agent-acp-rs/src/sdk_options.rs:151 parses persistSession; process.rs:214-340 never emits the flag |  [pkg:F4a] |
+| O-125 | argv --fork-session, --resume-session-at, --resume-drops-turn | sdk.mjs@1197635-1197799 | MISSING | none | (dedupe) [pkg:F29] |
+| O-126 | argv --session-mirror (sessionMirror) | sdk.mjs@1197247 | MISSING | none | (dedupe) [pkg:FX-1] |
+| O-127 | argv --channels | sdk.mjs@1196428 | MISSING | none | (dedupe) [pkg:FX-1] |
+| O-129 | session hooks: user, project and IDE (_meta settings.hooks) hooks run per session, settings files untouched | src/tests/session-hooks.test.ts:42-202 | MISSING | rust/claude-agent-acp-rs/src/sdk_options.rs:10 (settings/hooks keys ignored) | (dedupe) [pkg:F4a] |
+| O-130 | session hooks: IDE hooks replaced or removed on session/load | src/tests/session-hooks.test.ts:181-202 | MISSING | none (see O-129) |  [pkg:F4a] |
+| O-131 | ACP mcpServers (stdio/http/sse, headers/env arrays) mapped to SDK mcpServers and argv --mcp-config | acp-agent.ts:11029-11053, 11252-11255; sdk.mjs --mcp-config | MISSING | none (sdk_options.rs:10 ignores the key; http/sse advertised at agent.rs:156) | WB-13 [pkg:F4a] |
+| O-132 | argv --permission-prompts | sdk.mjs | MISSING | none | (dedupe) [pkg:FX-1] |
+| O-133 | legacy _meta.systemPrompt (string replaces; object merged into the preset; ACP systemPrompt wins) | acp-agent.ts:11060-11080 | MISSING | none |  [pkg:F4a] |
+| O-134 | _meta.disableBuiltInTools gives tools:[]; default is the claude_code preset | acp-agent.ts:11127-11131 | MISSING | none |  [pkg:F4a] |
+| O-135 | AskUserQuestion disallowed only without elicitation.form | acp-agent.ts:11116-11123 | PARTIAL | agent.rs:322 always disallows |  [pkg:F23a] |
+| O-136 | enableFileCheckpointing for file-change-report clients | acp-agent.ts:11236-11238 | MISSING | none |  [pkg:AG-3] |
+| O-137 | child env CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1 | acp-agent.ts:11203 | DONE | process.rs:555 |  |
+| O-138 | readTextFile / writeTextFile passthrough on the public library agent | acp-agent.ts:9547-9555 | MISSING | none |  [pkg:FX-4] |
+| O-139 | experimental ACP v2 opt-in (CLAUDE_AGENT_ACP_EXPERIMENTAL_V2); v1 served by default, never routed by version | serve.ts:9-12 | MISSING | none |  [pkg:F38a] |
+| O-143 | _meta.claudeCode.options.skills | src/acp-agent.ts:1601-1640 | MISSING | rust/claude-agent-acp-rs/src/control.rs:130; rust/claude-agent-acp-rs/src/agent.rs:694-700 | InitializeOptions.skills never set from options (split) [pkg:F24] |
+| O-144 | _meta.claudeCode.options.agents | src/acp-agent.ts:1601-1640 | MISSING | rust/claude-agent-acp-rs/src/control.rs:123; rust/claude-agent-acp-rs/src/agent.rs:694-700 | InitializeOptions.agents never set from options (split) [pkg:F11] |
+| O-153 | _meta.claudeCode.options.agentProgressSummaries | src/acp-agent.ts:1601-1640 | MISSING | none | - (split) [pkg:F14] |
+| O-154 | _meta.claudeCode.options.planModeInstructions | src/acp-agent.ts:1601-1640 | MISSING | none | - (split) [pkg:F21] |
+| O-155 | _meta.claudeCode.options.toolAliases | src/acp-agent.ts:1601-1640 | MISSING | rust/claude-agent-acp-rs/src/control.rs:132; rust/claude-agent-acp-rs/src/agent.rs:694-700 | InitializeOptions.tool_aliases never set from options (split) [pkg:F6a] |
+| O-156 | _meta.claudeCode.options.executableArgs | src/acp-agent.ts:1601-1640 | MISSING | none | - (split) [pkg:F4a] |
+| O-158 | _meta.claudeCode.options.pluginDelivery | src/acp-agent.ts:1601-1640 | MISSING | none | - (split) [pkg:F4a] |
+| O-159 | _meta.claudeCode.options.sandbox | src/acp-agent.ts:1601-1640 | MISSING | rust/claude-agent-acp-rs/src/sdk_options.rs:11 | not parsed (listed as ignored) (split) [pkg:F4a] |
+| O-160 | _meta.claudeCode.options.sessionStoreFlush | src/acp-agent.ts:1601-1640 | MISSING | none | - (split) [pkg:F31] |
+| O-161 | _meta.claudeCode.options.toolConfig | src/acp-agent.ts:1601-1640 | MISSING | none | - (split) [pkg:F6a] |
+| O-162 | _meta.claudeCode.options.verbatimPrompts | src/acp-agent.ts:1601-1640 | MISSING | none | - (split) [pkg:F24] |
+| O-165 | _meta.claudeCode.options.env: per-session env merged over the process env, before provider env and CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS | acp-agent.ts:11183-11191 | DONE | rust/claude-agent-acp-rs/src/sdk_options.rs:91-98; rust/claude-agent-acp-rs/src/agent.rs:318-319 |  |
+| O-166 | argv --project-config-root (_meta.claudeCode.options.projectConfigRoot) | acp-agent.ts:11251, 1631; sdk.mjs | MISSING | none: process.rs:307-308 emits only when set; agent.rs:330-360 never sets it; sdk_options.rs does not parse projectConfigRoot | split from O-114 [pkg:F4a] |
+| O-167 | SDK default child env: CLAUDE_AGENT_SDK_VERSION set when unset; DEBUG stripped unless DEBUG_CLAUDE_AGENT_SDK is set; ENTRYPOINT, SDK_READS_SESSION_STATE and NODE_OPTIONS handled | sdk.mjs ProcessTransport (0.3.303, pinned lock) | PARTIAL | rust/claude-agent-acp-rs/src/process.rs:538-586 (no CLAUDE_AGENT_SDK_VERSION, no DEBUG strip) |  [pkg:F4a] |
+
+## 5. Slash and local commands
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| S-01 | /usage structured markdown via usage_EXPERIMENTAL (5 s timeout, falls back to original text) | src/acp-agent.ts:501-533, 3718-3733 | MISSING | rust/claude-agent-acp-rs/src/transcript.rs:180 (replay skip list only) | (dedupe) [pkg:F24] |
+| S-02 | /mcp structured markdown, reconnect and enable/disable through control API, OAuth follow-up | src/acp-agent.ts:3735-3758 | MISSING | none | (dedupe) [pkg:AG-4] |
+| S-03 | /remote-control prompt: connect (optional name) and off via enableRemoteControl | src/acp-agent.ts:567-593 | MISSING | rust/claude-agent-acp-rs/src/map.rs:993 (command listing only) | (dedupe) [pkg:F24] |
+| S-04 | Terminal-bound slash commands hidden; adapter's remote-control entry stands in for the CLI's | src/acp-agent.ts:595-608, 2091-2100 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:954-1030 | initial command list built with an empty terminal list (agent.rs:833, 1005-1007) [pkg:LD-1] |
+| S-05 | Success result text forwarded when no text streamed (cache replay, local-only commands) | src/acp-agent.ts:7351-7375 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:895-917; rust/claude-agent-acp-rs/src/session.rs:2777-2790 | basic #453 fallback exists; guards missing: deliveredCompactionOutput, noticeTexts, local-command markdown replacement, cancelled-local-command skip (acp-agent.ts:7333-7360) [pkg:F24] |
+| S-06 | local-command-stdout in live user/assistant frames -> markdown transcript | src/acp-agent.ts:7833-7943 | MISSING | live user arm drops string content (session.rs:2148-2157); local-command handling only in transcript.rs:159-206 (history replay) |  [pkg:F24] |
+| S-07 | local-command-stderr in live frames logged as error | src/acp-agent.ts:7947-7953 | MISSING | none in live path; transcript.rs:164 history only |  [pkg:F24] |
+| S-08 | promptToClaude: /mcp:server:command rewritten to /server:command (MCP) | acp-agent.ts:12678-12684 | MISSING | none | text passes through unchanged [pkg:AG-4] |
+| S-10 | usage Limits section: 5-hour, weekly all models, model-scoped windows or Opus/Sonnet fallback, bar, reset time | src/usage-markdown.ts:115-171 | MISSING | none |  [pkg:F24] |
+| S-11 | usage This-session table (cost, API time, active) and token breakdown totals | src/usage-markdown.ts:174-200 | MISSING | none |  [pkg:F24] |
+| S-12 | usage "What's using your limits" section: top 3 MCP servers per 24 h and 7 d period | src/usage-markdown.ts:129-147, 202-213 | MISSING | none |  [pkg:F24] |
+| S-13 | markdown helpers: escapeMarkdown, formatDuration, compact formatCount, usage bar of 20 cells | src/usage-markdown.ts:76-100, 84-86 | MISSING | none |  [pkg:F24] |
+| S-14 | /mcp entry in available_commands with name, description and input hint | src/mcp-command.ts:9-13 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:1017-1027 (entry present; the /mcp prompt has no handler) | /mcp entry is present; the /mcp prompt has no handler (see S-15..S-20, A-23, A-24) [pkg:AG-4] |
+| S-15 | parseMcpCommand: exact /mcp, /mcp reconnect / enable / disable | src/mcp-command.ts:28-46 | MISSING | none | exact /mcp and subcommands (reconnect, enable, disable); see AG-4 [pkg:AG-4] |
+| S-17 | formatMcpStatus: summary line, Failed / Needs authentication / Connecting / Connected groups, disabled line, reconnect hint, scope tags for duplicate names | src/mcp-command.ts:75-257 | MISSING | none |  [pkg:AG-4] |
+| S-18 | cleanMcpError: wrapper-segment stripping, two sentences, 160 code points | src/mcp-command.ts:98-166 | MISSING | none |  [pkg:AG-4] |
+| S-20 | Claude Code terminal and unavailable sentences removed from /mcp output | src/mcp-command.ts:289-296, 351-353, 385 | MISSING | none |  [pkg:AG-4] |
+| S-21 | /goal <objective> and /goal clear prompt interception | src/goal-extension.ts:36-50; src/acp-agent.ts:4250-4262 (outside G7) | MISSING | none | (dedupe) [pkg:AG-1] |
+| S-22 | AIR skill command meta: kind skill and skillPath (absolute SKILL.md path) | src/air-extension.ts:60-61, docs/air-extensions.md:171-199 | MISSING | none | (dedupe) [pkg:F24] |
+| S-23 | supported commands from initialize handshake (query.supportedCommands) | src/acp-agent.ts:3814, 10408 | DONE | rust/claude-agent-acp-rs/src/agent.rs:831-840 |  |
+| S-24 | local-only slash commands /context, /heapdump, /extra-usage | src/acp-agent.ts:2091 | DONE | rust/claude-agent-acp-rs/src/agent.rs:212 |  |
+| S-25 | replay-hidden slash commands /compact, /model, /mcp, /status, /usage | src/acp-agent.ts:2093-2103 | DONE | rust/claude-agent-acp-rs/src/transcript.rs:173-180 |  |
+| S-31 | MCP prompts surfaced as "(MCP)" slash commands | src/acp-agent.ts:12619-12624 | MISSING | none |  [pkg:F24] |
+
+## 6. Claude control protocol and stream frames
+
+### 6A. Control requests the adapter sends (outbound)
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| A-01 | MCP OAuth at session start and on /mcp reconnect (mcpAuthenticate, URL elicitation, status poll, 10 min timeout) | src/acp-agent.ts:539-557, 2532-2660 | MISSING | none |  [pkg:F23c] |
+| A-02 | Fast mode apply: applyFlagSettings({fastMode}) before state change, refresh option | src/acp-agent.ts:10759-10781 | MISSING | none |  [pkg:F11] |
+| A-03 | live agent switch via applyFlagSettings({agent}), null for Default | src/acp-agent.ts:10676-10688 | MISSING | none |  [pkg:F11] |
+| A-04 | custom agent discovery via supportedAgents, built-in and "default" names excluded | src/acp-agent.ts:12324-12355 | MISSING | none | agent-discovery.test.ts [pkg:F11] |
+| A-05 | setModel skipped when resolved value is verbatim SDK value; switch-to-listed when SDK default dropped | src/session-model.ts:450-600 (skipSetModel block) | PARTIAL | rust/claude-agent-acp-rs/src/session_config.rs:807-812; rust/claude-agent-acp-rs/src/session.rs:435 | switch-to-listed never fires: sdk_default_dropped is always false; resumed gateway branch (session-model.ts:528-538) and stay-on-prior-model (session-model.ts:575-589) absent; depends on O-43, O-47, A-06 [pkg:F5b] |
+| A-06 | fresh-session setModel failure advisory when switching to listed model or PreModelSwitch hook veto | src/session-model.ts:446-449, 500-520 | MISSING | rust/claude-agent-acp-rs/src/session.rs:464-475 (always returns SessionError::Start) |  [pkg:F5b] |
+| A-07 | resumed-session setModel failure: keep transcript model and read it back | src/session-model.ts:500-520 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:464-475 (error ignored on resume, no read-back) |  [pkg:F5b] |
+| A-08 | effort sync after model switch: AIR always syncs; legacy only when a pin was clamped | src/acp-agent.ts:10606-10636 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1719-1751 | fire-and-forget; pin cleared even if apply fails [pkg:F11] |
+| A-09 | effort sync failure: restore last applied value or drop the effort option | src/acp-agent.ts:10637-10668; src/tests/session-config-options.test.ts:726-810 | MISSING | none |  [pkg:F11] |
+| A-10 | background get_context_usage(summary) after switch, dropped if model changed or window authoritative | src/acp-agent.ts:10477-10506 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1295-1302, 1770-1785 (no current-model guard) | background refinement now reads rawMaxTokens at the payload level (see A-21); model guard gap as named [pkg:F5b] |
+| A-11 | PostToolUse hook registered once per non-TodoWrite, non-Task tool_use | acp-agent.ts:13088-13127 | DONE | rust/claude-agent-acp-rs/src/session.rs:2559-2593; rust/claude-agent-acp-rs/src/hooks.rs:78-90 |  |
+| A-12 | hook callback registry: owner, 30s retention, onRelease | tools.ts:359-426 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs (expiry release); rust/claude-agent-acp-rs/src/map.rs (mark_emitted); rust/claude-agent-acp-rs/src/hooks.rs |  [pkg:F9] |
+| A-13 | generated session title via generate_session_title control request, once per session, when at least 10 chars of context exist, persisted | src/session-titles.ts:28-42, 172-222, 302-353 | MISSING | none (grep for generateSessionTitle and title generation in rust/claude-agent-acp-rs/src: no hits) |  [pkg:F30] |
+| A-14 | parseUsageResponse: runtime shape validation of the experimental get_usage response | src/usage-markdown.ts:4-70 | MISSING | none |  [pkg:F24] |
+| A-15 | file-change report: rewindFiles dryRun preview with 2 s timeout, published as session_info_update _meta.jetbrains.air.agentFileChangeReport | src/file-change-audit.ts:95-98, 196-233 | MISSING | none | (dedupe) [pkg:AG-3] |
+| A-17 | control interrupt (query.interrupt) | src/acp-agent.ts:8730 | DONE | rust/claude-agent-acp-rs/src/session.rs:1051, 1108 |  |
+| A-18 | control set_model (query.setModel) | src/acp-agent.ts:9026 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1550-1556 | error control_response treated as success; see A-44 [pkg:F3a] |
+| A-19 | control set_permission_mode (query.setPermissionMode) | src/session-mode.ts:255 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1357, 1532-1535 | error control_response treated as success; mode errors reported as "Invalid Mode"; see A-44 [pkg:F3a] |
+| A-20 | control apply_flag_settings (query.applyFlagSettings, incl. fastMode) | src/acp-agent.ts:10612, 10682, 10692, 10777 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:562, 1572-1578 | error control_response treated as success; see A-44 [pkg:F3a] |
+| A-21 | control get_context_usage (query.getContextUsage) | acp-agent.ts:10461-10506 | DONE | rust/claude-agent-acp-rs/src/control.rs (raw_max_tokens); rust/claude-agent-acp-rs/src/session.rs:1777; rust/claude-agent-acp-rs/src/agent.rs:730-732 | payload read at frame.response.response by control.rs raw_max_tokens at both call sites; unit test raw_max_tokens_reads_the_nested_reply_payload |
+| A-22 | control stop_task (query.stopTask) | src/acp-agent.ts:4397, 8399, 8423 | DONE | rust/claude-agent-acp-rs/src/session.rs:1248 |  |
+| A-23 | control mcp_status (query.mcpServerStatus) | src/acp-agent.ts:2579, 2672; src/mcp-command.ts:59 | MISSING | none | (dedupe) [pkg:AG-4] |
+| A-24 | control mcp reconnect / toggle (query.reconnectMcpServer, toggleMcpServer) | src/mcp-command.ts:371-372 | MISSING | none | (dedupe) [pkg:AG-4] |
+| A-25 | control mcp_authenticate (query.mcpAuthenticate) | src/acp-agent.ts:2605 | MISSING | none |  [pkg:F23c] |
+| A-27 | control enable_remote_control (query.enableRemoteControl) | src/acp-agent.ts:3967, 3975 | MISSING | none |  [pkg:F24] |
+| A-28 | account identity via query.accountInfo | src/hide-claude-auth.ts:279 | PARTIAL | rust/claude-agent-acp-rs/src/auth_status.rs:323-332 (probes `claude auth status` instead of accountInfo; apiProvider bedrock/vertex mapped at auth_status.rs:94-95, 690, 761) |  [pkg:F34] |
+| A-44 | outbound control request rejects on an error control_response | sdk.mjs pendingControlResponses (rejects when subtype is not success); acp-agent.ts:10696-10716 | PARTIAL | rust/claude-agent-acp-rs/src/control.rs:446-447 (every response resolves Ok); session.rs:3031 (only stop_task checks the subtype) | set_permission_mode, set_model and apply_flag_settings resolve Ok for error responses (session.rs:1532-1535, 1553-1556, 1575-1578) [pkg:F3a] |
+
+### 6R. Control requests the CLI sends (inbound)
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| R-01 | PostModelSwitch hook (external switch): full reconcile of mode, effort, fast mode, context window, notify | src/acp-agent.ts:11316-11340; src/acp-agent.ts:10724-10770 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs (PostModelSwitch arm; external_switch_target; ModelApplied notify_client) |  [pkg:F11] |
+| R-02 | PostToolUse dispatch: callback fired then unregistered | tools.ts:428-450 | DONE | rust/claude-agent-acp-rs/src/hooks.rs:236-260; rust/claude-agent-acp-rs/src/session.rs:1964-1975 |  |
+| R-03 | PostCompact hook summary: recordSummary, compactionSummaryText framing strip (analysis/summary tags, continuation framing) | src/context-compaction.ts:85-124,300-313; src/acp-agent.ts:11356-11357 | MISSING | none (session.rs POST_COMPACT arm records the summary into session_ext.last_compaction_summary; no reader) | PostCompact summary recorded but never read; compactionSummaryText framing strip and the compaction summary consumer are missing [pkg:F20] |
+| R-04 | inbound control can_use_tool | src/acp-agent.ts (permission callback) | DONE | rust/claude-agent-acp-rs/src/session.rs:799-815 |  |
+| R-05 | inbound control hook_callback | src/acp-agent.ts (hooks) | DONE | rust/claude-agent-acp-rs/src/session.rs:815; rust/claude-agent-acp-rs/src/hooks.rs:23-52 |  |
+| R-07 | inbound unknown control subtype answered with error | src/acp-agent.ts (control handler) | PARTIAL | rust/claude-agent-acp-rs/src/control.rs:332-346, 796-806 | error string missing: upstream answers "Unsupported control request subtype: <x>" (SDK handleControlRequest catch); Rust sends subtype and request_id only [pkg:F3a] |
+| R-08 | inbound request_user_dialog (onUserDialog, supportedDialogKinds) | acp-agent.ts:11259-11269 | MISSING | none |  [pkg:F23b] |
+| R-09 | inbound control_cancel_request aborts the pending request | SDK; control.rs:16 | DONE | control.rs:16 |  |
+| R-10 | MCP elicitation inbound control request (form and url modes) | src/elicitation.ts:381-452; src/acp-agent.ts:6632 | MISSING | none (no "elicitation" in Rust src) | existing elicitation evidence kept (split) [pkg:F23b] |
+
+### 6N. Stream frames and system subtypes
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| N-01 | command_lifecycle frame lane (started/completed/cancelled/discarded/refused, per-uuid orphanCommands) | src/acp-agent.ts:5839-5945 | MISSING | rust/claude-agent-acp-rs/src/turn.rs:65-67 (documented deviation; no handler) | frame never handled in session.rs system/user/result arms [pkg:F13] |
+| N-02 | init: latch msg_lifecycle_v1 and request_marker_lists_v1 capabilities | src/acp-agent.ts:5949-5960 | MISSING | none (no "init" arm in rust/claude-agent-acp-rs/src/session.rs:2291-2427) |  [pkg:F13] |
+| N-03 | init: reconcile fast_mode_state / fast_mode_disabled_reason | src/acp-agent.ts:5961-5975 | MISSING | none (init subtype not matched) | fast mode is seeded at session creation only (session_config.rs) [pkg:F11] |
+| N-04 | init: terminal_slash_commands latch and re-advertise available commands | src/acp-agent.ts:5976-5998 | MISSING | none |  [pkg:LD-1] |
+| N-05 | init: plugin_errors logged on change | src/acp-agent.ts:5999-6001 | MISSING | none | log-only; silently dropped in session.rs:2427 `_ => {}` [pkg:F2b] |
+| N-06 | status requesting after cancel reopens window for new work (servesCancelledWork) | src/acp-agent.ts:6002-6013 | MISSING | none |  [pkg:F16a] |
+| N-07 | status compacting / compact_result drive compaction lifecycle | src/acp-agent.ts:6014-6032 | MISSING | none (no ContextCompactionLifecycle in Rust; grep empty) |  [pkg:F20] |
+| N-08 | compact_boundary: finish compaction, tool_call vs compaction_update presentation | src/acp-agent.ts:6033-6069 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2347-2396 | always emits "Compact conversation" tool_call; no compaction_update presentation branch [pkg:F20] |
+| N-09 | compact_boundary: usage_update refresh from post_tokens with _claude/model | src/acp-agent.ts:6040-6065 | DONE | rust/claude-agent-acp-rs/src/session.rs:2397-2405; rust/claude-agent-acp-rs/src/usage.rs:211 | size from context window, used from post_tokens |
+| N-10 | local_command_output: structured markdown replacement, mirror dedupe, cancel skip | src/acp-agent.ts:6070-6087 | MISSING | none (no "local_command_output" arm) | transcript.rs only mentions local-command for replay [pkg:F24] |
+| N-11 | session_state_changed running transition sweeps owed trailing-idle debt | src/acp-agent.ts:6088-6110 | MISSING | rust/claude-agent-acp-rs/src/turn.rs:982-984 (only records state) |  [pkg:F12] |
+| N-12 | session_state_changed idle: cancelled settle, held drain, owed-debt absorb, issue-825 fail | src/acp-agent.ts:6150-6260 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:990-1020 | order matches; steered-settle and autonomous-cycle branches differ [pkg:F12] |
+| N-13 | mirror_error: log persistence failure and warn in transcript | src/acp-agent.ts:6289-6298 | MISSING | none (dropped by session.rs:2427) |  [pkg:F7b] |
+| N-14 | informational: notice vs transcript line, severity, one notice per tool_use, notice text dedupe | src/acp-agent.ts:6354-6406 | MISSING | none |  [pkg:F7b] |
+| N-15 | active_goal frame published as runtime goal | src/acp-agent.ts:5938-5945 | MISSING | none |  [pkg:AG-1] |
+| N-16 | Result-frame usage_update with _claude/model and context window update from modelUsage | src/acp-agent.ts:4725-4740 (attachUsageModel); result case beyond range | DONE | rust/claude-agent-acp-rs/src/session.rs:2222-2255; rust/claude-agent-acp-rs/src/usage.rs:197-226 | result arm itself is outside G2a range |
+| N-17 | task_started registers live task with taskType, backgrounded, parentTaskId; forgets foreground call | src/acp-agent.ts:5093-5117 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2292-2312; rust/claude-agent-acp-rs/src/turn.rs:626-627 | only is_subagent and parent tool id kept (dedupe) [pkg:F14] |
+| N-18 | task_notification / task_updated: settle live task and end background terminal | src/acp-agent.ts:5118-5147, 5148-5158 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2317-2346 | task settle present; background terminal end missing [pkg:F14] |
+| N-19 | Top-level frame routing: user/assistant/result/system/stream_event/rate_limit_event to session, control to control.rs | src/acp-agent.ts:6411-8334 | DONE | rust/claude-agent-acp-rs/src/dispatch.rs:71-81 | none |
+| N-20 | tool_progress beat -> tool_call progress update (elapsed time, subagent retry, id fallback to parent) | src/acp-agent.ts:8125-8176 | MISSING | dispatch.rs:76-79 (type not routed, falls to Ignore); no handler in session.rs (grep 0) | none (dedupe) [pkg:F7a] |
+| N-21 | prompt_suggestion top-level frame handling (expected-gate, publish) | src/acp-agent.ts:8216-8227 | PARTIAL | dispatch.rs:76-79 excludes the type so session.rs:2618-2620 arm is unreachable; publish skipped by design | arm dead under real routing [pkg:F24] |
+| N-22 | auth_status top-level frame clears auth_required failures | src/acp-agent.ts:8228-8232 | MISSING | none in session.rs; auth_status.rs is a separate probe actor (agent.rs:600-632) |  [pkg:F25] |
+| N-23 | tool_use_summary frame is a no-op | src/acp-agent.ts:8214-8215 | DONE | dispatch.rs:79 (Ignore) | none |
+| N-24 | stream_event text/thinking deltas -> chunks; empty deltas skipped | src/acp-agent.ts:7636-7694 | DONE | map.rs:1075-1160 (content_block_delta arm); map.rs:855-889 | none |
+| N-25 | Consolidated assistant forwards only the un-streamed remainder (diff vs streamed record) | src/acp-agent.ts:7997-8004 | DONE | map.rs:529-560 (map_consolidated_assistant), map.rs:574-618 (unstreamed_remainder) | none |
+| N-26 | message_start clears per-lane streamed record and captures API message id | src/acp-agent.ts:7511-7530 | DONE | map.rs:1075-1160 (message_start arm, clear_streamed_blocks) | none |
+| N-27 | Stream usage_update on message_start/message_delta (cumulative snapshot, changed-only) | src/acp-agent.ts:7535-7587 | DONE | rust/claude-agent-acp-rs/src/session.rs:2445-2500 | none |
+| N-28 | Context window inferred from model id on message_start until authoritative | src/acp-agent.ts:7548-7556 | DONE | session.rs:2456-2470 | none |
+| N-29 | Result emits usage_update with cost and origin | src/acp-agent.ts:7008-7024 | PARTIAL | session.rs:2236-2255; usage.rs:220-240 | same order defect as B-13: a stale usage_update on an echo-less promotion (session.rs:2238-2254) [pkg:F16a] |
+| N-30 | Result updates context window from matchingModelUsage (>0 guard) and seeds cross-session cache | src/acp-agent.ts:6973-7003 | PARTIAL | session.rs:2228-2235; usage.rs:185 update_window_if_positive; no cacheContextWindow equivalent (grep 0) | cross-session cache missing [pkg:F5b] |
+| N-31 | fast_mode state reconciliation on result (even on error/cancel) | src/acp-agent.ts:6805-6816 | MISSING | result arm session.rs:2222-2290 reads no fast_mode_state; only SupportsFastMode fields session_config.rs:31 |  [pkg:F11] |
+| N-32 | Compaction: stream heartbeat from compaction block/compaction_delta; reset on result | src/acp-agent.ts:7477-7479, 7493-7510 | MISSING | map.rs:1075-1164 has no compaction arm (default `_ => Vec::new()`); grep compaction_delta 0 |  [pkg:F20] |
+| N-33 | Late task frames from earlier run ignored (run_id guard) on task_* frames | src/acp-agent.ts:6413-6417, 6429-6434, 6480-6485, 6519-6524 | MISSING | grep run_id 0 hits in crate |  [pkg:F14] |
+| N-34 | task_progress -> async task progress (AIR asyncTasks) | src/acp-agent.ts:6412-6427 | DONE | session.rs:2313-2316 | none |
+| N-35 | task_notification: stale-end guard, subagent finish, discardPending, stream-record cleanup, stopped-subagent tool-call close, background terminal end, settle | src/acp-agent.ts:6479-6517 | PARTIAL | session.rs:2317-2346 (on_task_ended, settle_events, tasks.task_notification); no stale-end guard, no stopped-subagent tool-call close, no stream-record cleanup (grep 0) |  [pkg:F14] |
+| N-36 | task_updated: terminal patch finish, is_backgrounded tracking, running/pending resume of finished subagent | src/acp-agent.ts:6518-6575 | PARTIAL | session.rs:2317-2346 (terminal via is_terminal_task_update; tasks.task_updated); async_tasks.rs:237 isBackgrounded; no resume for running/pending (grep resumeLiveTask 0) |  [pkg:F14] |
+| N-37 | elicitation_complete -> client.completeElicitation when url elicitation supported | src/acp-agent.ts:6586-6600 | MISSING | grep 0 hits in crate |  [pkg:F23b] |
+| N-38 | api_retry -> warning notice (Reconnecting / Retrying, attempt N of M, no_response wait); auth_required retry suppressed | src/acp-agent.ts:6606-6631 | MISSING | grep 0 hits in crate |  [pkg:F7b] |
+| N-39 | model_refusal_fallback -> notice (AIR advisory or transcript line) and persistent model sync | src/acp-agent.ts:6632-6709 | MISSING | grep model_refusal: session_store.rs only; no system subtype arm |  [pkg:F7b] |
+| N-40 | model_refusal_no_fallback seeds refusal explanation (refused_user_message_uuid null guard) | src/acp-agent.ts:6710-6728 | MISSING | grep 0 hits in session/turn |  [pkg:F7b] |
+| N-41 | plugin_install / notification / thinking_tokens are no-ops | src/acp-agent.ts:6601-6605 | DONE | session.rs:2289-2440 (system match default arm) | none |
+| N-42 | control_request_progress is a no-op | src/acp-agent.ts:6731-6732 | DONE | session.rs:2289-2440 (system match default arm) | none |
+| N-43 | background_tasks_changed reconciles liveBackgroundTasks (replace semantics, endedPerLevel) | src/acp-agent.ts:6733-6777 | MISSING | grep 0 hits in crate | (dedupe) [pkg:F14] |
+| N-44 | conversation_reset clears subagents, tasks, plan, title, prompt suggestion, failure lifecycle | src/acp-agent.ts:8191-8213 | MISSING | grep 0 hits in crate |  [pkg:F7b] |
+| N-45 | Fast mode SDK state sync (on/off, cooldown ignored, reason-only updates, notice on user-intent flip) | src/acp-agent.ts:10805-10860 | MISSING | none |  [pkg:F11] |
+| N-46 | stream content_block_start tool_use: tool_call without rawInput while input streams (AIR) | acp-agent.ts:13388-13423; renderer.ts:237-264 | DONE | rust/claude-agent-acp-rs/src/map.rs:1075-1104, 717-721 |  |
+| N-47 | stream input_json_delta: partial top-level refinement, deduped by top-level comma | acp-agent.ts:13424-13462; renderer.ts:288-299 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:1217-1294 | missing shouldEmitToolCall gate (acp-agent.ts:13470) and stampParentToolUseId (acp-agent.ts:13476) [pkg:F6b] |
+| N-48 | stream content_block_stop drops only that block's streamed input | acp-agent.ts:13466-13478 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:1148-1157 | drops the whole lane's streamed inputs instead of the index; harmless only while blocks do not overlap [pkg:FX-3] |
+| N-49 | stream message_start clears lane input and streamed record; ping and message_delta are no-ops | acp-agent.ts:13460-13470, 13462-13465 | DONE | rust/claude-agent-acp-rs/src/map.rs:1136-1147, 1159-1163 |  |
+| N-50 | continued-in-session detection from the transcript tail | src/session-index/transcript-scan.ts:630-660 | MISSING | none |  [pkg:F26a] |
+| N-51 | titles reset on conversation_reset | src/session-titles.ts:151-159 | MISSING | none |  [pkg:F30] |
+| N-52 | goal snapshot from the SDK active-goal message (objective, iterations, last reason, set_at) published on change | src/goal-extension.ts:16-29, 71-82 | MISSING | none |  [pkg:AG-1] |
+| N-53 | synthetic usage-limit message detection and replay of the active limit failure | src/session-failure-extension.ts:181-235 | MISSING | none (session.rs has no usage-limit detection) |  [pkg:AG-2] |
+| N-54 | taskStarted of a subagent opens a child generation (name, task, prompt, parent) | src/native-subagents.ts:304-385 | MISSING | rust/claude-agent-acp-rs/src/async_tasks.rs:727-731 (subagent tasks ignored only) |  [pkg:F35a] |
+| N-55 | Resume of a finished child opens a new generation (taskResumed, running patch) | src/native-subagents.ts:387-454 | MISSING | none |  [pkg:F35a] |
+| N-56 | Child end-state mapping (`rfdEndState`, `nativeSubagentState`, TaskEnd error/reason, unexplained end) | src/native-subagents.ts:65-75,1300-1325,1397-1404 | MISSING | none |  [pkg:F35a] |
+| N-57 | Late async-task update guard (`isLateAsyncTaskUpdate`) and failed-tool-call guard for control updates | src/native-subagents.ts:1430-1445 | MISSING | none |  [pkg:F35c] |
+| N-58 | taskStarted: spawn held until tool-call id is known; announce when backgrounded or held | src/async-tasks.ts:142-171,618-655 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:102-133,579-629 |  |
+| N-59 | Subagent tasks ignored (`subagent_type` present or `local_agent`) | src/async-tasks.ts:147,995-1000 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:102-110,727-731 |  |
+| N-60 | Monitor tasks ignored by task type (`local_monitor`) | src/async-tasks.ts:147,991-993 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:722-725 |  |
+| N-61 | Monitor tasks ignored by owning tool name (`toolNameOf` "Monitor") at announce | src/async-tasks.ts:623-627,989 | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:722-725 (task type only, no tool-name lookup) |  [pkg:F15] |
+| N-62 | taskBackgrounded: background promotion of a foreground task (announce) | src/async-tasks.ts:173-194 | MISSING | none |  [pkg:F15] |
+| N-63 | taskUpdated with isBackgrounded=true announces the task | src/async-tasks.ts:207-209 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:221-245 (line 237) |  |
+| N-64 | taskUpdated running/paused state deferred until the held spawn is sent | src/async-tasks.ts:226-232,572-575 | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:506-517 (when_announced_state drops the update when not announced) | Held task loses running/paused state [pkg:F15] |
+| N-65 | taskUpdated terminal state with error (finish, event source) | src/async-tasks.ts:236,657-689 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:221-275 |  |
+| N-66 | taskProgress: usage, summary, lastToolName, output path, tool call id; dedupe; held beats after spawn | src/async-tasks.ts:239-274 | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:749-766 | usage numbers emitted as f64 (1234 becomes 1234.0); upstream passes JS numbers (async-tasks.ts:1015-1025) [pkg:F14] |
+| N-67 | taskNotification terminal (summary, output file, tool call id, event source) | src/async-tasks.ts:276-318 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:192-220; rust/claude-agent-acp-rs/src/session.rs:2317-2340 |  |
+| N-69 | Terminal tombstone kept until a late Bash result proves backgrounding | src/async-tasks.ts:110-115; src/tests/async-tasks.test.ts:714-753 | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:116-117 (tombstones kept; no Bash-result path to use them) |  [pkg:F15] |
+| N-70 | mergeStarted: workflow name, skipTranscript, panel-only level recovery (late task_started cannot create transcript UI) | src/async-tasks.ts:528-550,979-1007 tests | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:406-452 (no panelOnlyRecovery) |  [pkg:F14] |
+| N-71 | Snake/camel field lookup for task identity and fields (`taskId`/`task_id`, `outputFilePath`/`output_file`, etc.) | src/async-tasks.ts:1027-1048 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:668-672; rust/claude-agent-acp-rs/src/async_tasks.rs:453-457 |  |
+| N-72 | Output file path merged from structured fields (later structured value wins) | src/async-tasks.ts:596-602 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:453-457 |  |
+| N-73 | `contextCompactionMetadataFromBoundary`: trigger (auto -> automatic), preTokens, postTokens, durationMs | src/context-compaction.ts:411-427 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2349-2368 (same facts in legacy rawOutput; no typed metadata object, no AIR key) |  [pkg:F20] |
+| N-74 | hook_started / hook_progress / hook_response / files_persisted are no-ops | acp-agent.ts:6407-6411 | DONE | session.rs default arm |  |
+| N-75 | server_tool_use / mcp_tool_use and the 7 *_tool_result variants; ignored block list | acp-agent.ts:13083-13085, 13177-13184, 13337-13348 | DONE | map.rs:638, 657-664 |  |
+
+### 6B. Behaviour: lanes, cancel, steer, close, replay
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| B-01 | Session lifecycle phase timing log lines ([session/<op>] phase= durationMs= totalMs=) | src/session-timing.ts:1-27; src/acp-agent.ts:3153-3164 | MISSING | none |  [pkg:F2b] |
+| B-02 | session/load: validate cwd, then replay stored history while the CLI starts | src/acp-agent.ts:3052-3104, 3152-3170 | PARTIAL | rust/claude-agent-acp-rs/src/agent.rs:788-860 | history replayed before the response; no overlap of replay with CLI start (dedupe) [pkg:PC-2] |
+| B-03 | session/load on a live session: replay history, return live modes and config, re-send commands | src/acp-agent.ts:3156-3167 | DONE | rust/claude-agent-acp-rs/src/agent.rs:962-1001 |  |
+| B-04 | Stream loop wakes on cancel abort and force-cancel backstop | src/acp-agent.ts:5651-5700 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:947-972 | wake-on-cancel and force-cancel backstop present; missing commandFinished-aware orphan seeding on the backstop (acp-agent.ts:5680-5705), which depends on N-01 (F13) [pkg:F16a] |
+| B-05 | Echo-driven turn activation clears cancelled flag and reports inserted | src/acp-agent.ts:4802-4875 | DONE | rust/claude-agent-acp-rs/src/session.rs:2110-2135 | Activated event ends stopped-work window and resets usage scratch |
+| B-06 | Echo-less result promotes queue head (ensureActiveTurn) | src/acp-agent.ts:4876-5000 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:1140-1165 | only the coarse pending_orphan_results count lane; per-uuid orphanCommands lane absent [pkg:F13] |
+| B-07 | Autonomous model cycle start/end and close of its open tool calls on idle | src/acp-agent.ts:5391-5408, 6110-6160 | MISSING | none | no endAutonomousCycle or closeCycleToolCalls equivalent [pkg:F16c] |
+| B-08 | Cancelled turn: close open tool calls with unfinished report (closeCancelledToolCalls) | src/acp-agent.ts:5263-5320, 5480-5490 | MISSING | rust/claude-agent-acp-rs/src/unfinished.rs:116-160 (end_turn only); session.rs:985-1000 (cancel clears tracker, no close) | cancelled settles leave open calls unclosed (dedupe) [pkg:F17] |
+| B-09 | Cancel: deliver interrupted tool_result for calls the client holds open (sendInterruptedToolResults) | src/acp-agent.ts:5336-5390 | MISSING | none |  [pkg:F17] |
+| B-10 | end_turn settle: close abandoned calls failed and stuck calls with incomplete_tool_call -32603 | src/acp-agent.ts:5440-5530 | DONE | rust/claude-agent-acp-rs/src/unfinished.rs:116-160; rust/claude-agent-acp-rs/src/agent.rs:497-498 | 1000 cap and terminal_exit tracked as B-64 and T-84 |
+| B-11 | Background-subagent tool calls exempt from unfinished check | src/acp-agent.ts:5450-5456 | DONE | rust/claude-agent-acp-rs/src/unfinished.rs:116-160 (background_parents filter) |  |
+| B-13 | Per-turn scratch reset on activation (usage, model, stopReason) | src/acp-agent.ts:4764-4800 | PARTIAL | rust/claude-agent-acp-rs/src/usage.rs:177-181; rust/claude-agent-acp-rs/src/session.rs:2238-2262 | usage_update is emitted before the activation scratch reset and before releaseHeld (session.rs:2238-2270); upstream order is releaseHeld, ensureActiveTurn, then usage_update (acp-agent.ts:6790, 6829, 7008-7024) [pkg:F16a] |
+| B-14 | Carry accumulated usage from queued/held turn into next turn scratch (carriedUsage) | src/acp-agent.ts:4790-4799 | PARTIAL | rust/claude-agent-acp-rs/src/usage.rs:177-181 (reset only; no carried-usage handoff found) |  [pkg:F19] |
+| B-15 | Held turn settles only when spawned subagents drain (settleOrDefer, turnAwaitingSubagents) | src/acp-agent.ts:5159-5220 | DONE | rust/claude-agent-acp-rs/src/turn.rs:626-635 (spawned_task_ids), turn.rs:990-1020 |  |
+| B-16 | Background-origin result that answers pending prompt (user_message_uuids) is not an autonomous result | src/acp-agent.ts:5030-5067 | DONE | rust/claude-agent-acp-rs/src/turn.rs:736-745 |  |
+| B-17 | Stream loop yields event loop when message backlog runs long (messageLoopYielder) | src/acp-agent.ts:5651-5660 | MISSING | none (Rust actor is channel driven; no yielder) | no yielder: upstream yields between messages when the backlog runs long (utils.ts:114-145) [pkg:CONC-2] |
+| B-18 | Post-cancel drop of stream/assistant output, with running-background-subagent exception; work-end report | src/acp-agent.ts:7589-7625, 7818-7831 | PARTIAL | map.rs:121-131 (begin/end_stopped_work); session.rs:1004, 2121; no isRunningBackgroundSubagentOutput equivalent (grep 0) | stream events and tool_use blocks are not gated in the stopped window; upstream drops every streamed event and latches droppedStreams (acp-agent.ts:7611-7628); exception and workEndReported not ported (dedupe) [pkg:F16b] |
+| B-19 | Per-turn accumulated usage tally (user-turn results only; autonomous excluded) | src/acp-agent.ts:6930-6936 | DONE | rust/claude-agent-acp-rs/src/turn.rs:795-843 | user-result usage tally at turn.rs:795-843; autonomous results return before the fold (acp-agent.ts:6930-6936) |
+| B-20 | Per-model quota increment from running modelUsage (advance on autonomous too) | src/acp-agent.ts:6938-6965 | DONE | rust/claude-agent-acp-rs/src/turn.rs:381-397, 822, 843; rust/claude-agent-acp-rs/src/quota.rs:149-183 | advance_model_reading runs for every result; user results fold the increment; resumed-first seed handled (turn.rs:381-396; quota.rs:149-183) |
+| B-21 | Autonomous result detection (origin kinds) with answersPendingPrompt exception | src/acp-agent.ts:6799-6801 | DONE | turn.rs:735-760 | none |
+| B-22 | Folded prompt answered by its stamped autonomous result; later result does not leak usage | src/acp-agent.ts:6827-6829; src/tests/folded-prompt-scenario.test.ts:206-234 | DONE | turn.rs:739-760; turn/turn_tests.rs:1646-1655 (inv_42_folded_prompt_settles) | none |
+| B-23 | Refusal result ends turn with refusal stop reason (any subtype) | src/acp-agent.ts:7253-7271 | DONE | turn.rs:852-855 | none |
+| B-25 | User echo promotes queued turn; previous turn handed off (cancelled / held / steer / end_turn) | src/acp-agent.ts:7727-7798 | DONE | rust/claude-agent-acp-rs/src/turn.rs:649-733 | all four hand-off branches present in the upstream order (turn.rs:649-700; acp-agent.ts:7727-7798) |
+| B-26 | Replayed user echo (isReplay) consumed, not forwarded | src/acp-agent.ts:7800-7815 | DONE | session.rs:2148-2160 (is_echo includes isReplay) | none |
+| B-27 | Top-level model snapshot for result attribution (synthetic excluded) | src/acp-agent.ts:7857-7869 | DONE | session.rs:2528-2540; turn.rs:367-370 | none |
+| B-28 | Trailing-idle debt (owedTrailingIdles) so a result's trailing idle is absorbed, not read as abandoned turn | src/acp-agent.ts:6918-6922, 7755, 7783 | DONE | rust/claude-agent-acp-rs/src/turn.rs:329, 796-819, 1002-1011 | trailing-idle debt counter present and absorbed |
+| B-29 | ACP messageId -> SDK uuid mapping recorded per consolidated message (rewind/fork) | src/acp-agent.ts:7712-7719 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:529-560 (derives the ACP id; no uuid map) | no message-id to SDK-uuid map recorded per consolidated message (acp-agent.ts:7715-7718), so rewind and fork cannot resolve the SDK uuid [pkg:F29] |
+| B-30 | Steered turn: is_error result with pending steer echo stays on steer lane | src/acp-agent.ts:7279-7286 | DONE | turn.rs:857-866 | none |
+| B-31 | cancel: drop queued user messages via cancel_async_message before interrupt | src/acp-agent.ts:8362-8381, 8729 | DONE | rust/claude-agent-acp-rs/src/session.rs:1024-1040, 1085-1100 | sent per abandoned uuid, then interrupt; no typeof guard for old CLIs (Node skips when method absent) (dedupe) |
+| B-32 | cancel: orphan tracking, msg_lifecycle_v1 per-uuid map lane | src/acp-agent.ts:8335-8346, 8521-8590, 8761-8778 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:309-312, 596 | count lane only; orphanCommands map lane deferred in turn.rs:596 [pkg:F13] |
+| B-33 | cancel: orphan count reconciled against interrupt receipt still_queued | src/acp-agent.ts:8738-8787 | DONE | rust/claude-agent-acp-rs/src/control.rs (still_queued_of); rust/claude-agent-acp-rs/src/session.rs:1054-1058 | still_queued read at the payload level (unit test still_queued_reads_the_nested_reply_payload); the per-uuid map gap is B-32 |
+| B-34 | cancel: queued (not yet started) turns settled cancelled with no usage | src/acp-agent.ts:8527-8537; src/turn-events.ts:27-31 | DONE | rust/claude-agent-acp-rs/src/turn.rs:463-500; turn.rs:203-216 (had_usage) |  |
+| B-35 | cancel: held active turn settled cancelled inline, with its stored usage | src/acp-agent.ts:8613-8686 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:520-531 | no followupLive guard: upstream settles only when not open or followupLive is false (acp-agent.ts:8630-8638); Rust settles whenever is_held_turn (turn.rs:507-510) [pkg:F16a] |
+| B-36 | cancel: pre-count owed trailing idles (issue #825) for held/steered cancels | src/acp-agent.ts:8672-8674, 8694-8696 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:503-545 | same missing followupLive guard before the owed-idle pre-count (acp-agent.ts:8630-8638) [pkg:F16a] |
+| B-37 | cancel: force-cancel backstop armed once per turn, forces "cancelled" | src/acp-agent.ts:8698-8722 | DONE | rust/claude-agent-acp-rs/src/session.rs:943-962, 1016-1022 |  |
+| B-38 | cancel: late model output of cancelled prompts judged via cancelledPrompts set | src/acp-agent.ts:8452-8457, 8728 | MISSING | none | (dedupe) [pkg:F16b] |
+| B-39 | cancel: reset localCommandAbort, contextCompaction, pendingExitPlan state | src/acp-agent.ts:8441-8460, 8474 | MISSING | none | exitPlan.cancel and compaction interrupt absent [pkg:F16a] |
+| B-40 | cancel: publish cancelled native-subagent state (parentCancelled) | src/acp-agent.ts:8485-8502 | MISSING | none | no native subagent runtime [pkg:F35a] |
+| B-41 | cancel: route cancel to a subagent child session (cancelChild) | src/acp-agent.ts:8383-8409 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:573 (cancel routed to owning session only) |  [pkg:F36] |
+| B-42 | cancel: stop background local_workflow tasks after interrupt | src/acp-agent.ts:8411-8430, 8737 | MISSING | none (no local_workflow stop on cancel; async_tasks.rs only maps task type) |  [pkg:F16c] |
+| B-43 | replay skips replay-hidden meta messages (peer/channel/observer/slack-ping) | src/acp-agent.ts:9292, 942-950 | DONE | rust/claude-agent-acp-rs/src/transcript.rs:51-58, 506 |  |
+| B-44 | replay skips synthetic "/login" assistant message | src/acp-agent.ts:9319-9321 | DONE | rust/claude-agent-acp-rs/src/transcript.rs:61, 511 |  |
+| B-45 | replay skips task-notification records; restores background task cards | src/acp-agent.ts:9257-9284, 9367-9375 | PARTIAL | rust/claude-agent-acp-rs/src/transcript.rs:236-243, 506 | records skipped; no restoreTaskNotification or async task card replay [pkg:F31] |
+| B-46 | replay strips nested subagent text/thinking (plain client) | src/acp-agent.ts:9355-9362 | DONE | rust/claude-agent-acp-rs/src/transcript.rs:516-521 |  |
+| B-47 | replay strips local-command metadata from user content | src/acp-agent.ts:9371, 9367-9375 | DONE | rust/claude-agent-acp-rs/src/transcript.rs:196, 524-528 |  |
+| B-48 | replay: marker-tag stripping of stored user prompts | src/acp-agent.ts:2110-2230 (2179-2189) | PARTIAL | rust/claude-agent-acp-rs/src/transcript.rs:186 | marker-only command without command-args is dropped: marker_tag_text returns None; upstream returns commandName (acp-agent.ts:2187-2188, range 2110-2230) [pkg:F31] |
+| B-49 | replay groups chunks under API message id | src/acp-agent.ts:9310, 9440 | DONE | rust/claude-agent-acp-rs/src/transcript.rs:468-499, 546 |  |
+| B-50 | replay: compaction summary materialized as completed compaction entity | src/acp-agent.ts:9403-9422 | MISSING | rust/claude-agent-acp-rs/src/transcript.rs:454-458 (is_meta marking only) |  [pkg:F31] |
+| B-51 | replay: usage-limit synthetic message restored as typed failure | src/acp-agent.ts:9062-9063, 9328-9344 | MISSING | none |  [pkg:F31] |
+| B-52 | replay: native subagent child sessions (subagent_spawned, transcripts, state updates) | src/acp-agent.ts:9079-9234, 9461-9494, 9511-9523 | MISSING | none |  [pkg:F37] |
+| B-53 | replay: load-replay-end session_info_update marker | src/acp-agent.ts:9529-9544 | MISSING | none | (dedupe) [pkg:F31] |
+| B-54 | replay: backfill messageId to uuid map for rewind/fork | src/acp-agent.ts:9306-9314 | MISSING | none |  [pkg:F29] |
+| B-55 | replay: yield to event loop between messages | src/acp-agent.ts:9289-9291; tests/event-loop-yield.test.ts:71-120 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:845-848 (synchronous send loop) |  [pkg:F31] |
+| B-56 | session_messages: parentUuid chain from latest leaf, compaction relinking | src/acp-agent.ts:9044 (SDK getSessionMessages) | PARTIAL | rust/claude-agent-acp-rs/src/transcript.rs:386-466, 15-18 | queue-command re-link and branch-turn walk not ported (transcript.rs:15-18) [pkg:F31] |
+| B-57 | TurnEvents.inserted(messageId) for ACP v2 prompt insertion | src/turn-events.ts:13-26 | MISSING | none (protocolVersion ignored: rust/claude-agent-acp-rs/src/agent.rs:883-886) | v2 only [pkg:F39] |
+| B-58 | TurnEvents.ended / failed for v1 prompt answer | src/turn-events.ts:27-37 | DONE | rust/claude-agent-acp-rs/src/turn.rs:198-226 (Settled, Failed) |  |
+| B-59 | ForegroundEvents running / awaitingUser / ended / failed | src/turn-events.ts:56-76; src/acp-agent.ts:9647-9672 | MISSING | none | v2 state reporting (dedupe) [pkg:F39] |
+| B-60 | awaiting-user bookkeeping: open permission/question requests while work runs | src/acp-agent.ts:9557-9630; tests/turn-events.test.ts:336-500 | MISSING | none |  [pkg:F39] |
+| B-61 | autonomous model cycle started by Claude Code is foreground work | src/acp-agent.ts:9674-9693, 9771-9782 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:726-736 (autonomous result classification) | results handled; cycle start/end not reported as foreground work [pkg:F16c] |
+| B-62 | stopped-work tool use: wait for stream to reach tool use before dropping it | src/acp-agent.ts:9714-9767 | MISSING | none |  [pkg:F16b] |
+| B-63 | turn-cancel mid-backlog and teardown mid-backlog settle turn | tests/event-loop-yield.test.ts:122-216 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1069-1110; rust/claude-agent-acp-rs/src/turn.rs:1 | no race test yet for cancel or teardown mid-backlog (CONC-2 Race 2) [pkg:CONC-2] |
+| B-64 | recordDispatchedToolUses: book of dispatched tool_use ids (1000 cap) | acp-agent.ts:12841-12872 | PARTIAL | rust/claude-agent-acp-rs/src/unfinished.rs:45-60 | books are an unbounded set, no 1000-entry cap [pkg:F17] |
+| B-65 | recordReachedToolUse: reached-tool-use record and waiter wake-up | acp-agent.ts:12874-12887 | MISSING | none |  [pkg:F17] |
+| B-66 | recordForegroundToolCall: foreground tool calls of the active turn | acp-agent.ts:12889-12902 | PARTIAL | rust/claude-agent-acp-rs/src/unfinished.rs:62-73 | no SandboxNetworkAccess exclusion: upstream records a permission-surfaced call as foreground only when toolName is not SandboxNetworkAccess (acp-agent.ts:9897-9905); Rust does not, so settle sends an extra failed update (unfinished.rs:127-138) [pkg:F17] |
+| B-67 | tool cache entry pruned once its result is emitted | acp-agent.ts:13329-13336 | DONE | rust/claude-agent-acp-rs/src/map.rs:772-776 |  |
+| B-68 | inferContextWindowFromModel: 1m token in model id or display text gives 1,000,000 | acp-agent.ts:13631-13651 | DONE | rust/claude-agent-acp-rs/src/usage.rs:91-112 |  |
+| B-69 | contextWindowCache: cross-session window cache keyed by backend and model, cleared on logout | acp-agent.ts:13652-13681 | MISSING | rust/claude-agent-acp-rs/src/session.rs:1310 (comment: PARITY pending) |  [pkg:F5b] |
+| B-70 | providerCacheKeyFor: routing env vars form the backend key | acp-agent.ts:13679-13712 | MISSING | none |  [pkg:F5b] |
+| B-71 | immediateContextWindow: cached window, else heuristic, else default; authoritative flag | acp-agent.ts:13718-13750 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1305-1325 | heuristic and default only; no cache, no authoritative flag [pkg:F5b] |
+| B-72 | getMatchingModelUsage: longest common prefix over modelUsage keys; commonPrefixLength | acp-agent.ts:13783-13803, 13619-13630 | DONE | rust/claude-agent-acp-rs/src/usage.rs:122-143 |  |
+| B-73 | unfinished-tool closing report: failed (v1), per-case text; cancelled-turn text | renderer.ts:656-672; unfinished.rs | PARTIAL | rust/claude-agent-acp-rs/src/unfinished.rs:97-113, 116-170 | v1 failed and both texts present; cancelled-turn text absent and cancelled turns get no closing report (unfinished.rs:166-170) [pkg:F17] |
+| B-74 | Clear-context restart: close query, restart session with restartParams, carry usage and fast mode, push continuation message | src/clear-context-coordinator.ts:71-100, 105-163 | MISSING | rust/claude-agent-acp-rs/src/permission_options.rs:1018-1024 (deny only); no restart code in session.rs | grep finds no "Implement the following plan" or restart path in Rust [pkg:F22] |
+| B-75 | ExitPlanCoordinator: per-session abort on cancel, replacement destroy, failure settle | src/exit-plan.ts:189-271 | MISSING | none | Depends on B-74 [pkg:F22] |
+| B-76 | Keep-planning interrupt mapped back to cancellation (pendingExitPlanModeInterruption, result_type=user and stop_reason=tool_use diagnostic) | src/exit-plan.ts:75-105, 116-127; src/acp-agent.ts:7032-7039 | MISSING | none (hooks.rs and session.rs have no ExitPlanMode interruption tracking) |  [pkg:F21] |
+| B-77 | forks held back from the list until the fork response is out | src/session-index/list-subscriptions.ts:252-294; src/session-index/service.ts:510-511, 733-747; src/session-index/connection.ts:192-215 | MISSING | none |  [pkg:F27b] |
+| B-78 | rolling context ring of user and assistant text, capped at 1000 chars, dropped once titled | src/session-titles.ts:24-26, 73-78, 129-149 | MISSING | none |  [pkg:F30] |
+| B-79 | client-set title guard: explicit title is never replaced by a generated one; rename waits for generation in flight | src/session-titles.ts:230-265; src/session-index/explicit-title.ts:1-65 | MISSING | none |  [pkg:F30] |
+| B-80 | report finish reasons cancelled, timeout, invalidOutput, notReported, providerError; publish at most once per request | src/file-change-audit.ts:14-69, 143-155, 243-246 | MISSING | none |  [pkg:AG-3] |
+| B-81 | CLI probe `claude auth status --json` after initialize response, never awaited | src/acp-agent.ts:2841,3390-3466, src/auth-status.ts:50-52 | DONE | rust/claude-agent-acp-rs/src/agent.rs:896-901, rust/claude-agent-acp-rs/src/auth_status.rs:366-400 | 5 s bound; non-zero exit stdout still parsed |
+| B-82 | Probe timeout: push nothing and keep last state; warn once | src/acp-agent.ts:3418-3427, src/tests/auth-status.test.ts:1062-1095 | PARTIAL | rust/claude-agent-acp-rs/src/auth_status.rs:591-596 | timeout keeps state, but no once-per-connection error log [pkg:F34] |
+| B-83 | In-flight probe sharing (one run unless fresh) | src/acp-agent.ts:3370-3387 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:545-549 |  |
+| B-84 | Epoch: probe started before logout is discarded | src/acp-agent.ts:3391-3394,3453-3458,3672-3673 | DONE | rust/claude-agent-acp-rs/src/auth_status.rs:560-566 |  |
+| B-85 | Epoch bump on authenticate and on settings-context change | src/acp-agent.ts:3260,3340 | MISSING | none | no authenticate and no settings context in Rust [pkg:F34] |
+| B-86 | Re-probe when session cwd differs from last probe cwd | src/acp-agent.ts:3330-3341 | PARTIAL | rust/claude-agent-acp-rs/src/auth_status.rs:609-620 | cwd change re-probes without bumping the epoch (upstream acp-agent.ts:3329-3342); a slow probe of the old context still satisfies the epoch check (auth_status.rs:597-601); see B-87 [pkg:F34] |
+| B-87 | Re-probe when apiKeyHelper or launch env changes | src/acp-agent.ts:3324-3343 | MISSING | none |  [pkg:F34] |
+| B-88 | Per-prompt start-of-prompt probe (finds external login/logout) | src/auth-status.ts:19-21, src/acp-agent.ts:3370-3387 | MISSING | none | no probe on session/prompt, PARITY pending [pkg:F34] |
+| B-89 | billsClaudeSubscription predicate (subscriptionType, no tokenSource, firstParty, no key above subscription) | src/hide-claude-auth.ts:96-107 | MISSING | none |  [pkg:F34] |
+| B-90 | holdsNonSubscriptionCredential and API_KEY_SOURCES_ABOVE_SUBSCRIPTION set | src/hide-claude-auth.ts:72-76,119-130 | MISSING | none |  [pkg:F34] |
+| B-91 | Per-turn guard: shared pending run, onAccount hook before decision, fails open | src/hide-claude-auth.ts:226-287 | MISSING | none |  [pkg:F34] |
+| B-92 | Degraded-guard warning logged once per session | src/hide-claude-auth.ts:171-187 | MISSING | none |  [pkg:F34] |
+| B-93 | NativeSubagentRuntime: connection-local child registry keyed by task id, tool-use maps | src/native-subagents.ts:127-189 | MISSING | none | No child-session type anywhere in Rust [pkg:F35a] |
+| B-94 | Buffering of unannounced child updates (caps 64 parents / 256 updates / 32 per parent) | src/native-subagents.ts:117-119,1037-1062 | MISSING | none |  [pkg:F35a] |
+| B-95 | SendMessage tracking: sender per call, resumed agent id, resume prompt text | src/native-subagents.ts:963-975,1349-1396 | MISSING | none |  [pkg:F35a] |
+| B-96 | parentCancelled: no report until the SDK ends the child | src/native-subagents.ts:577-593 | MISSING | none |  [pkg:F35a] |
+| B-97 | cancelChild: client cancels one child's task, leaves the end to the SDK (RFD only, AIR grants none) | src/native-subagents.ts:594-646 | MISSING | none |  [pkg:F36] |
+| B-98 | Restore of agents from before a load/resume from history (restoreLaunch / restoreAgent; AIR and RFD) | src/native-subagents.ts:721-870 | MISSING | none |  [pkg:F37] |
+| B-99 | subagentHistory: list `subagents/agent-<id>.jsonl` and `.meta.json` (launch id, name, type, background, stoppedByUser) | src/subagent-history.ts:48-98 | MISSING | none (no subagents/ path reads in rust/claude-agent-acp-rs/src) |  [pkg:F37] |
+| B-100 | subagentLaunchedBy / subagentLineage: root-first ancestor chain, sidechain-aware, compaction-aware | src/subagent-history.ts:99-174; src/tests/subagent-history.test.ts:72-276 | MISSING | none |  [pkg:F37] |
+| B-101 | subagentLaunchIds: launch tool_use ids (Agent/Task/SendMessage) from a transcript, incl. before compaction | src/subagent-history.ts:175-249 | MISSING | none |  [pkg:F37] |
+| B-102 | readSubagentMessages via SDK getSubagentMessages | src/subagent-history.ts:250-268 | MISSING | none |  [pkg:F37] |
+| B-103 | stripForkPrefix: drop inherited fork history, keep only the directive prompt | src/subagent-history.ts:269-323; src/tests/subagent-history.test.ts:277-317 | MISSING | none (no fork-boilerplate handling in rust/claude-agent-acp-rs/src) |  [pkg:F37] |
+| B-104 | RFD replay: announce each child right after its launch call, then send its history | src/subagent-replay.ts:1-20,56-186 | MISSING | none; rust/claude-agent-acp-rs/src/transcript.rs:14-17 states native-subagent replay is not ported |  [pkg:F37] |
+| B-105 | Replay finish: children end before replay ends; notice when launch has no metadata (history missing) | src/subagent-replay.ts:187-293 | MISSING | none |  [pkg:F37] |
+| B-106 | replaySubagentTerminalState: foreground launch result maps to completed / failed / cancelled | src/subagent-replay.ts:294-303 | MISSING | none |  [pkg:F37] |
+| B-107 | Stop: canStop / claimStop / releaseStop / taskStopped with one-shot stop acknowledgement | src/async-tasks.ts:395-439 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:295-345; rust/claude-agent-acp-rs/src/session.rs:1262-1266; rust/claude-agent-acp-rs/src/agent.rs:1381-1395 |  |
+| B-108 | releaseHeld at prompt result: send spawns of held tasks without tool-call id | src/async-tasks.ts:476-486 | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:31, 276-294 | held spawns are released in HashMap order (async_tasks.rs:31, 276-290); upstream iterates a Map in insertion order (async-tasks.ts:476-486); see N-64 and B-13 [pkg:F15] |
+| B-109 | Lifecycle reset / interrupt / resume: open entity closed as `cancelled` at turn boundary; late frames dropped after interrupt | src/context-compaction.ts:185-221; src/tests/context-compaction.test.ts:407-512 | MISSING | none |  [pkg:F20] |
+| B-110 | `isCompactSummaryMessage`: user message flagged `isCompactSummary` | src/context-compaction.ts:125-133 | DONE | rust/claude-agent-acp-rs/src/transcript.rs:454-456; rust/claude-agent-acp-rs/src/session_store.rs:258 |  |
+| B-111 | Cancel of a child session by its session id (SDK Query.stopTask), parent turn continues | README.md:38-94 | MISSING | rust/claude-agent-acp-rs/src/session.rs:201-213 (stop_task claim for async tasks only) |  [pkg:F36] |
+| B-112 | Replay clearing on v2: empty message before the first replayed chunk, per message; replayed subagents replay with their parent; child state after replay | src/v2/agent.ts:168-228, 252-286, 322-336, 389-402 | MISSING | none |  [pkg:F39] |
+| B-113 | v2 cancel and withdrawal rules: cancelled tool calls, withdrawn requests report no running, held turns, #1061 stopped-work deny | src/tests/acp-v2.test.ts:1414-1797, 2090-2122, 4302-4680 | MISSING | none for v2 states (v1 cancel path only, rust/claude-agent-acp-rs/src/agent.rs:573) | test-only behaviour, counted [pkg:F16a] |
+| B-114 | v2 model cycles that Claude Code starts on its own (running, then idle with cycle usage) | src/v2/prompt.ts:85-89; src/tests/acp-v2.test.ts:2302-2372 | MISSING | none |  [pkg:F16c] |
+| B-115 | v2 child sessions and requests: child announced, requires_action while a foreground subagent request is open, child state on its own stream | src/tests/acp-v2.test.ts:3714-4300 | MISSING | none |  [pkg:F35c] |
+| B-116 | v2 replay order: history replays before the session/resume response; approved ExitPlanMode plan as markdown plan; compaction replayed as one completed update; live notices | src/tests/acp-v2.test.ts:1147-1345, 1193-1232 | MISSING | none |  [pkg:F31] |
+| B-117 | load/resume of a live session with changed params tears down and recreates it (computeSessionFingerprint, recreateLiveSession, keeps live mode) | acp-agent.ts:1700-1730, 10870-10910 | MISSING | agent.rs:972-1001 always reuses; no fingerprint | card F19 owns this; audit suggested F31, kept F19 [pkg:F19] |
+| B-118 | session/resume of a live session re-sends available_commands_update | acp-agent.ts:3144-3149, 10434-10439 | PARTIAL | agent.rs:1004 sends only when replaying |  [pkg:LD-1] |
+| B-119 | /login auth (success subtype with "Please run /login" text) | src/acp-agent.ts:7310-7442 | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:876-882 | upstream gates on is_error (acp-agent.ts:7312); Rust matches text regardless of is_error (split) [pkg:F25] |
+| B-120 | max_tokens (success and error_during_execution) | src/acp-agent.ts:7310-7442 | DONE | rust/claude-agent-acp-rs/src/turn.rs:884-887; rust/claude-agent-acp-rs/src/turn.rs:921-924 | - (split) |
+| B-121 | budget (error_max_budget_usd) | src/acp-agent.ts:7310-7442 | DONE | rust/claude-agent-acp-rs/src/turn.rs:936-946 | split from B-24; matches acp-agent.ts:7310-7437 |
+| B-122 | max turns (error_max_turns) | src/acp-agent.ts:7310-7442 | DONE | rust/claude-agent-acp-rs/src/turn.rs:947-957 | split from B-24; matches acp-agent.ts:7310-7437 |
+| B-123 | structured-output retries (error_max_structured_output_retries) | src/acp-agent.ts:7310-7442 | DONE | rust/claude-agent-acp-rs/src/turn.rs:958-968 | split from B-24; matches acp-agent.ts:7310-7437 |
+| B-124 | error_during_execution | src/acp-agent.ts:7310-7442 | DONE | rust/claude-agent-acp-rs/src/turn.rs:921-934 | split from B-24; matches acp-agent.ts:7310-7437 |
+
+## 7. Tool rendering and permissions
+
+### 7T. Tool rendering
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| T-01 | Terminal rendering choice from _meta.terminal_output and terminal_output_delta | src/tool-calls/client-capabilities.ts:21-45 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:11 (terminal_output not advertised) |  [pkg:F2a] |
+| T-02 | AIR diffPatch choice: exact git patch in diffs | src/tool-calls/client-capabilities.ts:25, 47 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:106 (advertised only) |  [pkg:F9] |
+| T-03 | AIR rawInputRendering choice: no display copy of rawInput | src/tool-calls/client-capabilities.ts:21-53 | MISSING | none | (dedupe) [pkg:F9] |
+| T-04 | AIR planFile choice: ExitPlanMode plan read from rawInput.planFilePath | src/tool-calls/client-capabilities.ts:54, 76-80 | MISSING | rust/claude-agent-acp-rs/src/agent.rs:107 (advertised only) |  [pkg:F9] |
+| T-05 | memory_recall frame becomes memory tool_call | src/acp-agent.ts:6259-6265 | MISSING | none |  [pkg:F7a] |
+| T-06 | Background command terminal end update (terminal_exit exit_code null) | src/acp-agent.ts:5118-5136 | MISSING | none (grep background_terminal/terminal_exit empty in session.rs, map.rs) |  [pkg:F15] |
+| T-07 | stream content_block_start tool_use -> tool_call; streamed partial input refinement | src/acp-agent.ts:7660-7694 | PARTIAL | map.rs:1080-1095; map.rs:1196-1300 | streamed refinement lacks the shouldEmitToolCall gate (acp-agent.ts:13469-13470; Rust map.rs:1256, 1265-1289); see T-14 [pkg:F6b] |
+| T-08 | Consolidated user frame tool_result -> tool_call_update; hooks completion and task-plan updates | src/acp-agent.ts:7697-7698, 7954-7963, 8019-8122 | DONE | session.rs:2148-2220 | none |
+| T-09 | TodoWrite tool_use -> plan; Task* tool_use and result suppressed; task plan published | src/acp-agent.ts:8204 (publishTaskPlan), 8107 (toAcpNotifications call) | PARTIAL | map.rs:650-665; map.rs:639-642, 670-683 | TodoWrite is never cached, so its tool_result emits tool_call_update (map.rs:680); upstream caches every tool_use and suppresses TodoWrite results (acp-agent.ts:13083-13087); see T-19 and WB-03 [pkg:F6b] |
+| T-10 | PostToolUse hook registration on first tool_use sighting (non-TodoWrite, non-Task) | src/acp-agent.ts:7660-7662 | DONE | session.rs:2510-2531 (assistant), session.rs:2579-2595 (stream content_block_start) | none |
+| T-11 | Background Bash tool result: taskBackgrounded, running terminal (terminal_output) and backgroundedBashToolCall rendering | src/acp-agent.ts:8027-8050, 8113-8120 | MISSING | grep backgroundBash / background_bash 0 hits in crate |  [pkg:F15] |
+| T-12 | Resumed native subagent (SendMessage/resume) on tool_result: resume prompt and live task resume | src/acp-agent.ts:8058-8080 | MISSING | no native subagent resume path in session.rs (grep 0) |  [pkg:F14] |
+| T-13 | tool_result_meta (CLI 2.1.216+) passed to tool-call mapping | src/acp-agent.ts:8099-8105 | MISSING | grep tool_result_meta 0 hits in crate |  [pkg:F7a] |
+| T-14 | isTaskTool / shouldEmitToolCall: TodoWrite and Task* never a streamed tool_call | acp-agent.ts:12806-12824 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:1196, 1214-1289 | streamed TodoWrite and Task* refinements not suppressed (acp-agent.ts:13470); see WB-03 [pkg:F6b] |
+| T-15 | recordToolCallParent: subagent tool call remembers its Agent/Task parent (1000 cap) | acp-agent.ts:12828-12839 | MISSING | none | no parent map; map.rs never stamps parentToolUseId on tool_call/update [pkg:F6b] |
+| T-16 | rememberResolvedToolNames: tool name kept for a result after cache prune (1000 cap) | acp-agent.ts:12927-12944 | MISSING | none |  [pkg:F6b] |
+| T-17 | tool_use_result honored only when the message carries exactly one tool_result | acp-agent.ts:12969-12975 | MISSING | none | tool_use_result is never read; tools.rs:812 comment promises it (dedupe) [pkg:F7a] |
+| T-18 | TodoWrite tool_use becomes plan snapshot when todos is an array | acp-agent.ts:13046-13060 | DONE | rust/claude-agent-acp-rs/src/map.rs:639-642, 921-942 |  |
+| T-19 | every tool_use cached by id, TodoWrite included | acp-agent.ts:13083-13087 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:639-642 | TodoWrite is never inserted into tool_use_cache; its tool_result then hits the untracked path (map.rs:670-683) and emits a tool_call_update for an id the client never saw [pkg:F6b] |
+| T-20 | tool_result for a tool_use not in cache: complete only if permission-surfaced, else log and drop | acp-agent.ts:13177-13212 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:670-683, 752-818 | untracked results are emitted as tool_call_update, not dropped; no surfaced-call completion path [pkg:F6b] |
+| T-21 | permission-surfaced TodoWrite or Task* call resolved at its tool_result | acp-agent.ts:13216-13236 | MISSING | none |  [pkg:PC-1] |
+| T-22 | Task* tool_result drives plan snapshot (TaskCreate, TaskUpdate, TaskList; TaskGet silent) | acp-agent.ts:13237-13290 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs (task_permission_resolution, result loop); rust/claude-agent-acp-rs/src/hooks.rs (apply_task_update_output, apply_task_list_output) | permission-surfaced Task* calls are resolved (tool_call_update), but the settle clearing does not run, so end_turn still fails (HAZARD-IMPL PC-1.5-settle; differential inv_24_task_perm_settle, ignored); TaskGet and TaskList ordering unverified [pkg:PC-1] |
+| T-23 | Task output parsing: structured JSON or text forms, owner and blocked-by suffixes, not-found update | rust/claude-agent-acp-rs/src/hooks.rs:407-420, 543-603 | PARTIAL | owner and blocked-by suffixes stripped; TaskList strictness; not-found and Failed-to-delete handled by task_update_text; remaining output forms unverified |  [pkg:PC-1] |
+| T-24 | applyTaskUpdate keeps existing status when update has none | tools.ts:289-306 | DONE | rust/claude-agent-acp-rs/src/hooks.rs:472-478 (apply_task_update); test pc1_5_task_update_without_status_keeps_progress | applyTaskUpdate keeps the existing status when the update has none; test pc1_5_task_update_without_status_keeps_progress (hooks.rs) |
+| T-25 | applyTaskCreate: needs output task id, no input-id fallback | tools.ts:274-287 | PARTIAL | rust/claude-agent-acp-rs/src/hooks.rs:305-320 | falls back to input.taskId when output has no id [pkg:PC-1] |
+| T-26 | tool_result _meta.claudeCode carries nonExecutionKind and userFeedback from tool_result_meta | acp-agent.ts:13177-13180, 13299-13302; tool-result-meta.ts:16-31 | MISSING | none | tool_result_meta is never parsed; map.rs:779-818 meta is toolName only (dedupe) [pkg:F7a] |
+| T-27 | tool result status: is_error gives failed, otherwise completed (v1) | renderer.ts:193-203 | DONE | rust/claude-agent-acp-rs/src/map.rs:764-768 | v2 cancelled status: see C-24 (renderer.ts:32-42) |
+| T-28 | Bash/PowerShell-independent Bash shape: title = command or "Terminal", kind execute | reporters/bash.ts:19-30 | DONE | rust/claude-agent-acp-rs/src/tools.rs:467-474 |  |
+| T-29 | shellDescription: description, else command_description; description wins; description as display content | reporters/bash.ts:6-17, 28; renderer.ts:750-757 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:470 | display reads only description and keeps empty strings; command_description fallback and empty-string omission missing (reporters/bash.ts:12-17, 23-28) [pkg:F6a] |
+| T-30 | PowerShell shares the Bash reporter | reporters/index.ts:23 | MISSING | none (tools.rs:757 falls to generic Other shape) |  [pkg:F6a] |
+| T-31 | Bash result: structured BashOutput (stdout, stderr, interrupted, persisted-output and background notes), exit code from "Exit code N" text | reporters/bash.ts:37-133 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:820-838 | raw text only; no structured output, no interrupted or truncation notes, no exit-code parse [pkg:F7a] |
+| T-32 | Bash result: error gives generic fence; success gives console block | reporters/bash.ts:33-35; renderer.ts:419-431 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:820-838 | error and success shapes match, but success output is raw text and images are lost; see T-31 [pkg:F7a] |
+| T-33 | command terminal channel: _meta terminal_info, terminal_output(_delta), terminal_exit, terminal content | renderer.ts:173-175, 246, 391-418 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:9-13 (supportsTerminalOutput always false) |  [pkg:F15] |
+| T-34 | backgrounded Bash: _meta.jetbrains.air.asyncTasks.backgrounded marker; terminal_exit withheld | background.ts:24-73 | MISSING | none |  [pkg:F15] |
+| T-35 | Read title: "(start - end)" range, "(from line N)", or plain | reporters/read.ts:19-33 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:475-497 | offset without limit drops "(from line N)"; limit 0 with no offset yields "(from line 1)" [pkg:F6a] |
+| T-36 | Read locations: path and line (offset or 1) | reporters/read.ts:31 | DONE | rust/claude-agent-acp-rs/src/tools.rs:498-500 |  |
+| T-37 | Read result rebuilt from structured file content with line numbers; truncation note; markdown fence | reporters/read.ts:35-66; content.ts:238-246 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:810-818 | raw text used, so line numbers absent and system-reminder blocks can leak (LIVE-FINDINGS D4) [pkg:LD-2] |
+| T-38 | Read result: image and document blocks via toAcpContentBlock | reporters/read.ts:67-78; content.ts:143-236 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:810-818 | result_text keeps text blocks only [pkg:F6a] |
+| T-39 | Write title, kind edit, locations; "Preparing file…" without path | reporters/file-edit.ts:25-35 | DONE | rust/claude-agent-acp-rs/src/tools.rs:503-523 |  |
+| T-40 | Write input diff: oldText null, newText content; gated off for diffPatch clients, v2, and replay keeps it | reporters/file-edit.ts:42-55 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:503-512, 60-71 | always a diff; file_text, file_content and path aliases unsupported; oldText null not emitted (LIVE-FINDINGS D8); newText "" where upstream has none [pkg:LD-3] |
+| T-41 | Edit title, kind edit, locations | reporters/file-edit.ts:101-104 | DONE | rust/claude-agent-acp-rs/src/tools.rs:524-558 |  |
+| T-42 | Edit input diff: old_string and new_string; oldText null when old_string empty | reporters/file-edit.ts:110-120 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:524-547 | an empty old_string is passed as Some("") so oldText is "" rather than null [pkg:LD-3] |
+| T-43 | Edit and Write PostToolUse final change: structuredPatch diff, text fallback, Write update fallback | reporters/file-edit.ts:128-150; diff.ts:298-381 | PARTIAL | rust/claude-agent-acp-rs/src/hooks.rs:145-225, 236-260 | fallbacks present; upstream returns nothing when structuredPatch is not an array, Rust does not gate on it [pkg:F8] |
+| T-44 | diffPatch: exact git patch preview and final, created-file diff, v2 diff | diff.ts:118-296, 383-427, 700-748; file-edit.ts:140-170 | MISSING | none (rust/claude-agent-acp-rs/src/agent.rs:106 advertises diffPatch only) |  [pkg:F9] |
+| T-45 | NotebookEdit non-AIR shape: title "NotebookEdit", kind other | reporters/index.ts:27; reporters/file-edit.ts:181-183 | DONE | rust/claude-agent-acp-rs/src/tools.rs:757 |  |
+| T-46 | NotebookEdit AIR rendering: cell title, source display, rawInput kept | reporters/file-edit.ts:180-220 | MISSING | none |  [pkg:F9] |
+| T-47 | Glob title, kind search, locations | reporters/search.ts:5-17 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:559-571 | empty Glob path is treated as present (title Find with an empty pattern, locations [{path:""}]); upstream treats it as absent (search.ts:9, 14) [pkg:F6a] |
+| T-48 | Grep title as grep command line, incl. -l/-c from flags, path from file_path, truthiness of flags | reporters/search.ts:20-67 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:572-618 | no file_path fallback for path; -l/-c boolean forms not read; -i, -n, multiline need strict true [pkg:F6a] |
+| T-49 | WebFetch title "Fetch <url>" with "(from char N)" and prompt display | reporters/web.ts:9-21 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:620-630 | offset suffix absent [pkg:F6a] |
+| T-50 | WebSearch title `Search "<query>"` or "Web search" | reporters/web.ts:24-31 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:631-657 | title is `"<query>"` with no "Search " prefix, and adds allowed/blocked suffixes upstream does not have [pkg:F6a] |
+| T-51 | WebSearch result: hits rendered as "Title (url)" from structured output | reporters/web.ts:33-55; content.ts:92-97 | MISSING | none (tools.rs:804-844 has no WebSearch arm) |  [pkg:F7a] |
+| T-52 | Agent/Task title: description plus " (<effort> effort)" unless fork | reporters/agent.ts:8-19 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:459-466 | effort suffix absent [pkg:F6a] |
+| T-53 | Agent/Task prompt as display content | reporters/agent.ts:17; renderer.ts:750-757 | DONE | rust/claude-agent-acp-rs/src/tools.rs:462-464 |  |
+| T-54 | Agent/Task result: structured report, trailer strip, subagent hand-back unwrap, partial-turn label | reporters/agent.ts:21-226 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:839 (generic_content) | model-directed trailer and hand-back frame reach the client [pkg:F7a] |
+| T-55 | Agent/Task AIR subagent flag | renderer.ts:776-780 | DONE | rust/claude-agent-acp-rs/src/tools.rs:152-154 |  |
+| T-56 | Skill title "Load skill: <name>", kind other; result is empty | reporters/interaction.ts:118-128 | DONE | rust/claude-agent-acp-rs/src/tools.rs:723-729, 840 | Skill result is empty on success; failed-result text is covered by T-107 |
+| T-57 | Skill AIR path: SKILL.md located by name and declared frontmatter | reporters/interaction.ts:221-420 | DONE | rust/claude-agent-acp-rs/src/tools.rs:385-447 | scoped, plugin and marketplace containers, declared-name check, separator guard and .claude/commands exclusion match; mtime cache (performance only) not ported |
+| T-58 | ExitPlanMode tool_call: title "Approve Plan", kind switch_mode, plan as display | reporters/interaction.ts:37-48 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:716-722 | title is "Ready to code?" [pkg:PC-3] |
+| T-59 | ExitPlanMode result: title "Exited Plan Mode", unfenced rawOutput, plan file released | reporters/interaction.ts:51-58; exit-plan.ts:163-169; renderer.ts:503-516 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:841 (returns None) |  [pkg:PC-3] |
+| T-60 | ExitPlanMode AIR: planFile path in place of plan text; error text as plan rejection | reporters/interaction.ts:37-72 | MISSING | none (agent.rs:107 advertises planFile only) |  [pkg:F9] |
+| T-61 | AskUserQuestion: single-question title (non-AIR), fixed title for AIR; questions as display | reporters/interaction.ts:94-116 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:730-751 | non-AIR title and content match; no AIR-specific fixed title [pkg:F6a] |
+| T-62 | TodoWrite title "Update TODOs: <contents>" | reporters/interaction.ts:139-146 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:658-672 | empty array gives "Update TODOs" (upstream "Update TODOs: ") [pkg:F6a] |
+| T-63 | TaskCreate, TaskUpdate, TaskList, TaskGet titles, kind think | reporters/interaction.ts:148-159 | DONE | rust/claude-agent-acp-rs/src/tools.rs:700-715 |  |
+| T-64 | ReportFindings title and finding lines | reporters/interaction.ts:165-185 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:673-699 | line 0 printed as "file:0"; entries without file dropped [pkg:F6a] |
+| T-65 | Generic, MCP and unknown tool: title is tool name, kind other | reporters/interaction.ts:188-207; reporters/index.ts:50-52 | DONE | rust/claude-agent-acp-rs/src/tools.rs:757; rust/claude-agent-acp-rs/src/map.rs:709-713 |  |
+| T-66 | "Other" tool input as fenced pretty JSON | reporters/interaction.ts:191-206 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:753 | closing fence follows a newline; upstream writes none before the closing fence (reporters/interaction.ts:204) [pkg:F6a] |
+| T-67 | SendMessage, TaskStop, ListAgents, Monitor: title is name; AIR error text unfenced | reporters/interaction.ts:209-219 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:757 | title matches; AIR error rendering absent [pkg:F6a] |
+| T-68 | generic tool result: string or text blocks; error text fenced | content.ts:107-141; tools.ts (toolUpdateFromToolResult) | DONE | rust/claude-agent-acp-rs/src/tools.rs:848-866, 774-780 | generic result fenced for error text; failed-result handling for the specific tools is T-107 |
+| T-69 | generic tool result: object content and document, web, code-execution, tool-reference blocks rendered as text | content.ts:143-236 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:848-866 | non-text, non-image blocks and bare objects dropped [pkg:F6a] |
+| T-70 | image URL block text "[image: <url>]" | content.ts:164-168 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:886-887 | prints literal "[image: url]" without the URL [pkg:F6a] |
+| T-71 | base64 image result block as ACP image content | content.ts:155-162 | DONE | rust/claude-agent-acp-rs/src/tools.rs:869-884 |  |
+| T-73 | toDisplayPath: path relative to cwd for titles and locations | content.ts:66-74 | MISSING | rust/claude-agent-acp-rs/src/tools.rs:451-453 (stub returns path unchanged) | LIVE-FINDINGS D3 [pkg:LD-2] |
+| T-74 | markdownEscape fence around Read text | content.ts:238-246; reporters/read.ts:65,73,80 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:784-797, 816 | indented backtick runs are counted (tools.rs:787-796; upstream counts line-start runs only, content.ts:238-246); text blocks are joined into one fenced item (tools.rs:894-906) where upstream escapes each block (reporters/read.ts:68-77); see T-37, T-38 [pkg:F6a] |
+| T-76 | parentToolUseId on tool_call and tool_call_update of subagent calls | renderer.ts:57-60; acp-agent.ts:12946-13190 (stampParentToolUseId calls) | PARTIAL | rust/claude-agent-acp-rs/src/hooks.rs:246-248; rust/claude-agent-acp-rs/src/permission.rs:328, 376 | PostToolUse and permission paths stamp it; map.rs tool_call and result updates do not [pkg:F6b] |
+| T-77 | Task hook TaskCreated and TaskCompleted populate task state and publish plan | tools.ts:452-485 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2005-2040 | empty task_id or task_subject is accepted and publishes a plan; upstream rejects them (tools.ts:467, 470) [pkg:PC-1] |
+| T-78 | tool_call shape: name, status pending, title, kind, content, locations, rawInput | renderer.ts:237-264; map.rs:737-747 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:737-747 | fields are set in code; LIVE-FINDINGS D2 says status, content and locations are omitted on the wire [pkg:LD-3] |
+| T-79 | tool result reports: output then status, rawOutput placed once (AIR rule), terminal variant | renderer.ts:441-518 | PARTIAL | rust/claude-agent-acp-rs/src/map.rs:752-819 | AIR rawOutput rule and non-AIR raw output present; command output and terminal split absent [pkg:F15] |
+| T-80 | AIR viewed-file read or search drops text content | renderer.ts:448-458, 520-534 | DONE | rust/claude-agent-acp-rs/src/map.rs:782-801; rust/claude-agent-acp-rs/src/tools.rs:193-215 |  |
+| T-81 | permission denied report: "Permission denied: <reason>", failed, toolResponse decision fields | renderer.ts:612-644 | MISSING | none |  [pkg:F7a] |
+| T-82 | memory recall report: "Recalled N memories" or synthesized memory, kind read | renderer.ts:578-605 | MISSING | none |  [pkg:F7a] |
+| T-83 | compaction tool call: in_progress start, completed or failed with facts, error text, AIR contextCompaction meta | reporters/compaction.ts:25-85 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2355-2395 | one completed tool_call with rawOutput; no start, no error text, no AIR meta [pkg:F20] |
+| T-84 | unfinished command: terminal_exit closes display terminal | renderer.ts:681-690 | MISSING | none |  [pkg:F17] |
+| T-85 | AIR rawInput without file text keys and plan text (fileTextKeys, planFilePath) | renderer.ts:729-743 | MISSING | none |  [pkg:F9] |
+| T-86 | non-AIR display copy of input in content, not next to a terminal | renderer.ts:750-757 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:467-474 | display copy only from description; no rawInputRendering gate (renderer.ts:755); see T-29 [pkg:F6a] |
+| T-87 | Accepted-plan tool result completion (status completed, drop rawOutput and content) and plan fence stripping for ExitPlanMode | src/exit-plan.ts:12-28, 161-169 | MISSING | none (tools.rs:716-723 shows only the start shape) |  [pkg:F21] |
+| T-88 | approvedPlan extraction: plan from output or input, skip subagent and leader-approval, trim, empty is undefined | src/exit-plan.ts:129-150 | MISSING | none |  [pkg:F21] |
+| T-89 | subagent file-tool edits (Edit, Write, MultiEdit, NotebookEdit) recorded for the report | src/file-change-audit.ts:101-133; src/acp-agent.ts:8016-8024 | MISSING | none |  [pkg:AG-3] |
+| T-90 | AIR tool-call keys commandTitle, subagent, skill, mcp; is_mcp_tool_call | docs/air-extensions.md:171-199 | DONE | rust/claude-agent-acp-rs/src/tools.rs:137-175, rust/claude-agent-acp-rs/src/map.rs:735 |  |
+| T-92 | failedControlFallback: failed AIR control call with no child becomes one ordinary failed tool call | src/native-subagents.ts:249-261,1446-1499 | MISSING | none |  [pkg:F35c] |
+| T-93 | Control-call identity merge from rawInput (name, subagent_type, description, prompt) | src/native-subagents.ts:218-224,1540-1591 | MISSING | none |  [pkg:F35c] |
+| T-94 | Control-tool detection (`isNativeSubagentControlTool`, `isNativeSubagentControlUpdate`: Agent/Task/SendMessage) | src/native-subagents.ts:1405-1429; src/subagent-history.ts:175-186 | MISSING | none |  [pkg:F35a] |
+| T-95 | toolResults: output path recovered from tool-result text (`tasks/<id>.output`, cap 500) | src/async-tasks.ts:451-474,917-958 | MISSING | rust/claude-agent-acp-rs/src/async_tasks.rs:476 (merge_tool_result_path is a no-op) |  [pkg:F15] |
+| T-96 | backgroundBashTaskFromToolResult / backgroundedBashToolCallIds: recover a background Bash task from structured result | src/async-tasks.ts:780-870 | MISSING | none |  [pkg:F15] |
+| T-97 | isBackgroundedToolCall: whether a tool call's task went to the background | src/async-tasks.ts:441-449 | MISSING | none |  [pkg:F15] |
+| T-98 | Default friendly task type and default description (`friendlyTaskType`, `defaultDescription`) | src/async-tasks.ts:971-981 | DONE | rust/claude-agent-acp-rs/src/async_tasks.rs:683-721 |  |
+| T-99 | Legacy "Compact conversation" tool call: in_progress opened on `compacting` status, terminal on boundary | src/context-compaction.ts:238-255,315-374; src/tool-calls/reporters/compaction.ts:18-40; src/acp-agent.ts:6022-6053 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:2347-2390 (one completed tool_call at compact_boundary; no in_progress opening, no compacting status handling) |  [pkg:F20] |
+| T-100 | compact_result failed path: failed status with "Compaction failed:" content and duplicate stdout suppression | src/context-compaction.ts:227-236,332-334; src/tool-calls/reporters/compaction.ts:58-60; src/acp-agent.ts:6024-6026 | MISSING | none (no compact_result handling in rust/claude-agent-acp-rs/src) |  [pkg:F20] |
+| T-101 | v2 tool-call form: one tool_call_update upserts; null fields dropped; content replaced whole; v1 diff rejected; v2 diff passed | src/v2/tool-call.ts:14-68 | MISSING | none for v2 form (v1 tool_call_update payload only, rust/claude-agent-acp-rs/src/hooks.rs:250) |  [pkg:F40] |
+| T-102 | Display terminals: terminal_info / terminal_output / terminal_output_delta / terminal_exit become terminal_update and terminal_output_chunk (base64), forgotten on close | src/v2/terminal.ts:21-130; src/v2/agent.ts:116 | MISSING | rust/claude-agent-acp-rs/src/meta_filter.rs:23 (terminal_info only in v1 unchanged-key compare) |  [pkg:F40] |
+| T-103 | v2 tool-call _meta patch semantics: per-key patch, null removes, claudeCode merged per key, toolName becomes name once, permission subject carries full meta | src/v2/tool-call-meta.ts:31-126 | MISSING | rust/claude-agent-acp-rs/src/meta_filter.rs:1-30 (v1 unchanged-key filter, different semantics) |  [pkg:F40] |
+| T-104 | v2 display terminal of background commands: keeps running after the Bash call, ends when the task ends | src/tests/acp-v2.test.ts:4681-4830 | MISSING | none |  [pkg:F15] |
+| T-105 | v2 PreToolUse Edit or Write exact-patch preview hook | acp-agent.ts:9950-10000, 11284-11291 | MISSING | none |  [pkg:F40] |
+| T-106 | diff memo: approval patch reused by PostToolUse, re-diff on change or budget, small cache | diff.ts; tests/diff-memo.test.ts | MISSING | none |  [pkg:F8] |
+| T-107 | failed tool result: upstream shows error text (reporter errorResult or fenced error content) before the per-tool result handler (Edit, Write, Skill, non-AIR ExitPlanMode) | tool-calls/renderer.ts:359-368; tool-calls/content.ts:107-137; reporters/interaction.ts:60-66 | PARTIAL | rust/claude-agent-acp-rs/src/tools.rs:840-841 (returns None); map.rs:781 (rawOutput only, unfenced) | error text reaches the client only as raw output; see T-56, T-68 [pkg:F6a] |
+
+### 7P. Permissions and presentation
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| P-01 | permission_denied: fail the tool call with reason, agent-scoped lineage | src/acp-agent.ts:6299-6353 | MISSING | none |  [pkg:F7a] |
+| P-02 | ExitPlanMode interruption correlated on result (cancelled settle, context-reset restart) | src/acp-agent.ts:7177-7238 | MISSING | request side only: permission.rs:542-546; no pendingExitPlanModeInterruption on result path (grep 0 in session.rs/turn.rs) |  [pkg:F21] |
+| P-03 | cancel: withdraw open permission/question requests (openUserInputs.cancelled) | src/acp-agent.ts:8446-8449 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:987-994 | cancel aborts pending permissions; upstream also sets cancelled on every open user input (acp-agent.ts:8446-8449), which Rust has no list for [pkg:F3b] |
+| P-04 | background subagent permission request routed to child session | tests/live-capability-session-audit.test.ts:192-248 | MISSING | none | depends on the native subagent runtime (B-93) [pkg:F35c] |
+| P-05 | Auto availability per model (supportsAutoMode !== true) at select time | src/session-mode.ts:324-330 | DONE | rust/claude-agent-acp-rs/src/session.rs:1346-1350 | (dedupe) |
+| P-06 | Auto fallback warning shown once per session, deferred to first prompt for initial clamp | src/session-mode.ts:113-152, 287-290 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1395-1400 (once flag only) | no deferred initial-clamp warning: upstream publishes it at the first prompt (session-mode.ts:137; acp-agent.ts:3863-3864); Rust clamps at initialize with no pending flag (session.rs:506-523) [pkg:F11] |
+| P-07 | initial mode: Auto unsupported on model clamps to acceptEdits | src/session-mode.ts:127-138 | DONE | rust/claude-agent-acp-rs/src/session.rs:505-516 |  |
+| P-08 | initial mode: unavailable mode falls back to default | src/session-mode.ts:139-146 | DONE | rust/claude-agent-acp-rs/src/session.rs:517-519 |  |
+| P-09 | model switch reconciles Auto to acceptEdits (set_permission_mode, current_mode_update, warning) | src/session-mode.ts:225-244; src/acp-agent.ts:10509-10540 | DONE | rust/claude-agent-acp-rs/src/session.rs:1675-1690, 1748-1765 |  |
+| P-10 | prePlanMode tracking on plan entry/exit | src/session-mode.ts:171-184 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1380-1395; rust/claude-agent-acp-rs/src/session.rs:1590-1600 | prePlanMode not set on the EnterPlanMode path (session.rs:1933-1955) and not cleared by ExitPlanModeApplied (session.rs:1436-1450); upstream syncConfig sets it on every mode change (session-mode.ts:171-184) [pkg:F21] |
+| P-11 | escalating defaultMode trust filter (project untrusted for bypass/auto/acceptEdits; local also for bypass/auto) | src/settings.ts:110; src/tests/settings.test.ts:202-230 | DONE | rust/claude-agent-acp-rs/src/settings.rs:65-137 |  |
+| P-12 | allowBypass from disableBypassPermissionsMode and allowDangerouslySkipPermissions | src/acp-agent.ts:11088-11092 | DONE | rust/claude-agent-acp-rs/src/settings.rs:177-180; rust/claude-agent-acp-rs/src/agent.rs:390-393 |  |
+| P-13 | initial permission mode: explicit > resumed transcript > settings defaultMode > default (bypass clamp, unavailable resumed mode skipped) | src/session-mode.ts:85-107; src/tests/session-mode.test.ts:248-290 | DONE | rust/claude-agent-acp-rs/src/permission_mode.rs:66-88; rust/claude-agent-acp-rs/src/agent.rs:390-406 | explicit is always None in Rust (agent.rs:368-371, matches Node ignoring _meta.permissionMode) (dedupe) |
+| P-14 | resolvePermissionMode aliases (manual, acceptedits, dontask, bypass), trim, case-insensitive | src/tests/resolve-permission-mode.test.ts:18-48 | DONE | rust/claude-agent-acp-rs/src/permission_mode.rs:29-56 | alias table, trim, lowercase and bypass clamp match permissions/modes.ts:11-59; log lines are O-64 |
+| P-16 | permission tool_call shape: whole call (non-AIR) or minimal (AIR) with preview and extra locations | renderer.ts:307-348 | PARTIAL | rust/claude-agent-acp-rs/src/permission.rs:287-380 | AIR minimal permission toolCall not implemented: upstream branches on the AIR client (renderer.ts:320, 338-346); Rust always emits the full shape (permission.rs:289-333) [pkg:F10] |
+| P-17 | per-tool option builder dispatch (Bash, PowerShell, Read, Glob, Grep, Edit, Write, NotebookEdit, WebFetch, Skill, EnterPlanMode, ExitPlanMode, SandboxNetworkAccess, fallback) | src/permissions/options.ts:35-68 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:251-272 |  |
+| P-18 | option sort: allow_once, allow_always, other, reject (applied on every call) | src/permissions/options.ts:25-33, 73-100 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:243-248 | Rust sorts only when default_to_no is set; ExitPlanMode order differs (upstream puts exit-plan-default first; Rust test at permission_options.rs:1418 asserts auto first) [pkg:FX-2] |
+| P-19 | defaultToNo decline-first ordering | src/permissions/options.ts:29, 80-98 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:245-247, 529-541 |  |
+| P-20 | Bash/PowerShell durable label: path-form and mixed forms (allow reading from, always allow access to, similar) | src/permissions/options/shell.ts:18-100 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:814-817 | Rust returns None for any path or directory suggestion, so the allow-with-updates option is dropped; the Node label is not reproduced (PARITY C) [pkg:FX-2] |
+| P-21 | Bash/PowerShell commands-only durable label "don't ask again for X commands" and Yes/No options | src/permissions/options/shell.ts:48-116 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:772-850, 279-283 |  |
+| P-22 | Read/Edit/Write/NotebookEdit session labels (during this session, all edits, own-settings label, directory label) | src/permissions/options/filesystem.ts:101-165 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:564-750 | session label rows match; the path-suffix stripping gap is P-24 [pkg:FX-2] |
+| P-23 | Glob/Grep default path to session cwd when input.path missing | src/permissions/options/filesystem.ts:166-171 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:260-261, 693 | Rust passes None for a missing path, so a cwd or parent session rule is not recognised as covering it [pkg:FX-2] |
+| P-24 | permission path suffix normalisation (strip trailing /** or \** only) | src/permissions/options/filesystem.ts:71-75 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:222-225 | Rust uses replace() which strips every occurrence, not only the suffix [pkg:FX-2] |
+| P-25 | WebFetch "don't ask again for <hostname>" option | src/permissions/options/tools.ts:14-29 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:285-294, 501-527 | Hostname is parsed by hand (no WHATWG URL, no IDN or punycode normalisation) [pkg:FX-2] |
+| P-26 | WebFetch allow-with-updates effect (domain:host localSettings rule) | src/permissions/effects.ts:79-89, 197-200 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:944-956, 875-877 |  |
+| P-27 | Skill options: allow-skill-exact and allow-skill-prefix (only when persistent allowed) | src/permissions/options/tools.ts:31-52 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:296-320 |  |
+| P-28 | Skill selection effect: input.skill validated only for exact/prefix branches | src/permissions/effects.ts:91-108 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:888-892 | Rust validates skill eagerly, so allow-once with an empty or missing skill errors and denies; Node allows [pkg:F10] |
+| P-29 | EnterPlanMode options ("Yes, enter plan mode" / "No, start implementing now") and allow-once effect | src/permissions/options/tools.ts:54-56; src/permissions/effects.ts:201-202 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:322-327, 958-986 |  |
+| P-30 | ExitPlanMode option set (clear-context, auto, bypass, accept-edits fallback, default, keep planning) | src/permissions/options/tools.ts:58-125 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:407-466 | ExitPlanMode option set matches; order differs: upstream sorts on every call (permissions/options.ts:29-32), Rust sorts only with defaultToNo; see P-18 [pkg:FX-2] |
+| P-31 | ExitPlanMode setMode effect: default temporary, auto and bypass permanent | src/permissions/effects.ts:110-123, 138-159 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:1027-1037; rust/claude-agent-acp-rs/src/permission.rs:541-550, 456-479 |  |
+| P-32 | ExitPlanMode keep-planning deny with interrupt true | src/permissions/effects.ts:152-157 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:1040-1046; rust/claude-agent-acp-rs/src/permission.rs:481-493, 541-546 | keep-planning deny message is lost: upstream sends "User chose to keep planning" with interrupt (permissions/effects.ts:152-157); Rust hardcodes "User refused permission to run tool"; the clear-context deny message is lost the same way [pkg:F10] |
+| P-33 | Auto permission effect falls back to acceptEdits when the model lacks Auto (applyPermissionFallback on every permission result) | src/acp-agent.ts:10219-10221 | MISSING | rust/claude-agent-acp-rs/src/session.rs:1436-1450 (ExitPlanModeApplied sets mode without fallback); session.rs:1346 applies fallback only to set_mode | Node applies it to any permission result, including ExitPlanMode auto [pkg:F10] |
+| P-34 | ExitPlanMode clear-context options with "(N% used)" label and allow_always kind | src/permissions/options/tools.ts:58-89; src/permissions/effects.ts:125-136 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:422-441, 1014-1025 | Options are offered and selection denies with interrupt, but no fresh-context hand-off follows (see B-74) [pkg:F21] |
+| P-35 | Option-offered guard: selected id not in offered set is rejected | src/permissions/response.ts:18-24 | PARTIAL | rust/claude-agent-acp-rs/src/permission.rs:516-518 | Node throws "Permission option was not offered"; Rust denies with the R28 payload [pkg:F10] |
+| P-36 | Non-selected outcome: Node throws "Tool use aborted"; unknown option id throws | src/permissions/effects.ts:27; src/permissions/effects.ts:173-174 | PARTIAL | rust/claude-agent-acp-rs/src/permission.rs:502-511; rust/claude-agent-acp-rs/src/permission_options.rs:960-986 | Rust maps cancelled and unknown ids to a deny instead of an error [pkg:F10] |
+| P-37 | Allow and deny control_response shapes (updatedInput, toolUseID, decisionClassification user_temporary, user_permanent, user_reject, R28 deny message) | src/permissions/effects.ts:34-60 | DONE | rust/claude-agent-acp-rs/src/permission.rs:395-479 |  |
+| P-38 | allow-once, allow-with-updates (verbatim suggestions, permanent), reject selection effects | src/permissions/effects.ts:161-176, 178-187 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:958-986, 1059-1066 |  |
+| P-39 | Normalization: known update shapes, destinations, limits, UTF-16 length, control-char rejection, snapshot clone | src/permissions/normalization.ts:19-129 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:101-113, 115-128, 132-180 | Fail-closed accessor and proxy tests do not apply to serde Value |
+| P-40 | Forced ask (noPersistentRule) drops every durable option | src/permissions/normalization.ts:103-107; src/acp-agent.ts:10127-10128 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:101-106; rust/claude-agent-acp-rs/src/session.rs:2695-2699 |  |
+| P-41 | matchedAskRule presence test (!== undefined) | src/acp-agent.ts:10127 | PARTIAL | rust/claude-agent-acp-rs/src/permission.rs:620-621 | Rust treats a JSON null as absent, Node treats it as present [pkg:F10] |
+| P-42 | defaultToNo read from wire field default_to_no | src/acp-agent.ts:10048; node SDK maps request.default_to_no | DONE | rust/claude-agent-acp-rs/src/permission.rs:626 | Wire name confirmed in the pinned SDK |
+| P-43 | allowPersistentOptions gating for generated options (WebFetch, Skill, generic fallback) | src/permissions/options/tools.ts:14-52, 138-159 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:285-300, 469-499 |  |
+| P-44 | MCP "don't ask again" option gated by isMcpAllowChangeSet | src/permissions/options/shared.ts:72-93; src/permissions/options/tools.ts:138-159 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:469-487, 544-562 |  |
+| P-45 | Computer-use MCP options (prefix check before tool switch, label without commands suffix) | src/permissions/options/tools.ts:161-186 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:330-359 |  |
+| P-46 | SandboxNetworkAccess options (durable only for exact localSettings host rule) | src/permissions/options/tools.ts:127-136; shared.ts exactLocalAllowRule | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:362-404 |  |
+| P-47 | Generic fallback options: displayName label, generated rule, "commands" suffix | src/permissions/options/tools.ts:138-159 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:469-499 |  |
+| P-48 | Generic tool allow-with-updates effect (localSettings rule for toolName) | src/permissions/effects.ts:190-222 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:880-884, 1059-1066 |  |
+| P-49 | MCP tool and Read/Glob/Grep/Edit/Bash/NotebookEdit effects use common selection | src/permissions/effects.ts:190-222 | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:866-871 |  |
+| P-50 | AIR permission _meta record (version 1, title, description, defaultToNo) on the permission request | src/permissions/presentation.ts:70-136 (121-134); src/acp-agent.ts:10139-10151 | MISSING | rust/claude-agent-acp-rs/src/session.rs:2707-2710 (params carry only options, sessionId, toolCall) | No AIR permission key in Rust [pkg:F10] |
+| P-51 | v2 client: request title and description fields | src/permissions/presentation.ts:135 | MISSING | rust/claude-agent-acp-rs/src/session.rs:2707-2710 |  [pkg:F40] |
+| P-52 | decisionReason shown as "Reason:" description (4000 char cap) | src/permissions/presentation.ts:93-94; src/acp-agent.ts:10139-10151 | MISSING | rust/claude-agent-acp-rs/src/permission.rs:591-630 (decision_reason not read) |  [pkg:F10] |
+| P-53 | blockedPath added as an extra location on the permission toolCall | src/permissions/presentation.ts:95-99, 101-106 | MISSING | rust/claude-agent-acp-rs/src/permission.rs:591-630 (blocked_path not read) |  [pkg:F10] |
+| P-54 | Preview patch (previewContent) on the permission toolCall for diffPatch or v2 clients | src/permissions/presentation.ts:26, 101-102; src/acp-agent.ts:10116-10122 | MISSING | rust/claude-agent-acp-rs/src/permission.rs:289-341 |  [pkg:F9] |
+| P-55 | JSON input shown as fallback content for SandboxNetworkAccess and computer-use with no content | src/permissions/presentation.ts:108-119 | MISSING | none |  [pkg:F10] |
+| P-56 | Presentation title: SandboxNetworkAccess host and computer-use displayName as subject; "Use tool?" fallback; Bash and PowerShell kept uncompacted | src/permissions/presentation.ts:77-92 | MISSING | rust/claude-agent-acp-rs/src/permission.rs:289-341 (uses the tool-call shape title only) |  [pkg:F10] |
+| P-57 | Permission toolCall _meta: claudeCode mcpServer {name, source}, toolName for non-AIR, parentToolUseId for non-AIR | src/acp-agent.ts:10160-10168 | PARTIAL | rust/claude-agent-acp-rs/src/permission.rs:289-341 | parentToolUseId emitted; mcpServer missing; toolName emitted for AIR too [pkg:F10] |
+| P-58 | Permission builder refuses AskUserQuestion (throws, routed to elicitation) | src/permissions/options.ts:41-43 | PARTIAL | rust/claude-agent-acp-rs/src/permission_options.rs:251-272 | No AskUserQuestion arm; falls to the generic fallback. Tool is disallowed upstream so likely unreachable [pkg:F23a] |
+| P-59 | AIR permission key _meta.jetbrains.air.permission on session/request_permission | src/air-extension.ts:62, docs/air-extensions.md:171-199 | MISSING | none | no emitter in crate [pkg:F10] |
+| P-60 | Child open requests: requires_action while a permission/question is open; withdrawn requests; cancel counts | src/native-subagents.ts:38-39,1284-1299; src/tests/native-subagents.test.ts:1482-1602 | MISSING | rust/claude-agent-acp-rs/src/session.rs:2650-2654 (attribution only, no state) |  [pkg:F36] |
+| P-61 | v2 permission request: title required, description, subject {type tool_call, toolCall patch}, options | src/v2/permission.ts:18-30 | MISSING | rust/claude-agent-acp-rs/src/permission.rs (v1 request shape only) |  [pkg:F40] |
+| P-62 | v2 permission answer to v1: any outcome other than selected becomes cancelled | src/v2/permission.ts:39-50 | MISSING | none |  [pkg:F40] |
+| P-63 | permission request emits the tool_call first if it has not streamed yet (ensureToolCallEmitted) | acp-agent.ts:9799-9811 | DONE | rust/claude-agent-acp-rs/src/permission.rs:337-343; rust/claude-agent-acp-rs/src/map.rs:200 |  |
+
+## 8. Recovery, supervision, teardown
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| V-01 | Shutdown on SIGINT and SIGTERM: dispose, then exit 0 | src/index.ts:91-104 | PARTIAL | rust/claude-agent-acp-rs/src/process.rs:822-835 | upstream serve path handles SIGTERM and SIGINT (index.ts:98-104); Rust handles SIGTERM only, SIGINT not handled. SIGHUP is relayed only in --cli (index.ts:18-26) [pkg:F2b] |
+| V-02 | Process exits when the ACP connection closes (stdin EOF) | src/index.ts:98-101, 107 | DONE | rust/claude-agent-acp-rs/src/bin/claude-agent-acp-rs.rs:28-33 | serve future returns on stdio close |
+| V-03 | Stream death: fail_all settles held turn with deferred outcome, cancelled active, rejects queued with session-ended | src/acp-agent.ts:5602-5650, 6300-6330 (EOF branch) | PARTIAL | rust/claude-agent-acp-rs/src/turn.rs:1102-1124 | fail_all has no branch for cancelled-active-turn -> cancelled outcome (acp-agent.ts:5625-5626); only on_stream_end has it [pkg:F18] |
+| V-04 | Synthetic login assistant frame -> auth_required failure (live) | src/acp-agent.ts:7968-7975 | MISSING | transcript.rs:61, 511 history only; no live-path equivalent |  [pkg:F7b] |
+| V-05 | Assistant error snapshot (lastAssistantError, failure title, usage-limit synthetic) for failure data | src/acp-agent.ts:7857-7872 | PARTIAL | session.rs:2533-2535 records assistant_had_error only; agent.rs:489 errorKind | error text/title snapshot not ported [pkg:F25] |
+| V-06 | worker_shutting_down defers signal until transport end | src/acp-agent.ts:6576-6585 | MISSING | grep 0 hits in crate |  [pkg:F25] |
+| V-07 | force-cancel floor: interrupt awaited with bounded wait on close | src/acp-agent.ts:8730-8736, 8858 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:1103-1110 | Close waits 500ms on interrupt then ends; Node's awaitInterrupt:false path differs [pkg:F18] |
+| V-08 | teardown: wait for cancelled turns to end, else settle them (timeout) | src/acp-agent.ts:8847-8914 | PARTIAL | rust/claude-agent-acp-rs/src/session.rs:703-710 (5s client wait), session.rs:1069-1110, turn.rs:1056 | settles via on_stream_end; no per-turn end wait or timeout settle [pkg:F18] |
+| V-09 | teardown: session removed from registry at once | src/acp-agent.ts:8885-8886 | DONE | rust/claude-agent-acp-rs/src/agent.rs:1074 (registry remove first) |  |
+| V-10 | husk after stream end: session kept, prompt/config answer "session ended" | src/acp-agent.ts:8805-8838, 8951-8953 | MISSING | none (session removed from registry; later requests get not-found) | (dedupe) [pkg:F18] |
+| V-11 | agent dispose: tear down every session on connection close | src/acp-agent.ts:8917-8920 | PARTIAL | rust/claude-agent-acp-rs/src/control.rs:375 (teardown when control handles drop) | no dispose-all: upstream dispose() tears down every session (acp-agent.ts:8917-8920); Rust relies on the drop cascade and kill_on_drop kills only the direct child (process.rs:593) [pkg:F18] |
+| V-12 | live CLI registry reader (<config>/sessions/<pid>.json, pid liveness, procStart match, 24 h stale rule) | src/session-index/live-registry.ts:1-35, 62-279 | MISSING | none |  [pkg:F26b] |
+| V-13 | AIR failure policy: 13 kinds with category, actions and fallback titles | src/session-failure-extension.ts:19-166 | MISSING | none |  [pkg:AG-2] |
+| V-14 | advisory notices: stable id per notice title, epoch, lastNotice tracking | src/session-failure-extension.ts:81-86, 338-383 | MISSING | none |  [pkg:F25] |
+| V-15 | failure restore and clear on recovery, revision counting, active-state bookkeeping | src/session-failure-extension.ts:324-446 | MISSING | none |  [pkg:F25] |
+| V-16 | Mid-session sign-out respawn and probe-kind mismatch flag consumed at next turn | src/acp-agent.ts:3485-3501, src/hide-claude-auth.ts:17-24 | MISSING | none |  [pkg:F34] |
+| V-17 | finishAll: close still-running children at teardown with a state | src/native-subagents.ts:544-576 | MISSING | none |  [pkg:F35a] |
+| V-18 | finishAll at shutdown: finish each live task, aggregate errors, allow retry of a failed terminal publish | src/async-tasks.ts:380-393; src/tests/async-tasks.test.ts:1039-1081 | PARTIAL | rust/claude-agent-acp-rs/src/async_tasks.rs:346-362 (finish only; no error channel, no retry) |  [pkg:F18] |
+| V-19 | clear(): drop all task records and output-path caches | src/async-tasks.ts:488-491 | MISSING | none |  [pkg:F14] |
+| V-20 | serve() `dispose()` / shutdown handle for the owner of the process | src/serve.ts:29-34 | PARTIAL | rust/claude-agent-acp-rs/src/bin/claude-agent-acp-rs.rs:24-31; rust/claude-agent-acp-rs/src/process.rs:483 (child dispose only) | no library-level dispose; stop is stdin EOF or SIGTERM only [pkg:F2b] |
+
+## 9. Upstream modules (MODULE-MAP view)
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| Q-01 | module acp-agent.ts | acp-agent.ts | PARTIAL | agent.rs,session.rs,session_methods.rs,turn.rs,dispatch.rs,permission.rs,map.rs,session_config.rs,resumed_session.rs | roll-up row for the module; closed by the INFRA-3 final flip; per-behaviour owners are in sections 1-8 [pkg:INFRA-3] |
+| Q-02 | module acp-subagents.ts | acp-subagents.ts | MISSING | none | [not ported:AIR and RFD subagent event builders absent] [pkg:F35b] |
+| Q-03 | module air-extension.ts | air-extension.ts | PARTIAL | air.rs | [merged:air.rs] [pkg:F26b] |
+| Q-04 | module async-tasks.ts | async-tasks.ts | PARTIAL | async_tasks.rs | [merged:async_tasks.rs] [pkg:F14] |
+| Q-05 | module auth-status.ts | auth-status.ts | PARTIAL | auth_status.rs | [merged:auth_status.rs] [pkg:F34] |
+| Q-06 | module clear-context-coordinator.ts | clear-context-coordinator.ts | MISSING | none | [not ported:fresh-query clear-context hand-off absent] [pkg:F22] |
+| Q-07 | module client-system-prompt.ts | client-system-prompt.ts | DONE | system_prompt.rs | [1:1] |
+| Q-08 | module context-compaction-meta.ts | context-compaction-meta.ts | MISSING | none | [not ported:compaction meta lifecycle absent] [pkg:F20] |
+| Q-09 | module context-compaction.ts | context-compaction.ts | PARTIAL | none | module context-compaction.ts: compaction behaviour rows N-73, T-99, U-102 are PARTIAL [pkg:F20] |
+| Q-10 | module diff.ts | diff.ts | PARTIAL | rust/claude-agent-acp-rs/src/hooks.rs:145-225 (T-43) | module diff.ts: diff engine not ported; partial code in hooks.rs (T-43) [pkg:F8] |
+| Q-11 | module elicitation.ts | elicitation.ts | MISSING | none | [not ported:ACP elicitation mapping absent] [pkg:F23a] |
+| Q-12 | module exit-plan.ts | exit-plan.ts | PARTIAL | none | module exit-plan.ts: ExitPlanMode hand-off rows are PARTIAL (U-28, P-10) [pkg:F21] |
+| Q-13 | module file-change-audit.ts | file-change-audit.ts | PARTIAL | none | module file-change-audit.ts: file-change report advertised (C-29), not served [pkg:AG-3] |
+| Q-14 | module fork-session.ts | fork-session.ts | PARTIAL | session_methods.rs | [merged:session_methods.rs] [pkg:F29] |
+| Q-15 | module gateway-models.ts | gateway-models.ts | MISSING | none | [not ported:gateway and Bedrock model listing absent] [pkg:F33] |
+| Q-16 | module goal-extension.ts | goal-extension.ts | MISSING | none | [not ported:_session/goal absent] [pkg:AG-1] |
+| Q-17 | module hide-claude-auth.ts | hide-claude-auth.ts | PARTIAL | none | module hide-claude-auth.ts: account identity and hide-claude-auth rows are PARTIAL (A-28) [pkg:F34] |
+| Q-18 | module index.ts | index.ts | PARTIAL | bin/claude-agent-acp-rs.rs | [1:1] [pkg:F2b] |
+| Q-19 | module lib.ts | lib.ts | PARTIAL | lib.rs | module lib.ts: public exports partial (see O-83) [pkg:FX-4] |
+| Q-20 | module managed-policy.ts | managed-policy.ts | MISSING | none | [not ported:managed env tier and MDM/registry tiers absent] [pkg:F5a] |
+| Q-21 | module mcp-command.ts | mcp-command.ts | PARTIAL | none | module mcp-command.ts: /mcp prompt has no handler (S-14, S-15..S-20) [pkg:AG-4] |
+| Q-22 | module native-subagents.ts | native-subagents.ts | MISSING | none | [not ported:native subagent child session registry absent] [pkg:F35a] |
+| Q-23 | module paths.ts | paths.ts | DONE | session_store.rs | [different:path helpers replaced by session storage] |
+| Q-24 | module permissions/effects.ts | permissions/effects.ts | PARTIAL | permission.rs | [merged:permission.rs] [pkg:F10] |
+| Q-25 | module permissions/modes.ts | permissions/modes.ts | PARTIAL | permission_mode.rs | module permissions/modes.ts: invalid-mode logging missing (see O-64) [pkg:F2b] |
+| Q-26 | module permissions/normalization.ts | permissions/normalization.ts | DONE | permission.rs | [merged:permission.rs] |
+| Q-27 | module permissions/options.ts | permissions/options.ts | PARTIAL | permission_options.rs | [merged:permission_options.rs] [pkg:FX-2] |
+| Q-28 | module permissions/options/filesystem.ts | permissions/options/filesystem.ts | PARTIAL | permission_options.rs | module permissions/options/filesystem.ts: option builder gaps (see FX-2) [pkg:FX-2] |
+| Q-29 | module permissions/options/shared.ts | permissions/options/shared.ts | DONE | rust/claude-agent-acp-rs/src/permission_options.rs:27-38, 182-221, 374-406, 529-563 | shared.ts helpers match; Yes/No labels are hardcoded and equal every upstream caller's argument |
+| Q-30 | module permissions/options/shell.ts | permissions/options/shell.ts | PARTIAL | permission_options.rs | [merged:permission_options.rs] [pkg:FX-2] |
+| Q-31 | module permissions/options/tools.ts | permissions/options/tools.ts | PARTIAL | permission_options.rs | module permissions/options/tools.ts: option builder gaps (see FX-2) [pkg:FX-2] |
+| Q-32 | module permissions/presentation.ts | permissions/presentation.ts | MISSING | none | [not ported:AIR permission presentation absent] [pkg:F10] |
+| Q-33 | module permissions/response.ts | permissions/response.ts | PARTIAL | permission.rs | [merged:permission.rs] [pkg:F10] |
+| Q-34 | module prompt-suggestions.ts | prompt-suggestions.ts | PARTIAL | none | module prompt-suggestions.ts: promptSuggestions option forwarded (C-27); frame and publishing rows are MISSING [pkg:F24] |
+| Q-35 | module resumed-session.ts | resumed-session.ts | PARTIAL | resumed_session.rs | module resumed-session.ts (see O-13) [pkg:F31] |
+| Q-36 | module serve.ts | serve.ts | PARTIAL | bin/claude-agent-acp-rs.rs | [merged:bin/claude-agent-acp-rs.rs] [pkg:F38a] |
+| Q-37 | module session-config-ids.ts | session-config-ids.ts | PARTIAL | session_config.rs | [merged:session_config.rs] [pkg:F11] |
+| Q-38 | module session-effort.ts | session-effort.ts | PARTIAL | session_config.rs | [merged:session_config.rs] [pkg:F11] |
+| Q-39 | module session-failure-extension.ts | session-failure-extension.ts | PARTIAL | none | module session-failure-extension.ts: sessionFailure capability advertised (C-30), not served [pkg:AG-2] |
+| Q-40 | module session-index/activity.ts | session-index/activity.ts | MISSING | none | [not ported:session-index activity tracking absent] [pkg:F26b] |
+| Q-41 | module session-index/archive-title.ts | session-index/archive-title.ts | PARTIAL | none | module session-index/archive-title.ts: title precedence and sanitize rows are PARTIAL (M-69) [pkg:F30] |
+| Q-42 | module session-index/connection.ts | session-index/connection.ts | PARTIAL | none | module session-index/connection.ts: delete and fork-point wrappers PARTIAL (M-90); delete for other clients DONE (M-88) [pkg:F26b] |
+| Q-43 | module session-index/dir-listing.ts | session-index/dir-listing.ts | MISSING | none | [not ported:directory listing scanner absent] [pkg:F26a] |
+| Q-44 | module session-index/explicit-title.ts | session-index/explicit-title.ts | MISSING | none | [not ported:explicit rename title absent] [pkg:F27a] |
+| Q-45 | module session-index/first-prompt.ts | session-index/first-prompt.ts | PARTIAL | session_store.rs | [merged:session_store.rs] [pkg:F26a] |
+| Q-46 | module session-index/list-subscriptions.ts | session-index/list-subscriptions.ts | MISSING | none | [not ported:session list subscriptions absent] [pkg:F28] |
+| Q-47 | module session-index/live-registry.ts | session-index/live-registry.ts | MISSING | none | [not ported:live session registry for listings absent] [pkg:F26b] |
+| Q-48 | module session-index/project-dirs.ts | session-index/project-dirs.ts | PARTIAL | session_store.rs | [merged:session_store.rs] [pkg:F26a] |
+| Q-49 | module session-index/service.ts | session-index/service.ts | PARTIAL | none | module session-index/service.ts: list cursor and scope rows PARTIAL (M-59, M-69) [pkg:F26b] |
+| Q-50 | module session-index/session-index.ts | session-index/session-index.ts | PARTIAL | session_store.rs | [merged:session_store.rs] [pkg:F26b] |
+| Q-51 | module session-index/session-info.ts | session-index/session-info.ts | MISSING | none | [not ported:session-info rows and _meta absent] [pkg:F26b] |
+| Q-52 | module session-index/transcript-scan.ts | session-index/transcript-scan.ts | PARTIAL | session_store.rs | [merged:session_store.rs] [pkg:F26a] |
+| Q-53 | module session-index/worktrees.ts | session-index/worktrees.ts | MISSING | none | [not ported:worktree listing absent] [pkg:F26a] |
+| Q-54 | module session-mode.ts | session-mode.ts | PARTIAL | permission_mode.rs | [merged:permission_mode.rs] [pkg:F10] |
+| Q-55 | module session-model.ts | session-model.ts | PARTIAL | session_config.rs | [merged:session_config.rs] [pkg:F5b] |
+| Q-56 | module session-notices.ts | session-notices.ts | PARTIAL | none | module session-notices.ts: notice fallback rows PARTIAL (U-03) [pkg:F2a] |
+| Q-57 | module session-timing.ts | session-timing.ts | MISSING | none | [not ported:session timing log lines absent] [pkg:F2b] |
+| Q-58 | module session-titles.ts | session-titles.ts | PARTIAL | none | module session-titles.ts: sanitizeTitle rows PARTIAL (M-73) [pkg:F30] |
+| Q-59 | module settings.ts | settings.ts | PARTIAL | settings.rs | [merged:settings.rs] [pkg:F5a] |
+| Q-60 | module subagent-history.ts | subagent-history.ts | MISSING | none | [not ported:subagent transcript reader absent] [pkg:F37] |
+| Q-61 | module subagent-replay.ts | subagent-replay.ts | MISSING | none | [not ported:subagent replay absent] [pkg:F37] |
+| Q-62 | module tool-calls/background.ts | tool-calls/background.ts | MISSING | none | [not ported:backgrounded Bash tool-call shaping absent] [pkg:F15] |
+| Q-63 | module tool-calls/changed-meta-filter.ts | tool-calls/changed-meta-filter.ts | DONE | meta_filter.rs | [1:1] |
+| Q-64 | module tool-calls/client-capabilities.ts | tool-calls/client-capabilities.ts | PARTIAL | agent.rs | [merged:agent.rs] [pkg:F2a] |
+| Q-65 | module tool-calls/content.ts | tool-calls/content.ts | PARTIAL | map.rs | [merged:map.rs] [pkg:F6a] |
+| Q-66 | module tool-calls/facts.ts | tool-calls/facts.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-67 | module tool-calls/field-tracker.ts | tool-calls/field-tracker.ts | PARTIAL | map.rs | [merged:map.rs] [pkg:F9] |
+| Q-68 | module tool-calls/renderer.ts | tool-calls/renderer.ts | PARTIAL | map.rs | [merged:map.rs] [pkg:F6a] |
+| Q-69 | module tool-calls/reporters/agent.ts | tool-calls/reporters/agent.ts | PARTIAL | tools.rs | module tool-calls/reporters/agent.ts: reporter not complete (see F6a) [pkg:F6a] |
+| Q-70 | module tool-calls/reporters/bash.ts | tool-calls/reporters/bash.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-71 | module tool-calls/reporters/compaction.ts | tool-calls/reporters/compaction.ts | PARTIAL | none | module tool-calls/reporters/compaction.ts: legacy compaction tool call PARTIAL (T-99) [pkg:F20] |
+| Q-72 | module tool-calls/reporters/file-edit.ts | tool-calls/reporters/file-edit.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F8] |
+| Q-73 | module tool-calls/reporters/index.ts | tool-calls/reporters/index.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-74 | module tool-calls/reporters/interaction.ts | tool-calls/reporters/interaction.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-75 | module tool-calls/reporters/read.ts | tool-calls/reporters/read.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-76 | module tool-calls/reporters/search.ts | tool-calls/reporters/search.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-77 | module tool-calls/reporters/web.ts | tool-calls/reporters/web.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-78 | module tool-result-meta.ts | tool-result-meta.ts | MISSING | none | [not ported:tool result meta parsing absent] [pkg:F7a] |
+| Q-79 | module tools.ts | tools.ts | PARTIAL | tools.rs | [merged:tools.rs] [pkg:F6a] |
+| Q-80 | module turn-events.ts | turn-events.ts | PARTIAL | turn.rs | [merged:turn.rs] [pkg:F39] |
+| Q-81 | module usage-markdown.ts | usage-markdown.ts | MISSING | none | [not ported:/usage markdown formatter absent] [pkg:F24] |
+| Q-82 | module utils.ts | utils.ts | PARTIAL | none | utils.ts holds EventLoopYielder and messageLoopYielder (utils.ts:114-145); behaviour rows B-17 and B-55 are MISSING [pkg:CONC-2] |
+| Q-83 | module v2/agent.ts | v2/agent.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F38b] |
+| Q-84 | module v2/initialize.ts | v2/initialize.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F38a] |
+| Q-85 | module v2/permission.ts | v2/permission.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F40] |
+| Q-86 | module v2/prompt.ts | v2/prompt.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F39] |
+| Q-87 | module v2/session-update.ts | v2/session-update.ts | PARTIAL | none | module v2/session-update.ts: v2 messageId requirement PARTIAL (U-82) [pkg:F39] |
+| Q-88 | module v2/session.ts | v2/session.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F38a] |
+| Q-89 | module v2/terminal.ts | v2/terminal.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F40] |
+| Q-90 | module v2/tool-call-meta.ts | v2/tool-call-meta.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F40] |
+| Q-91 | module v2/tool-call.ts | v2/tool-call.ts | MISSING | none | [not ported:ACP v2 surface absent] [pkg:F40] |
+
+## 10. Extension specs
+
+| ID | feature | upstream | status | evidence | note |
+|---|---|---|---|---|---|
+| D-01 | README "Experimental ACP v2" section: v2 served only when opted in, v1 otherwise | README.md:96-107 | MISSING | none |  [pkg:F38a] |
+| D-02 | README subagent sessions for non-AIR clients (subagents RFD, `subagent_update`, child sessions) | README.md:38-94 | MISSING | none (no `subagent_update` in rust/*/src) |  [pkg:F36] |
+| D-03 | v2 scenario harness: schema check, v2 golden files, tool calls reported with title first | src/tests/acp-scenarios-v2.test.ts:116-171 | MISSING | none (no v2 golden or schema harness in rust tests) | v2 scenario harness: schema check, v2 golden files, tool calls reported with title first [pkg:INFRA-2] |
+
+## Merge history (removed IDs, for traceability only; these rows no longer exist)
+
+| Kept row | Merged-away IDs (history only; these rows no longer exist) |
+|---|---|
+| kept B-38 | G3-09 (round 1 dedupe) |
+| kept C-06 | G8-28 (round 1 dedupe) |
+| kept C-02 | G8-01 (round 1 dedupe) |
+| kept P-05 | G4-77 (round 1 dedupe) |
+| kept B-08 | G3-11 (round 1 dedupe) |
+| kept B-31 | G3-71 (round 1 dedupe) |
+| kept V-10 | G3-26 (round 1 dedupe) |
+| kept B-59 | G3-65 (round 1 dedupe) |
+| kept M-33 | G1-47 (round 1 dedupe) |
+| kept C-18 | G8-32 (round 1 dedupe) |
+| kept O-07 | G8-33 (round 1 dedupe) |
+| kept P-13 | G6-57 (round 1 dedupe) |
+| kept B-02 | G3-28 (round 1 dedupe) |
+| kept P-14 | G6-54 (round 1 dedupe) |
+| kept C-49 | G8-52 (round 1 dedupe) |
+| kept M-129 | G8-48 (round 1 dedupe) |
+| kept M-15 | G8-46 (round 1 dedupe) |
+| kept O-13 | G3-46 (round 1 dedupe) |
+| kept N-17 | G2b-36 (round 1 dedupe) |
+| kept C-15 | G8-31 (round 1 dedupe) |
+| kept M-93 | M-23,M-57,M-107,M-119 (round 2 group) |
+| kept M-78 | M-09,M-122 (round 2 group) |
+| kept M-81 | M-10,M-80 (round 2 group) |
+| kept M-82 | M-11 (round 2 group) |
+| kept M-12 | M-54,M-98,M-99 (round 2 group) |
+| kept M-15 | M-16,M-17,M-55,M-102,M-123 (round 2 group) |
+| kept M-87 | M-08 (round 2 group) |
+| kept M-33 | M-35,M-91 (round 2 group) |
+| kept M-53 | M-124,M-56,M-120,M-121 (round 2 group) |
+| kept M-39 | M-28 (round 2 group) |
+| kept M-13 | M-97 (round 2 group) |
+| kept M-95 | M-14 (round 2 group) |
+| kept U-08 | U-46 (round 2 group) |
+| kept U-10 | U-105 (round 2 group) |
+| kept U-05 | U-60 (round 2 group) |
+| kept U-50 | U-106 (round 2 group) |
+| kept U-38 | U-94 (round 2 group) |
+| kept U-02 | U-103 (round 2 group) |
+| kept U-45 | U-99 (round 2 group) |
+| kept U-03 | U-73 (round 2 group) |
+| kept O-02 | O-81 (round 2 group) |
+| kept O-05 | O-82,O-97 (round 2 group) |
+| kept O-06 | O-79,O-98 (round 2 group) |
+| kept O-62 | O-94 (round 2 group) |
+| kept O-48 | O-63,O-95 (round 2 group) |
+| kept O-45 | O-88 (round 2 group) |
+| kept O-09 | O-91,O-92,O-93 (round 2 group) |
+| kept C-13 | C-26,C-32 (round 2 group) |
+| kept C-12 | C-31 (round 2 group) |
+| kept C-20 | C-33 (round 2 group) |
+| kept C-10 | C-39 (round 2 group) |
+| kept S-01 | S-09,S-26 (round 2 group) |
+| kept S-02 | S-27 (round 2 group) |
+| kept S-03 | S-28 (round 2 group) |
+| kept S-21 | S-29 (round 2 group) |
+| kept S-22 | S-30 (round 2 group) |
+| kept N-20 | U-34 (round 2 group) |
+| kept N-43 | N-68 (round 2 group) |
+| kept B-53 | U-64 (round 2 group) |
+| kept T-03 | T-91 (round 2 group) |
+| kept T-17 | T-72 (round 2 group) |
+| kept T-26 | T-75 (round 2 group) |
+| kept A-15 | A-26 (round 2 group) |
+| kept A-23 | S-16 (round 2 group) |
+| kept A-24 | S-19 (round 2 group) |
+| kept C-01 | A-29,A-38 (round 3 group) |
+| kept C-02 | A-30,C-03 (round 3 group) |
+| kept C-04 | A-31 (round 3 group) |
+| kept C-05 | A-32 (round 3 group) |
+| kept C-06 | A-33 (round 3 group) |
+| kept C-49 | A-34 (round 3; the providers advertisement field) |
+| kept C-08 | A-35 (dropped, round 3) |
+| kept C-09 | A-36 (round 3 group) |
+| kept C-10 | A-37 (round 3 group) |
+| kept C-15 | A-39 (round 3 group) |
+| kept C-11 | A-40 (round 3 group) |
+| kept C-12 | A-41 (round 3 group) |
+| kept C-13 | A-42 (round 3 group) |
+| kept C-14 | C-28,C-36,A-43 (round 3 group) |
+| kept O-01 | O-80 (round 3 group) |
+| kept O-64 | P-15 (round 3 group) |
+| kept O-49 | O-140 (round 3 group) |
+| kept O-129 | O-141 (round 3 group) |
+| kept O-123 | O-142 (round 3 group) |
+| kept O-121 | O-145 (round 3 group) |
+| kept O-122 | O-146 (round 3 group) |
+| kept O-120 | O-147 (round 3 group) |
+| kept O-62 | O-148 (round 3 group) |
+| kept O-117 | O-163 (round 3 group) |
+| kept O-125 | O-149,O-150 (round 3 group) |
+| kept O-132 | O-157 (round 3 group) |
+| kept O-119 | O-164 (round 3 group) |
+| dropped | O-151 (not SDK Options keys; round 3) |
+| dropped | O-152 (not SDK Options keys; round 3) |
+| kept B-18 | B-12 (round 5 group) |
+| kept C-49 | C-07 (restored here as the providers advertisement row, round 4) |
+| dropped | O-128 (split into O-140..O-164; keys merged with argv rows, round 2) |
+| dropped | A-16 (split into A-29..A-43, round 2; folded into the C rows, round 3) |
+| dropped | R-06 (split into R-08 and R-10, round 2) |
+| dropped | B-24 (split into B-119..B-124, round 2) |
