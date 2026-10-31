@@ -22,6 +22,7 @@ fn registry() -> Registry {
         fingerprints: std::collections::HashMap::new(),
         deferred_tx,
         deferred_rx,
+        redeliver_tx: mpsc::unbounded_channel().0,
         index: session_index_connection(&ServeOptions::default()),
         provider: None,
         gateway_auth: None,

@@ -414,6 +414,9 @@ pub struct LoadedSession {
     pub on_closed: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+/// The connection's session index handle. Every field is a cloneable handle, so
+/// a task running off the request handler (a fork's copy and start) can own one.
+#[derive(Clone)]
 pub struct SessionIndexConnection {
     paths: IndexPaths,
     log_error: LogError,
@@ -592,6 +595,11 @@ impl SessionIndexConnection {
         Ok(Box::pin(async move { service.subscribe_list(&cwd).await }))
     }
 
+    /// Diagnostics of the list subscriptions (upstream `handles()`), for tests.
+    pub async fn subscription_handles(&self) -> Option<Value> {
+        self.service.as_ref()?.subscription_handles().await
+    }
+
     /// `_session/list/unsubscribe`. Idempotent.
     pub fn unsubscribe_list(&self, params: &Value) -> Result<Value, Error> {
         let subscription_id = parse_list_unsubscribe_request(params)?;
@@ -625,6 +633,7 @@ impl SessionIndexConnection {
         let service = self.require_service(SESSION_RENAME_METHOD)?;
         let board = self.board.clone();
         let order = board.reserve_title_order(&request.session_id);
+        let loaded = live_loaded(&board, &request.session_id, loaded);
         Ok(Box::pin(async move {
             let session_id = request.session_id.clone();
             // As the CLI keeps it, and never with the archive prefix: a rename does
@@ -671,6 +680,7 @@ impl SessionIndexConnection {
         // The run this archive closes: a load of the id while the archive runs is
         // a newer incarnation, whose state the archive must not wipe.
         let incarnation = board.current(&request.session_id);
+        let loaded = live_loaded(&board, &request.session_id, loaded);
         Ok(Box::pin(async move {
             let session_id = request.session_id;
             let is_loaded = loaded.is_some();
@@ -740,6 +750,7 @@ impl SessionIndexConnection {
         let service = self.require_service(SESSION_UNARCHIVE_METHOD)?;
         let board = self.board.clone();
         let order = board.reserve_title_order(&request.session_id);
+        let loaded = live_loaded(&board, &request.session_id, loaded);
         Ok(Box::pin(async move {
             let session_id = request.session_id;
             let is_loaded = loaded.is_some();
@@ -804,13 +815,36 @@ impl SessionIndexConnection {
     }
 }
 
-/// A new session this connection runs that may have no transcript yet: it resumed
-/// no stored conversation and no turn of it has ended. A session whose query ended,
-/// or that has history, needs its transcript.
+/// The loaded session only while it still runs here. A husk (its query ended and
+/// the board retired it) has no live title state to reach: upstream treats it as
+/// an unloaded session (`running = session !== undefined && !session.queryClosed`,
+/// `connection.ts:320-341`), so a rename or archive needs its transcript.
+fn live_loaded(
+    board: &OwnSessionBoard,
+    session_id: &str,
+    loaded: Option<LoadedSession>,
+) -> Option<LoadedSession> {
+    loaded.filter(|_| board.current(session_id).is_some())
+}
+
+/// A new session this connection runs that may have no transcript yet: it is
+/// still running here (the board holds its row), resumed no stored conversation
+/// and no turn of it has ended. A session whose query ended (a husk: its actor
+/// ended and the board retired it), or that has history, needs its transcript
+/// (`running = session !== undefined && !session.queryClosed`,
+/// `connection.ts:320-341`).
 fn is_unwritten(board: &OwnSessionBoard, session_id: &str) -> bool {
-    board
-        .get(session_id)
-        .is_none_or(|own| !own.resumed_from_history && own.last_turn_ended_at.is_none())
+    // No incarnation runs here: the actor ended (a husk), the session was
+    // closed, or it never ran. None of those may be archived without a
+    // transcript.
+    if board.current(session_id).is_none() {
+        return false;
+    }
+    board.get(session_id).is_none_or(|own| {
+        !own.resumed_from_history
+            && own.last_turn_ended_at.is_none()
+            && own.query_failed_at.is_none()
+    })
 }
 
 /// Tells the client the archive state of a session that was loaded on this
@@ -930,6 +964,28 @@ async fn retitle(
     }
 }
 
+/// Whether a failed `rename_session` says the CLI does not have the control
+/// method at all (an older CLI): upstream refuses the change with
+/// `RequestError.invalidRequest` (-32600) instead of surfacing the SDK error
+/// (`connection.ts:325-334`: `typeof query?.renameSession !== "function"`).
+fn rename_method_missing(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("rename_session")
+        || lower.contains("unknown control request")
+        || lower.contains("unsupported control request")
+        || lower.contains("method not found")
+}
+
+/// The -32600 upstream answers when the running session's CLI cannot take a
+/// title: the CLI holds the title and would write it back over ours.
+fn rename_unavailable(session_id: &str) -> Error {
+    Error::new(
+        -32600,
+        "The Claude Code CLI of this session cannot change its title while it runs.",
+    )
+    .data(json!({ "sessionId": session_id }))
+}
+
 /// `rename_session` through the CLI of a loaded session (`query.renameSession`).
 fn rename_fn(session: Session, session_id: String) -> RenameFn {
     Box::new(move |title| {
@@ -943,7 +999,14 @@ fn rename_fn(session: Session, session_id: String) -> RenameFn {
                     "session_id": session_id,
                 }))
                 .await
-                .map_err(|e| internal_error(&e.to_string()))?;
+                .map_err(|e| {
+                    let message = e.to_string();
+                    if rename_method_missing(&message) {
+                        rename_unavailable(&session_id)
+                    } else {
+                        internal_error(&message)
+                    }
+                })?;
             if response
                 .pointer("/response/subtype")
                 .and_then(Value::as_str)
@@ -953,6 +1016,9 @@ fn rename_fn(session: Session, session_id: String) -> RenameFn {
                     .pointer("/response/error")
                     .and_then(Value::as_str)
                     .unwrap_or("rename_session failed");
+                if rename_method_missing(message) {
+                    return Err(rename_unavailable(&session_id));
+                }
                 return Err(internal_error(message));
             }
             Ok(())
@@ -963,6 +1029,63 @@ fn rename_fn(session: Session, session_id: String) -> RenameFn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1a #8 (`session-index.test.ts`: "is unknown once the session had
+    /// history, and allowed for a new unwritten one"): only a running new
+    /// session may be archived without a transcript. A husk (the actor ended
+    /// and the board retired it), a failed query, a resumed session and one
+    /// that ended a turn all need their transcript, so the archive answers
+    /// -32002 through `may_be_unwritten == false`.
+    #[test]
+    fn archive_needs_a_transcript_once_the_session_is_a_husk() {
+        let board = OwnSessionBoard::new();
+        let fresh = board.begin("fresh");
+        assert!(
+            is_unwritten(&board, "fresh"),
+            "a running new session may have no transcript yet"
+        );
+        // The actor ended (clean EOF): the board retires the row, as the
+        // agent's forwarder does; the session is a husk.
+        board.retire("fresh", fresh);
+        assert!(
+            !is_unwritten(&board, "fresh"),
+            "a husk needs its transcript (upstream's queryClosed)"
+        );
+
+        board.begin("failed");
+        board.note_query_failed("failed", 5.0);
+        assert!(!is_unwritten(&board, "failed"), "a failed query is closed");
+
+        board.begin("resumed");
+        board.update("resumed", |own| own.resumed_from_history = true);
+        assert!(!is_unwritten(&board, "resumed"));
+
+        board.begin("ended");
+        board.update("ended", |own| own.last_turn_ended_at = Some(1.0));
+        assert!(!is_unwritten(&board, "ended"));
+    }
+
+    /// P1a #9 (`session-index.test.ts`: "is not written for a running session
+    /// whose CLI cannot take a title"): a CLI without the `rename_session`
+    /// control method is refused with -32600, not -32603.
+    #[test]
+    fn a_cli_without_rename_session_is_refused_as_invalid_request() {
+        assert!(rename_method_missing(
+            "Unsupported control request subtype: rename_session"
+        ));
+        assert!(rename_method_missing(
+            "Unknown control request: rename_session"
+        ));
+        assert!(rename_method_missing("method not found"));
+        assert!(!rename_method_missing("the transcript is locked"));
+        let error = rename_unavailable("s");
+        assert_eq!(i32::from(error.code), -32600);
+        assert_eq!(
+            error.message,
+            "The Claude Code CLI of this session cannot change its title while it runs."
+        );
+        assert_eq!(error.data, Some(json!({"sessionId": "s"})));
+    }
 
     /// session list subscription > forgets a closed session's own state and keeps the map bounded
     #[test]

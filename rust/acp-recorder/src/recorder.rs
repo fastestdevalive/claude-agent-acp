@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
-    CreateElicitationResponse, ElicitationAction, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
+    CreateElicitationResponse, ElicitationAction, ImageContent, InitializeRequest,
+    LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, TextContent,
 };
@@ -32,6 +32,18 @@ use crate::script::{PermissionPolicy, Script, Step};
 /// giving up (a bound; a hang is a failure).
 const UPDATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A fake-claude transcript writes a whole `emit` batch at once, so every frame
+/// of it is in the adapter's pipe before the first one reaches the recorder —
+/// but under load the adapter can still be forwarding the rest when the
+/// `cancel_after_updates` poll observes the threshold. A cancel that wins that
+/// race drops the sibling frames, flipping the recorded order
+/// (`cancel-mid-turn`, 11.T4; the Node capture has the whole batch before the
+/// cancel). Wait for the update count to stay unchanged for this long before
+/// sending the cancel, so the recorded order is stable.
+const CANCEL_SETTLE_QUIET: Duration = Duration::from_millis(100);
+/// The bound on the settle wait (a hang is a failure).
+const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// After `session/new` / `session/load` the adapter emits a trailing
 /// `available_commands_update` via `setTimeout(0)`. Its position relative to
@@ -350,6 +362,7 @@ async fn run_script(
             }
             Step::Prompt {
                 text,
+                image,
                 cancel_after_updates,
                 no_wait,
             } => {
@@ -357,10 +370,14 @@ async fn run_script(
                     return Err(agent_client_protocol::Error::invalid_params()
                         .data("session/prompt before any session/new"));
                 };
-                let request = PromptRequest::new(
-                    sid.clone(),
-                    vec![ContentBlock::Text(TextContent::new(text.clone()))],
-                );
+                let mut blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
+                if let Some(image) = image {
+                    blocks.push(ContentBlock::Image(ImageContent::new(
+                        image.data.clone(),
+                        image.mime_type.clone(),
+                    )));
+                }
+                let request = PromptRequest::new(sid.clone(), blocks);
                 let started_at = update_count.load(Ordering::SeqCst);
                 last_prompt_started_at = started_at;
                 let sent = connection.send_request(request);
@@ -369,6 +386,18 @@ async fn run_script(
                     if !wait_for_updates(&update_count, target, UPDATE_WAIT_TIMEOUT).await {
                         return Err(agent_client_protocol::Error::internal_error()
                             .data(format!("timed out waiting for {n} updates before cancel")));
+                    }
+                    // Record the rest of the batch the CLI already wrote before
+                    // the cancel, as the Node capture did.
+                    if !wait_for_updates_settle(
+                        &update_count,
+                        CANCEL_SETTLE_QUIET,
+                        CANCEL_SETTLE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        return Err(agent_client_protocol::Error::internal_error()
+                            .data("the updates did not settle before the cancel"));
                     }
                     connection.send_notification(CancelNotification::new(sid.clone()))?;
                 }
@@ -547,6 +576,28 @@ async fn wait_for_updates(count: &AtomicUsize, target: usize, timeout: Duration)
     }
 }
 
+/// Wait until no update has been recorded for `quiet` (bounded by `timeout`,
+/// never hangs): the frames a CLI wrote before the cancel have all landed.
+async fn wait_for_updates_settle(count: &AtomicUsize, quiet: Duration, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last = count.load(Ordering::SeqCst);
+    let mut stable_since = tokio::time::Instant::now();
+    loop {
+        if stable_since.elapsed() >= quiet {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(UPDATE_POLL_INTERVAL).await;
+        let now = count.load(Ordering::SeqCst);
+        if now != last {
+            last = now;
+            stable_since = tokio::time::Instant::now();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +761,53 @@ mod tests {
     async fn wait_for_updates_gives_up_after_timeout() {
         let count = Arc::new(AtomicUsize::new(0));
         assert!(!wait_for_updates(&count, usize::MAX, Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_updates_settle_returns_once_quiet() {
+        let count = Arc::new(AtomicUsize::new(2));
+        let started = tokio::time::Instant::now();
+        assert!(
+            wait_for_updates_settle(&count, Duration::from_millis(30), Duration::from_secs(1))
+                .await
+        );
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn wait_for_updates_settle_waits_for_a_late_update() {
+        let count = Arc::new(AtomicUsize::new(1));
+        let bump = count.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            bump.store(2, Ordering::SeqCst);
+        });
+        assert!(
+            wait_for_updates_settle(&count, Duration::from_millis(60), Duration::from_secs(2))
+                .await
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_updates_settle_gives_up_after_timeout() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let bump = count.clone();
+        tokio::spawn(async move {
+            // Keep moving: the counter never settles.
+            for _ in 0..40 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                bump.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        assert!(
+            !wait_for_updates_settle(
+                &count,
+                Duration::from_millis(50),
+                Duration::from_millis(120)
+            )
+            .await
+        );
     }
 
     #[tokio::test]

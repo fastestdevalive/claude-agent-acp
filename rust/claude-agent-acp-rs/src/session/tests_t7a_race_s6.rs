@@ -3,6 +3,12 @@
 //! A client that answers a permission request twice, after the turn ended, or
 //! after the session closed must not panic the actor, write a second
 //! `control_response`, or corrupt the state a later command sees.
+//!
+//! The close contract is "the actor ends", not "the close reply arrived": the
+//! reply is emitted by a spawned task after the close's flush barrier, while the
+//! actor may still be returning from `run_loop`. The late answer is checked
+//! after `tx.closed()` (the actor's own exit), so the assertion cannot race the
+//! teardown.
 
 use super::tests_t7a_race_common::*;
 use super::*;
@@ -148,7 +154,15 @@ async fn t7a_race_6_duplicate_and_late_replies() {
                     reply,
                 })
                 .expect("actor alive");
-            let _ = tokio::time::timeout(Duration::from_secs(2), reply_rx).await;
+            // The actor answers the command even when it ignores the answer: a
+            // dropped reply would be a hang, and this assertion makes the
+            // "ignored" behaviour checked through the command's own reply too.
+            tokio::time::timeout(Duration::from_secs(2), reply_rx)
+                .await
+                .map_err(|_| format!("a duplicate answer for {request_id} was never acknowledged"))?
+                .map_err(|_| {
+                    format!("the actor dropped the duplicate answer's reply for {request_id}")
+                })?;
         }
         jitter(&mut rng, 4).await;
         if extra_responses(&mut actor, "req-toolu_1", Duration::from_millis(30)).await != 0 {
@@ -164,8 +178,12 @@ async fn t7a_race_6_duplicate_and_late_replies() {
             .await
             .map_err(|_| "the actor stopped answering after the duplicate answers".to_string())?
             .map_err(|_| "the actor dropped the foreground reply".to_string())?;
-        // After close, a late answer finds the actor gone.
-        actor.shutdown().await;
+        // After close, a late answer finds the actor gone. `shutdown` waits for
+        // the actor's own exit (`tx.closed()`), not just its close reply: the
+        // reply is sent by a spawned task after the flush barrier, so the actor
+        // may still be returning from `run_loop` when it arrives, and a send at
+        // that instant would only be queued and never processed.
+        actor.shutdown().await?;
         let (reply, _reply_rx) = oneshot::channel();
         if actor
             .tx

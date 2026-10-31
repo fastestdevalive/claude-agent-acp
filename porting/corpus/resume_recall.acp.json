@@ -1,5 +1,8 @@
 {
   "permission": "allow",
+  "env": {
+    "FAKE_CLAUDE_CURSOR": "/tmp/fake-claude-cursor-resume_recall"
+  },
   "steps": [
     {"call": "initialize"},
     {"call": "session/new"},

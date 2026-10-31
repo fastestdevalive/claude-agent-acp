@@ -524,3 +524,11 @@ No push, tag or squash was performed.
   PASS (CARGO_TARGET_DIR=/private/tmp/claude-501/par-t9c-target).
 - The full `rust-gate.sh` was deliberately NOT run by this package; the
   orchestrator runs it.
+
+## TURN 9 CLOSED (programs audit)
+
+- Gate OK on e526bda (orchestrator run). TEST-MAP: 2400 rows, 0 missing, 0 unclassified, guard `--forbid-unclassified` enforced by the gate. MISSING.md at zero tickets.
+- Programs audit (read-only DeepSeek, reports porting/parity/audit-P1a.md, P1b, P2a, P3): P1a 3 HIGH/5 MEDIUM/6 LOW (false `different:` reasons), P1b 31 findings (weak ported tests, wrong DONE line ranges), P2a 1 HIGH (session start blocking the incoming loop) + MEDIUM race-suite weaknesses, P3 3 HIGH (shared corpus scenarios without assistant text/image, vacuous live-smoke cancel). Fixed by G5a (rows/tests), G5b (session start off the incoming loop, real corpus scenarios, live smoke, race suite), INTG5, G6 (test-side race: wait for the actor exit in close assertions), G7 (G5b regression: forwarded requests answered after the connection began draining; fixed by answering before the drain).
+- Fix rounds in T9: G5 (round 1), G6 (round 2), G7 (gate-red regression from G5b, exceeded the cap by exception).
+- Carry-over to T10 work orders: any audit item the G5 packages did not close (re-read the four audit reports against the code at the T10 head: P2a F10-F12 LOW, P3 LOW items, P1b LOW items), T7 audit items M4 M6 M7 L10 L13 unless the reports show them closed, and every FEATURES PARTIAL row (see its note).
+- Model log: all packages on DeepSeek vst subagents, at most two at a time; no Claude/Opus agents. Programs-audit auditors P1/P2 stalled once (known DeepSeek stall at ~0% CPU) and were respawned with narrower scope and a progress-based stall watcher.

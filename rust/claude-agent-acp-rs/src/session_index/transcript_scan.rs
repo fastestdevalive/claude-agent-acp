@@ -1015,6 +1015,112 @@ mod tests {
         );
     }
 
+    fn wt_record(session: Value) -> String {
+        json!({"type": "worktree-state", "worktreeSession": session}).to_string()
+    }
+
+    /// An assistant message of ~10 KB (`big` in `session-index.test.ts`).
+    fn big_assistant(ts: &str) -> String {
+        json!({"type": "assistant", "timestamp": ts, "cwd": "/w",
+            "message": {"role": "assistant", "model": "claude-x",
+                "content": [{"type": "text", "text": "z".repeat(10_000)}]}})
+        .to_string()
+    }
+
+    /// `session-index.test.ts`: "reads the worktree record of the tail, else of
+    /// an earlier scan, else of the head" — the tail record wins, a null record
+    /// appended to the tail wins over the head, and the record an earlier scan
+    /// found stands when the grown tail lost it (not the head's older record).
+    #[test]
+    fn reads_the_worktree_record_of_the_tail_then_an_earlier_scan_then_the_head() {
+        let messages: Vec<String> = (0..20)
+            .map(|i| big_assistant(&format!("2026-07-01T00:00:{i:02}.000Z")))
+            .collect();
+        // `claude --worktree` writes the record at the start; 200 KB pushes it
+        // out of the 64 KB tail.
+        let head = format!(
+            "{}\n{}\n",
+            wt_record(json!({"path": "/wt"})),
+            messages.join("\n")
+        );
+        let path = temp_file("wt-precedence", head.as_bytes());
+        let mut cache = FullSearchCache::default();
+        let facts = scan_transcript_file(&path, head.len() as u64, None, None, None, &mut cache)
+            .expect("scanned");
+        assert_eq!(facts.agent_worktree, Some(true), "the head record");
+
+        // A later record in the tail wins over the head.
+        let null = format!("{}\n", wt_record(Value::Null));
+        let with_null = format!("{head}{null}");
+        std::fs::write(&path, &with_null).expect("write");
+        let facts =
+            scan_transcript_file(&path, with_null.len() as u64, None, None, None, &mut cache)
+                .expect("scanned");
+        assert_eq!(facts.agent_worktree, Some(false));
+
+        // A file with the null record before the tail and a prompt at its end:
+        // the earlier scan found `false`, the grown tail lost it, the head has
+        // `true`. The earlier scan's record stands.
+        let before = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            wt_record(json!({"path": "/wt"})),
+            messages.join("\n"),
+            wt_record(Value::Null),
+            big_assistant("2026-07-01T00:01:00.000Z"),
+            user("2026-07-01T00:01:01.000Z", "hi"),
+        );
+        let grown = temp_file("wt-grown", before.as_bytes());
+        let first = scan_transcript_file(&grown, before.len() as u64, None, None, None, &mut cache)
+            .expect("scanned");
+        assert_eq!(first.agent_worktree, Some(false));
+        let appended: String = (0..6)
+            .map(|i| big_assistant(&format!("2026-07-01T00:02:{i:02}.000Z")))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&grown, format!("{before}{appended}")).expect("write");
+        let previous = PreviousScan::of(&first, before.len() as u64);
+        let second = scan_transcript_file(
+            &grown,
+            (before.len() + appended.len()) as u64,
+            None,
+            Some(&previous),
+            None,
+            &mut cache,
+        )
+        .expect("scanned");
+        assert_eq!(
+            second.agent_worktree,
+            Some(false),
+            "the earlier scan's record stands, not the head's"
+        );
+    }
+
+    /// `session-index.test.ts`: "takes the worktree record of a wider tail over
+    /// the head's" — the null record lies beyond the 64 KB tail and the 64 KB
+    /// head but inside the wider tail the scan grows.
+    #[test]
+    fn takes_the_worktree_record_of_a_wider_tail_over_the_heads() {
+        let messages: Vec<String> = (0..10)
+            .map(|i| big_assistant(&format!("2026-07-01T00:00:{i:02}.000Z")))
+            .collect();
+        let later: Vec<String> = (0..10)
+            .map(|i| big_assistant(&format!("2026-07-01T00:01:{i:02}.000Z")))
+            .collect();
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            wt_record(json!({"path": "/wt"})),
+            messages.join("\n"),
+            wt_record(Value::Null),
+            later.join("\n"),
+        );
+        let path = temp_file("wt-wider", content.as_bytes());
+        let mut cache = FullSearchCache::default();
+        let facts = scan_transcript_file(&path, content.len() as u64, None, None, None, &mut cache)
+            .expect("scanned");
+        assert_eq!(facts.agent_worktree, Some(false));
+    }
+
     /// row facts of the tail and head > knows forkedFrom only from a fork's records
     #[test]
     fn forked_from_comes_from_a_forks_records_only() {

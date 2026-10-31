@@ -451,6 +451,30 @@ fn declared_skill_name(skill_md: &Path) -> Option<String> {
     None
 }
 
+/// The container scans of one available-commands pass (`SkillScanCache`,
+/// `reporters/interaction.ts:349-411`): a list of slash commands is resolved in
+/// one synchronous pass, so every container is listed once for the whole pass
+/// instead of once per skill command. A later pass sees the directories as they
+/// are then.
+pub type SkillScanCache =
+    std::collections::HashMap<PathBuf, std::collections::HashMap<String, PathBuf>>;
+
+/// The `SKILL.md` of `container` that declares `name`, scanning the container
+/// once per pass ([`SkillScanCache`]).
+fn skill_by_declared_name(
+    container: &Path,
+    name: &str,
+    scans: &mut SkillScanCache,
+) -> Option<PathBuf> {
+    if let Some(cached) = scans.get(container) {
+        return cached.get(name).cloned();
+    }
+    let by_name = skills_by_declared_name(container);
+    let found = by_name.get(name).cloned();
+    scans.insert(container.to_path_buf(), by_name);
+    found
+}
+
 /// The `SKILL.md` paths of `container`, keyed by declared name (sorted listing,
 /// first declaration wins).
 fn skills_by_declared_name(container: &Path) -> std::collections::HashMap<String, PathBuf> {
@@ -501,6 +525,18 @@ pub fn resolve_skill_path_in(
     skill_name: &str,
     cwd: Option<&Path>,
     home: Option<&Path>,
+) -> Option<PathBuf> {
+    resolve_skill_path_in_with_cache(skill_name, cwd, home, &mut SkillScanCache::new())
+}
+
+/// [`resolve_skill_path_in`] with the container scans of one resolution pass:
+/// pass the same cache for every command of one list, so each container is
+/// listed once instead of once per command (`resolveSkillPath(..., scans)`).
+pub fn resolve_skill_path_in_with_cache(
+    skill_name: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    scans: &mut SkillScanCache,
 ) -> Option<PathBuf> {
     let cwd = cwd.filter(|c| !c.as_os_str().is_empty())?;
     let (scope, name) = match skill_name.split_once(':') {
@@ -577,7 +613,7 @@ pub fn resolve_skill_path_in(
     }
     containers
         .iter()
-        .find_map(|container| skills_by_declared_name(container).remove(name))
+        .find_map(|container| skill_by_declared_name(container, name, scans))
 }
 
 /// The display path of `path` relative to `cwd` (port of `toDisplayPath`,
@@ -2381,6 +2417,41 @@ mod tests {
         dir
     }
 
+    /// `tools.test.ts`: "lists a container once for the whole resolution pass" —
+    /// a `SKILL.md` written between two commands of one pass is not resolved by
+    /// the same [`SkillScanCache`]; a fresh pass sees it.
+    #[test]
+    fn skill_scan_cache_lists_a_container_once_per_pass() {
+        let root = scratch("scan-cache");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut scans = SkillScanCache::new();
+        let first = write_skill(
+            &cwd,
+            ".claude/skills/holder/SKILL.md",
+            "---\nname: first\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in_with_cache("first", Some(&cwd), None, &mut scans),
+            Some(first)
+        );
+        let added = write_skill(
+            &cwd,
+            ".claude/skills/later/SKILL.md",
+            "---\nname: second\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in_with_cache("second", Some(&cwd), None, &mut scans),
+            None,
+            "the pass lists the container as it was"
+        );
+        assert_eq!(
+            resolve_skill_path_in("second", Some(&cwd), None),
+            Some(added),
+            "a fresh pass sees the new skill"
+        );
+    }
+
     /// rust-air-gaps 1.4 — `resolveSkillPath` on a temp tree: project and home
     /// containers, frontmatter name mismatch, scoped / plugin layouts, commands
     /// shadowing, and rejection of path escapes.
@@ -3273,6 +3344,15 @@ mod tests {
                 "**undefined** — no file",
             ]
         );
+
+        // The singular branch (`tools.test.ts`: "should report a singular title
+        // and empty findings array").
+        let one = tool_shape(
+            "ReportFindings",
+            &json!({"findings": [{"file": "src/baz.ts", "summary": "Leak"}]}),
+            None,
+        );
+        assert_eq!(one.title, "Report 1 finding");
 
         let none = tool_shape("ReportFindings", &json!({"findings": []}), None);
         assert_eq!(none.title, "Report findings: none found");

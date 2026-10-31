@@ -6839,6 +6839,7 @@ fn handle_user_frame_blocks(
                                 &block["content"],
                                 parent,
                                 non_exec.get(tool_use_id),
+                                map_state.v2_reporting(),
                             ),
                         })));
                     }
@@ -7239,12 +7240,24 @@ fn suppressed_result_resolution(
     content: &Value,
     parent_tool_use_id: Option<&str>,
     non_exec: Option<&crate::tool_meta::NonExecution>,
+    v2_reporting: bool,
 ) -> Value {
     let meta = crate::tool_meta::meta_with_parent_and_nonexec(name, non_exec, parent_tool_use_id);
+    // `renderer.resultStatus(isError, nonExecution, {cancelled})`: a v2 client
+    // gets `cancelled` for an error result the CLI stamped aborted
+    // (`interrupted`/`cancelled`), v1 keeps `failed` (it has no `cancelled`).
+    let aborted = is_error && crate::tool_meta::is_aborted(non_exec);
+    let status = if aborted && v2_reporting {
+        "cancelled"
+    } else if is_error {
+        "failed"
+    } else {
+        "completed"
+    };
     json!({
         "sessionUpdate": "tool_call_update",
         "toolCallId": tool_use_id,
-        "status": if is_error { "failed" } else { "completed" },
+        "status": status,
         "rawOutput": content,
         "_meta": meta,
     })
@@ -12135,13 +12148,21 @@ mod tests {
             &json!("ok"),
             Some("toolu_PARENT"),
             None,
+            false,
         );
         assert_eq!(
             sub["_meta"]["claudeCode"]["parentToolUseId"],
             "toolu_PARENT"
         );
-        let root =
-            suppressed_result_resolution("toolu_TK4", "TodoWrite", false, &json!("ok"), None, None);
+        let root = suppressed_result_resolution(
+            "toolu_TK4",
+            "TodoWrite",
+            false,
+            &json!("ok"),
+            None,
+            None,
+            false,
+        );
         assert!(root["_meta"]["claudeCode"].get("parentToolUseId").is_none());
         assert_eq!(root["_meta"]["claudeCode"]["toolName"], "TodoWrite");
 
@@ -12156,6 +12177,7 @@ mod tests {
             &json!("stopped"),
             None,
             Some(&non_exec),
+            false,
         );
         assert_eq!(
             aborted["_meta"]["claudeCode"],
@@ -12277,6 +12299,64 @@ mod tests {
             resolution["update"]["_meta"]["claudeCode"],
             json!({"toolName": "TodoWrite", "nonExecutionKind": "user-rejected"})
         );
+    }
+
+    // P1a #1 (`tools.test.ts`: "reports an aborted run of a tool call that only
+    // a permission request surfaced as cancelled on v2"): the same resolution
+    // for a call only the permission flow emitted, whose sidecar says the run
+    // was aborted, is `cancelled` on v2 and keeps `failed` on v1.
+    #[test]
+    fn aborted_todo_resolution_is_cancelled_on_v2_only() {
+        for (v2, expected) in [(true, "cancelled"), (false, "failed")] {
+            let mut map_state = MapState::default();
+            map_state.v2.set_reporting(v2);
+            map_state.mark_emitted(
+                "toolu_TODO".to_string(),
+                json!({"type": "tool_use", "id": "toolu_TODO", "name": "TodoWrite",
+                       "input": {"todos": [{"content": "x", "status": "pending", "activeForm": "x"}]}}),
+            );
+            let line = json!({
+                "type": "user",
+                "parent_tool_use_id": null,
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_TODO", "is_error": true,
+                     "content": "stopped"}
+                ]},
+                "tool_result_meta": [
+                    {"id": "toolu_TODO", "non_execution_kind": "interrupted"}
+                ]
+            });
+            let mut ext = SessionExt::new(
+                None,
+                PathBuf::new(),
+                crate::env_snapshot::EnvSnapshot::empty(),
+            );
+            let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+            let blocks = line["message"]["content"].as_array().unwrap();
+            handle_user_frame_blocks(
+                SendIo {
+                    tasks: &mut AsyncTaskRuntime::new(false),
+                    update_tx: &update_tx,
+                    session_id: "s",
+                },
+                &line,
+                blocks,
+                &mut map_state,
+                &mut ext,
+                None,
+            );
+            let out: Vec<SessionOutbound> =
+                std::iter::from_fn(|| update_rx.try_recv().ok()).collect();
+            assert_eq!(out.len(), 1);
+            let SessionOutbound::RawUpdate(resolution) = &out[0] else {
+                panic!("expected the raw resolution");
+            };
+            assert_eq!(resolution["update"]["status"], expected, "v2={v2}");
+            assert_eq!(
+                resolution["update"]["_meta"]["claudeCode"],
+                json!({"toolName": "TodoWrite", "nonExecutionKind": "interrupted"})
+            );
+        }
     }
 
     // G10c review (3) / T-76: a Task* result of a subagent's frame stamps the
@@ -12431,6 +12511,7 @@ mod tests {
             &json!("done"),
             None,
             None,
+            false,
         );
         assert_eq!(ok["toolCallId"], "toolu_TK1");
         assert_eq!(ok["status"], "completed");
@@ -12443,6 +12524,7 @@ mod tests {
             &json!("boom"),
             None,
             None,
+            false,
         );
         assert_eq!(failed["status"], "failed");
     }

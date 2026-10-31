@@ -8,8 +8,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+mod common;
+
 use claude_agent_acp_rs::air::AirClient;
-use claude_agent_acp_rs::session_index::connection::{IndexPaths, SessionIndexConnection};
+use claude_agent_acp_rs::control::InitializeOptions;
+use claude_agent_acp_rs::env_snapshot::EnvSnapshot;
+use claude_agent_acp_rs::process::{SpawnOptions, Timings};
+use claude_agent_acp_rs::session::{Session, SessionOptions, SessionOutbound};
+use claude_agent_acp_rs::session_index::connection::{
+    IndexPaths, LoadedSession, SessionIndexConnection,
+};
 use claude_agent_acp_rs::session_index::project_dirs::{encode_project_path, Platform};
 use claude_agent_acp_rs::session_index::service::{
     RetitleOptions, ServiceDeps, SessionIndexService, SidecarMode, TitleChange,
@@ -225,6 +233,69 @@ async fn t2b_list_orders_newest_first_and_pages_with_an_opaque_cursor() {
     assert_eq!(ids(&all).len(), 5);
 }
 
+/// `session-index.test.ts`: "enumerates again once a transcript is added or
+/// removed" — draining 30 sessions in pages of 10 while a transcript is added
+/// after page 1 and removed after page 2 lists the added row in its place, drops
+/// the removed one, and still lists 30 rows.
+#[tokio::test]
+async fn t2b_a_page_loop_rereads_when_a_transcript_is_added_or_removed() {
+    let env = Env::new("pages-reread");
+    let cwd = env.cwd("app");
+    let mut sessions = Vec::new();
+    for n in 1..=30 {
+        // The newest is id(1), so page 1 is 1..=10, page 2 11..=20, page 3 21..=30.
+        sessions.push(simple_session(&env, &cwd, n, T0 - n as i64 * 60_000));
+    }
+    let service = env.service();
+    let mut listed: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut page = 0;
+    loop {
+        page += 1;
+        let response = list(
+            &service,
+            json!({"cwd": cwd, "cursor": cursor, "_meta": air(json!({"limit": 10}))}),
+        )
+        .await
+        .expect("page");
+        listed.extend(ids(&response));
+        cursor = response["nextCursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+        if page == 1 {
+            // An older session copied in: between the 25th and the 26th.
+            simple_session(&env, &cwd, 31, T0 - 25 * 60_000 - 30_000);
+        } else if page == 2 {
+            // The oldest transcript goes away.
+            std::fs::remove_file(
+                env.project_dir(&cwd)
+                    .join(format!("{}.jsonl", sessions[29])),
+            )
+            .expect("remove");
+        }
+    }
+    let added = id(31);
+    let pos_added = listed
+        .iter()
+        .position(|session| session == &added)
+        .expect("the added row is listed");
+    let pos_25 = listed
+        .iter()
+        .position(|session| session == &sessions[24])
+        .expect("the 25th is listed");
+    assert_eq!(
+        pos_added,
+        pos_25 + 1,
+        "the added row sits immediately after the 25th: {listed:?}"
+    );
+    assert!(
+        !listed.contains(&sessions[29]),
+        "the removed row is absent: {listed:?}"
+    );
+    assert_eq!(listed.len(), 30, "30 rows in total: {listed:?}");
+}
+
 /// list request parsing: a foreign cursor and a cursor of another scope are -32602
 #[tokio::test]
 async fn t2b_list_rejects_a_foreign_cursor_and_one_of_another_scope() {
@@ -418,48 +489,109 @@ async fn t2b_list_includes_linked_worktrees_on_request() {
     assert_eq!(rows[0]["cwd"], linked.as_str(), "a row keeps its own cwd");
 }
 
-/// session/list > marks the rows of sessions in a worktree Claude Code made (agentWorktree)
+/// `session-index.test.ts`: "marks the rows of sessions in a worktree Claude Code
+/// made (agentWorktree)" — `true` only for a linked worktree with a made record;
+/// enteredExisting, a user-made worktree, a later null record and the main
+/// checkout (even with a misleading record) omit the field (never `false`), and
+/// the worktree's own list carries it too.
 #[tokio::test]
 async fn t2b_list_marks_a_worktree_claude_code_made() {
     let env = Env::new("agent-worktree");
     let main = env.cwd("main");
-    let linked = env.cwd("linked");
-    std::fs::create_dir_all(Path::new(&main).join(".git/worktrees/linked")).expect("git");
-    std::fs::write(
-        Path::new(&main).join(".git/worktrees/linked/commondir"),
-        "../..\n",
-    )
-    .expect("commondir");
-    std::fs::write(
-        Path::new(&linked).join(".git"),
-        format!("gitdir: {main}/.git/worktrees/linked\n"),
-    )
-    .expect("dot git");
-    let made = id(1);
+    let worktree = |name: &str| {
+        let path = env.cwd(name);
+        std::fs::create_dir_all(Path::new(&main).join(".git/worktrees").join(name)).expect("git");
+        std::fs::write(
+            Path::new(&main)
+                .join(".git/worktrees")
+                .join(name)
+                .join("gitdir"),
+            format!("{path}/.git\n"),
+        )
+        .expect("gitdir");
+        std::fs::write(
+            Path::new(&main)
+                .join(".git/worktrees")
+                .join(name)
+                .join("commondir"),
+            "../..\n",
+        )
+        .expect("commondir");
+        std::fs::write(
+            Path::new(&path).join(".git"),
+            format!("gitdir: {main}/.git/worktrees/{name}\n"),
+        )
+        .expect("dot git");
+        path
+    };
+    let made_wt = worktree("made");
+    let entered_wt = worktree("entered");
+    let user_wt = worktree("user");
+    let left_wt = worktree("left");
+
+    let made_id = id(1);
     env.transcript(
-        &linked,
-        &made,
+        &made_wt,
+        &made_id,
         &[
             json!({"type": "worktree-state", "worktreeSession": {"worktreeName": "w"}}),
-            user(&made, &linked, "work in the worktree", T0),
-            assistant(&made, T0 + 1000),
-        ],
-        T0 + 2000,
-    );
-    let entered = id(2);
-    env.transcript(
-        &linked,
-        &entered,
-        &[
-            json!({"type": "worktree-state", "worktreeSession": {"enteredExisting": true}}),
-            user(&entered, &linked, "entered an existing one", T0 + 5000),
-            assistant(&entered, T0 + 6000),
+            user(&made_id, &made_wt, "made", T0 + 5000),
+            assistant(&made_id, T0 + 6000),
         ],
         T0 + 7000,
     );
-    let response = list(&env.service(), json!({"cwd": linked}))
-        .await
-        .expect("list");
+    let entered_id = id(2);
+    env.transcript(
+        &entered_wt,
+        &entered_id,
+        &[
+            json!({"type": "worktree-state", "worktreeSession": {"enteredExisting": true}}),
+            user(&entered_id, &entered_wt, "entered", T0 + 4000),
+            assistant(&entered_id, T0 + 4500),
+        ],
+        T0 + 5000,
+    );
+    let user_id = id(3);
+    env.transcript(
+        &user_wt,
+        &user_id,
+        &[
+            user(&user_id, &user_wt, "user made", T0 + 3000),
+            assistant(&user_id, T0 + 3500),
+        ],
+        T0 + 4000,
+    );
+    let left_id = id(4);
+    env.transcript(
+        &left_wt,
+        &left_id,
+        &[
+            json!({"type": "worktree-state", "worktreeSession": {"worktreeName": "w"}}),
+            json!({"type": "worktree-state", "worktreeSession": null}),
+            user(&left_id, &left_wt, "left", T0 + 2000),
+            assistant(&left_id, T0 + 2500),
+        ],
+        T0 + 3000,
+    );
+    let main_id = id(5);
+    env.transcript(
+        &main,
+        &main_id,
+        &[
+            json!({"type": "worktree-state", "worktreeSession": {"worktreeName": "w"}}),
+            user(&main_id, &main, "main checkout", T0 + 1000),
+            assistant(&main_id, T0 + 1500),
+        ],
+        T0 + 2000,
+    );
+
+    let service = env.service();
+    let response = list(
+        &service,
+        json!({"cwd": main, "_meta": air(json!({"includeWorktrees": true}))}),
+    )
+    .await
+    .expect("list");
     let rows = response["sessions"].as_array().expect("rows");
     let air_of = |session: &str| {
         rows.iter()
@@ -467,8 +599,21 @@ async fn t2b_list_marks_a_worktree_claude_code_made() {
             .map(|r| r["_meta"]["jetbrains"]["air"].clone())
             .expect("row")
     };
-    assert_eq!(air_of(&made)["agentWorktree"], true);
-    assert!(air_of(&entered).get("agentWorktree").is_none());
+    assert_eq!(air_of(&made_id)["agentWorktree"], true);
+    for session in [&entered_id, &user_id, &left_id, &main_id] {
+        assert!(
+            air_of(session).get("agentWorktree").is_none(),
+            "the field is omitted, not false: {session}"
+        );
+    }
+    // The worktree's own list carries it too.
+    let own = list(&service, json!({"cwd": made_wt}))
+        .await
+        .expect("own list");
+    assert_eq!(
+        own["sessions"][0]["_meta"]["jetbrains"]["air"]["agentWorktree"],
+        true
+    );
 }
 
 /// session/list > reports the row fields of the RFDs, flat
@@ -583,6 +728,55 @@ async fn t2b_list_leaves_out_another_path_that_shares_the_project_directory() {
     assert_eq!(
         ids(&list(&service, json!({"cwd": b})).await.expect("b")),
         vec![theirs]
+    );
+}
+
+/// `session-index.test.ts`: "are listed together once the other path is gone, as
+/// the SDK lists them" — a transcript whose cwd (a colliding spelling) does not
+/// exist is listed under the other path; once the directory reappears it is
+/// hidden again.
+#[tokio::test]
+async fn t2b_list_shows_a_colliding_path_once_the_other_path_is_gone() {
+    let env = Env::new("collide-gone");
+    let dashed = env.cwd("app-v2");
+    let dotted = env.base.join("work").join("app.v2");
+    let dotted_s = dotted.to_string_lossy().into_owned();
+    // `app.v2` does not exist (any more): the transcript is listed under
+    // `app-v2`, the other path that encodes to the same project directory.
+    let gone = id(1);
+    let here = id(2);
+    env.transcript(
+        &dotted_s,
+        &gone,
+        &[
+            user(&gone, &dotted_s, "gone", T0 + 3000),
+            assistant(&gone, T0 + 4000),
+        ],
+        T0 + 5000,
+    );
+    env.transcript(
+        &dashed,
+        &here,
+        &[
+            user(&here, &dashed, "here", T0),
+            assistant(&here, T0 + 1000),
+        ],
+        T0 + 2000,
+    );
+    let service = env.service();
+    let response = list(&service, json!({"cwd": dashed})).await.expect("list");
+    assert_eq!(ids(&response), vec![gone.clone(), here.clone()]);
+    assert_eq!(
+        response["sessions"][0]["cwd"], dotted_s,
+        "the row reports the cwd it was written with"
+    );
+    // Once the path exists again, it is another path's session.
+    std::fs::create_dir_all(&dotted).expect("mkdir");
+    assert_eq!(
+        ids(&list(&service, json!({"cwd": dashed}))
+            .await
+            .expect("hidden")),
+        vec![here]
     );
 }
 
@@ -727,6 +921,14 @@ async fn t2b_archive_and_unarchive_are_idempotent_and_keep_updated_at() {
         "archiving moves nothing"
     );
     assert_eq!(archived["sessions"][0]["title"], "prompt 1");
+    assert_eq!(
+        archived["sessions"][0]["_meta"]["jetbrains"]["air"]["archived"], true,
+        "the archived row carries AIR's flag"
+    );
+    assert!(
+        !env.project_dir(&cwd).join(&session).exists(),
+        "AIR writes no sidecar for an archive"
+    );
     assert_eq!(archive(false).await.as_deref(), Some("prompt 1"));
     assert_eq!(archive(false).await, None, "idempotent");
     assert_eq!(
@@ -922,6 +1124,19 @@ async fn t2b_capabilities_are_advertised_only_after_negotiation() {
             "sessionWorktrees"
         ]
     );
+    // Declaring `sessionArchive`/`sessionRename` alone enables nothing: the
+    // index capability is the gate (`session-index.test.ts`: air("sessionArchive",
+    // "sessionRename") -> baseline).
+    let archive_only = AirClient::from_client_capabilities(&json!({
+        "_meta": {"jetbrains": {"air": {"version": 1,
+            "capabilities": ["sessionArchive", "sessionRename"]}}}
+    }))
+    .expect("air client");
+    connection.negotiate(Some(&archive_only), false);
+    assert!(
+        connection.capabilities().is_empty(),
+        "archive/rename alone advertise nothing"
+    );
     // A later initialize without the capability drops the index.
     connection.negotiate(None, false);
     assert!(connection.capabilities().is_empty());
@@ -1097,4 +1312,326 @@ async fn t2b_list_cursor_does_not_bind_the_limit() {
     .await
     .expect("a cursor works with another limit");
     assert_eq!(ids(&second), vec![id(3)]);
+}
+
+// ---------------------------------------------------------------------------
+// Loaded-session mutations over a real (fake) CLI: the archive/unarchive rules
+// of `session-index.test.ts` need a session that runs here.
+// ---------------------------------------------------------------------------
+
+/// The built `fake-claude` under the target dir cargo uses for this run.
+fn fake_claude_binary() -> PathBuf {
+    let root = common::repo_root();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("rust/target"));
+    let bin = target.join("debug").join("fake-claude");
+    if !bin.exists() {
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--manifest-path",
+                "rust/Cargo.toml",
+                "-p",
+                "fake-claude",
+            ])
+            .current_dir(&root)
+            .status()
+            .expect("spawn cargo build fake-claude");
+        assert!(status.success(), "fake-claude must build");
+    }
+    bin
+}
+
+fn short_timings() -> Timings {
+    Timings {
+        stdin_close_wait: Duration::from_millis(100),
+        term_to_kill_wait: Duration::from_millis(200),
+        force_cancel_grace: Duration::from_millis(100),
+        stderr_drain_cap: Duration::from_millis(100),
+    }
+}
+
+/// Start a real session actor over the fake CLI, replaying `lines` (the fake
+/// transcript). `exit` makes the fake close its stdout after the handshake, so
+/// the session becomes a husk.
+async fn start_session(
+    env: &Env,
+    session_id: &str,
+    cwd: &str,
+    lines: &str,
+) -> (Session, tokio::task::JoinHandle<()>) {
+    let config_dir = env.base.join("config");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    let transcript = env.base.join(format!("{session_id}.fake.jsonl"));
+    std::fs::write(&transcript, lines).expect("fake transcript");
+    let spawn = SpawnOptions {
+        claude_path: Some(fake_claude_binary()),
+        extra_env: vec![(
+            "FAKE_CLAUDE_SCRIPT".to_string(),
+            transcript.to_string_lossy().into_owned(),
+        )],
+        default_cwd: Some(PathBuf::from(cwd)),
+        ..Default::default()
+    };
+    let (session, mut updates) = Session::start(
+        SessionOptions::new(spawn, short_timings(), InitializeOptions::default()).with_env(
+            EnvSnapshot::from_pairs([(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                config_dir.to_string_lossy().into_owned(),
+            )]),
+        ),
+        session_id.to_string(),
+    )
+    .await
+    .expect("the session starts");
+    // The agent layer's forwarder: drain the actor's updates and resolve its
+    // flush barriers (the title change waits for one). The task ends when the
+    // actor ends.
+    let forwarder = tokio::spawn(async move {
+        while let Some(out) = updates.recv().await {
+            match out {
+                SessionOutbound::Flush(done) => {
+                    let _ = done.send(());
+                }
+                SessionOutbound::FlushAcked { done, ack } => {
+                    let _ = done.send(());
+                    let _ = ack.await;
+                }
+                _ => {}
+            }
+        }
+    });
+    (session, forwarder)
+}
+
+fn init_step(exit: bool) -> String {
+    let mut step = json!({
+        "expect": {"type": "control_request", "request": {"subtype": "initialize"}},
+        "emit": [{"type": "control_response", "response": {
+            "subtype": "success", "request_id": "$REQ",
+            "response": {"models": [], "commands": []}
+        }}]
+    });
+    if exit {
+        step["exit"] = json!(true);
+    }
+    format!("{step}\n")
+}
+
+fn interrupt_step() -> String {
+    format!(
+        "{}\n",
+        json!({
+            "expect": {"type": "control_request", "request": {"subtype": "interrupt"}},
+            "emit": [{"type": "control_response", "response": {
+                "subtype": "success", "request_id": "$REQ", "response": {}
+            }}]
+        })
+    )
+}
+
+fn rename_step(title: &str) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "expect": {"type": "control_request", "request": {
+                "subtype": "rename_session", "title": title
+            }},
+            "emit": [{"type": "control_response", "response": {
+                "subtype": "success", "request_id": "$REQ", "response": {}
+            }}]
+        })
+    )
+}
+
+fn rename_error_step(error: &str) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "expect": {"type": "control_request", "request": {"subtype": "rename_session"}},
+            "emit": [{"type": "control_response", "response": {
+                "subtype": "error", "request_id": "$REQ", "error": error
+            }}]
+        })
+    )
+}
+
+fn loaded(session: Session, session_id: &str, cwd: &str) -> LoadedSession {
+    LoadedSession {
+        session,
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        on_closed: None,
+    }
+}
+
+/// `session-index.test.ts`: "is unknown once the session had history, and
+/// allowed for a new unwritten one" — a husk (the query ended, no transcript,
+/// no turn end) is -32002, not an allowed archive.
+#[tokio::test]
+async fn t2b_archive_of_a_husk_without_a_transcript_is_unknown() {
+    let env = Env::new("husk-archive");
+    let cwd = env.cwd("app");
+    let session_id = id(3);
+    let (session, forwarder) = start_session(&env, &session_id, &cwd, &init_step(true)).await;
+    let mut connection = env.connection();
+    connection.negotiate(Some(&air_client()), false);
+    let incarnation = connection.board().begin(&session_id);
+    // The fake CLI exited after the handshake: wait until the actor ended (the
+    // forwarder's update channel closes), then retire the row as the agent's
+    // forwarder does.
+    let _ = forwarder.await;
+    connection.board().retire(&session_id, incarnation);
+    let (publish_tx, _publish_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let publish: Arc<dyn Fn(Value) + Send + Sync> =
+        Arc::new(move |value| drop(publish_tx.send(value)));
+    let operation = connection
+        .archive(
+            &json!({"sessionId": session_id.clone()}),
+            Some(loaded(session, &session_id, &cwd)),
+            publish,
+        )
+        .expect("accepted");
+    let error = timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("finished")
+        .expect_err("a husk needs its transcript");
+    assert_eq!(code(&error), -32002);
+    assert_eq!(error.message, format!("Session not found: {session_id}"));
+}
+
+/// `session-index.test.ts`: "is not written for a running session whose CLI
+/// cannot take a title" — rename and archive of a running CLI without the
+/// `rename_session` control method answer -32600 and leave the transcript
+/// byte-identical.
+#[tokio::test]
+async fn t2b_rename_and_archive_refuse_a_running_cli_without_a_title_method() {
+    let env = Env::new("no-rename");
+    let cwd = env.cwd("app");
+    let session_id = id(4);
+    let path = env.transcript(
+        &cwd,
+        &session_id,
+        &[
+            user(&session_id, &cwd, "work", T0),
+            assistant(&session_id, T0 + 1000),
+        ],
+        T0 + 2000,
+    );
+    let before = std::fs::read(&path).expect("read transcript");
+    let lines = format!(
+        "{}{}{}{}",
+        init_step(false),
+        rename_error_step("Unsupported control request subtype: rename_session"),
+        interrupt_step(),
+        rename_error_step("Unsupported control request subtype: rename_session"),
+    );
+    let (session, forwarder) = start_session(&env, &session_id, &cwd, &lines).await;
+    let mut connection = env.connection();
+    connection.negotiate(Some(&air_client()), false);
+    connection.board().begin(&session_id);
+    let (publish_tx, _publish_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let publish: Arc<dyn Fn(Value) + Send + Sync> =
+        Arc::new(move |value| drop(publish_tx.send(value)));
+
+    let renamed = connection
+        .rename(
+            &json!({"sessionId": session_id.clone(), "title": "Later"}),
+            Some(loaded(session.clone(), &session_id, &cwd)),
+            publish.clone(),
+        )
+        .expect("accepted");
+    let error = timeout(Duration::from_secs(30), renamed)
+        .await
+        .expect("finished")
+        .expect_err("the CLI cannot take a title");
+    assert_eq!(code(&error), -32600);
+    assert_eq!(
+        error.message,
+        "The Claude Code CLI of this session cannot change its title while it runs."
+    );
+
+    let archived = connection
+        .archive(
+            &json!({"sessionId": session_id.clone()}),
+            Some(loaded(session, &session_id, &cwd)),
+            publish,
+        )
+        .expect("accepted");
+    let error = timeout(Duration::from_secs(30), archived)
+        .await
+        .expect("finished")
+        .expect_err("the CLI cannot take a title");
+    assert_eq!(code(&error), -32600);
+    assert_eq!(
+        std::fs::read(&path).expect("read transcript"),
+        before,
+        "a refused title leaves the transcript untouched"
+    );
+    forwarder.abort();
+}
+
+/// `session-index.test.ts`: "is reported to a loaded session on unarchive, which
+/// keeps running" — one `session_info_update` with `archived:false`, the CLI
+/// rename with the visible (prefix-free) title, and the session not closed.
+#[tokio::test]
+async fn t2b_unarchive_reports_to_the_loaded_session_and_keeps_it_running() {
+    let env = Env::new("unarchive-report");
+    let cwd = env.cwd("app");
+    let session_id = id(5);
+    env.transcript(
+        &cwd,
+        &session_id,
+        &[
+            user(&session_id, &cwd, "work", T0),
+            assistant(&session_id, T0 + 1000),
+            custom_title(&session_id, "[archived] Work"),
+            agent_name(&session_id, "[archived] Work"),
+        ],
+        T0 + 2000,
+    );
+    let lines = format!(
+        "{}{}{}",
+        init_step(false),
+        rename_step("Work"),
+        rename_step("Work")
+    );
+    let (session, forwarder) = start_session(&env, &session_id, &cwd, &lines).await;
+    let mut connection = env.connection();
+    connection.negotiate(Some(&air_client()), false);
+    connection.board().begin(&session_id);
+    let (publish_tx, mut publish_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let publish: Arc<dyn Fn(Value) + Send + Sync> =
+        Arc::new(move |value| drop(publish_tx.send(value)));
+
+    let operation = connection
+        .unarchive(
+            &json!({"sessionId": session_id.clone()}),
+            Some(loaded(session.clone(), &session_id, &cwd)),
+            publish,
+        )
+        .expect("accepted");
+    timeout(Duration::from_secs(60), operation)
+        .await
+        .expect("finished")
+        .expect("unarchived");
+    let update = publish_rx.try_recv().expect("one report");
+    assert_eq!(
+        update,
+        json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": {"jetbrains": {"air": {"version": 1, "archived": false}}}
+            }
+        })
+    );
+    assert!(publish_rx.try_recv().is_err(), "exactly one report");
+    // The unarchive does not close the loaded session: it still answers.
+    assert!(
+        session.live_state().await.is_ok(),
+        "the unarchived session keeps running"
+    );
+    forwarder.abort();
 }

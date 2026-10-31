@@ -1128,8 +1128,31 @@ fn t8c_skill_path_picks_up_a_rewrite() {
     std::fs::create_dir_all(&cwd).unwrap();
     let file = write_skill(&cwd, ".claude/skills/commits", &declared("commits"));
     let resolve = |name: &str| crate::tools::resolve_skill_path_in(name, Some(cwd.as_path()), None);
+    // `tools.test.ts`: "picks up a rewrite that restored the modification time
+    // of the file" — the rename keeps the file's length and mtime, so only the
+    // inode change time tells the two apart; the resolver must still see it.
+    let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(stamp)
+        .unwrap();
+    let before = std::fs::metadata(&file).unwrap().modified().unwrap();
     assert_eq!(resolve("renamed"), None);
+    // `commits` and `renamed` are both seven characters: the file keeps its size.
     std::fs::write(&file, declared("renamed")).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(stamp)
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().modified().unwrap(),
+        before,
+        "the rewrite restored the modification time"
+    );
     assert_eq!(resolve("renamed"), Some(file));
     let _ = std::fs::remove_dir_all(&root);
 }

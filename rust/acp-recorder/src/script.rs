@@ -28,6 +28,16 @@ pub enum PermissionPolicy {
     OptionId(String),
 }
 
+/// A base64 image block of a `session/prompt` step.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PromptImage {
+    /// Base64-encoded media payload.
+    pub data: String,
+    /// MIME type describing the encoded payload.
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+}
+
 /// One ACP call to issue.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "call", rename_all = "lowercase")]
@@ -66,10 +76,14 @@ pub enum Step {
         #[serde(default)]
         cwd: Option<PathBuf>,
     },
-    /// `session/prompt` with a text payload.
+    /// `session/prompt` with a text payload, optionally followed by one base64
+    /// image block (`image`): the client→agent multi-modal path.
     #[serde(rename = "session/prompt")]
     Prompt {
         text: String,
+        /// A base64 image block sent after the text block.
+        #[serde(default)]
+        image: Option<PromptImage>,
         #[serde(default)]
         cancel_after_updates: Option<usize>,
         /// Send the prompt without awaiting its response (`no_wait`), so it can
@@ -207,6 +221,7 @@ mod tests {
             script.steps[2],
             Step::Prompt {
                 text: "hello".to_string(),
+                image: None,
                 cancel_after_updates: None,
                 no_wait: false
             }
@@ -230,6 +245,7 @@ mod tests {
             script.steps[0],
             Step::Prompt {
                 text: "x".to_string(),
+                image: None,
                 cancel_after_updates: Some(5),
                 no_wait: false
             }
@@ -250,6 +266,7 @@ mod tests {
             script.steps[0],
             Step::Prompt {
                 text: "a".to_string(),
+                image: None,
                 cancel_after_updates: None,
                 no_wait: true
             }
@@ -258,6 +275,7 @@ mod tests {
             script.steps[1],
             Step::Prompt {
                 text: "b".to_string(),
+                image: None,
                 cancel_after_updates: None,
                 no_wait: false
             }

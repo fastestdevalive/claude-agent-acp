@@ -125,7 +125,11 @@ pub struct Actor {
     pub wire: mpsc::UnboundedReceiver<WireItem>,
     /// Every JSON line the actor wrote to the child's stdin (control frames).
     pub control_lines: mpsc::UnboundedReceiver<Value>,
+    /// Every `Flush`/`FlushAcked` barrier the forwarder saw.
     pub flushes: Arc<AtomicUsize>,
+    /// The settle barriers (`FlushAcked`) only: one per settled turn. A bare
+    /// `Flush` (an update/permission barrier) must not count as a settle.
+    pub settles: Arc<AtomicUsize>,
 }
 
 impl Actor {
@@ -174,6 +178,8 @@ impl Actor {
         let (wire_tx, wire) = mpsc::unbounded_channel::<WireItem>();
         let flushes = Arc::new(AtomicUsize::new(0));
         let flush_count = Arc::clone(&flushes);
+        let settles = Arc::new(AtomicUsize::new(0));
+        let settle_count = Arc::clone(&settles);
         tokio::spawn(async move {
             while let Some(item) = update_rx.recv().await {
                 match item {
@@ -181,12 +187,15 @@ impl Actor {
                         flush_count.fetch_add(1, Ordering::Relaxed);
                         let _ = ack.send(());
                     }
+                    // The production forwarder (`agent.rs`): resolves the reply's
+                    // barrier, then waits INLINE (bounded) for the prompt task to
+                    // ack before it forwards the next item, so a slow prompt task
+                    // stalls the session's update stream exactly as in production.
                     SessionOutbound::FlushAcked { done, ack } => {
                         flush_count.fetch_add(1, Ordering::Relaxed);
+                        settle_count.fetch_add(1, Ordering::Relaxed);
                         let _ = done.send(());
-                        tokio::spawn(async move {
-                            let _ = ack.await;
-                        });
+                        let _ = tokio::time::timeout(Duration::from_secs(1), ack).await;
                     }
                     SessionOutbound::RawUpdate(value) => {
                         let _ = wire_tx.send(WireItem::Update(value["update"].clone()));
@@ -226,6 +235,7 @@ impl Actor {
             wire,
             control_lines,
             flushes,
+            settles,
         }
     }
 
@@ -263,13 +273,51 @@ impl Actor {
         }
     }
 
-    /// Close the session and wait (bounded) for the actor to end.
-    pub async fn shutdown(&mut self) {
+    /// Close the session and wait (bounded) until the actor has actually ended:
+    /// its close reply arrives (or the actor ended before answering, e.g. the
+    /// child's stream ended first), then its command receiver is dropped. The
+    /// reply is sent by a spawned task after the close's flush barrier, so it can
+    /// be observed while the actor is still returning from `run_loop`; asserting
+    /// on the command channel at that instant races the actor's own exit. This
+    /// waits for the documented end (`tx.closed()`) with the stream still open,
+    /// so only the close itself can satisfy it — never a sleep, never the
+    /// stream's own end.
+    pub async fn shutdown(&mut self) -> Result<(), String> {
         let (reply, reply_rx) = oneshot::channel();
         if self.tx.send(Command::Close { reply }).is_ok() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), reply_rx).await;
+            match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+                Ok(Ok(())) => {}
+                // The actor ended before it could answer (the child's stream
+                // ended first, as scenario 7's exit does): the close is moot and
+                // the actor's end below is the contract that matters.
+                Ok(Err(_)) => {}
+                Err(_) => return Err("the close hung (no reply)".to_string()),
+            }
         }
+        // Wait with the stream still open: `session/close` alone must end the
+        // actor (inv_52). Dropping the stream first would let a close that forgot
+        // to end the actor pass via the stream's own end.
+        tokio::time::timeout(Duration::from_secs(3), self.tx.closed())
+            .await
+            .map_err(|_| "the actor did not end after its close reply".to_string())?;
         self.stream_tx = None;
+        Ok(())
+    }
+
+    /// Wait until every command sent before this one was processed AND every
+    /// update the actor emitted so far was forwarded. `Command::FlushUpdates`
+    /// answers through the outbound channel, behind everything the actor queued
+    /// before it, so this is a real barrier for the counters — not a quiet
+    /// window that a loaded scheduler can expire before the actor runs.
+    pub async fn sync(&self, within: Duration) -> Result<(), String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::FlushUpdates { reply })
+            .map_err(|_| "the actor ended before the barrier".to_string())?;
+        tokio::time::timeout(within, reply_rx)
+            .await
+            .map_err(|_| "the actor never flushed its updates".to_string())?
+            .map_err(|_| "the actor dropped the flush barrier".to_string())
     }
 
     /// The CLI's echo of a prompt's user message.
@@ -286,19 +334,18 @@ impl Actor {
         self.stream_tx = None;
     }
 
-    /// Collect updates until `within` elapses with nothing new.
-    pub async fn updates_until_idle(&mut self, within: Duration) -> Vec<Value> {
-        let mut updates = Vec::new();
+    /// Wait (bounded) until at least `n` settle barriers were forwarded, and
+    /// return the count. A settle barrier carries no update, so a quiet-window
+    /// drain alone cannot observe it.
+    pub async fn wait_settles(&self, n: usize, within: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + within;
         loop {
-            match tokio::time::timeout(within, self.wire.recv()).await {
-                Ok(Some(WireItem::Update(value))) => updates.push(value),
-                Ok(Some(WireItem::Permission { reply })) => {
-                    let _ = reply.send(Ok(json!({"outcome": {"outcome": "cancelled"}})));
-                }
-                Ok(None) | Err(_) => break,
+            let count = self.settles.load(Ordering::Relaxed);
+            if count >= n || tokio::time::Instant::now() >= deadline {
+                return count;
             }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        updates
     }
 
     /// Every update already queued, in emission order (a settled prompt's flush

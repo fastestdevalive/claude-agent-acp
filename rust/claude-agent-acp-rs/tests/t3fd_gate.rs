@@ -639,3 +639,136 @@ async fn t9b_logout_leaves_live_sessions_alone_without_a_override() {
     .await
     .expect("the exchange finished in time");
 }
+
+/// A turn that stays open until the CLI is interrupted.
+fn open_turn(text: &str) -> String {
+    json!({
+        "expect": {"type": "user"},
+        "emit": [
+            {"type": "user", "uuid": "$MATCH.uuid", "isReplay": true,
+             "message": {"role": "user", "content": [{"type": "text", "text": text}]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "working"}
+            ]}}
+        ]
+    })
+    .to_string()
+        + "\n"
+        + &json!({
+            "expect": {"type": "control_request", "request": {"subtype": "interrupt"}},
+            "emit": [
+                {"type": "control_response", "response": {"subtype": "success", "request_id": "$REQ"}},
+                {"type": "result", "subtype": "success", "stop_reason": "cancelled",
+                 "is_error": false, "result": "",
+                 "usage": {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}
+            ]
+        })
+        .to_string()
+}
+
+/// P2a F2: a cold `session/new` start must not stop the connection reading
+/// `session/cancel` for another session. Session B's child start is held for 3 s
+/// (a `sleep_ms` step in the fake CLI) while A's cancel is sent. A's prompt must
+/// settle before B's `session/new` answers: before the fix the handler awaited
+/// the start inline, so the cancel was only read after B answered.
+#[tokio::test]
+async fn t3fd_a_cold_session_start_does_not_delay_another_sessions_cancel() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
+        let mut harness = Harness::start(
+            "cold-cancel",
+            &[
+                vec![initialize_step(None), open_turn("work")],
+                vec![initialize_step(Some(3000))],
+            ],
+        );
+        harness.initialize().await;
+        let a = harness.open_session(2).await;
+        harness.send_json(prompt(3, &a, "work")).await;
+        harness
+            .send_json(json!({"jsonrpc":"2.0","id":4,"method":"session/new",
+                "params":{"cwd":repo_root().to_string_lossy(),"mcpServers":[]}}))
+            .await;
+        harness
+            .send_json(json!({"jsonrpc":"2.0","method":"session/cancel",
+                "params":{"sessionId":a}}))
+            .await;
+        let frames = harness.read_responses(&[3, 4]).await;
+        assert_eq!(
+            frames[0]["id"], 3,
+            "A's cancel was served while B's child started: {frames:?}"
+        );
+        assert_eq!(response_of(&frames, 3)["result"]["stopReason"], "cancelled");
+        assert!(
+            response_of(&frames, 4)["result"]["sessionId"].is_string(),
+            "B's session/new answered"
+        );
+        harness.finish().await;
+    })
+    .await
+    .expect("the exchange finished in time");
+}
+
+/// P2a F2: the same for a permission answer — a response frame the SDK routes to
+/// the agent's own request. A cold `session/new` must not stop the connection
+/// reading it while another session's turn waits on it.
+#[tokio::test]
+async fn t3fd_a_cold_session_start_does_not_delay_another_sessions_permission_answer() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
+        let mut harness = Harness::start(
+            "cold-permission",
+            &[
+                vec![initialize_step(None), permission_turn()],
+                vec![initialize_step(Some(3000))],
+            ],
+        );
+        harness.initialize().await;
+        let a = harness.open_session(2).await;
+        harness.send_json(prompt(3, &a, "use a tool")).await;
+        let request_id = permission_request(&mut harness).await;
+        harness
+            .send_json(json!({"jsonrpc":"2.0","id":4,"method":"session/new",
+                "params":{"cwd":repo_root().to_string_lossy(),"mcpServers":[]}}))
+            .await;
+        harness.send_json(permission_answer(&request_id)).await;
+        let frames = harness.read_responses(&[3, 4]).await;
+        assert_eq!(
+            frames[0]["id"], 3,
+            "A's permission answer was served while B's child started: {frames:?}"
+        );
+        assert_eq!(response_of(&frames, 3)["result"]["stopReason"], "end_turn");
+        assert!(
+            response_of(&frames, 4)["result"]["sessionId"].is_string(),
+            "B's session/new answered"
+        );
+        harness.finish().await;
+    })
+    .await
+    .expect("the exchange finished in time");
+}
+
+/// The registry entry of a spawned `session/new` start is applied before the
+/// request that follows its response: the prompt runs on the new session instead
+/// of answering "Session not found".
+#[tokio::test]
+async fn t3fd_a_prompt_after_a_cold_session_new_runs_on_the_registered_session() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
+        let mut harness = Harness::start(
+            "cold-prompt",
+            &[vec![initialize_step(Some(500)), answering_turn("hello")]],
+        );
+        harness.initialize().await;
+        let b = harness.open_session(2).await;
+        harness.send_json(prompt(3, &b, "hello")).await;
+        let response = harness.read_response(3).await;
+        assert_eq!(
+            response["result"]["stopReason"], "end_turn",
+            "the prompt after the start runs on the new session: {response}"
+        );
+        harness.finish().await;
+    })
+    .await
+    .expect("the exchange finished in time");
+}

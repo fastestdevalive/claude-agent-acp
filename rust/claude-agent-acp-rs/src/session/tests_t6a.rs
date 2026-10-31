@@ -313,26 +313,157 @@ fn t6a_a_cycle_reports_running_then_idle_with_its_usage() {
     assert_eq!(updates[0]["usage"]["totalTokens"], 11);
 }
 
-/// acp-v2.test.ts: "ends a cycle that the client cancels with idle cancelled".
+/// acp-v2.test.ts: "ends a cycle that the client cancels with idle cancelled" —
+/// a prompt ends, Claude Code starts a follow-up cycle on its own (running and a
+/// chunk), the client cancels, and the follow-up result ends the cycle `idle
+/// cancelled` (not by injecting the cycle end).
 #[test]
 fn t6a_a_cancelled_cycle_reports_idle_cancelled() {
     let mut rig = rig_v2();
-    rig.map_state.v2.start_cycle();
+    let _intake = queue_v2(&mut rig, "p1");
+    echo(&mut rig, "p1");
+    result(&mut rig, "end_turn");
+    rig.feed(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
     drain(&mut rig);
     v2_out(&mut rig);
-    rig.map_state
-        .v2
-        .set_cycle_end(ForegroundEnd::Ended(TurnOutcome {
-            stop_reason: crate::turn::StopReason::Cancelled,
-            usage: None,
-            meta: None,
-        }));
-    rig.map_state
-        .v2
-        .after_events(&[TurnEvent::CycleEnded], false);
+    // Claude Code starts a follow-up cycle on its own.
+    rig.feed(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"message_start","message":{"id":"msg_followup",
+            "role":"assistant","content":[],"usage":{}}}}));
+    rig.feed(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"The build"}}}));
     drain(&mut rig);
     let (updates, _) = v2_out(&mut rig);
-    assert_eq!(trace(&updates), vec!["idle cancelled"]);
+    assert_eq!(
+        trace(&updates),
+        vec!["running", "usage_update", "agent_message_chunk"],
+        "the follow-up cycle leads in: {updates:?}"
+    );
+    // The client cancels while the cycle runs.
+    let events = rig.machine.cancel();
+    rig.map_state.begin_stopped_work();
+    settle_events(
+        events,
+        &mut rig.tasks,
+        &mut rig.map_state,
+        &rig.live_background,
+        &mut rig.pending,
+        &rig.tx,
+        "s",
+        &rig.high_water,
+        &rig.ext.failure_ctx,
+        rig.ext.air.as_ref(),
+        None,
+        &mut rig.ext.titles,
+        &mut rig.ext.t2a.failures,
+        &mut rig.ext.t2a.usage_turns,
+        &mut crate::session::FileChangeReports::default(),
+    );
+    // The follow-up result and idle end the cycle cancelled.
+    rig.feed(json!({"type":"result","subtype":"success","is_error":false,
+        "stop_reason":"end_turn","result":"The build",
+        "origin":{"kind":"task-notification"},
+        "usage":{"input_tokens":1,"output_tokens":1}}));
+    rig.feed(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+    drain(&mut rig);
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(
+        trace(&updates),
+        vec!["usage_update", "idle cancelled"],
+        "the cancelled cycle ends idle cancelled: {updates:?}"
+    );
+}
+
+/// acp-v2.test.ts: "ends a cycle that the interrupt stopped cancelled, when
+/// Claude Code had started it before the cancel arrived" — two cycles, each
+/// reporting `running`, its chunk, and `idle cancelled` (the v2 trace, not the
+/// machine predicates). The `requesting` marker reopens the cancel window for
+/// the second cycle.
+#[test]
+fn t6a_two_cycles_the_interrupt_stopped_end_idle_cancelled() {
+    let mut rig = rig_v2();
+    rig.machine.latch_capabilities(&["request_marker_lists_v1"]);
+    let _intake = queue_v2(&mut rig, "p1");
+    echo(&mut rig, "p1");
+    result(&mut rig, "end_turn");
+    rig.feed(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+    drain(&mut rig);
+    v2_out(&mut rig);
+
+    // The first cycle is running when the cancel arrives.
+    rig.feed(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"message_start","message":{"id":"msg_first",
+            "role":"assistant","content":[],"usage":{}}}}));
+    rig.feed(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"The first build passed."}}}));
+    drain(&mut rig);
+    v2_out(&mut rig);
+    let events = rig.machine.cancel();
+    rig.map_state.begin_stopped_work();
+    settle_events(
+        events,
+        &mut rig.tasks,
+        &mut rig.map_state,
+        &rig.live_background,
+        &mut rig.pending,
+        &rig.tx,
+        "s",
+        &rig.high_water,
+        &rig.ext.failure_ctx,
+        rig.ext.air.as_ref(),
+        None,
+        &mut rig.ext.titles,
+        &mut rig.ext.t2a.failures,
+        &mut rig.ext.t2a.usage_turns,
+        &mut crate::session::FileChangeReports::default(),
+    );
+    rig.feed(json!({"type":"result","subtype":"success","is_error":false,
+        "stop_reason":"end_turn","result":"The first build passed.",
+        "origin":{"kind":"task-notification"},
+        "usage":{"input_tokens":1,"output_tokens":1}}));
+    rig.feed(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+    drain(&mut rig);
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(
+        trace(&updates),
+        vec!["usage_update", "idle cancelled"],
+        "the first cycle ends cancelled: {updates:?}"
+    );
+
+    // A `requesting` marker that serves none of the stopped prompts reopens the
+    // cancel window; Claude Code starts the second cycle.
+    rig.feed(json!({"type":"system","subtype":"status","status":"requesting"}));
+    rig.feed(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"message_start","message":{"id":"msg_second",
+            "role":"assistant","content":[],"usage":{}}}}));
+    rig.feed(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"The second build"}}}));
+    drain(&mut rig);
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(
+        trace(&updates),
+        vec!["running", "agent_message_chunk"],
+        "the second cycle leads in: {updates:?}"
+    );
+    // The interrupt stops it: its aborted result ends the cycle cancelled.
+    rig.feed(
+        json!({"type":"result","subtype":"error_during_execution","is_error":true,
+        "stop_reason":"end_turn","result":"",
+        "terminal_reason":"aborted_streaming",
+        "origin":{"kind":"task-notification"},
+        "usage":{"input_tokens":1,"output_tokens":1}}),
+    );
+    rig.feed(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+    drain(&mut rig);
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(
+        trace(&updates),
+        vec!["usage_update", "idle cancelled"],
+        "the second cycle ends cancelled: {updates:?}"
+    );
 }
 
 // ---------------------------------------------------------------- B-113

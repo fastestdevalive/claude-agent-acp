@@ -2142,6 +2142,9 @@ pub fn map_commands_changed_with_skills(
 
     let mut avail = Vec::new();
     let mut has_non_terminal_remote_control = false;
+    // One available-commands pass resolves every skill against the same
+    // container scans (`SkillScanCache`), so each container is listed once.
+    let mut skill_scans = crate::tools::SkillScanCache::new();
     if let Some(list) = commands.as_array() {
         for command in list {
             let Some(name) = command["name"].as_str() else {
@@ -2189,7 +2192,12 @@ pub fn map_commands_changed_with_skills(
             // MCP prompt, and only when the file exists on disk.
             if let Some(cwd) = air_skill_cwd {
                 if !mcp_prompt && command.get("builtin").and_then(Value::as_bool) != Some(true) {
-                    if let Some(path) = crate::tools::resolve_skill_path_in(name, Some(cwd), home) {
+                    if let Some(path) = crate::tools::resolve_skill_path_in_with_cache(
+                        name,
+                        Some(cwd),
+                        home,
+                        &mut skill_scans,
+                    ) {
                         let meta = crate::air::with_air_meta(
                             Some(&crate::air::with_air_meta(
                                 None,

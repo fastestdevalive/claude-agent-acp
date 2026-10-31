@@ -40,17 +40,20 @@ async fn t7a_race_1_cancel_vs_result() {
         if reason != "cancelled" && reason != "end_turn" {
             return Err(format!("unexpected stopReason {reason}"));
         }
-        // Let the loser of the race be processed, then count the settle
-        // barriers: one turn, one response.
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        let _ = actor.updates_until_idle(Duration::from_millis(20)).await;
-        let flushes = actor.flushes.load(std::sync::atomic::Ordering::Relaxed);
-        if flushes != 1 {
+        // The loser of the race is processed before the barrier: `FlushUpdates`
+        // is answered behind everything the actor queued before it, so the
+        // settle counter is complete (a quiet window could expire first on a
+        // loaded scheduler). Then count the SETTLE barriers only: one turn, one
+        // response.
+        actor.sync(Duration::from_secs(2)).await?;
+        let settles = actor.settles.load(std::sync::atomic::Ordering::Relaxed);
+        if settles != 1 {
             return Err(format!(
-                "one turn settled {flushes} times (stopReason {reason})"
+                "one turn settled {settles} times (stopReason {reason}, {} barriers)",
+                actor.flushes.load(std::sync::atomic::Ordering::Relaxed)
             ));
         }
-        actor.shutdown().await;
+        actor.shutdown().await?;
         Ok(())
     })
     .await;

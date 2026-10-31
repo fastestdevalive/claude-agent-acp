@@ -983,3 +983,115 @@ async fn t8c_pushes_central_from_the_effective_pre_session_settings_and_suppress
     .await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// A gateway that answers `/v1/models` only once `release` fires: a slow listing
+/// another provider request can queue behind.
+async fn slow_gateway(ids: &[&str]) -> (String, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let body =
+        json!({ "data": ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>() }).to_string();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 2048];
+        let _ = socket.read(&mut buf).await;
+        let _ = release_rx.await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.shutdown().await;
+        // A later listing of the same gateway answers at once.
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (base, release_tx)
+}
+
+/// `providers.test.ts`: "applies providers/set and providers/disable in the order
+/// they arrive while a listing runs" — the disable that arrived while the set's
+/// listing was in flight wins.
+#[tokio::test]
+async fn t3b_a_disable_behind_a_slow_listing_wins_in_arrival_order() {
+    let tmp = temp_dir("provider-order");
+    let opts = options(&tmp, &json!({"apiKeySource": "ANTHROPIC_API_KEY"}));
+    let (slow, release) = slow_gateway(&["claude-sonnet-5"]).await;
+    with_agent(opts, false, move |connection, _statuses| async move {
+        call(&connection, "initialize", json!({"protocolVersion": 1})).await?;
+        let set = connection
+            .send_request(UntypedMessage::new(
+                "providers/set",
+                json!({"providerId": "main", "apiType": "anthropic", "baseUrl": slow}),
+            )?)
+            .block_task();
+        let disable = connection
+            .send_request(UntypedMessage::new(
+                "providers/disable",
+                json!({"providerId": "main"}),
+            )?)
+            .block_task();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = release.send(());
+        let (set_result, disable_result) = tokio::join!(set, disable);
+        set_result?;
+        disable_result?;
+        let listed = call(&connection, "providers/list", json!({})).await?;
+        assert_eq!(
+            listed["providers"][0]["current"],
+            json!({"apiType": "anthropic", "baseUrl": "https://api.anthropic.com"}),
+            "the later disable is the current routing"
+        );
+        Ok(())
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// `providers.test.ts`: "keeps the later providers/set when an earlier one lists
+/// slower" — the later set is the current routing.
+#[tokio::test]
+async fn t3b_the_later_provider_set_wins_when_an_earlier_one_lists_slower() {
+    let tmp = temp_dir("provider-later");
+    let opts = options(&tmp, &json!({"apiKeySource": "ANTHROPIC_API_KEY"}));
+    let (slow, release) = slow_gateway(&["claude-sonnet-5"]).await;
+    let fast = stub_gateway(&["claude-opus-4-5"]).await;
+    with_agent(opts, false, move |connection, _statuses| async move {
+        call(&connection, "initialize", json!({"protocolVersion": 1})).await?;
+        let first = connection
+            .send_request(UntypedMessage::new(
+                "providers/set",
+                json!({"providerId": "main", "apiType": "anthropic", "baseUrl": slow}),
+            )?)
+            .block_task();
+        let second = connection
+            .send_request(UntypedMessage::new(
+                "providers/set",
+                json!({"providerId": "main", "apiType": "anthropic", "baseUrl": fast}),
+            )?)
+            .block_task();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = release.send(());
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result?;
+        second_result?;
+        let listed = call(&connection, "providers/list", json!({})).await?;
+        assert_eq!(
+            listed["providers"][0]["current"]["baseUrl"], fast,
+            "the later set is the current routing"
+        );
+        Ok(())
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}

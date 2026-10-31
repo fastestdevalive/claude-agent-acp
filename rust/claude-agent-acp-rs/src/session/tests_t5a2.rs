@@ -714,6 +714,46 @@ async fn t5a2_result_reconciles_fast_mode_and_ignores_cooldown_and_autonomous_re
     assert!(updates.is_empty(), "autonomous result ignored: {updates:?}");
 }
 
+/// `acp-agent.test.ts`: "only reconciles Fast mode from user-driven results, not
+/// task-notification followups" — a background result that says `on` changes
+/// nothing; the user turn's own result flips the toggle on with exactly one
+/// config_option_update.
+#[tokio::test]
+async fn t5a2_a_user_result_flips_fast_mode_on_and_an_autonomous_one_does_not() {
+    let models = vec![model("claude-sonnet-4-5", true, None, true)];
+    let mut config = base(models.clone(), "claude-sonnet-4-5", true, false);
+    config.fast_mode_enabled = false;
+    let mut actor = Actor::new(composed(config, true), caps(true, false), false);
+    // The task-notification result says "on": it must not flip or notify.
+    let updates = actor
+        .feed(
+            json!({"type": "result", "subtype": "success", "is_error": false,
+            "stop_reason": "end_turn", "fast_mode_state": "on",
+            "origin": {"kind": "task-notification"}}),
+        )
+        .await;
+    assert!(updates.is_empty(), "autonomous result ignored: {updates:?}");
+    assert_eq!(
+        option(&actor.config().await, "fast").unwrap().current_value,
+        "false"
+    );
+    // The user turn's own result flips it on.
+    let updates = actor
+        .feed(
+            json!({"type": "result", "subtype": "success", "is_error": false,
+            "stop_reason": "end_turn", "fast_mode_state": "on"}),
+        )
+        .await;
+    let configs = updates_of(&updates, "config_option_update");
+    assert_eq!(configs.len(), 1, "one update: {updates:?}");
+    let options = wire_options(configs[0]);
+    assert_eq!(option(&options, "fast").unwrap().current_value, "true");
+    assert_eq!(
+        option(&actor.config().await, "fast").unwrap().current_value,
+        "true"
+    );
+}
+
 #[tokio::test]
 async fn t5a2_fast_mode_reason_only_and_no_option_preserve_intent() {
     let models = vec![

@@ -21,7 +21,7 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | acp-agent.ts@readTextFile | agent.rs | merged:agent.rs | fs/foreground/autonomous bookkeeping |
 | acp-agent.ts@requestPermissionFromClient | permission.rs, permission_options.rs | split:permission.rs | permission + elicitation + canUseTool |
 | acp-agent.ts@updateConfigOption | session_config.rs | merged:session_config.rs | config option application, fast mode |
-| acp-agent.ts@getOrCreateSession | session.rs, session_store.rs, resumed_session.rs | split:session.rs | incl. createSession |
+| acp-agent.ts@getOrCreateSession | agent.rs, session.rs | split:agent.rs | fingerprint compare + teardown/recreate + else `createSession(resume)`: `compute_session_fingerprint` (`agent.rs:543`) and the `session/new` arm (`agent.rs:3551-3600`); the start path is `session.rs`; `session_store.rs`/`resumed_session.rs` hold the load/resume/fork helpers, not this method (P3-16) |
 | acp-agent.ts@shouldEmitRawMessage | quota.rs, usage.rs | split:usage.rs | usage/quota/provider helpers |
 | acp-agent.ts@discoverCustomAgents | settings.rs, sdk_options.rs | split:settings.rs | buildConfigOptions/commands |
 | acp-agent.ts@promptToClaude | turn.rs, tools.rs | split:turn.rs | prompt conversion + tool-call bookkeeping |
@@ -44,9 +44,9 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | goal-extension.ts | goal.rs | 1:1 | `_session/goal` goal extension (AG-1) |
 | hide-claude-auth.ts | hide_claude_auth.rs | 1:1 | account predicates, refusal errors, per-turn guard |
 | index.ts | bin/claude-agent-acp-rs.rs | 1:1 | node entrypoint |
-| lib.ts | lib.rs | different:Rust crate exports differ from the TS public surface (FX-4) | public exports |
+| lib.ts | lib.rs | different:Rust crate exports differ from the TS public surface (FX-4) | public exports; two upstream re-exports (`streamEventToAcpNotifications`, `isLocalCommandMetadata`) have no `pub use` (`strip_local_command_metadata` is crate-private in `transcript.rs:206`). P3-21 |
 | managed-policy.ts | settings.rs | merged:settings.rs | managed env tier and MDM/registry tiers (F5a) |
-| mcp-command.ts | mcp_command.rs | 1:1 | `/mcp` prompt (AG-4) |
+| mcp-command.ts | mcp_command.rs, map.rs, control.rs | split:mcp_command.rs | `parseMcpCommand`/`runMcpCommand`/`cleanMcpError`/`formatMcpStatus` in `mcp_command.rs`; the exported `MCP_AVAILABLE_COMMAND` (`/mcp` entry) is built inline in `map.rs:2211-2218`; the status read (`readMcpServerStatus`) goes through `control.rs:475` (`mcp_status`). P3-18 |
 | native-subagents.ts | native_subagents.rs, native_subagents/runtime.rs, async_tasks/subagents.rs | split:native_subagents.rs | native subagent child-session registry; history lookups wired (Q-22 DONE) |
 | paths.ts | session_store.rs | different:path helpers replaced by session storage | path helpers |
 | permissions/effects.ts | permission_effects.rs | 1:1 | permission effects (T6A2) |
@@ -64,7 +64,7 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | serve.ts | bin/claude-agent-acp-rs.rs, v2/serve.rs | split:bin/claude-agent-acp-rs.rs | serve entrypoint; protocol router in v2/serve.rs (T5C) |
 | session-config-ids.ts | session_config.rs | merged:session_config.rs | config ids |
 | session-effort.ts | session_config.rs | merged:session_config.rs | effort config |
-| session-failure-extension.ts | session_failure.rs | 1:1 | session failure controller, replay, advisory notices |
+| session-failure-extension.ts | session_failure.rs, session/failures.rs, agent.rs | split:session_failure.rs | pure helpers in `session_failure.rs` (`sessionFailureMeta`, `providerFailureCategory`, `ClaudeFailureKind`, `assistantMessageText`); the lifecycle (`SessionFailureController.prepare/publish/clear/restore`) is `session/failures.rs:68-266`; `airSessionFailureCapabilityMeta` is the literal AIR list at `agent.rs:192-200` + the initialize meta at `session.rs`; `supportsAirSessionFailures` is `ext.air_supports("sessionFailure")` (`session.rs:5903,8983`). P3-17 |
 | session-index/activity.ts | session_index/activity.rs | 1:1 | session activity board (running/idle/requires_action/error, cost); session-side producers partly lane-A hooks (M-65 PARTIAL) |
 | session-index/archive-title.ts | session_index/archive_title.rs | 1:1 | archive prefix, title precedence |
 | session-index/connection.ts | session_index/connection.rs | 1:1 | index connection wrappers: delete, fork holds, archive; handlers and call sites wired (Q-42 DONE) |
@@ -91,14 +91,14 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | tool-calls/changed-meta-filter.ts | meta_filter.rs | 1:1 | changed-meta filter |
 | tool-calls/client-capabilities.ts | client_caps.rs | 1:1 | full capability parse (terminal, AIR, notices, compaction, auth, elicitation); C-25 |
 | tool-calls/content.ts | tools.rs | merged:tools.rs | content rendering (`textContent`, `toAcpContentUpdate`, `markdownEscape`, `toDisplayPath`, `resultText`, `structuredResult`) |
-| tool-calls/facts.ts | tools.rs | merged:tools.rs | tool facts |
+| tool-calls/facts.ts | tools.rs, tools/reporters.rs, client_caps.rs | merged:tools.rs | type-only upstream module: `ToolShape` (`tools.rs:33`), `BashFacts` (`tools/reporters.rs:14`) and `CommandOutcome` (`client_caps.rs`) model `ToolUseFacts`/`ToolResultFacts`/`ToolReporter`; no named Rust structs for those three. P3-19 |
 | tool-calls/field-tracker.ts | map.rs | merged:map.rs | field tracker (`MapState::TrackedToolCall`: changed-field filter, merged `_meta`, pinned approval content, entry lifetime; U-25/U-30/U-36) |
 | tool-calls/renderer.ts | map.rs, tools.rs, permission.rs | merged:map.rs | renderer: reporter-facts dispatch in map.rs, `toolShape`/`rawInput`/`toolUseContent` facts in tools.rs, `permissionToolCall` in permission.rs; AIR `rawInputRendering`/`planFile` gated on the client capabilities (T-03/T-04/T-85/T-86) |
 | tool-calls/reporters/agent.ts | tools.rs | merged:tools.rs | agent reporter |
 | tool-calls/reporters/bash.ts | tools.rs | merged:tools.rs | bash reporter |
 | tool-calls/reporters/compaction.ts | tool_reporters_compaction.rs | 1:1 | compaction tool call reporter (T5A) |
 | tool-calls/reporters/file-edit.ts | tools.rs, hooks.rs, diff.rs | merged:tools.rs | file-edit reporter: Write/Edit facts and diffs, NotebookEdit AIR rendering (T-46), `finalChange` exact patch in hooks.rs |
-| tool-calls/reporters/index.ts | tools.rs | merged:tools.rs | reporter registry |
+| tool-calls/reporters/index.ts | tools.rs | merged:tools.rs | the only export `reporterFor(toolName)` has no Rust lookup function: the dispatch is the `tool_shape` match (`tools.rs:865-1300`); behaviourally merged, but a bump to `reporterFor` is not found by symbol search. P3-20 |
 | tool-calls/reporters/interaction.ts | tools.rs, map.rs | merged:tools.rs | interaction reporter: ExitPlanMode (incl. AIR planFile path and plan-file clear call, T-59/T-60) in tools.rs + map.rs |
 | tool-calls/reporters/read.ts | tools.rs | merged:tools.rs | read reporter |
 | tool-calls/reporters/search.ts | tools.rs | merged:tools.rs | search reporter |

@@ -39,7 +39,11 @@ fn init_line(fast_state: &str) -> String {
     )
 }
 
-const CONTEXT_LINE: &str = "{\"expect\":{\"type\":\"control_request\",\"request\":{\"subtype\":\"get_context_usage\"}},\"emit\":[{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$REQ\",\"response\":{\"rawMaxTokens\":200000}}}]}\n";
+/// The session/new background probe must ask for the summary detail: the fake
+/// CLI only consumes this step when the request carries `detail:"summary"`
+/// (a bare `{subtype}` request would be auto-acked, leaving the step pending and
+/// failing the next expectation).
+const CONTEXT_LINE: &str = "{\"expect\":{\"type\":\"control_request\",\"request\":{\"subtype\":\"get_context_usage\",\"detail\":\"summary\"}},\"emit\":[{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$REQ\",\"response\":{\"rawMaxTokens\":200000}}}]}\n";
 
 #[tokio::test]
 async fn t5a2_fast_mode_is_seeded_and_toggled_end_to_end() {

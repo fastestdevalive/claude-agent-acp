@@ -552,7 +552,7 @@ async fn t8d_live_load_replay_end_is_sent_after_the_replay() {
         "u1",
         "hello",
     )];
-    let (updates, _response) = live_load_exchange(
+    let (updates, response) = live_load_exchange(
         "live-replay-end",
         json!({"_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["loadReplayEnd"]}}}}),
         &messages,
@@ -563,6 +563,38 @@ async fn t8d_live_load_replay_end_is_sent_after_the_replay() {
         vec!["user_message_chunk", "end"],
         "{updates:?}"
     );
+    let id = response["sessionId"].as_str().expect("a session id");
+    let end = updates
+        .iter()
+        .find(|(_, params)| is_end(params))
+        .expect("an end event");
+    assert_eq!(
+        end.1,
+        json!({
+            "sessionId": id,
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": {"jetbrains": {"air": {"version": 1, "loadReplayEnd": true}}}
+            }
+        }),
+        "the end event's exact body"
+    );
+    // The end event follows the replayed message (the commands update may come
+    // after it).
+    let end_at = updates
+        .iter()
+        .position(|(_, params)| is_end(params))
+        .expect("an end event");
+    let chunk_at = updates
+        .iter()
+        .position(|(_, params)| {
+            params
+                .pointer("/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("user_message_chunk")
+        })
+        .expect("the replayed message");
+    assert!(chunk_at < end_at, "the replay precedes the end event");
 }
 
 /// One end event after the replay, before the response, with no title/updatedAt;

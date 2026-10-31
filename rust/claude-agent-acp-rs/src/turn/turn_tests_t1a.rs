@@ -526,18 +526,45 @@ fn f13_result_naming_cancelled_prompt_does_not_settle_next_prompt() {
     machine.enqueue(Turn::new("p1".into(), false));
     machine.on_echo("p1");
     machine.enqueue(Turn::new("p2".into(), false));
-    machine.cancel();
+    // The queued p2 is swept and settles cancelled at the cancel.
+    let cancel_events = machine.cancel();
+    assert_eq!(
+        settled(&cancel_events),
+        vec![("p2", StopReason::Cancelled)],
+        "the queued prompt is swept cancelled"
+    );
     // The receipt left p2 out: the count credit is uncounted.
     machine.reconcile_orphan_receipt(Some(&[]));
-    machine.on_idle();
+    // The cancelled p1 settles cancelled at the idle.
+    let idle_events = machine.on_idle();
+    assert_eq!(
+        settled(&idle_events),
+        vec![("p1", StopReason::Cancelled)],
+        "the active prompt ends cancelled"
+    );
     machine.enqueue(Turn::new("p3".into(), true));
-    let events = machine.on_result(&stamped(result_frame("success", false), "p2"), false);
+    // p2's late stamped result carries its own (large) usage: it is not p3's.
+    let mut late = stamped(result_frame("success", false), "p2");
+    late["usage"] = serde_json::json!({"input_tokens": 999, "output_tokens": 0});
+    let events = machine.on_result(&late, false);
     assert!(
         settled(&events).is_empty(),
         "p2's stamped result is not p3's"
     );
-    let events = machine.on_result(&stamped(result_frame("success", false), "p3"), false);
+    // p3 settles end_turn with its own usage, not the abandoned 999.
+    let mut third = stamped(result_frame("success", false), "p3");
+    third["usage"] = serde_json::json!({"input_tokens": 0, "output_tokens": 0});
+    let events = machine.on_result(&third, false);
     assert_eq!(settled(&events), vec![("p3", StopReason::EndTurn)]);
+    let usage = events.iter().find_map(|e| match e {
+        TurnEvent::Settled { usage, .. } => Some(*usage),
+        _ => None,
+    });
+    assert_eq!(
+        usage.map(|u| u.input_tokens),
+        Some(0),
+        "the abandoned prompt's usage is not attributed to the next turn"
+    );
 }
 
 /// R72-2 — the empty-interruption `[ede_diagnostic]` result of a cancelled

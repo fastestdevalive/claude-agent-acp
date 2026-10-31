@@ -299,7 +299,10 @@ fn t3a_interrupt_marker_needs_the_tool_result_and_never_leaks() {
     );
 }
 
-/// B-76 — a cancel forgets both markers.
+/// B-76 — a cancel forgets both markers and ends the turn cancelled
+/// (`acp-agent.test.ts`: "clears pending ExitPlanMode state even after the query
+/// has closed"). A husk's actor is gone, so its markers are gone with it and a
+/// cancel is refused (`SESSION_GONE`): the client never sees a stale marker.
 #[test]
 fn t3a_cancel_forgets_the_pending_plan_markers() {
     let mut rig = Rig::new();
@@ -312,6 +315,11 @@ fn t3a_cancel_forgets_the_pending_plan_markers() {
     rig.feed(interruption_diagnostic());
     assert!(rig.ext.t2a.exit_plan.interruption.is_none());
     assert!(rig.ext.t2a.exit_plan.context_reset.is_none());
+    assert_eq!(
+        stop_reason_of(&mut rig, "p1"),
+        "cancelled",
+        "the cancel also ends the turn"
+    );
 }
 
 /// U-24 / T-88 — an approved plan of a client that takes plan operations is

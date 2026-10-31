@@ -110,12 +110,19 @@ fn autonomous_result() -> Value {
 
 // ---------------------------------------------------------------- C-24 (745)
 
-/// acp-v2.test.ts: "reports a command whose result says interrupted as
-/// cancelled" — a successful command whose structured output says `interrupted`
-/// is an aborted run, so v2 gets `cancelled` and v1 keeps `completed`.
+/// `tools.test.ts`: "reports an interrupted command as cancelled to a v2
+/// client, and as completed to every other client" — a successful command
+/// whose structured output says `interrupted` is an aborted run, so v2 gets
+/// `cancelled` and v1 keeps `completed`; the same command without the flag is
+/// `completed` on v2 too.
 #[test]
 fn t9a_g3_a_command_result_that_says_interrupted_is_cancelled_on_v2() {
-    for (v2, expected) in [(true, "cancelled"), (false, "completed")] {
+    for (v2, interrupted, expected) in [
+        (true, true, "cancelled"),
+        (false, true, "completed"),
+        (true, false, "completed"),
+        (false, false, "completed"),
+    ] {
         let mut rig = if v2 { rig_v2() } else { Rig::new() };
         rig.feed(json!({"type":"assistant","parent_tool_use_id":null,
             "message":{"id":"msg_bash","role":"assistant","model":"claude-sonnet-4-6",
@@ -124,16 +131,16 @@ fn t9a_g3_a_command_result_that_says_interrupted_is_cancelled_on_v2() {
         rig.updates();
         rig.feed(json!({"type":"user","parent_tool_use_id":null,
             "uuid":"u1",
-            "tool_use_result":{"stdout":"","stderr":"Command aborted before execution",
-                "interrupted":true,"isImage":false},
+            "tool_use_result":{"stdout":"partial","stderr":"",
+                "interrupted":interrupted,"isImage":false},
             "message":{"role":"user","content":[{"type":"tool_result",
                 "tool_use_id":"toolu_bash",
-                "content":"Command aborted before execution<error>Command was aborted before completion</error>"}]}}));
+                "content":"partial"}]}}));
         let notes = notifications(&mut rig);
         assert_eq!(
             last_status(&notes, "toolu_bash"),
             Some(json!(expected)),
-            "{notes:?}"
+            "v2={v2} interrupted={interrupted}: {notes:?}"
         );
     }
 }

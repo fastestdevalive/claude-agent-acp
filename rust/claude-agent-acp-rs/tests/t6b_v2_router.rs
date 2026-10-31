@@ -51,7 +51,12 @@ fn transcript(tmp: &Path) -> PathBuf {
             "subtype": "success", "request_id": "$REQ", "response": {}
         }}]
     });
-    std::fs::write(&path, format!("{init}\n{mode}\n")).expect("write transcript");
+    let auth_status = json!({
+        "auth_status_stdout": {
+            "loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty"
+        }
+    });
+    std::fs::write(&path, format!("{init}\n{mode}\n{auth_status}\n")).expect("write transcript");
     path
 }
 
@@ -576,29 +581,61 @@ async fn m106_without_opt_in_the_connection_stays_v1() {
     };
     let (agent_channel, client_channel) = Channel::duplex();
     let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
+    let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<Value>();
     let response = timeout(
         Duration::from_secs(60),
-        Client.builder().connect_with(
-            client_channel,
-            move |connection: ConnectionTo<Agent>| async move {
-                let init = call(
-                    &connection,
-                    "initialize",
-                    json!({
-                        "protocolVersion": 1,
-                        "clientCapabilities": {"auth": {"terminal": true}},
-                    }),
-                )
-                .await?;
-                assert_eq!(init["protocolVersion"], 1);
-                call(
-                    &connection,
-                    "session/new",
-                    json!({"cwd": cwd(), "mcpServers": []}),
-                )
-                .await
-            },
-        ),
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: UntypedMessage, _cx| {
+                    if notification.method() == "_auth/status_update" {
+                        let _ = auth_tx.send(notification.params().clone());
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                client_channel,
+                move |connection: ConnectionTo<Agent>| async move {
+                    let init = call(
+                        &connection,
+                        "initialize",
+                        json!({
+                            "protocolVersion": 1,
+                            "clientCapabilities": {"auth": {"terminal": true}},
+                        }),
+                    )
+                    .await?;
+                    // The unchanged v1 handshake (`acp-v2.test.ts`: "serves the
+                    // unchanged v1 handshake to a v1 client").
+                    assert_eq!(init["protocolVersion"], 1);
+                    assert_eq!(init["agentCapabilities"]["loadSession"], true);
+                    assert_eq!(
+                        init["agentCapabilities"]["sessionCapabilities"]["resume"],
+                        json!({})
+                    );
+                    let methods = init["authMethods"]
+                        .as_array()
+                        .expect("authMethods is an array");
+                    assert!(!methods.is_empty(), "at least one auth method");
+                    for method in methods {
+                        assert!(method.get("id").is_some(), "every method has an id");
+                    }
+                    // The auth status notification follows the handshake.
+                    let status = timeout(Duration::from_secs(10), auth_rx.recv())
+                        .await
+                        .expect("an auth status update")
+                        .expect("the notification is sent");
+                    assert!(status.get("authStatus").is_some(), "{status}");
+                    call(
+                        &connection,
+                        "session/new",
+                        json!({"cwd": cwd(), "mcpServers": []}),
+                    )
+                    .await
+                },
+            ),
     )
     .await
     .expect("in time")

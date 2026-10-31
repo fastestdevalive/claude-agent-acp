@@ -65,26 +65,58 @@ fn identifiers(line: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Every banned lock type import/use, in any `use`/brace form (including a
-/// multi-line `use a::{ ... };`). Test modules are NOT skipped: the rule is a
-/// property of the whole crate source.
+/// The lock type names of `std::sync`/`tokio::sync` this crate bans. `MutexGuard`
+/// and the `RwLock*Guard` types are included: a helper that returns a guard is a
+/// lock in the tree even when the acquisition is not on one line.
+const STD_LOCK_TOKENS: [&str; 5] = [
+    "Mutex",
+    "RwLock",
+    "MutexGuard",
+    "RwLockReadGuard",
+    "RwLockWriteGuard",
+];
+const TOKIO_LOCK_TOKENS: [&str; 8] = [
+    "Mutex",
+    "RwLock",
+    "broadcast",
+    "MutexGuard",
+    "RwLockReadGuard",
+    "RwLockWriteGuard",
+    "OwnedMutexGuard",
+    "OwnedRwLockWriteGuard",
+];
+
+fn is_lock_token(crate_name: &str, token: &str) -> bool {
+    match crate_name {
+        "std" => STD_LOCK_TOKENS.contains(&token),
+        "tokio" => TOKIO_LOCK_TOKENS.contains(&token),
+        _ => false,
+    }
+}
+
+/// Every banned lock type import/use, in any `use`/brace/glob form (including a
+/// multi-line `use a::{ ... };` and `use a::sync::*;` followed by a bare lock
+/// type). Test modules are NOT skipped: the rule is a property of the whole
+/// crate source.
 fn banned_lock_types(file: &Path, content: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let mut in_block_comment = false;
     // The crate of an open multi-line `use` statement.
     let mut open_use: Option<&'static str> = None;
+    // A glob import of `std::sync::*` / `tokio::sync::*`: a bare lock type later
+    // is that crate's.
+    let mut glob_std_sync = false;
+    let mut glob_tokio_sync = false;
 
     for (idx, raw) in content.lines().enumerate() {
         let line = strip_comments(raw, &mut in_block_comment);
         let tokens = identifiers(&line);
-        let has = |token: &str| tokens.contains(&token);
+        let bare_lock = tokens
+            .iter()
+            .any(|token| is_lock_token("std", token) || is_lock_token("tokio", token));
 
         if let Some(crate_name) = open_use {
-            let banned = match crate_name {
-                "std" => has("Mutex") || has("RwLock"),
-                "tokio" => has("Mutex") || has("RwLock") || has("broadcast"),
-                _ => false,
-            };
+            let banned = tokens.iter().any(|token| is_lock_token(crate_name, token));
             if banned {
                 violations.push(format!(
                     "{}:{}: banned lock type in a `use {crate_name}::sync` block",
@@ -92,16 +124,27 @@ fn banned_lock_types(file: &Path, content: &str) -> Vec<String> {
                     idx + 1
                 ));
             }
+            if line.contains('*') {
+                match crate_name {
+                    "std" => glob_std_sync = true,
+                    "tokio" => glob_tokio_sync = true,
+                    _ => {}
+                }
+            }
             if line.contains(';') {
                 open_use = None;
             }
             continue;
         }
 
-        let std_banned = line.contains("std::sync") && (has("Mutex") || has("RwLock"));
-        let tokio_banned =
-            line.contains("tokio::sync") && (has("Mutex") || has("RwLock") || has("broadcast"));
-        if std_banned || tokio_banned {
+        let std_line = line.contains("std::sync");
+        let tokio_line = line.contains("tokio::sync");
+        let std_banned = std_line && tokens.iter().any(|t| is_lock_token("std", t));
+        let tokio_banned = tokio_line && tokens.iter().any(|t| is_lock_token("tokio", t));
+        // A glob import makes a bare lock type later that crate's.
+        let glob_banned =
+            bare_lock && !std_line && !tokio_line && (glob_std_sync || glob_tokio_sync);
+        if std_banned || tokio_banned || glob_banned {
             violations.push(format!(
                 "{}:{}: banned lock type `{}`",
                 file.display(),
@@ -112,20 +155,74 @@ fn banned_lock_types(file: &Path, content: &str) -> Vec<String> {
 
         // A `use` that does not end on this line: keep scanning its braced list.
         if line.contains("use ") && !line.contains(';') {
-            if line.contains("std::sync") {
+            if std_line {
                 open_use = Some("std");
-            } else if line.contains("tokio::sync") {
+            } else if tokio_line {
                 open_use = Some("tokio");
             }
         }
+        if line.contains("use ") && line.contains(';') {
+            if std_line && line.contains('*') {
+                glob_std_sync = true;
+            }
+            if tokio_line && line.contains('*') {
+                glob_tokio_sync = true;
+            }
+        }
     }
-
     violations
+}
+
+/// Whether a file can hold a lock guard at all: a lock type name, or a glob
+/// import of a sync module. A `.read()`/`.write()` on a non-lock receiver (a
+/// plain method named `read`) is not a guard.
+fn file_may_hold_guards(content: &str) -> bool {
+    let mut in_block_comment = false;
+    for raw in content.lines() {
+        let line = strip_comments(raw, &mut in_block_comment);
+        let tokens = identifiers(&line);
+        // A lock type name, or a glob import of a sync module (whose bare lock
+        // types the type scanner reports; this scan only needs to run).
+        if tokens
+            .iter()
+            .any(|token| STD_LOCK_TOKENS.contains(token) || TOKIO_LOCK_TOKENS.contains(token))
+        {
+            return true;
+        }
+        if line.contains("use ")
+            && line.contains('*')
+            && (line.contains("std::sync") || line.contains("tokio::sync"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// A call that returns a guard through a helper (`self.guard()`, `read_lock(&s)`,
+/// `MutexGuard::new`): its name ends in `guard`/`lock` (or is exactly one), so the
+/// binding is a guard even though no `.lock()` appears on its line.
+fn calls_guard_helper(line: &str) -> bool {
+    identifiers(line).into_iter().any(|token| {
+        (token == "guard"
+            || token == "lock"
+            || token.ends_with("_lock")
+            || token.ends_with("_guard")
+            || token.ends_with("Guard"))
+            && line.contains(&format!("{token}("))
+    })
 }
 
 /// Lock guard bindings held across `.await` in the same block. Simple brace
 /// tracking: the guard dies when its block closes (or on an explicit `drop(`).
+///
+/// The acquisition and the await may share a line (`let g = m.lock(); work().await;`),
+/// which the old one-line rule skipped; a tokio `.lock().await` is the
+/// acquisition itself, not a guard held across an await.
 fn lock_across_await(file: &Path, content: &str) -> Vec<String> {
+    if !file_may_hold_guards(content) {
+        return Vec::new();
+    }
     let mut violations = Vec::new();
     let mut in_block_comment = false;
     let mut depth: i32 = 0;
@@ -141,8 +238,21 @@ fn lock_across_await(file: &Path, content: &str) -> Vec<String> {
             }
         }
 
-        let binding = line.contains("let ")
-            && (line.contains(".lock()") || line.contains(".read()") || line.contains(".write()"));
+        let acquires =
+            line.contains(".lock()") || line.contains(".read()") || line.contains(".write()");
+        let binding = line.contains("let ") && (acquires || calls_guard_helper(&line));
+        let own_await = line.contains(".lock().await")
+            || line.contains(".read().await")
+            || line.contains(".write().await");
+        // A guard acquired on this line and an `.await` on it (not the lock's own
+        // await) is held across that await.
+        if binding && line.contains(".await") && !own_await {
+            violations.push(format!(
+                "{}:{}: guard bound on the same line is held across .await",
+                file.display(),
+                idx + 1
+            ));
+        }
         if line.contains(".await") && !binding {
             if let Some((bind_line, _)) = guard {
                 violations.push(format!(
@@ -162,13 +272,14 @@ fn lock_across_await(file: &Path, content: &str) -> Vec<String> {
         }
 
         if binding {
+            // A `.lock().await` acquires the guard as part of this line; the
+            // guard is live from here on.
             guard = Some((idx + 1, depth));
         }
         if line.contains("drop(") {
             guard = None;
         }
     }
-
     violations
 }
 
@@ -232,6 +343,22 @@ fn checker_flags_banned_lock_types() {
             "use tokio::sync::{\n    RwLock,\n};",
             "multi-line braced import",
         ),
+        (
+            "use std::sync::*;\nfn f() { let m = Mutex::new(0); }",
+            "glob import then a bare Mutex",
+        ),
+        (
+            "use tokio::sync::*;\nfn f() { let m = RwLock::new(0); }",
+            "glob import then a bare RwLock",
+        ),
+        (
+            "fn guard(&self) -> std::sync::MutexGuard<'_, u8> { todo!() }",
+            "a helper returning a MutexGuard",
+        ),
+        (
+            "fn guard(&self) -> std::sync::RwLockReadGuard<'_, u8> { todo!() }",
+            "a helper returning an RwLockReadGuard",
+        ),
     ] {
         assert!(
             !banned_lock_types(file, snippet).is_empty(),
@@ -244,6 +371,7 @@ fn checker_flags_banned_lock_types() {
 fn checker_flags_lock_guard_across_await() {
     let file = Path::new("synthetic.rs");
     let bad = r#"
+use std::sync::Mutex;
 async fn bad() {
     let guard = state.lock();
     do_work().await;
@@ -256,6 +384,7 @@ async fn bad() {
     );
 
     let bad_tokio = r#"
+use tokio::sync::Mutex;
 async fn bad() {
     let guard = state.lock().await;
     do_work().await;
@@ -264,6 +393,31 @@ async fn bad() {
     assert!(
         !lock_across_await(file, bad_tokio).is_empty(),
         "the checker must flag a tokio guard held across a later .await"
+    );
+
+    // The acquisition and the await share one line: the old rule skipped it.
+    let same_line = r#"
+use std::sync::Mutex;
+async fn bad() {
+    let guard = state.lock(); do_work().await;
+}
+"#;
+    assert!(
+        !lock_across_await(file, same_line).is_empty(),
+        "the checker must flag a guard acquired and awaited on the same line"
+    );
+
+    // A guard obtained through a helper, with the lock type elsewhere in the file.
+    let helper = r#"
+fn guard(&self) -> MutexGuard<'_, u8> { self.inner.lock() }
+async fn bad() {
+    let g = state.guard();
+    do_work().await;
+}
+"#;
+    assert!(
+        !lock_across_await(file, helper).is_empty(),
+        "the checker must flag a guard obtained through a helper"
     );
 }
 
@@ -298,5 +452,23 @@ async fn also_fine() {
     assert!(
         lock_across_await(file, clean).is_empty(),
         "a guard dropped before .await must pass"
+    );
+
+    // A plain method named `read` on a non-lock type is not a guard (the old
+    // scanner armed a guard on any `let x = foo.read()`).
+    let plain_read = r#"
+fn snapshot(&self) -> Snapshot {
+    let snapshot = by_session(self.read());
+    snapshot
+}
+async fn later(&self) {
+    let snapshot = by_session(self.read());
+    do_work().await;
+    consume(snapshot);
+}
+"#;
+    assert!(
+        lock_across_await(file, plain_read).is_empty(),
+        "a plain `read()` method must not arm a lock guard"
     );
 }

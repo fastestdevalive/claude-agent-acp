@@ -646,6 +646,61 @@ async fn t8d_two_subscriptions_share_one_scope_and_are_both_notified() {
     })
     .await;
     assert!(found, "both subscriptions were notified: {seen:?}");
+    // Both subscriptions of one cwd share one watch.
+    let handles = connection
+        .subscription_handles()
+        .await
+        .expect("subscriptions exist");
+    assert_eq!(handles["watches"], 1, "one watch for the scope: {handles}");
+    assert_eq!(handles["subscriptions"], 2);
+
+    // Unsubscribing the first leaves one watch and only the second notified.
+    connection
+        .unsubscribe_list(&json!({"subscriptionId": first}))
+        .expect("unsubscribed");
+    let handles = connection
+        .subscription_handles()
+        .await
+        .expect("subscriptions exist");
+    assert_eq!(
+        handles["watches"], 1,
+        "the remaining one watches: {handles}"
+    );
+    assert_eq!(handles["subscriptions"], 1);
+    let second_session = id(2);
+    env.transcript(
+        &env.cwd,
+        &second_session,
+        &[
+            user(&second_session, &env.cwd, "second", T0 + 3000),
+            assistant(&second_session, T0 + 4000),
+        ],
+        T0 + 5000,
+    );
+    let mut after = std::collections::HashSet::new();
+    let found = wait_for(&mut rx, |change| {
+        if let Some(id) = change["subscriptionId"].as_str() {
+            after.insert(id.to_string());
+        }
+        after.contains(&second)
+    })
+    .await;
+    assert!(found, "the remaining subscription is notified");
+    assert!(
+        !after.contains(&first),
+        "the unsubscribed one is not notified: {after:?}"
+    );
+
+    // Unsubscribing the last drops the watch.
+    connection
+        .unsubscribe_list(&json!({"subscriptionId": second}))
+        .expect("unsubscribed");
+    let handles = connection
+        .subscription_handles()
+        .await
+        .expect("subscriptions exist");
+    assert_eq!(handles["watches"], 0, "no watch is left: {handles}");
+    assert_eq!(handles["subscriptions"], 0);
     connection.dispose();
 }
 

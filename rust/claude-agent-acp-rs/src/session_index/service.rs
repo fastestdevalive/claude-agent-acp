@@ -1234,6 +1234,16 @@ impl SessionIndexService {
     }
 
     /// The response of a `session/fork` of `source_id` is out: the list
+    /// Diagnostics of the list subscriptions (upstream `handles()`): one shared
+    /// watch per scope, the subscriptions, and their scheduled timers. `None`
+    /// until a subscription is created.
+    pub async fn subscription_handles(&self) -> Option<Value> {
+        match self.subscriptions.get() {
+            Some(subscriptions) => Some(subscriptions.handles().await),
+            None => None,
+        }
+    }
+
     /// subscriptions send the rows they held back.
     pub fn fork_answered(&self, source_id: &str) {
         if self.fork_holds.answered(source_id) {

@@ -45,6 +45,7 @@ pub(super) fn rig() -> Rig {
         fingerprints: std::collections::HashMap::new(),
         deferred_tx,
         deferred_rx,
+        redeliver_tx: mpsc::unbounded_channel().0,
         recreating: std::collections::HashMap::new(),
         recreate_tx,
         index: session_index_connection(&opts),

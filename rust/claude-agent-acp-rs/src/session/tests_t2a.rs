@@ -61,10 +61,20 @@ impl Rig {
     }
 
     pub(super) fn echo(&mut self, uuid: &str) {
+        self.enqueue(uuid);
+        self.echo_only(uuid);
+    }
+
+    /// Enqueue a prompt (with its reply channels) without its echo.
+    pub(super) fn enqueue(&mut self, uuid: &str) {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.pending.insert(uuid.to_string(), reply_tx);
         self.replies.insert(uuid.to_string(), reply_rx);
         self.machine.enqueue(Turn::new(uuid.into(), false));
+    }
+
+    /// The CLI's echo of an already enqueued prompt.
+    pub(super) fn echo_only(&mut self, uuid: &str) {
         self.feed(json!({"type":"user","uuid":uuid,"message":{"role":"user",
             "content":[{"type":"text","text":"hi"}]}}));
     }
@@ -120,6 +130,45 @@ fn t2a_tool_progress_frame_updates_the_call() {
     assert_eq!(
         updates[0]["_meta"]["claudeCode"]["toolResponse"]["elapsedTimeSeconds"],
         4
+    );
+}
+
+/// `acp-agent.test.ts`: "keeps a child tool beat in the legacy flattened
+/// transcript" — after `task_started`, a beat for the child's tool keeps its real
+/// id (it is not hoisted onto the Agent card) and carries the parent stamp.
+#[test]
+fn t2a_a_child_tool_beat_keeps_its_real_id_in_the_flattened_transcript() {
+    let mut rig = Rig::new();
+    rig.echo("p1");
+    rig.tool_use(
+        "toolu_task",
+        "Agent",
+        json!({"description": "x", "prompt": "p"}),
+    );
+    rig.feed(
+        json!({"type":"system","subtype":"task_started","task_id":"agent-1",
+        "tool_use_id":"toolu_task","description":"x","subagent_type":"general-purpose",
+        "task_type":"local_agent"}),
+    );
+    rig.feed(json!({"type":"assistant","parent_tool_use_id":"toolu_task",
+        "message":{"id":"msg_inner","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"tool_use","id":"toolu_inner","name":"Bash",
+                "input":{"command":"ls"}}]}}));
+    rig.updates();
+    rig.feed(
+        json!({"type":"tool_progress","tool_use_id":"toolu_inner","tool_name":"Bash",
+        "parent_tool_use_id":"toolu_task","elapsed_time_seconds":1}),
+    );
+    let updates = rig.updates();
+    let beats: Vec<&Value> = updates
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "tool_call_update")
+        .collect();
+    assert_eq!(beats.len(), 1, "one beat: {updates:?}");
+    assert_eq!(beats[0]["toolCallId"], "toolu_inner", "the real id wins");
+    assert_eq!(
+        beats[0]["_meta"]["claudeCode"]["parentToolUseId"],
+        "toolu_task"
     );
 }
 
@@ -375,6 +424,12 @@ fn t2a_informational_transcript_line_for_a_plain_client() {
         updates[0]["_meta"],
         json!({"claudeCode": {"kind": "informational", "level": "warning"}})
     );
+    // An info-level line carries the same informational meta, also without a
+    // severity prefix in its text.
+    assert_eq!(
+        updates[1]["_meta"],
+        json!({"claudeCode": {"kind": "informational", "level": "info"}})
+    );
     assert!(
         rig.emitted_assistant_text,
         "the line is delivered assistant text"
@@ -410,6 +465,43 @@ fn t2a_informational_notice_dedupes_and_owns_the_result_text() {
     // tokens: the #453 fallback must not emit it a second time.
     rig.feed(result_frame("Blocked by hook:   do it again", 0));
     assert_eq!(rig.reply_chunks("p1"), Vec::<String>::new());
+}
+
+/// `acp-agent.test.ts`: "preserves a queued turn's streamed answer across an
+/// interleaved autonomous result" — the queued turn's answer streams before its
+/// echo; the autonomous result must not close the stretch, so the zero-output
+/// result's duplicate text is not re-emitted (exactly one delivery).
+#[test]
+fn t2a_a_queued_turns_streamed_answer_survives_an_interleaved_autonomous_result() {
+    let mut rig = Rig::new();
+    rig.echo("p1");
+    rig.feed(result_frame("ok", 1));
+    rig.feed(idle());
+    // Turn 2 is queued, not yet echoed.
+    rig.enqueue("p2");
+    // Its answer streams before the echo.
+    rig.feed(json!({"type":"assistant","parent_tool_use_id":null,
+        "message":{"id":"msg_streamed","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"streamed answer"}]}}));
+    assert_eq!(chunk_texts(&rig.updates()), vec!["streamed answer"]);
+    // An autonomous result interleaves while p2 is queued: it must not close
+    // the delivery stretch.
+    rig.feed(json!({"type":"result","subtype":"success","is_error":false,
+        "stop_reason":"end_turn","result":"background note",
+        "origin":{"kind":"task-notification"},
+        "usage":{"input_tokens":1,"output_tokens":1}}));
+    // The echo activates p2; a zero-output result repeats its answer.
+    rig.echo_only("p2");
+    rig.feed(json!({"type":"result","subtype":"success","is_error":false,
+        "stop_reason":"end_turn","result":"streamed answer","user_message_uuid":"p2",
+        "usage":{"input_tokens":1,"output_tokens":0}}));
+    rig.feed(idle());
+    assert!(rig.answered("p2"), "turn 2 settles");
+    assert_eq!(
+        rig.reply_chunks("p2"),
+        Vec::<String>::new(),
+        "the #453 fallback must not re-emit the streamed answer"
+    );
 }
 
 /// N-14 — without a matching notice the same zero-token result is forwarded.
@@ -1013,6 +1105,49 @@ fn t8a_legacy_agent_lifecycle_without_capabilities() {
             .unwrap()
             .contains("hidden child output")),
         "a plain client gets the flattened child text: {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|u| u["toolCallId"] == "toolu_parent"),
+        "the Agent call stays: {updates:?}"
+    );
+}
+
+/// `acp-agent.test.ts`: "keeps AIR Agent child text internal without native
+/// subagent sessions" — no lifecycle frames, no child text, and the parent
+/// Agent call still reaches the client.
+#[test]
+fn t8a_air_keeps_child_text_internal_without_native_subagents() {
+    let mut rig = air_rig(&[]);
+    rig.map_state.configure_air(PathBuf::from("/repo"));
+    rig.echo("p1");
+    rig.tool_use(
+        "toolu_parent",
+        "Agent",
+        json!({"description": "Investigate", "subagent_type": "Explore"}),
+    );
+    rig.feed(
+        json!({"type":"system","subtype":"task_started","task_id":"agent-42",
+        "tool_use_id":"toolu_parent","description":"Investigate",
+        "subagent_type":"Explore","task_type":"local_agent"}),
+    );
+    rig.feed(
+        json!({"type":"stream_event","parent_tool_use_id":"toolu_parent",
+        "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"hidden child output"}}}),
+    );
+    let updates = rig.updates();
+    assert!(
+        updates
+            .iter()
+            .all(|u| u["sessionUpdate"] != "subagent_spawned"
+                && u["sessionUpdate"] != "subagent_state_update"),
+        "no native lifecycle without negotiation: {updates:?}"
+    );
+    assert!(
+        updates.iter().all(|u| !serde_json::to_string(u)
+            .unwrap()
+            .contains("hidden child output")),
+        "AIR keeps the child text internal: {updates:?}"
     );
     assert!(
         updates.iter().any(|u| u["toolCallId"] == "toolu_parent"),
@@ -2318,6 +2453,31 @@ async fn t2a_remembered_title_and_client_mapping_apply_to_the_next_publish() {
     })
     .unwrap();
     assert_eq!(next_session_info(&mut rx).await.unwrap()["title"], "Old");
+
+    // The "only" half: a client without the stripping mapping (not AIR) keeps
+    // the archive prefix (`session-index.test.ts`: a non-AIR client gets
+    // "[archived] Done").
+    let (tx, mut rx, _far_end) = spawn_title_actor();
+    tx.send(Command::RememberStoredTitle {
+        title: "[archived] Old".into(),
+    })
+    .unwrap();
+    tx.send(Command::TitleInfo {
+        transcript: None,
+        info: Some(crate::session_store::StoredSessionInfo {
+            custom_title: Some("[archived] Old".into()),
+            summary: None,
+            mtime_ms: 1_700_000_000_000,
+        }),
+        cancelled: false,
+        renames: 0,
+    })
+    .unwrap();
+    assert_eq!(
+        next_session_info(&mut rx).await.unwrap()["title"],
+        "[archived] Old",
+        "a non-AIR client keeps the prefix"
+    );
 }
 
 /// N-51 — a conversation reset releases the title: the client-set guard, the

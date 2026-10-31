@@ -233,6 +233,49 @@ async fn inv_31_idle_without_result_fails() {
     );
 }
 
+/// `acp-agent.test.ts`: "fails the in-flight prompt when the SDK goes idle
+/// without emitting a result" — the session recovers: the next prompt runs
+/// normally on the same stream and settles with its own usage (10 tokens).
+/// (Kept separate: `inv_31_idle_without_result_fails` is a protected hazard
+/// test and is not edited.)
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_without_result_then_the_next_prompt_recovers() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    let events = machine.on_idle();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TurnEvent::Failed {
+                kind: FailureKind::NoResult,
+                ..
+            }
+        )),
+        "the idle fails the active turn"
+    );
+    assert!(!machine.has_active());
+    machine.enqueue(Turn::new("p2".into(), false));
+    machine.on_echo("p2");
+    let mut result = result_frame("success", false);
+    result["usage"] = serde_json::json!({"input_tokens": 10, "output_tokens": 2});
+    let events = machine.on_result(&result, false);
+    assert_eq!(
+        settled_events(&events),
+        vec![("p2", StopReason::EndTurn)],
+        "the next prompt settles end_turn"
+    );
+    let usage = events.iter().find_map(|e| match e {
+        TurnEvent::Settled { usage, .. } => Some(*usage),
+        _ => None,
+    });
+    assert_eq!(
+        usage.map(|u| u.input_tokens),
+        Some(10),
+        "the recovered turn keeps its own usage"
+    );
+}
+
 /// Blocker #1 (review) — the held-turn idle drain must EMIT its `Settled`
 /// event (the actor needs it to resolve the oneshot), not discard it.
 #[tokio::test(flavor = "multi_thread")]
@@ -592,20 +635,28 @@ async fn cancel_sweeps_queued_and_inline_settles_held() {
     );
 }
 
-/// Major #10 (review) — `on_stream_end()` settles the active turn and
-/// rejects queued turns with `SESSION_ENDED_MESSAGE`.
+/// `acp-agent.test.ts`: "rejects (not 'cancelled') a prompt enqueued after a
+/// cancel when the stream then ends" — turn 1 settles `cancelled` at the cancel,
+/// and turn 2, enqueued AFTER the cancel, is rejected with the session-ended
+/// message when the stream ends (it was not part of the cancellation).
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_end_settles_active_rejects_queued() {
     let mut machine = TurnMachine::new();
     machine.enqueue(Turn::new("p1".into(), false));
     machine.on_echo("p1");
+    let cancelled = machine.cancel();
+    assert!(
+        settled_events(&cancelled).is_empty(),
+        "the cancel waits for the stream's verdict on the active turn"
+    );
+    // Turn 2 is enqueued after the cancel: it was not part of the cancellation.
     machine.enqueue(Turn::new("q1".into(), false));
 
     let events = machine.on_stream_end();
     assert_eq!(
         settled_events(&events),
-        vec![("p1", StopReason::EndTurn)],
-        "stream end settles the active turn with the scratch outcome"
+        vec![("p1", StopReason::Cancelled)],
+        "the cancelled turn settles cancelled when the stream ends"
     );
     let failed = events.iter().filter_map(|e| match e {
         TurnEvent::Failed { kind, message, .. } => Some((*kind, message.as_str())),
@@ -616,6 +667,7 @@ async fn stream_end_settles_active_rejects_queued() {
         vec![(FailureKind::SessionEnded, SESSION_ENDED_MESSAGE)],
         "queued turns are rejected with SESSION_ENDED_MESSAGE"
     );
+    assert!(SESSION_ENDED_MESSAGE.contains("start a new session"));
     assert!(!machine.has_active());
 }
 

@@ -53,7 +53,7 @@ async fn t7a_race_7_child_exit_mid_turn() {
                 }
             }
         }
-        actor.shutdown().await;
+        actor.shutdown().await?;
         // The actor ended (a closed session accepts no command).
         if actor.tx.send(Command::Cancel).is_ok() {
             return Err("the actor outlived its stream and close".into());

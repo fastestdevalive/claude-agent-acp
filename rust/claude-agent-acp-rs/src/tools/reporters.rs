@@ -467,15 +467,31 @@ mod tests {
         assert_eq!(facts.exit_code, Some(4));
     }
 
-    /// T-32 — image output is plain content, never a command.
+    /// T-32 — image output is plain content, never a command
+    /// (`tools.test.ts`: "should surface image content as ACP image content
+    /// (terminal disabled)"): the exact ACP block shape, and no terminal meta
+    /// (the reporter returns content only).
     #[test]
     fn t2a_bash_image_output_is_content() {
-        let facts = bash_facts(
-            None,
-            &json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}]),
-            false,
-        );
-        assert!(matches!(facts, BashFacts::Content(Some(_))));
+        for (media_type, data) in [
+            ("image/png", "iVBORw0KGgo="),
+            ("image/jpeg", "iVBORw0KGgo="),
+        ] {
+            let BashFacts::Content(Some(content)) = bash_facts(
+                None,
+                &json!([{"type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data}}]),
+                false,
+            ) else {
+                panic!("image output must be plain content");
+            };
+            assert_eq!(
+                serde_json::to_value(&content).unwrap(),
+                json!([{"type": "content", "content": {
+                    "type": "image", "data": data, "mimeType": media_type
+                }}])
+            );
+        }
     }
 
     /// T-51 — the structured hits render as `Title (url)`, off-spec hits skipped.

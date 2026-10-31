@@ -3,6 +3,6 @@
   "steps": [
     {"call": "initialize"},
     {"call": "session/new"},
-    {"call": "session/prompt", "text": "hello"}
+    {"call": "session/prompt", "text": "hello", "image": {"data": "aGk=", "mimeType": "image/png"}}
   ]
 }

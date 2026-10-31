@@ -145,30 +145,11 @@ async fn t7a_race_4_permission_reply_timing() {
             let _ = first.send(Ok(allow()));
         }
 
-        let ids: &[&str] = if mode == 3 {
-            &["req-toolu_1", "req-toolu_2"]
-        } else {
-            &["req-toolu_1"]
-        };
-        let counts = count_responses(&mut actor, ids, 1, Duration::from_secs(2)).await;
-        for id in ids {
-            let count = counts.get(*id).copied().unwrap_or(0);
-            if count != 1 {
-                return Err(format!(
-                    "{id} got {count} control responses (exactly one expected)"
-                ));
-            }
-        }
-        // A short extra window: no request may be answered twice.
-        let extra = count_responses(&mut actor, ids, 1, Duration::from_millis(20)).await;
-        for id in ids {
-            if extra.get(*id).copied().unwrap_or(0) != 0 {
-                return Err(format!("{id} was answered twice"));
-            }
-        }
         // M5 (`review-T7`): the prompt must settle (cancelled or end_turn),
         // never hang, and never fail: swallowing `Err`/`Ok(Err)` here would let
-        // a dropped or failed reply pass as "still settles".
+        // a dropped or failed reply pass as "still settles". Settling first also
+        // releases the forwarder's inline ack wait (the production barrier), so
+        // the `FlushUpdates` below is not stalled behind it.
         match settle(reply_rx, Duration::from_secs(5)).await {
             Ok(Ok(reply)) => {
                 if reply.stop_reason != "cancelled" && reply.stop_reason != "end_turn" {
@@ -185,7 +166,33 @@ async fn t7a_race_4_permission_reply_timing() {
             }
             Err(error) => return Err(format!("the prompt did not settle: {error}")),
         }
-        actor.shutdown().await;
+        let ids: &[&str] = if mode == 3 {
+            &["req-toolu_1", "req-toolu_2"]
+        } else {
+            &["req-toolu_1"]
+        };
+        let counts = count_responses(&mut actor, ids, 1, Duration::from_secs(2)).await;
+        for id in ids {
+            let count = counts.get(*id).copied().unwrap_or(0);
+            if count != 1 {
+                return Err(format!(
+                    "{id} got {count} control responses (exactly one expected)"
+                ));
+            }
+        }
+        // Every command queued before the barrier is processed (the cancel, a
+        // late answer), so a duplicate response cannot still be waiting on the
+        // actor when the extra window starts; the window only covers the control
+        // writer's last hop to stdin.
+        actor.sync(Duration::from_secs(2)).await?;
+        // A short extra window: no request may be answered twice.
+        let extra = count_responses(&mut actor, ids, 1, Duration::from_millis(20)).await;
+        for id in ids {
+            if extra.get(*id).copied().unwrap_or(0) != 0 {
+                return Err(format!("{id} was answered twice"));
+            }
+        }
+        actor.shutdown().await?;
         Ok(())
     })
     .await;

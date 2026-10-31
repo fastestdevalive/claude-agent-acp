@@ -79,6 +79,10 @@ pub struct Step {
     /// dying mid-turn before its `result` (8.T11, stream-EOF lane).
     #[serde(default)]
     pub exit: bool,
+    /// The process exit code of an `exit` step (`None`: 0, a clean exit). A
+    /// non-zero code is the abnormal-exit lane.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 /// A whole transcript (the file `$FAKE_CLAUDE_SCRIPT`).
@@ -487,6 +491,14 @@ fn field_of(matched: &Value, path: &str) -> Value {
     }
 }
 
+/// What a replay did: the steps it consumed and, for an `exit` step, the exit
+/// code the process should return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayOutcome {
+    pub steps: usize,
+    pub exit_code: Option<i32>,
+}
+
 /// Replay `transcript` against stdin/stdout. Returns the number of steps
 /// consumed; fails loudly (stderr) on a mismatch.
 ///
@@ -501,6 +513,7 @@ pub fn replay(
     stdout: impl Write,
 ) -> Result<usize, ReplayError> {
     replay_segment(transcript, 0, argv, arg_out, init_out, stdin, stdout)
+        .map(|outcome| outcome.steps)
 }
 
 /// Replay only `segment_index` of `transcript` (F1 multi-spawn: a restarted
@@ -513,7 +526,7 @@ pub fn replay_segment(
     init_out: Option<&Path>,
     stdin: impl Read,
     mut stdout: impl Write,
-) -> Result<usize, ReplayError> {
+) -> Result<ReplayOutcome, ReplayError> {
     if let Some(out) = arg_out {
         record_argv_env(out, argv)?;
     }
@@ -536,7 +549,10 @@ pub fn replay_segment(
                 Err(error) => return Err(ReplayError::Io(error)),
             };
             if bytes == 0 {
-                return Ok(step_index);
+                return Ok(ReplayOutcome {
+                    steps: step_index,
+                    exit_code: None,
+                });
             }
             let line = line.trim();
             if fake_claude_env("FAKE_CLAUDE_LOG_FRAMES").is_some() && !line.is_empty() {
@@ -648,8 +664,12 @@ pub fn replay_segment(
         if step.exit {
             // The transcript asks us to die here (e.g. mid-turn before a
             // `result`): return so main exits and stdout closes, letting the
-            // host see the stream EOF.
-            return Ok(step_index);
+            // host see the stream EOF. A non-zero `exit_code` is the abnormal
+            // exit the host reports as a failed turn.
+            return Ok(ReplayOutcome {
+                steps: step_index,
+                exit_code: step.exit_code,
+            });
         }
     }
 }

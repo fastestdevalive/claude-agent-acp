@@ -142,15 +142,11 @@ impl LiveClient {
             };
             self.frames.push(frame.clone());
 
-            // Check if this is the response to our request
-            if frame.get("id").and_then(Value::as_u64) == Some(id) {
-                if let Some(err) = frame.get("error") {
-                    return Err(format!("{method} failed: {err}"));
-                }
-                return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
-            }
-
-            // Answer any agent->client permission requests
+            // An agent->client request is answered even when its id collides with
+            // the pending client request id: the two id spaces are separate (the
+            // adapter's own requests start at 0 and increment). Checked BEFORE the
+            // response branch, or the Nth permission request would be consumed as
+            // this request's response (P3-11).
             if frame.get("method").and_then(Value::as_str) == Some("session/request_permission") {
                 if let Some(req_id) = frame.get("id") {
                     let options = frame
@@ -178,6 +174,16 @@ impl LiveClient {
                     });
                     self.send(&reply).await?;
                 }
+                continue;
+            }
+
+            // Check if this is the response to our request
+            if frame.get("method").is_none() && frame.get("id").and_then(Value::as_u64) == Some(id)
+            {
+                if let Some(err) = frame.get("error") {
+                    return Err(format!("{method} failed: {err}"));
+                }
+                return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
             }
         }
     }
@@ -320,6 +326,7 @@ async fn parity_live_tiny_prompt() {
             .expect("start client");
         init(&mut client).await.expect("initialize");
         let session = new_session(&mut client, &cwd).await.expect("session/new");
+        let before = client.frames.len();
         let resp = client
             .request(
                 "session/prompt",
@@ -331,10 +338,18 @@ async fn parity_live_tiny_prompt() {
             .await
             .expect("prompt");
         assert_eq!(resp["stopReason"], json!("end_turn"));
-        assert!(client
-            .frames
-            .iter()
-            .any(|f| f.get("method").and_then(Value::as_str) == Some("session/update")));
+        // The prompt must produce assistant text: the `session/update` that
+        // follows `session/new` (`available_commands_update`) would satisfy a
+        // bare "any update" assertion (P3-10).
+        assert!(
+            client.frames[before..].iter().any(|f| {
+                f.get("method").and_then(Value::as_str) == Some("session/update")
+                    && f.pointer("/params/update/sessionUpdate")
+                        .and_then(Value::as_str)
+                        == Some("agent_message_chunk")
+            }),
+            "expected an agent_message_chunk for the tiny prompt"
+        );
         client.close().await;
         let _ = std::fs::remove_dir_all(&cwd);
     })
@@ -427,6 +442,9 @@ async fn parity_live_cancel() {
             .expect("send cancel");
 
         let deadline = tokio::time::Instant::now() + TIMEOUT;
+        // P3-08: a stream that ends (EOF) before the prompt's response must fail
+        // the test, not pass vacuously.
+        let mut saw_cancel = false;
         loop {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
@@ -437,12 +455,18 @@ async fn parity_live_cancel() {
                 .expect("reading stream");
             let Some(line) = line_opt else { break };
             if let Ok(frame) = serde_json::from_str::<Value>(&line) {
-                if frame.get("id").and_then(Value::as_u64) == Some(id) {
-                    assert_eq!(frame["result"]["stopReason"], json!("cancelled"));
+                if frame.get("method").is_none()
+                    && frame.get("id").and_then(Value::as_u64) == Some(id)
+                {
+                    saw_cancel = frame["result"]["stopReason"] == json!("cancelled");
                     break;
                 }
             }
         }
+        assert!(
+            saw_cancel,
+            "the cancelled prompt never settled with stopReason `cancelled` (the stream ended first)"
+        );
         client.close().await;
         let _ = std::fs::remove_dir_all(&cwd);
     })
@@ -491,6 +515,7 @@ async fn parity_live_resume() {
             .await
             .expect("resume session");
 
+        let before = client.frames.len();
         let resp = client
             .request(
                 "session/prompt",
@@ -502,6 +527,19 @@ async fn parity_live_resume() {
             .await
             .expect("recall prompt");
         assert_eq!(resp["stopReason"], json!("end_turn"));
+        // P3-09: the resumed session must actually recall the stored word. An
+        // RPC-success check alone passes for a resume that loses the history.
+        assert!(
+            client.frames[before..].iter().any(|f| {
+                f.pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("agent_message_chunk")
+                    && f.pointer("/params/update/content/text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.to_lowercase().contains("banana"))
+            }),
+            "the resumed session did not recall the stored word `banana`"
+        );
         client.close().await;
         let _ = std::fs::remove_dir_all(&cwd);
     })

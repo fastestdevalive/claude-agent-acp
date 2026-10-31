@@ -64,12 +64,15 @@ fn main() -> ExitCode {
     );
 
     match result {
-        Ok(steps) => {
-            if steps == 0 {
+        Ok(outcome) => {
+            if outcome.steps == 0 {
                 eprintln!("fake-claude: transcript had no steps");
                 ExitCode::FAILURE
             } else {
-                ExitCode::SUCCESS
+                match outcome.exit_code {
+                    Some(code) => ExitCode::from(code as u8),
+                    None => ExitCode::SUCCESS,
+                }
             }
         }
         Err(error) => {

@@ -243,7 +243,37 @@ async fn create_task(actor: &mut Actor, id: &str, subject: &str) -> Vec<Value> {
 #[tokio::test]
 async fn prompt_republishes_the_session_task_snapshot() {
     let mut actor = Actor::new(ClientCapabilities::default(), None, None);
-    let _ = create_task(&mut actor, "task-1", "Run tests").await;
+    // task-1 starts in_progress with an activeForm ("Running tests"); the plan
+    // renders that form, not the subject, for an in_progress task.
+    let _ = actor
+        .feed(json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_create_1","role":"assistant","model":"claude-opus-5",
+            "content":[{"type":"tool_use","id":"toolu_create_1","name":"TaskCreate",
+                "input":{"subject":"Run tests","description":"Run tests",
+                    "activeForm":"Running tests"}}]}}))
+        .await;
+    let _ = actor
+        .feed(
+            json!({"type":"user","parent_tool_use_id":null,"uuid":"u_create_1",
+            "message":{"role":"user","content":[{"type":"tool_result",
+                "tool_use_id":"toolu_create_1","content":"created"}]},
+            "tool_use_result":{"task":{"id":"task-1"}}}),
+        )
+        .await;
+    let _ = actor
+        .feed(json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_update_1","role":"assistant","model":"claude-opus-5",
+            "content":[{"type":"tool_use","id":"toolu_update_1","name":"TaskUpdate",
+                "input":{"taskId":"task-1","status":"in_progress"}}]}}))
+        .await;
+    let _ = actor
+        .feed(
+            json!({"type":"user","parent_tool_use_id":null,"uuid":"u_update_1",
+            "message":{"role":"user","content":[{"type":"tool_result",
+                "tool_use_id":"toolu_update_1","content":"updated"}]},
+            "tool_use_result":{"success":true,"taskId":"task-1","updatedFields":["status"]}}),
+        )
+        .await;
     let _ = create_task(&mut actor, "task-2", "Write release notes").await;
     let _ = actor.collect().await;
 
@@ -259,14 +289,18 @@ async fn prompt_republishes_the_session_task_snapshot() {
     let updates = actor.collect().await;
     let plans = plan_updates(&updates);
     assert_eq!(plans.len(), 1, "{updates:?}");
+    // The full notification, sessionId included, exactly as upstream sends it.
     assert_eq!(
-        serde_json::to_string(&plans[0]["update"]).unwrap(),
+        serde_json::to_string(&plans[0]).unwrap(),
         json!({
-            "sessionUpdate": "plan",
-            "entries": [
-                {"content": "Run tests", "status": "pending", "priority": "medium"},
-                {"content": "Write release notes", "status": "pending", "priority": "medium"}
-            ]
+            "sessionId": "s",
+            "update": {
+                "sessionUpdate": "plan",
+                "entries": [
+                    {"content": "Running tests", "status": "in_progress", "priority": "medium"},
+                    {"content": "Write release notes", "status": "pending", "priority": "medium"}
+                ]
+            }
         })
         .to_string()
     );

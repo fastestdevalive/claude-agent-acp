@@ -56,16 +56,17 @@ async fn t7a_race_3_close_during_prompt() {
             .await
             .map_err(|_| "the close hung".to_string())?
             .map_err(|_| "the close reply was dropped".to_string())?;
-        // The actor ended: a later command finds it gone.
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            let (late, _late_rx) = oneshot::channel();
-            if actor.tx.send(Command::Close { reply: late }).is_err() {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        // The actor ended: its command channel is closed, so a later command
+        // finds it gone. `tx.closed()` is the actor's own exit, not a polling
+        // window, so the assertion below cannot race the teardown.
+        tokio::time::timeout(Duration::from_secs(5), actor.tx.closed())
+            .await
+            .map_err(|_| "the actor did not end after close".to_string())?;
+        let (late, _late_rx) = oneshot::channel();
+        if actor.tx.send(Command::Close { reply: late }).is_ok() {
+            return Err("the actor still accepts commands after close".into());
         }
-        Err("the actor still accepts commands after close".into())
+        Ok(())
     })
     .await;
 }

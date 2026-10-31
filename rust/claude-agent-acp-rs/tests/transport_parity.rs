@@ -31,6 +31,13 @@ use tokio::sync::mpsc;
 /// The corpus scripts 12.T3 covers (text-only, single-tool, cancel-mid-turn).
 const SCRIPTS: &[&str] = &["text-only", "single-tool", "cancel-mid-turn"];
 
+/// A transcript writes its whole `emit` batch at once; wait for the update
+/// count to stay unchanged this long before the cancel so the recorded order
+/// does not race the adapter forwarding the rest of the batch.
+const CANCEL_SETTLE_QUIET: Duration = Duration::from_millis(100);
+/// The bound on the settle wait (a hang is a failure).
+const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The ignore set shared with the differentials (the fields the port
 /// intentionally diverges on).
 fn transport_ignore() -> Vec<JsonPath> {
@@ -252,6 +259,14 @@ async fn drive_script(
                         return Err(agent_client_protocol::Error::internal_error()
                             .data("timed out waiting for updates before cancel"));
                     }
+                    // A transcript writes its whole `emit` batch at once: wait
+                    // for the adapter to finish forwarding it before the cancel,
+                    // so the recorded order does not race it (`cancel-mid-turn`,
+                    // 11.T4; the Node capture has the whole batch first).
+                    if !wait_for_updates_settle(update_count).await {
+                        return Err(agent_client_protocol::Error::internal_error()
+                            .data("the updates did not settle before the cancel"));
+                    }
                     connection.send_notification(CancelNotification::new(sid.clone()))?;
                 }
                 let _response = sent.block_task().await?;
@@ -272,6 +287,28 @@ async fn wait_for_updates(count: &AtomicUsize, target: usize) -> bool {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     true
+}
+
+/// Wait until no update has been recorded for [`CANCEL_SETTLE_QUIET`] (bounded):
+/// the batch the CLI wrote before the cancel has all been recorded.
+async fn wait_for_updates_settle(count: &AtomicUsize) -> bool {
+    let deadline = tokio::time::Instant::now() + CANCEL_SETTLE_TIMEOUT;
+    let mut last = count.load(Ordering::SeqCst);
+    let mut stable_since = tokio::time::Instant::now();
+    loop {
+        if stable_since.elapsed() >= CANCEL_SETTLE_QUIET {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let now = count.load(Ordering::SeqCst);
+        if now != last {
+            last = now;
+            stable_since = tokio::time::Instant::now();
+        }
+    }
 }
 
 /// 12.T3 (INV-26) — text-only, single-tool and cancel scripts over

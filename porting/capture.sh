@@ -468,6 +468,15 @@ for name in "${names[@]}"; do
   FAKE_HOME="$(mktemp -d)"
   mkdir -p "$FAKE_HOME/.claude"
 
+  # A multi-spawn script counts its spawns in `FAKE_CLAUDE_CURSOR`. A file left
+  # by an earlier capture would start the replay at the wrong segment, so the
+  # capture is deterministic: clear it before the run.
+  for env_line in "${SCRIPT_ENV[@]+"${SCRIPT_ENV[@]}"}"; do
+    case "$env_line" in
+      FAKE_CLAUDE_CURSOR=*) rm -f "${env_line#FAKE_CLAUDE_CURSOR=}" ;;
+    esac
+  done
+
   echo "==> capturing $name"
   # The adapter must run under an `env -i` allow-list (Decision 4 / F1): the
   # host shell leaks ANTHROPIC_*/CLAUDE_* (and 0.94 reads SSH_*, NO_BROWSER,

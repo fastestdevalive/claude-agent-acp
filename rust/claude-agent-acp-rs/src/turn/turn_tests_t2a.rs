@@ -161,6 +161,29 @@ fn t2a_level_signal_ends_and_unends_the_hold() {
     assert!(settled(&machine.on_idle()).is_empty(), "still held");
 }
 
+/// `acp-agent.test.ts`: "resolves at the result when the subagent already settled
+/// during the turn" — a subagent that ended before the result does not hold the
+/// turn: its own result settles `end_turn` (no trailing idle needed).
+#[test]
+fn t2a_result_settles_when_the_subagent_already_settled() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.register_live_task("t1", Some("AG"), true, background_placement());
+    let ended = machine.on_task_ended("t1");
+    assert!(
+        settled(&ended).is_empty(),
+        "the turn still runs after its subagent ends"
+    );
+    let events = machine.on_result(&plain_result(), false);
+    assert_eq!(
+        settled(&events),
+        vec![("p1", StopReason::EndTurn)],
+        "the result settles the turn; the trailing idle is not needed"
+    );
+    assert!(!machine.has_active());
+}
+
 /// N-43 — an absent task that is not a subagent is dropped from the live set.
 #[test]
 fn t2a_level_signal_drops_absent_shell_tasks() {

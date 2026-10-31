@@ -173,3 +173,26 @@ nothing here blocks work.
   `nfc.rs`/`nfc_data.rs` with one call — smaller source, new direct dependency;
   (b) keep the tables (recommended for the dependency policy) and regenerate
   them whenever the Unicode version pinned to the upstream runtime changes.
+
+## D13 — v2 reporting of a stopped background subagent (G5a)
+
+- **What:** `acp-v2.test.ts` "ends the tool call of a background subagent as
+  cancelled when the SDK reports it stopped while the root is idle" expects a
+  child-session `state_update` (idle cancelled) on `agent-1`, the `toolu_child`
+  update carrying `sessionId:"agent-1"` and `status:"cancelled"`, the child idle
+  before the status, and one report. At this head the AIR form publishes only a
+  `subagent_state_update` on the root (with `subagentSessionId`), and
+  `v2_session_update` does not translate `subagent_state_update`
+  (`src/v2/translate_tests.rs:27`), so a v2 client never sees the child idle or
+  the child-session cancelled status. TEST-MAP row 749 is `different:` and
+  FEATURES U-101 carries the note `[pkg:G5a]`.
+- **Why it matters:** an AIR v2 client that cancels while a background subagent
+  runs keeps showing the child's command open; the child's idle and its
+  cancelled tool status are lost.
+- **Alternatives:** (a) translate `subagent_state_update` to a v2 child
+  `state_update` and route the closing/result updates to the child session even
+  when the child is terminal (matching Node's `sendUpdate` path); (b) keep the
+  AIR `subagent_state_update` only and accept the v2 gap (current state); (c)
+  force the RFD form for v2 clients, which reports child state through
+  `subagent_update`/`state_update`. Recommendation: (a), scoped to a later v2
+  native-subagent package.

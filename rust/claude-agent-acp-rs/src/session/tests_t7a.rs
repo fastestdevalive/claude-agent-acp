@@ -188,13 +188,24 @@ async fn t7a_b17_the_pause_lets_a_cancel_task_run_mid_backlog() {
     }
 
     // Without the pause the spawned task cannot run: the drain owns the
-    // single-threaded runtime until it is done.
-    let cancel = AtomicBool::new(false);
+    // single-threaded runtime until it is done. The task is real here (not a
+    // tautology): it would set the flag at its first yield, so a drain that
+    // paused at all would stop early.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancel);
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        flag.store(true, Ordering::SeqCst);
+    });
     let mut yielder = crate::event_loop_yield::EventLoopYielder::with_clock(0.0);
     assert_eq!(
         drain(&cancel, &mut yielder, false).await,
         5_000,
         "a drain that never pauses starves the cancel task"
+    );
+    assert!(
+        !cancel.load(Ordering::SeqCst),
+        "the cancel task ran during a drain that never pauses"
     );
 
     // With the pause (budget 0: every call after the first yields) the task

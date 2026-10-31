@@ -325,6 +325,10 @@ enum Cmd {
     OwnChanged(String),
     SessionWritten(String),
     DeliverPending,
+    /// Diagnostics for tests (Node's `handles()`).
+    Handles {
+        reply: oneshot::Sender<Value>,
+    },
     Dispose,
 }
 
@@ -381,6 +385,18 @@ impl ListSubscriptions {
 
     pub fn dispose(&self) {
         let _ = self.tx.send(Cmd::Dispose);
+    }
+
+    /// Diagnostics of the live handles (upstream `handles()`): one shared watch
+    /// per scope, the subscriptions, and the subscriptions with a scheduled
+    /// delivery. Rust polls instead of `fs.watch`, so there are no OS watchers.
+    pub async fn handles(&self) -> Value {
+        let (reply, result) = oneshot::channel();
+        let empty = json!({"watches": 0, "subscriptions": 0, "timers": 0});
+        if self.tx.send(Cmd::Handles { reply }).is_err() {
+            return empty;
+        }
+        result.await.unwrap_or(empty)
     }
 }
 
@@ -905,6 +921,18 @@ impl Actor {
             Cmd::Unsubscribe(id) => self.unsubscribe(&id),
             Cmd::OwnChanged(id) => self.own_session_changed(&id),
             Cmd::SessionWritten(id) => self.session_written(&id),
+            Cmd::Handles { reply } => {
+                let timers = self
+                    .subscriptions
+                    .values()
+                    .filter(|subscription| subscription.timer_at.is_some())
+                    .count();
+                let _ = reply.send(json!({
+                    "watches": self.watches.len(),
+                    "subscriptions": self.subscriptions.len(),
+                    "timers": timers,
+                }));
+            }
             Cmd::DeliverPending => {
                 let ids: Vec<String> = self
                     .subscriptions

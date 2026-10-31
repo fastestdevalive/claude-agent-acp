@@ -280,6 +280,22 @@ impl LoopRig {
         }
     }
 
+    /// The next `control_request` of `subtype` the actor wrote to the child.
+    async fn next_written_control_request(&mut self, subtype: &str) -> Value {
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(10), self.written.recv())
+                .await
+                .expect("the actor writes a control request")
+                .expect("the stdin reader is alive");
+            let value: Value = serde_json::from_str(&line).expect("a JSON line");
+            if value.get("type").and_then(Value::as_str) == Some("control_request")
+                && value.pointer("/request/subtype").and_then(Value::as_str) == Some(subtype)
+            {
+                return value;
+            }
+        }
+    }
+
     fn permission(&self, tool_use_id: &str) -> oneshot::Receiver<Value> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -654,11 +670,38 @@ async fn t8a_default_to_no_leads_with_reject_and_forwards_the_hint() {
         .filter_map(|option| option["kind"].as_str())
         .collect();
     assert_eq!(kinds, vec!["reject_once", "allow_once", "allow_always"]);
+    // The full AIR meta, `air.version` included, exactly as upstream sends it.
     assert_eq!(
-        params["_meta"]["jetbrains"]["air"]["permission"],
-        json!({"version": 1, "title": "rm -rf build", "defaultToNo": true})
+        params["_meta"],
+        json!({"jetbrains": {"air": {"version": 1, "permission": {
+            "version": 1, "title": "rm -rf build", "defaultToNo": true
+        }}}})
     );
     let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "reject"})));
+    // A reject selection maps to the SDK's deny verdict (the same builder the
+    // actor uses; the LoopRig control channel has no inbound handler).
+    let ctx = crate::permission_options::OptionsContext {
+        tool_name: "Bash".into(),
+        display_name: None,
+        input: json!({"command": "rm -rf build"}),
+        cwd: std::env::temp_dir(),
+        change_set: None,
+        no_persistent_rule: false,
+        default_to_no: true,
+        available_modes: Vec::new(),
+        auto_unavailable: false,
+        pre_plan_mode: None,
+        context_used_percent: None,
+        home_dir: None,
+    };
+    let mapped = crate::permission::permission_control_response(
+        &json!({"outcome": {"outcome": "selected", "optionId": "reject"}}),
+        &ctx,
+        "req-tool-1",
+        "tool-1",
+        &json!({"command": "rm -rf build"}),
+    );
+    assert_eq!(mapped["response"]["response"]["behavior"], "deny");
 }
 
 // ---------------------------------------------------------------- finding 8
@@ -963,6 +1006,208 @@ async fn t1fa_eof_keeps_a_result_held_behind_a_mcp_run() {
     assert_eq!(reply.stop_reason, "max_tokens");
     let usage = reply.usage.expect("usage");
     assert_eq!((usage.input_tokens, usage.output_tokens), (11, 7));
+}
+
+/// P1a #3 (`mcp-command.test.ts`: "replaces the result text when no other shape
+/// carries it"): when the `/mcp` turn's only output shape is the result, the
+/// produced status markdown is published once, at the held result, and the
+/// CLI's result text is replaced (not echoed).
+#[tokio::test]
+async fn t1fa_mcp_result_only_shape_publishes_the_status_markdown() {
+    let mut rig = LoopRig::spawn();
+    let command = crate::mcp_command::parse_mcp_command("/mcp").expect("a /mcp prompt");
+    rig.tx
+        .send(Command::McpPrompt {
+            uuid: "p1".into(),
+            command,
+        })
+        .unwrap();
+    let p1 = rig.prompt("p1");
+    rig.echo("p1");
+    // The status read is delayed: the result reaches the actor first and is
+    // held behind the run.
+    let request = rig.next_written_control_request("mcp_status").await;
+    let request_id = request["request_id"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+    rig.send(json!({"type":"result","subtype":"success","is_error":false,
+        "stop_reason":"end_turn","result":"cli text",
+        "usage":{"input_tokens":1,"output_tokens":0}}));
+    // The held result waits for the run: no replacement yet.
+    assert!(
+        !std::iter::from_fn(|| rig.update_rx.try_recv().ok()).any(|item| {
+            matches!(item, SessionOutbound::Update(notif)
+                if serde_json::to_value(&notif.update).unwrap()["sessionUpdate"]
+                    == "agent_message_chunk")
+        }),
+        "the result is held until the control run answers"
+    );
+    rig.send(
+        json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":request_id,"response":{"mcpServers":[
+            {"name":"alpha","status":"connected"}]}}}),
+    );
+    let reply = reply_of(p1).await.expect("the turn settles");
+    assert_eq!(reply.stop_reason, "end_turn");
+    assert!(
+        reply.updates.is_empty(),
+        "the CLI's result text is replaced, not echoed"
+    );
+    let chunks: Vec<String> = std::iter::from_fn(|| rig.update_rx.try_recv().ok())
+        .filter_map(|item| match item {
+            SessionOutbound::Update(notif)
+                if serde_json::to_value(&notif.update).unwrap()["sessionUpdate"]
+                    == "agent_message_chunk" =>
+            {
+                Some(chunk_text(&notif))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chunks,
+        vec![crate::mcp_command::format_mcp_status(&[json!(
+            {"name":"alpha","status":"connected"}
+        )])],
+        "exactly one replacement chunk"
+    );
+}
+
+/// P1a #4 (`create-session-options.test.ts`: "asks for the summary context
+/// usage so the CLI sends no count_tokens requests"): the model-switch probe
+/// sends the summary request verbatim.
+#[tokio::test]
+async fn t1fa_model_switch_asks_for_the_summary_context_usage() {
+    let mut rig = LoopRig::spawn();
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    rig.tx
+        .send(Command::ModelApplied {
+            model_val: "claude-opus-4-1".into(),
+            result: Ok(()),
+            reply: reply_tx,
+            notify_client: true,
+            inline: false,
+        })
+        .unwrap();
+    let request = rig.next_written_control_request("get_context_usage").await;
+    assert_eq!(
+        request["request"],
+        json!({"subtype":"get_context_usage","detail":"summary"}),
+        "the model switch asks for the summary, not the SDK's full default"
+    );
+}
+
+/// `mcp-command.test.ts`: "publishes nothing when a cancel comes during the
+/// status read with %j" — the cancel clears the `/mcp` state, so the late
+/// result and the late control run publish nothing and the turn is cancelled.
+#[tokio::test]
+async fn t1fa_cancel_during_an_mcp_status_read_publishes_nothing() {
+    let mut rig = LoopRig::spawn();
+    let command = crate::mcp_command::parse_mcp_command("/mcp").expect("a /mcp prompt");
+    rig.tx
+        .send(Command::McpPrompt {
+            uuid: "p1".into(),
+            command,
+        })
+        .unwrap();
+    let p1 = rig.prompt("p1");
+    rig.echo("p1");
+    let request = rig.next_written_control_request("mcp_status").await;
+    let request_id = request["request_id"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+    rig.tx.send(Command::Cancel).unwrap();
+    // The cancelled turn's result and idle, then the producer's late answer.
+    rig.send(
+        json!({"type":"result","subtype":"error_during_execution","is_error":true,
+        "stop_reason":"end_turn","result":"cli text",
+        "usage":{"input_tokens":1,"output_tokens":0}}),
+    );
+    rig.send(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+    rig.send(
+        json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":request_id,"response":{"mcpServers":[
+            {"name":"alpha","status":"connected"}]}}}),
+    );
+    let reply = reply_of(p1).await.expect("the cancel settles the turn");
+    assert_eq!(reply.stop_reason, "cancelled");
+    let chunks: Vec<String> = std::iter::from_fn(|| rig.update_rx.try_recv().ok())
+        .filter_map(|item| match item {
+            SessionOutbound::Update(notif)
+                if serde_json::to_value(&notif.update).unwrap()["sessionUpdate"]
+                    == "agent_message_chunk" =>
+            {
+                Some(chunk_text(&notif))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        chunks.is_empty(),
+        "a cancelled /mcp turn publishes no replacement: {chunks:?}"
+    );
+}
+
+/// `mcp-command.test.ts`: "stops the actions and publishes nothing when a cancel
+/// comes during a reconnect" — the reconnect's late result is dropped.
+#[tokio::test]
+async fn t1fa_cancel_during_an_mcp_reconnect_publishes_nothing() {
+    let mut rig = LoopRig::spawn();
+    let command =
+        crate::mcp_command::parse_mcp_command("/mcp reconnect all").expect("a /mcp reconnect");
+    rig.tx
+        .send(Command::McpPrompt {
+            uuid: "p1".into(),
+            command,
+        })
+        .unwrap();
+    let p1 = rig.prompt("p1");
+    rig.echo("p1");
+    let status = rig.next_written_control_request("mcp_status").await;
+    let status_id = status["request_id"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+    rig.send(
+        json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":status_id,"response":{"mcpServers":[
+            {"name":"alpha","status":"failed"}]}}}),
+    );
+    let reconnect = rig.next_written_control_request("mcp_reconnect").await;
+    let reconnect_id = reconnect["request_id"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+    rig.tx.send(Command::Cancel).unwrap();
+    rig.send(
+        json!({"type":"result","subtype":"error_during_execution","is_error":true,
+        "stop_reason":"end_turn","result":"cli text",
+        "usage":{"input_tokens":1,"output_tokens":0}}),
+    );
+    rig.send(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+    rig.send(
+        json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":reconnect_id,"response":{}}}),
+    );
+    let reply = reply_of(p1).await.expect("the cancel settles the turn");
+    assert_eq!(reply.stop_reason, "cancelled");
+    let chunks: Vec<String> = std::iter::from_fn(|| rig.update_rx.try_recv().ok())
+        .filter_map(|item| match item {
+            SessionOutbound::Update(notif)
+                if serde_json::to_value(&notif.update).unwrap()["sessionUpdate"]
+                    == "agent_message_chunk" =>
+            {
+                Some(chunk_text(&notif))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        chunks.is_empty(),
+        "a cancelled /mcp reconnect publishes nothing: {chunks:?}"
+    );
 }
 
 // ---------------------------------------------------------------- G4 / T-PORT

@@ -568,10 +568,29 @@ fn finished_worker(state: &str) -> H {
 #[test]
 fn air_opens_a_new_generation_when_a_failed_child_runs_again() {
     let mut h = finished_worker("failed");
+    // A chunk under the failed generation's launch id after its terminal state
+    // is a late update: dropped (not delivered, not published).
+    assert_eq!(h.route(&output("launch-1", "stray")), None);
+    assert!(h
+        .rt
+        .take_logs()
+        .iter()
+        .any(|l| l.contains("ignoring late update for terminal subagent")));
+    assert!(
+        h.delivered
+            .iter()
+            .all(|n| !serde_json::to_string(n).unwrap().contains("stray")),
+        "the stray chunk is not delivered"
+    );
     h.resumed("worker-1", None);
+    let routed = h.route(&output("launch-1", "resumed")).expect("routed");
     assert_eq!(
-        session_of(&h.route(&output("launch-1", "resumed"))).as_deref(),
+        session_of(&Some(routed.clone())).as_deref(),
         Some("worker-1:generation:2")
+    );
+    assert!(
+        serde_json::to_string(&routed).unwrap().contains("resumed"),
+        "the resumed text is routed to the new generation"
     );
     h.resumed("worker-1", None);
     h.finish("worker-1", "completed", None);
@@ -638,6 +657,38 @@ fn air_keeps_work_of_a_child_tool_call_in_its_generation_and_async_tasks_reach_i
         json!({"sessionId": "root", "update": {"sessionUpdate": "agent_message_chunk"}});
     assert_eq!(h.rt.apply_route(route, &late_text), None);
     assert!(h.rt.route_of_tool_call("other", None).is_none());
+}
+
+/// `acp-agent.test.ts`: "pins a raced child tool lifecycle to the root where
+/// permission created it" — a permission request created the call in the root
+/// while its `parentToolUseId` names the child: the forced route keeps it on
+/// the root, and the same update without the force routes to the child.
+#[test]
+fn air_pins_a_raced_child_tool_lifecycle_to_the_root_where_permission_created_it() {
+    let mut h = air_with_launch("toolu_agent");
+    h.started(task(
+        "agent-1",
+        "toolu_agent",
+        Some("Explore"),
+        Some("Investigate"),
+    ));
+    let terminal = json!({"sessionId": "root", "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "toolu_child",
+        "status": "completed",
+        "_meta": {"claudeCode": {"toolName": "Bash", "parentToolUseId": "toolu_agent"}}}});
+    let routed =
+        h.rt.route(&terminal, Some("root"))
+            .routed
+            .expect("the forced route publishes");
+    assert_eq!(routed, terminal, "the forced route keeps it on the root");
+    assert_eq!(session_of(&Some(routed)).as_deref(), Some("root"));
+    // Without the force the call belongs to the child its parent names.
+    let routed =
+        h.rt.route(&terminal, None)
+            .routed
+            .expect("the child route publishes");
+    assert_eq!(session_of(&Some(routed)).as_deref(), Some("agent-1"));
 }
 
 #[test]

@@ -130,7 +130,7 @@ async fn t7a_race_5_notification_order() {
                 ));
             }
         }
-        actor.shutdown().await;
+        actor.shutdown().await?;
         Ok(())
     })
     .await;
