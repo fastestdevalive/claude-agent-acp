@@ -1,0 +1,18 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "wait_recv", "contains": "_auth/status_update"},
+    {"call": "request", "method": "authenticate", "expect_error": true,
+     "params": {"methodId": "other"}},
+    {"call": "request", "method": "authenticate", "expect_error": true,
+     "params": {"methodId": "gateway", "_meta": {"gateway": {"baseUrl": ""}}}},
+    {"call": "request", "method": "authenticate", "expect_error": true,
+     "params": {"methodId": "gateway-bedrock", "_meta": {"gateway": {"baseUrl": "ftp://g.example"}}}},
+    {"call": "request", "method": "authenticate", "expect_error": true,
+     "params": {"methodId": "gateway", "_meta": {"gateway": {"baseUrl": "https://g.example", "headers": "x"}}}},
+    {"call": "request", "method": "authenticate",
+     "params": {"methodId": "gateway", "_meta": {"gateway": {"baseUrl": "https://gateway.example:8443/anthropic", "headers": {"x-route": "a"}}}}},
+    {"call": "request", "method": "providers/list", "params": {}}
+  ]
+}

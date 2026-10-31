@@ -34,9 +34,9 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock, ContentChunk,
     CurrentModeUpdate, ImageContent, MessageId, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput,
+    PlanEntryStatus, SessionModeId, SessionUpdate, Terminal, TextContent, ToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, UnstructuredCommandInput,
 };
 use serde_json::Value;
 
@@ -63,7 +63,7 @@ pub enum MsgRole {
 ///   content index (7.4). Keyed by `parent_tool_use_id`/`""` then block index.
 #[derive(Debug, Default)]
 pub struct MapState {
-    emitted: HashSet<String>,
+    emitted: OrderedIds,
     tool_use_cache: HashMap<String, Value>,
     streamed_inputs: HashMap<(String, u64), StreamedInput>,
     /// The Anthropic API message id of the message currently streaming
@@ -127,6 +127,54 @@ pub struct MapState {
     /// `_meta["subagent-transcript"]` capability, native subagent sessions, or
     /// the `forwardSubagentText` session option. Off by default.
     forward_subagent_text: bool,
+    /// The client choices of a tool report (`ClientCapabilities`): the terminal
+    /// channel of a command (`renderer.ts:173-175`).
+    caps: crate::client_caps::ClientCapabilities,
+    /// The `_meta.claudeCode` keys the last progress beat of each open tool call
+    /// carried, so a repeated beat is dropped (the field tracker's merged-meta
+    /// record, `field-tracker.ts:146-182`).
+    progress_meta: HashMap<String, serde_json::Map<String, Value>>,
+    /// The Agent/Task calls of the live background subagents (see
+    /// [`MapState::set_background_subagents`]).
+    background_subagents: HashSet<String>,
+}
+
+/// A command tool: its output goes to the terminal channel (`BashReporter`,
+/// shared with PowerShell, `reporters/index.ts:23`).
+fn is_command_tool(name: &str) -> bool {
+    matches!(name, "Bash" | "PowerShell")
+}
+
+/// An insertion-ordered set of ids, like a JavaScript `Set`: a repeated insert
+/// keeps the first position, and iteration follows insertion order (a cancel
+/// closes the open tool calls in the order they were announced).
+#[derive(Debug, Default, Clone)]
+struct OrderedIds {
+    ids: Vec<String>,
+}
+
+impl OrderedIds {
+    fn insert(&mut self, id: String) -> bool {
+        if self.contains(&id) {
+            return false;
+        }
+        self.ids.push(id);
+        true
+    }
+
+    fn remove(&mut self, id: &str) -> bool {
+        match self.ids.iter().position(|existing| existing == id) {
+            Some(position) => {
+                self.ids.remove(position);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.iter().any(|existing| existing == id)
+    }
 }
 
 /// `MAX_TOOL_CALL_PARENTS` / `MAX_RESOLVED_TOOL_NAMES` (`acp-agent.ts:12826,12925`).
@@ -177,6 +225,90 @@ impl MapState {
     /// Whether the client negotiated `diffPatch`.
     pub(crate) fn diff_patch(&self) -> bool {
         self.diff_patch
+    }
+
+    /// Record the client's tool-report capabilities (the terminal channel).
+    pub(crate) fn set_client_caps(&mut self, caps: crate::client_caps::ClientCapabilities) {
+        self.caps = caps;
+    }
+
+    /// Whether the tool call `name` gets a display terminal: a command, for a
+    /// client that renders terminals (`hasTerminal`, `renderer.ts:173-175`).
+    pub(crate) fn has_terminal(&self, name: &str) -> bool {
+        self.caps.has_terminal(is_command_tool(name))
+    }
+
+    /// Put the display terminal into the content of a command's tool call: the
+    /// terminal marker replaces the display copy (`toolUseContent`,
+    /// `renderer.ts:750-757`).
+    pub(crate) fn apply_terminal_content(
+        &self,
+        name: &str,
+        id: &str,
+        shape: &mut tools::ToolShape,
+    ) {
+        if self.has_terminal(name) {
+            shape.content = vec![ToolCallContent::Terminal(Terminal::new(id.to_string()))];
+        }
+    }
+
+    /// Record the `_meta.claudeCode` keys of a progress beat and tell whether any
+    /// differs from what the last beat of `id` carried (the merged-meta record of
+    /// `ToolCallFieldTracker`, `field-tracker.ts:146-182`).
+    pub(crate) fn progress_meta_changed(
+        &mut self,
+        id: &str,
+        claude_code: &serde_json::Map<String, Value>,
+    ) -> bool {
+        let seen = self.progress_meta.entry(id.to_string()).or_default();
+        let mut changed = false;
+        for (key, value) in claude_code {
+            if seen.get(key) != Some(value) {
+                seen.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The Agent/Task calls of the background subagents that still run
+    /// (`runsInBackground`): the machine's live set, refreshed after every
+    /// session frame. A cancel leaves such a subagent's calls open.
+    pub(crate) fn set_background_subagents(&mut self, parents: HashSet<String>) {
+        self.background_subagents = parents;
+    }
+
+    /// Whether the subagent that the Agent call `parent` started runs in the
+    /// background and has not ended (`runsInBackground`).
+    pub(crate) fn runs_in_background(&self, parent: &str) -> bool {
+        self.background_subagents.contains(parent)
+    }
+
+    /// The `_meta` that ends the display terminal of a command whose tool call
+    /// gets no result (`AcpToolCallRenderer.terminalExit`, T-84): `None` for a
+    /// tool that is not a command, or a client that renders no terminal.
+    pub(crate) fn terminal_exit_meta(
+        &self,
+        name: &str,
+        id: &str,
+    ) -> Option<serde_json::Map<String, Value>> {
+        match self.caps.terminal_exit_meta(is_command_tool(name), id)? {
+            Value::Object(meta) => Some(meta),
+            _ => None,
+        }
+    }
+
+    /// Announce the display terminal of a command's first report
+    /// (`_meta.terminal_info`, `renderer.ts:246`).
+    pub(crate) fn apply_terminal_info(
+        &self,
+        name: &str,
+        id: &str,
+        meta: &mut serde_json::Map<String, Value>,
+    ) {
+        if let Some(Value::Object(info)) = self.caps.terminal_info_meta(is_command_tool(name), id) {
+            meta.extend(info);
+        }
     }
 
     /// The tool shape of a streamed or surfaced tool call for this client
@@ -255,13 +387,13 @@ impl MapState {
     /// Record the Agent/Task call that started the subagent making `id`
     /// (`recordToolCallParent`). A repeated id moves to the end of the
     /// insertion-ordered memory.
-    fn record_tool_call_parent(&mut self, id: &str, parent: &str) {
+    pub(crate) fn record_tool_call_parent(&mut self, id: &str, parent: &str) {
         remember(&mut self.tool_call_parents, id, parent);
     }
 
     /// Forget the parent of a tool call that reached a final status
     /// (`session.toolCallParents?.delete`, `acp-agent.ts:4570`).
-    fn forget_tool_call_parent(&mut self, id: &str) {
+    pub(crate) fn forget_tool_call_parent(&mut self, id: &str) {
         self.tool_call_parents.retain(|(key, _)| key != id);
     }
 
@@ -281,6 +413,18 @@ impl MapState {
     /// (`session.resolvedToolNames?.get`, `acp-agent.ts:4538`).
     pub fn resolved_tool_name(&self, id: &str) -> Option<&str> {
         recall(&self.resolved_tool_names, id)
+    }
+
+    /// Forget the streamed text/thinking record of the subagent that the Agent
+    /// call `parent` started (`streamedBlocksByParent.delete`).
+    pub(crate) fn forget_stream_record(&mut self, parent: &str) {
+        self.streamed_blocks.remove(parent);
+    }
+
+    /// Forget the remembered tool names (`session.resolvedToolNames?.clear()`,
+    /// `acp-agent.ts:8199`) after a conversation reset.
+    pub(crate) fn clear_resolved_tool_names(&mut self) {
+        self.resolved_tool_names.clear();
     }
 
     /// Open the stopped-work window after a cancel (Decision 18): a late
@@ -365,9 +509,16 @@ impl MapState {
         self.emitted.remove(id);
         self.tool_use_cache.remove(id);
         self.tool_tracker.remove(id);
+        self.progress_meta.remove(id);
         self.pending_hooks.remove(id);
         self.tool_call_parents.retain(|(key, _)| key != id);
         self.books.forget(id);
+    }
+
+    /// The tool calls the client holds open, in the order they were announced
+    /// (`[...session.emittedToolCalls]`).
+    pub(crate) fn emitted_ids(&self) -> Vec<String> {
+        self.emitted.ids.clone()
     }
 
     /// Whether a tool-call id has already surfaced to the client (used by
@@ -451,6 +602,7 @@ impl MapState {
                 entry.result_seen = true;
             } else {
                 self.tool_tracker.remove(id);
+                self.progress_meta.remove(id);
             }
         }
     }
@@ -461,6 +613,7 @@ impl MapState {
         if let Some(entry) = self.tool_tracker.get(id) {
             if entry.result_seen {
                 self.tool_tracker.remove(id);
+                self.progress_meta.remove(id);
             }
         }
     }
@@ -527,6 +680,7 @@ impl MapState {
 
     pub(crate) fn clear_tool_tracker(&mut self) {
         self.tool_tracker.clear();
+        self.progress_meta.clear();
         self.pending_hooks.clear();
     }
 }
@@ -1104,9 +1258,7 @@ fn map_block(
                 // hook is registered for Task*).
                 state.finish_result_tool_tracker(&id, false);
             } else if name != "TodoWrite" {
-                if let Some(update) = tool_update_from_result(block, &tool_use, state, ctx) {
-                    out.push(update);
-                }
+                out.extend(tool_update_from_result(block, &tool_use, state, ctx));
             } else {
                 // Plan-lane tool results never emit a tool_call_update (the plan
                 // was already emitted at tool_use time).
@@ -1160,7 +1312,8 @@ fn tool_call_from_use(
     }
 
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = state.tool_shape(&name, &input);
+    let mut shape = state.tool_shape(&name, &input);
+    state.apply_terminal_content(&name, &id, &mut shape);
     // AIR gets `rawInput` once it is complete; every other client gets the
     // input as it stands, also the empty input at the stream start.
     let sent_raw_input = if state.air && state.input_incomplete {
@@ -1181,6 +1334,7 @@ fn tool_call_from_use(
     );
     let mut meta = state.use_meta(&name, &input);
     crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
+    state.apply_terminal_info(&name, &id, &mut meta);
     if state.air && name.starts_with("mcp__") {
         meta.insert("is_mcp_tool_call".to_string(), Value::Bool(true));
     }
@@ -1202,6 +1356,95 @@ fn tool_call_from_use(
 /// caller already took the cached tool_use and cleared the emitted marker (Node
 /// does both at the top of its `tool_result` case).
 fn tool_update_from_result(
+    block: &Value,
+    tool_use: &Value,
+    state: &mut MapState,
+    ctx: &FrameCtx,
+) -> Vec<SessionUpdate> {
+    if let Some(updates) = terminal_command_updates(block, tool_use, state, ctx) {
+        return updates;
+    }
+    tool_update_from_result_single(block, tool_use, state, ctx)
+        .into_iter()
+        .collect()
+}
+
+/// The reports of a finished command on the terminal channel
+/// (`renderer.ts:391-418,455-480`): the output as a report of its own first
+/// (`terminal_output(_delta)`), then the status report carrying
+/// `terminal_exit` (and the terminal content again for a client that is not AIR).
+/// `None` when the client renders no terminal for it, or the result is not a
+/// command (image output): the ordinary result report applies.
+fn terminal_command_updates(
+    block: &Value,
+    tool_use: &Value,
+    state: &mut MapState,
+    ctx: &FrameCtx,
+) -> Option<Vec<SessionUpdate>> {
+    let name = tool_use["name"].as_str().unwrap_or("Other");
+    if !state.has_terminal(name) {
+        return None;
+    }
+    let id = block["tool_use_id"].as_str().unwrap_or("").to_string();
+    let is_error = block
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let raw = block.get("content").cloned().unwrap_or(Value::Null);
+    let tools::reporters::BashFacts::Command(command) =
+        tools::reporters::bash_facts(ctx.structured.as_ref(), &raw, is_error)
+    else {
+        return None;
+    };
+    let terminal = state.caps.terminal_result(
+        tool_use.get("id").and_then(Value::as_str),
+        Some(&id),
+        &command,
+        is_error,
+    )?;
+    let mut updates = Vec::new();
+    // The output report. A subagent's command is stamped with its parent too.
+    let mut output_meta = terminal
+        .output_meta
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    crate::tool_meta::stamp_parent(&mut output_meta, ctx.parent.as_deref());
+    updates.push(SessionUpdate::ToolCallUpdate(
+        ToolCallUpdate::new(id.clone(), ToolCallUpdateFields::new()).meta(output_meta),
+    ));
+    let mut meta = crate::tool_meta::meta_with_parent_and_nonexec(
+        name,
+        ctx.non_exec.get(&id),
+        ctx.parent.as_deref(),
+    );
+    if let Some(exit) = terminal.exit_meta.get("terminal_exit") {
+        meta.insert("terminal_exit".to_string(), exit.clone());
+    }
+    let status = if is_error {
+        ToolCallStatus::Failed
+    } else {
+        ToolCallStatus::Completed
+    };
+    let mut fields = ToolCallUpdateFields::new().status(status);
+    if let Some(content) = terminal
+        .content
+        .and_then(|block| serde_json::from_value::<ToolCallContent>(block).ok())
+    {
+        fields = fields.content(vec![content]);
+    }
+    if let Some(fields) = state.track_final_tool_call_update(&id, &fields) {
+        updates.push(SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(id.clone(), fields).meta(meta),
+        ));
+    }
+    let hook_pending = state.pending_hooks.contains(&id);
+    state.finish_result_tool_tracker(&id, hook_pending);
+    Some(updates)
+}
+
+/// [`tool_update_from_result`] without the terminal channel: one report.
+fn tool_update_from_result_single(
     block: &Value,
     tool_use: &Value,
     state: &mut MapState,
@@ -1321,7 +1564,8 @@ fn tool_call_update_refine(
         state.record_tool_call_parent(&id, parent);
     }
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = state.tool_shape(name, &input);
+    let mut shape = state.tool_shape(name, &input);
+    state.apply_terminal_content(name, &id, &mut shape);
     let mut fields = ToolCallUpdateFields::new()
         .kind(shape.kind)
         .title(shape.title)

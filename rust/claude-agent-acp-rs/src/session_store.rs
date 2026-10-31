@@ -21,6 +21,9 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
 
+use crate::session_index::js_text::{cut_utf16, is_js_ws, js_trim, utf16_len};
+use crate::session_index::project_dirs::{self, Platform};
+
 /// Sessions per `session/list` page (`SESSION_LIST_PAGE_SIZE`).
 pub const SESSION_LIST_PAGE_SIZE: usize = 1000;
 /// The SDK cuts an encoded project path at this length and appends a hash.
@@ -55,11 +58,15 @@ pub fn projects_root() -> PathBuf {
 
 /// Derive the projects root from an explicit environment snapshot.
 pub fn projects_root_with_env(env: &crate::env_snapshot::EnvSnapshot) -> PathBuf {
-    let config = env
-        .get_path("CLAUDE_CONFIG_DIR")
+    config_dir_with_env(env).join("projects")
+}
+
+/// The Claude configuration directory: `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`
+/// (`claudeConfigDir`, `paths.ts`).
+pub fn config_dir_with_env(env: &crate::env_snapshot::EnvSnapshot) -> PathBuf {
+    env.get_path("CLAUDE_CONFIG_DIR")
         .or_else(|| env.get_path("HOME").map(|h| h.join(".claude")))
-        .unwrap_or_default();
-    config.join("projects")
+        .unwrap_or_default()
 }
 
 /// Whether `value` names a transcript (a UUID).
@@ -73,66 +80,42 @@ pub fn is_session_id(value: &str) -> bool {
             .all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// `sanitizePath`: every non-ASCII-alphanumeric character becomes `-`.
-fn sanitize(path: &str) -> String {
-    path.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
 /// The SDK's string hash over UTF-16 code units, base 36 of its absolute value.
+#[cfg(test)]
 fn path_hash(path: &str) -> String {
-    let mut h: i32 = 0;
-    for unit in path.encode_utf16() {
-        h = h
-            .wrapping_shl(5)
-            .wrapping_sub(h)
-            .wrapping_add(i32::from(unit));
-    }
-    let mut n = i64::from(h).unsigned_abs();
-    if n == 0 {
-        return "0".to_string();
-    }
-    let mut digits = Vec::new();
-    while n > 0 {
-        digits.push(char::from_digit((n % 36) as u32, 36).unwrap_or('0'));
-        n /= 36;
-    }
-    digits.iter().rev().collect()
+    crate::session_index::project_dirs::hash_base36(path)
 }
 
 /// The project directory name of `path` (`_u`): the sanitized path, cut at 200
-/// characters plus `-<hash>` when longer.
+/// characters plus `-<hash>` when longer (the host's path rules).
 pub fn project_slug(path: &str) -> String {
-    let slug = sanitize(path);
-    if slug.chars().count() <= MAX_SLUG_LENGTH {
-        return slug;
-    }
-    let cut: String = slug.chars().take(MAX_SLUG_LENGTH).collect();
-    format!("{cut}-{}", path_hash(path))
+    project_dirs::encode_project_path(path, Platform::host())
 }
 
-/// The existing project directories for `dir`: the exact slug, plus (for a long
-/// path, whose hash the CLI computes differently) the directories sharing its
-/// 200-character prefix.
+/// The existing project directories for `dir`: the exact slug (found through the
+/// file system, so in any case on macOS), plus (for a long path, whose hash the
+/// CLI computes differently) the directories sharing its 200-character prefix.
 fn project_dirs_for(root: &Path, dir: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let exact = root.join(project_slug(dir));
     if exact.is_dir() {
         out.push(exact.clone());
     }
-    let slug = sanitize(dir);
-    if slug.chars().count() > MAX_SLUG_LENGTH {
-        let prefix: String = slug.chars().take(MAX_SLUG_LENGTH).collect();
-        let prefix = format!("{prefix}-");
+    let slug = project_dirs::sanitize(dir);
+    if slug.len() > MAX_SLUG_LENGTH {
         if let Ok(read) = std::fs::read_dir(root) {
             let mut names: Vec<_> = read.flatten().collect();
             names.sort_by_key(std::fs::DirEntry::file_name);
             for entry in names {
                 let path = entry.path();
                 if path.is_dir()
-                    && entry.file_name().to_string_lossy().starts_with(&prefix)
+                    && project_dirs::project_dir_matches(
+                        &entry.file_name().to_string_lossy(),
+                        dir,
+                        Platform::host(),
+                    )
                     && path != exact
+                    && !out.contains(&path)
                 {
                     out.push(path);
                 }
@@ -266,74 +249,46 @@ fn last_typed_line_field(text: &str, line_type: &str, field: &str) -> Option<Str
 
 /// `cm` — the first real user prompt in `head`, one line, at most 200 chars.
 fn first_prompt(head: &str) -> Option<String> {
-    for line in head.lines() {
-        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\": \"user\"") {
-            continue;
-        }
-        if line.contains("\"tool_result\"")
-            || line.contains("\"isMeta\":true")
-            || line.contains("\"isCompactSummary\":true")
-        {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if value.get("type").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        let content = value.pointer("/message/content");
-        let mut texts: Vec<&str> = Vec::new();
-        match content {
-            Some(Value::String(s)) => texts.push(s),
-            Some(Value::Array(blocks)) => {
-                for block in blocks {
-                    if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                        texts.clear();
-                        break;
-                    }
-                    if block.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(t) = block.get("text").and_then(Value::as_str) {
-                            texts.push(t);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        for text in texts {
-            let one_line = text.replace('\n', " ");
-            let trimmed = one_line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.chars().count() > 200 {
-                let cut: String = trimmed.chars().take(200).collect();
-                return Some(format!("{}…", cut.trim()));
-            }
-            return Some(trimmed.to_string());
-        }
-    }
-    None
+    Some(crate::session_index::first_prompt::first_prompt(head)).filter(|s| !s.is_empty())
 }
 
-/// `sanitizeTitle` (`session-titles.js`): collapse whitespace, cap at 256.
-pub fn sanitize_title(text: &str) -> String {
-    let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() > TITLE_SCAN_LENGTH {
-        let head: String = text.chars().take(TITLE_SCAN_LENGTH).collect();
-        let head = head.split_whitespace().collect::<Vec<_>>().join(" ");
-        if head.chars().count() >= MAX_TITLE_LENGTH + 2 {
-            let cut: String = head.chars().take(MAX_TITLE_LENGTH - 1).collect();
-            return format!("{cut}…");
+/// `replace(/\s+/g, " ")` with JavaScript's `\s`.
+fn collapse_js_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for c in text.chars() {
+        if is_js_ws(c) {
+            if !in_run {
+                out.push(' ');
+            }
+            in_run = true;
+        } else {
+            in_run = false;
+            out.push(c);
         }
     }
-    let sanitized = collapse(text);
-    if sanitized.chars().count() <= MAX_TITLE_LENGTH {
-        return sanitized;
+    out
+}
+
+/// `sanitizeTitle` (`session-titles.ts`): collapse whitespace, cap at 256 UTF-16
+/// units with an ellipsis. A text longer than 4096 units is judged by its first
+/// 4096 only: collapsing the white space of a prefix gives a prefix of the
+/// collapsed text, and two more units than a title hold at least one that is not
+/// a space, so the full text is longer than a title and gets the same cut.
+pub fn sanitize_title(text: &str) -> String {
+    if utf16_len(text) > TITLE_SCAN_LENGTH {
+        let head = collapse_js_whitespace(cut_utf16(text, TITLE_SCAN_LENGTH));
+        let head = head.trim_start_matches(is_js_ws);
+        if utf16_len(head) >= MAX_TITLE_LENGTH + 2 {
+            return format!("{}…", cut_utf16(head, MAX_TITLE_LENGTH - 1));
+        }
     }
-    let cut: String = sanitized.chars().take(MAX_TITLE_LENGTH - 1).collect();
-    format!("{cut}…")
+    let collapsed = collapse_js_whitespace(text);
+    let sanitized = js_trim(&collapsed);
+    if utf16_len(sanitized) <= MAX_TITLE_LENGTH {
+        return sanitized.to_string();
+    }
+    format!("{}…", cut_utf16(sanitized, MAX_TITLE_LENGTH - 1))
 }
 
 /// `new Date(ms).toISOString()`.
@@ -377,6 +332,8 @@ pub struct SessionRow {
     pub cwd: String,
     pub title: String,
     pub last_modified_ms: u64,
+    /// `SDKSessionInfo.customTitle`: kept for `hideArchived`, not on the wire.
+    pub custom_title: Option<String>,
 }
 
 impl SessionRow {
@@ -439,22 +396,14 @@ fn row_of(candidate: &Candidate) -> Option<SessionRow> {
         .or_else(|| last_string_field(&head, "customTitle").filter(|s| !s.is_empty()))
         .or_else(|| last_string_field(&tail, "aiTitle").filter(|s| !s.is_empty()))
         .or_else(|| last_string_field(&head, "aiTitle").filter(|s| !s.is_empty()));
+    let custom_title = custom.clone();
     let summary = custom
         .or_else(|| last_string_field(&tail, "lastPrompt").filter(|s| !s.is_empty()))
         .or_else(|| last_string_field(&tail, "summary").filter(|s| !s.is_empty()))
         .or_else(|| first_prompt(&head).filter(|s| !s.is_empty()))
         .or_else(|| {
-            head.lines().find_map(|l| {
-                if !l.contains("\"type\":\"user\"") || l.contains("\"tool_result\"") {
-                    None
-                } else if l.contains("\"type\":\"image\"") {
-                    Some("Image".to_string())
-                } else if l.contains("\"type\":\"document\"") {
-                    Some("Document".to_string())
-                } else {
-                    None
-                }
-            })
+            Some(crate::session_index::first_prompt::media_prompt(&head).to_string())
+                .filter(|s| !s.is_empty())
         })?;
     let cwd = last_typed_line_field(&tail, "relocated", "relocatedCwd")
         .filter(|s| !s.is_empty())
@@ -470,6 +419,7 @@ fn row_of(candidate: &Candidate) -> Option<SessionRow> {
         cwd,
         title: sanitize_title(&summary),
         last_modified_ms,
+        custom_title,
     })
 }
 
@@ -880,6 +830,66 @@ mod tests {
         let t = sanitize_title(&long);
         assert_eq!(t.chars().count(), 256);
         assert!(t.ends_with('…'));
+    }
+
+    /// The sanitizer before it learned to read only the start of a long text
+    /// (`fullScanTitle` in `session-titles.test.ts`).
+    fn full_scan_title(text: &str) -> String {
+        let sanitized = collapse_js_whitespace(text);
+        let sanitized = js_trim(&sanitized);
+        if utf16_len(sanitized) <= 256 {
+            sanitized.to_string()
+        } else {
+            format!("{}…", cut_utf16(sanitized, 255))
+        }
+    }
+
+    /// sanitizeTitle > gives a long text the same title as a scan of the whole text
+    #[test]
+    fn t2b_sanitize_title_gives_a_long_text_the_title_of_a_full_scan() {
+        let texts = [
+            "lorem ipsum dolor sit amet\n".repeat(400_000),
+            format!("{}{}", " \n\t".repeat(3000), "word ".repeat(2000)),
+            // The cut of the scanned prefix falls inside a run of whitespace.
+            format!("{}{}tail", "x".repeat(300), " ".repeat(5000)),
+            // Mostly whitespace: the prefix collapses below a title's length.
+            format!(
+                "{}{}{}",
+                "a ".repeat(100),
+                " ".repeat(10_000),
+                "b".repeat(300)
+            ),
+            format!("{}short", " ".repeat(10_000)),
+            format!(
+                "{}{}",
+                "\u{a0}\u{feff}".repeat(2100),
+                "\u{1f600}".repeat(2000)
+            ),
+            format!("{}{}", "y".repeat(4095), "\u{1f600}".repeat(10)),
+            format!("{}{}", "z".repeat(257), " ".repeat(4096)),
+            format!("{}{}", "z".repeat(256), " ".repeat(4096)),
+        ];
+        for text in &texts {
+            assert_eq!(sanitize_title(text), full_scan_title(text));
+        }
+    }
+
+    /// sanitizeTitle: lengths are UTF-16 units and the cut never splits a pair
+    #[test]
+    fn t2b_sanitize_title_counts_utf16_units_with_a_256_cap() {
+        let astral = "\u{1f600}".repeat(200);
+        let title = sanitize_title(&astral);
+        // 255 units hold 127 whole pairs (254 units); the ellipsis follows.
+        assert_eq!(title.chars().count(), 128);
+        assert!(title.ends_with('…'));
+        let exact = "w".repeat(256);
+        assert_eq!(sanitize_title(&exact), exact);
+        assert_eq!(utf16_len(&sanitize_title(&format!("{exact}w"))), 256);
+        // Newlines and the JavaScript white space set collapse to one space.
+        assert_eq!(sanitize_title("a\r\n\u{a0}\u{2028}b"), "a b");
+        // U+FEFF is white space to JavaScript's `\s`, U+0085 is not.
+        assert_eq!(sanitize_title("a\u{feff}b"), "a b");
+        assert_eq!(sanitize_title("a\u{85}b"), "a\u{85}b");
     }
 
     #[test]

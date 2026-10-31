@@ -1,25 +1,27 @@
 //! `authStatus` — the `_auth/status_update` push of the connection's auth
-//! identity (rust-air-gaps G2, Decision 11). A port of `dist/auth-status.js`
-//! (`fromCliStatus`, `fromAccountInfo`, `mergeAuthStatus`, `sameAuthStatus`,
-//! `planLabel`) plus an [`AuthActor`] that owns the last-reported status.
+//! identity (port of upstream `src/auth-status.ts` and the auth members of
+//! `acp-agent.ts`): the mapping tables (`fromCliStatus`, `fromAccountInfo`,
+//! `mergeAuthStatus`, `sameAuthStatus`, `planLabel`) and an actor
+//! ([`spawn_auth_actor`]) that owns the last-reported status, the auth epoch and
+//! the probe context.
 //!
 //! Push only. The status is read (a) after the `initialize` response from
-//! `claude auth status --json`, (b) from each created session's account and
-//! (c) again when a session's cwd differs from the last probe's. A payload is
-//! pushed only when it differs from the last one sent; an unreadable identity
-//! is silence, never an error.
-//!
-//! Not ported (no Rust counterpart, PARITY): ACP gateway authentication and
-//! provider overrides, the auth epoch, the `--hide-claude-auth` guard, the
-//! `vendor` bag, the per-prompt re-probe.
+//! `claude auth status --json`, (b) from each created session's account, (c) again
+//! when the probe context (cwd, apiKeyHelper, launch env) changes, (d) at the start
+//! of each user prompt, and (e) after `authenticate` and `logout`. A payload is
+//! pushed only when it differs from the last one sent; an unreadable identity is
+//! silence, never an error.
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+
+mod actor;
+pub use actor::{
+    gateway_auth_status, spawn_auth_actor, spawn_auth_actor_with, AuthActorConfig, AuthCmd,
+    AuthHandle, AuthPush, ProbeFn, SessionAuthContext,
+};
 
 /// Upper bound on one `claude auth status --json` run.
 pub const AUTH_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,12 +38,14 @@ pub struct AuthAccount {
 }
 
 /// One `authStatus` payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthStatus {
     pub kind: String,
     pub label: String,
     pub detail: Option<String>,
     pub account: Option<AuthAccount>,
+    /// Vendor-namespaced extras, e.g. `{claudeCode: {...}}`.
+    pub vendor: Option<Box<Value>>,
 }
 
 impl AuthStatus {
@@ -51,10 +55,11 @@ impl AuthStatus {
             label: label.to_string(),
             detail: None,
             account: None,
+            vendor: None,
         }
     }
 
-    /// The wire object (`{kind,label,detail?,account?}`).
+    /// The wire object (`{kind,label,detail?,account?,vendor?}`).
     pub fn to_json(&self) -> Value {
         let mut map = serde_json::Map::new();
         map.insert("kind".into(), json!(self.kind));
@@ -74,6 +79,9 @@ impl AuthStatus {
                 a.insert("organization".into(), json!(org));
             }
             map.insert("account".into(), Value::Object(a));
+        }
+        if let Some(vendor) = &self.vendor {
+            map.insert("vendor".into(), (**vendor).clone());
         }
         Value::Object(map)
     }
@@ -309,6 +317,9 @@ pub fn merge(previous: Option<&AuthStatus>, next: &AuthStatus) -> AuthStatus {
             organization: n.organization.or(p.organization),
         });
     }
+    if merged.vendor.is_none() {
+        merged.vendor = previous.vendor.clone();
+    }
     merged
 }
 
@@ -338,7 +349,7 @@ pub async fn read_api_key_helper_with_env(
 }
 
 /// The outcome of one CLI auth status probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProbeOutcome {
     Status(AuthStatus),
     LoggedOut,
@@ -354,31 +365,90 @@ pub async fn probe_cli(
     extra_env: &[(String, String)],
     env: &crate::env_snapshot::EnvSnapshot,
 ) -> ProbeOutcome {
+    let request = ProbeRequest::in_dir(cwd);
+    probe_cli_in(claude_path, &request, extra_env, env).await
+}
+
+/// What one probe runs against (`runCliAuthProbe`'s settings context): the cwd of
+/// the session's settings manager, the programmatic settings override (passed as
+/// `--settings`) and the launch env the sessions get on top of the process env.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeRequest {
+    pub cwd: PathBuf,
+    pub settings_override: Option<Value>,
+    pub launch_env: Option<Vec<(String, String)>>,
+    /// Where the probe's failures are logged (`None`: nowhere).
+    pub logger: Option<std::sync::Arc<crate::logger::Logger>>,
+}
+
+impl ProbeRequest {
+    /// A probe in `cwd` with no settings context.
+    pub fn in_dir(cwd: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            ..Self::default()
+        }
+    }
+}
+
+/// [`probe_cli`] in a settings context: `--settings <override>` and the launch env
+/// when the session had them (`acp-agent.ts:3405-3414`).
+pub async fn probe_cli_in(
+    claude_path: Option<&Path>,
+    request: &ProbeRequest,
+    extra_env: &[(String, String)],
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> ProbeOutcome {
+    let log = |message: &str| {
+        if let Some(logger) = &request.logger {
+            logger.error(message);
+        }
+    };
     let Ok(binary) = crate::process::resolve_claude(claude_path) else {
+        log("claude auth status failed: the claude binary was not found");
         return ProbeOutcome::LoggedOut;
     };
+    let settings_arg = request.settings_override.as_ref().map(Value::to_string);
+    let mut args: Vec<&str> = vec!["auth", "status", "--json"];
+    if let Some(settings) = &settings_arg {
+        args.push("--settings");
+        args.push(settings);
+    }
+    let mut run_env = extra_env.to_vec();
+    if let Some(launch) = &request.launch_env {
+        run_env.extend(launch.iter().cloned());
+    }
     let run = match crate::process::run_cli(
         &binary,
-        &["auth", "status", "--json"],
-        Some(cwd),
-        extra_env,
+        &args,
+        Some(&request.cwd),
+        &run_env,
         AUTH_STATUS_PROBE_TIMEOUT,
     )
     .await
     {
         Ok(r) => r,
-        Err(_) => return ProbeOutcome::LoggedOut,
+        Err(e) => {
+            log(&format!("claude auth status failed: {e}"));
+            return ProbeOutcome::LoggedOut;
+        }
     };
     if run.timed_out {
         return ProbeOutcome::TimedOut;
     }
     if run.stdout.trim().is_empty() {
+        log("claude auth status failed: no output");
         return ProbeOutcome::LoggedOut;
     }
-    let helper = read_api_key_helper_with_env(cwd, env).await;
+    let helper =
+        read_api_key_helper_with_override(&request.cwd, env, request.settings_override.as_ref())
+            .await;
     match from_cli_status(&run.stdout, helper.as_deref()) {
         Some(st) => ProbeOutcome::Status(st),
-        None => ProbeOutcome::LoggedOut,
+        None => {
+            log("claude auth status returned unparseable output");
+            ProbeOutcome::LoggedOut
+        }
     }
 }
 
@@ -431,41 +501,6 @@ pub async fn run_logout(
     })
 }
 
-/// A boxed probe: the cwd in, the mapped status out.
-pub type ProbeFn =
-    Box<dyn Fn(PathBuf) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send>> + Send + Sync>;
-
-/// Messages of the auth-status actor ([`spawn_auth_actor`]).
-#[derive(Debug)]
-pub enum AuthCmd {
-    /// Re-read the identity from the CLI. `fresh` forces a new run even when
-    /// one is in flight.
-    Probe { cwd: PathBuf, fresh: bool },
-    /// Bump epoch to invalidate in-flight probes (e.g. before logout subprocess).
-    BumpEpoch,
-    /// A session was created: publish its account (if informative) and re-probe
-    /// when its cwd differs from the last probe's.
-    SessionCreated {
-        cwd: PathBuf,
-        account: Option<Value>,
-    },
-    /// `logout` cleared the credentials: drop every probe that started before
-    /// (its answer is stale), re-read the store with a fresh probe and, when it
-    /// cannot be read, report "not logged in". `reply` resolves once the new
-    /// status (if any) was pushed.
-    Logout {
-        cwd: PathBuf,
-        reply: tokio::sync::oneshot::Sender<()>,
-    },
-    /// A spawned probe finished (internal). `epoch` is the actor epoch the
-    /// probe started in; `reply` is set for the post-logout read.
-    ProbeDone {
-        outcome: ProbeOutcome,
-        epoch: u64,
-        reply: Option<tokio::sync::oneshot::Sender<()>>,
-    },
-}
-
 /// The auth-probe context Node compares in `useAuthStatusSettings`
 /// (`acp-agent.ts:3324-3346`): the settings cwd, the api-key helper, and the
 /// launch env serialized with `JSON.stringify` (`None` for `undefined`).
@@ -496,157 +531,10 @@ pub fn auth_context_changed(prev: &AuthContext, next: &AuthContext) -> bool {
     prev.cwd != next.cwd || prev.api_key_helper != next.api_key_helper || prev.env != next.env
 }
 
-/// Cheap handle to the actor.
-#[derive(Debug, Clone)]
-pub struct AuthHandle {
-    tx: mpsc::UnboundedSender<AuthCmd>,
-}
-
-impl AuthHandle {
-    /// Fire-and-forget; a stopped actor is ignored.
-    pub fn send(&self, cmd: AuthCmd) {
-        let _ = self.tx.send(cmd);
-    }
-
-    /// Bump epoch before running logout (in-flight probes dropped).
-    pub fn bump_epoch(&self) {
-        self.send(AuthCmd::BumpEpoch);
-    }
-
-    /// Run a fresh probe in `cwd`.
-    pub fn probe(&self, cwd: PathBuf, fresh: bool) {
-        self.send(AuthCmd::Probe { cwd, fresh });
-    }
-}
-
-/// What the actor hands its forwarder, in wire order.
-#[derive(Debug)]
-pub enum AuthPush {
-    /// The `authStatus` object of a changed status.
-    Status(Value),
-    /// Resolved by the forwarder once every earlier push was sent, so a
-    /// response can be ordered behind its notifications.
-    Barrier(tokio::sync::oneshot::Sender<()>),
-}
-
-/// Spawn the actor. `push` receives every changed status (and barriers) for
-/// the forwarder; `probe` reads the CLI; `env` is the SAME injected managed
-/// source the sessions use, so the `apiKeyHelper` precedence (managed > user >
-/// project > local) never falls back to the host process environment. State
-/// (`current`, in-flight count, last probe cwd) lives only inside the task —
-/// no lock.
-pub fn spawn_auth_actor(
-    push: mpsc::UnboundedSender<AuthPush>,
-    probe: ProbeFn,
-    initial_cwd: PathBuf,
-    env: crate::env_snapshot::EnvSnapshot,
-) -> AuthHandle {
-    let (tx, mut rx) = mpsc::unbounded_channel::<AuthCmd>();
-    let self_tx = tx.clone();
-    tokio::spawn(async move {
-        let mut current: Option<AuthStatus> = None;
-        let mut in_flight = 0usize;
-        let mut last_cwd = initial_cwd;
-        // Bumped by a logout: a probe that started earlier read a world that no
-        // longer exists, so its answer is dropped (Node's `authEpoch`).
-        let mut epoch = 0u64;
-        let set = |current: &mut Option<AuthStatus>, next: AuthStatus| {
-            if same_status(current.as_ref(), &next) {
-                return;
-            }
-            let _ = push.send(AuthPush::Status(next.to_json()));
-            *current = Some(next);
-        };
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                AuthCmd::BumpEpoch => {
-                    epoch += 1;
-                }
-                AuthCmd::Probe { cwd, fresh } => {
-                    if in_flight > 0 && !fresh {
-                        continue;
-                    }
-                    in_flight += 1;
-                    let fut = probe(cwd);
-                    let done = self_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = done.send(AuthCmd::ProbeDone {
-                            outcome: fut.await,
-                            epoch,
-                            reply: None,
-                        });
-                    });
-                }
-                AuthCmd::Logout { cwd, reply } => {
-                    epoch += 1;
-                    in_flight += 1;
-                    let fut = probe(cwd);
-                    let done = self_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = done.send(AuthCmd::ProbeDone {
-                            outcome: fut.await,
-                            epoch,
-                            reply: Some(reply),
-                        });
-                    });
-                }
-                AuthCmd::ProbeDone {
-                    outcome,
-                    epoch: started,
-                    reply,
-                } => {
-                    in_flight = in_flight.saturating_sub(1);
-                    if reply.is_some() {
-                        // The post-logout read: an unreadable store means the
-                        // old identity is stale, so report "not logged in".
-                        // On probe timeout, keep current status instead of pushing notLoggedIn.
-                        match outcome {
-                            ProbeOutcome::Status(st) => {
-                                let next = merge(current.as_ref(), &st);
-                                set(&mut current, next);
-                            }
-                            ProbeOutcome::LoggedOut => {
-                                set(&mut current, not_logged_in());
-                            }
-                            ProbeOutcome::TimedOut => {
-                                if current.is_none() {
-                                    set(&mut current, not_logged_in());
-                                }
-                            }
-                        }
-                    } else if started == epoch {
-                        if let ProbeOutcome::Status(st) = outcome {
-                            let merged = merge(current.as_ref(), &st);
-                            set(&mut current, merged);
-                        }
-                    }
-                    if let Some(reply) = reply {
-                        // Resolve behind the forwarder so the logout response
-                        // cannot overtake the status it caused.
-                        let _ = push.send(AuthPush::Barrier(reply));
-                    }
-                }
-                AuthCmd::SessionCreated { cwd, account } => {
-                    if let Some(account) = account {
-                        let helper = read_api_key_helper_with_env(&cwd, &env).await;
-                        if let Some(status) = from_account_info(&account, helper.as_deref()) {
-                            set(&mut current, status);
-                        }
-                    }
-                    if cwd != last_cwd {
-                        last_cwd = cwd.clone();
-                        let _ = self_tx.send(AuthCmd::Probe { cwd, fresh: true });
-                    }
-                }
-            }
-        }
-    });
-    AuthHandle { tx }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     fn acct(plan: &str, email: Option<&str>, org: Option<&str>) -> AuthStatus {
         AuthStatus {
@@ -658,6 +546,7 @@ mod tests {
                 email: email.map(Into::into),
                 organization: org.map(Into::into),
             }),
+            vendor: None,
         }
     }
 
@@ -667,6 +556,7 @@ mod tests {
             label: label.into(),
             detail: detail.map(Into::into),
             account: None,
+            vendor: None,
         }
     }
 
@@ -1009,16 +899,28 @@ mod tests {
         let probed = acct("pro", Some("a@b.c"), None);
         let (handle, mut push_rx) = actor(fixed_probe(Some(probed.clone())), "/a");
         // An uninformative account pushes nothing; the cwd change re-probes.
+        handle
+            .use_context(SessionAuthContext {
+                cwd: PathBuf::from("/b"),
+                ..SessionAuthContext::default()
+            })
+            .await;
         handle.send(AuthCmd::SessionCreated {
+            session_id: None,
             cwd: PathBuf::from("/b"),
             account: Some(json!({"organizationId": "org-1", "subscriptionType": null})),
+            api_key_helper: None,
+            epoch: None,
         });
         assert_eq!(next_push(&mut push_rx).await, Some(probed.to_json()));
         // The richer session account for the same identity is a new payload.
         handle.send(AuthCmd::SessionCreated {
+            session_id: None,
             cwd: PathBuf::from("/b"),
             account: Some(json!({"apiProvider":"firstParty","subscriptionType":"pro",
                 "email":"a@b.c","organization":"Org"})),
+            api_key_helper: None,
+            epoch: None,
         });
         assert_eq!(
             next_push(&mut push_rx).await,
@@ -1063,3 +965,9 @@ mod tests {
         assert!(!auth_context_changed(&env, &same_env));
     }
 }
+
+#[cfg(test)]
+mod tests_t3b;
+
+#[cfg(test)]
+mod tests_t3fb;

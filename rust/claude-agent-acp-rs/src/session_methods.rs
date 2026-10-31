@@ -24,7 +24,15 @@ fn join_error(error: tokio::task::JoinError) -> Error {
 }
 
 /// `session/list`: one page of sessions, newest first.
-pub async fn list(params: &Value, env: &crate::env_snapshot::EnvSnapshot) -> Result<Value, Error> {
+///
+/// `is_air_client`: an AIR client archives with `session/delete`, so its archived
+/// sessions (an archived custom title) stay out of this list, as when the delete
+/// removed them (`hideArchived`, applied to the page after the cursor counted it).
+pub async fn list(
+    params: &Value,
+    env: &crate::env_snapshot::EnvSnapshot,
+    is_air_client: bool,
+) -> Result<Value, Error> {
     let cwd = params
         .get("cwd")
         .and_then(Value::as_str)
@@ -40,8 +48,13 @@ pub async fn list(params: &Value, env: &crate::env_snapshot::EnvSnapshot) -> Res
     })
     .await
     .map_err(join_error)?;
+    let visible = crate::session_index::connection::SessionIndexConnection::hide_archived(
+        is_air_client,
+        page.sessions,
+        |row| row.custom_title.as_deref(),
+    );
     let mut result = json!({
-        "sessions": page.sessions.iter().map(session_store::SessionRow::to_json).collect::<Vec<_>>(),
+        "sessions": visible.iter().map(session_store::SessionRow::to_json).collect::<Vec<_>>(),
     });
     if let (Some(cursor), Some(map)) = (page.next_cursor, result.as_object_mut()) {
         map.insert("nextCursor".into(), json!(cursor));

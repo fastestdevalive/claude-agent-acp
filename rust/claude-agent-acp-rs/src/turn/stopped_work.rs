@@ -44,6 +44,17 @@ pub enum StoppedWorkVerdict {
     Wait,
 }
 
+/// How the level signal (`background_tasks_changed`) marked a task that is
+/// absent from the live background set (`LiveBackgroundTask.endedPerLevel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EndedPerLevel {
+    /// The level proved the task gone (or its settle bookends lost): a hold no
+    /// longer waits on it, its attribution stays.
+    Ended,
+    /// The activation sweep armed it; the next activation deletes it.
+    SweepArmed,
+}
+
 /// What `task_started` told us about a task (`liveBackgroundTasks` record).
 #[derive(Debug, Clone)]
 pub(super) struct TaskMeta {
@@ -51,6 +62,20 @@ pub(super) struct TaskMeta {
     pub(super) backgrounded: bool,
     pub(super) is_subagent: bool,
     pub(super) task_type: Option<String>,
+    /// The task that spawned this one (`parentTaskId`).
+    pub(super) parent_task_id: Option<String>,
+    pub(super) ended_per_level: Option<EndedPerLevel>,
+}
+
+/// `MAX_RESUMABLE_SUBAGENTS` (`acp-agent.ts:441`).
+const MAX_RESUMABLE_SUBAGENTS: usize = 256;
+
+/// Where a live task runs (`registerLiveTask`'s `placement`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TaskPlacement<'a> {
+    pub backgrounded: Option<bool>,
+    pub parent_task_id: Option<&'a str>,
+    pub task_type: Option<&'a str>,
 }
 
 /// Whether `block` is a tool-use block (`isToolUseBlock`): `tool_use`,
@@ -82,8 +107,193 @@ impl TurnMachine {
                 backgrounded,
                 is_subagent,
                 task_type: task_type.map(str::to_string),
+                parent_task_id: None,
+                ended_per_level: None,
             },
         );
+    }
+
+    /// Register a live background task (`registerLiveTask`,
+    /// `acp-agent.ts:5093-5117`). A subagent is also recorded on the active turn,
+    /// so that turn holds until the subagent settles. A task that was settled and
+    /// is registered again is no longer resumable.
+    pub fn register_live_task(
+        &mut self,
+        task_id: &str,
+        parent_tool_use_id: Option<&str>,
+        is_subagent: bool,
+        placement: TaskPlacement<'_>,
+    ) {
+        self.on_task_started(task_id, is_subagent);
+        self.task_meta.insert(
+            task_id.to_string(),
+            TaskMeta {
+                parent_tool_use_id: parent_tool_use_id.map(str::to_string),
+                backgrounded: placement.backgrounded == Some(true),
+                is_subagent,
+                task_type: placement.task_type.map(str::to_string),
+                parent_task_id: placement.parent_task_id.map(str::to_string),
+                ended_per_level: None,
+            },
+        );
+        self.resumable_subagents.retain(|(id, _)| id != task_id);
+    }
+
+    /// Remove a settled task from the live set (`settleLiveBackgroundTask`,
+    /// `acp-agent.ts:445-455`). A subagent keeps its parent tool call for a later
+    /// resume (at most [`MAX_RESUMABLE_SUBAGENTS`], oldest dropped).
+    pub(super) fn settle_live_task(&mut self, task_id: &str) {
+        let Some(meta) = self.task_meta.remove(task_id) else {
+            return;
+        };
+        self.live_subagents.remove(task_id);
+        if !meta.is_subagent {
+            return;
+        }
+        self.resumable_subagents.retain(|(id, _)| id != task_id);
+        self.resumable_subagents
+            .push((task_id.to_string(), meta.parent_tool_use_id));
+        if self.resumable_subagents.len() > MAX_RESUMABLE_SUBAGENTS {
+            self.resumable_subagents.remove(0);
+        }
+    }
+
+    /// Register a settled subagent again when the SDK resumes it without a new
+    /// `task_started` (`resumeLiveTask`, `acp-agent.ts:5160-5168`): the active
+    /// turn is the one that resumed it, so it holds until the subagent settles
+    /// again. A repeated resume signal finds the subagent live and changes
+    /// nothing. Returns whether a settled subagent was registered again.
+    pub fn resume_live_task(&mut self, task_id: &str) -> bool {
+        if self.task_meta.contains_key(task_id) {
+            return false;
+        }
+        let Some(position) = self
+            .resumable_subagents
+            .iter()
+            .position(|(id, _)| id == task_id)
+        else {
+            return false;
+        };
+        let (_, parent) = self.resumable_subagents.remove(position);
+        // Claude Code always resumes a subagent in the background.
+        self.register_live_task(
+            task_id,
+            parent.as_deref(),
+            true,
+            TaskPlacement {
+                backgrounded: Some(true),
+                ..TaskPlacement::default()
+            },
+        );
+        true
+    }
+
+    /// A task moved to or from the background (`task_updated`'s
+    /// `is_backgrounded` patch): it no longer blocks the tool call that spawned
+    /// it (`acp-agent.ts:6531-6537`).
+    pub fn set_task_backgrounded(&mut self, task_id: &str, backgrounded: bool) {
+        if let Some(meta) = self.task_meta.get_mut(task_id) {
+            meta.backgrounded = backgrounded;
+        }
+    }
+
+    /// Whether `task_id` is a live background task (`liveBackgroundTasks.has`).
+    pub fn is_live_task(&self, task_id: &str) -> bool {
+        self.task_meta.contains_key(task_id)
+    }
+
+    /// The Agent/Task call of a live task, if any (`liveBackgroundTasks.get(id)
+    /// ?.parentToolUseId`).
+    pub fn live_task_parent(&self, task_id: &str) -> Option<&str> {
+        self.task_meta
+            .get(task_id)
+            .and_then(|meta| meta.parent_tool_use_id.as_deref())
+    }
+
+    /// The Agent/Task call of every live subagent, by task id: what attributes a
+    /// subagent's permission request or tool report to its parent call. Entries
+    /// the level signal ended stay (attribution outlives the hold).
+    pub fn live_subagent_parents(&self) -> std::collections::HashMap<String, String> {
+        self.task_meta
+            .iter()
+            .filter(|(_, meta)| meta.is_subagent)
+            .filter_map(|(id, meta)| Some((id.clone(), meta.parent_tool_use_id.clone()?)))
+            .collect()
+    }
+
+    /// The Agent/Task calls of the background subagents that still run: what
+    /// [`Self::runs_in_background`] answers, for every parent at once.
+    pub fn background_subagent_parents(&self) -> HashSet<String> {
+        self.task_meta
+            .iter()
+            .filter(|(task_id, meta)| {
+                meta.is_subagent
+                    && meta.backgrounded
+                    && meta.ended_per_level.is_none()
+                    && self.live_subagents.contains_key(*task_id)
+            })
+            .filter_map(|(_, meta)| meta.parent_tool_use_id.clone())
+            .collect()
+    }
+
+    /// The subagent that the Agent call `parent` started streams no more text:
+    /// its drop latch goes with its streamed record (`droppedStreams.delete`,
+    /// `acp-agent.ts:6506-6509`).
+    pub fn forget_dropped_stream(&mut self, parent: &str) {
+        self.stopped.dropped_streams.remove(parent);
+    }
+
+    /// Reconcile the live set with the SDK's `background_tasks_changed` level
+    /// (`acp-agent.ts:6733-6777`, replace semantics): an entry in the level is
+    /// proven live (un-ended); an absent one loses its bookends — a subagent is
+    /// kept for attribution but no hold waits on it (the level's universe is
+    /// BACKGROUND tasks only, so a live foreground subagent is legitimately
+    /// absent, #859), any other task is dropped. The level never adds entries.
+    /// Returns the ids of the dropped tasks.
+    pub fn reconcile_background_tasks(&mut self, live: &HashSet<String>) -> Vec<String> {
+        let mut dropped = Vec::new();
+        let ids: Vec<String> = self.task_meta.keys().cloned().collect();
+        for id in ids {
+            let Some(meta) = self.task_meta.get_mut(&id) else {
+                continue;
+            };
+            if live.contains(&id) {
+                meta.ended_per_level = None;
+            } else if meta.is_subagent {
+                meta.ended_per_level.get_or_insert(EndedPerLevel::Ended);
+            } else {
+                self.task_meta.remove(&id);
+                self.live_subagents.remove(&id);
+                dropped.push(id);
+            }
+        }
+        dropped.sort();
+        dropped
+    }
+
+    /// The activation-time sweep of the entries the level ended
+    /// (`activateTurn`, `acp-agent.ts:4833-4854`): armed at the first
+    /// activation, deleted at the second, which is the growth bound for leaked
+    /// entries whose settle bookends never arrive and gives a corrective
+    /// inclusive level one activation to rescue a live async agent.
+    pub(super) fn sweep_ended_tasks(&mut self) {
+        let ids: Vec<String> = self
+            .task_meta
+            .iter()
+            .filter(|(_, meta)| meta.ended_per_level.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let armed = self
+                .task_meta
+                .get(&id)
+                .is_some_and(|meta| meta.ended_per_level == Some(EndedPerLevel::SweepArmed));
+            if armed {
+                self.settle_live_task(&id);
+            } else if let Some(meta) = self.task_meta.get_mut(&id) {
+                meta.ended_per_level = Some(EndedPerLevel::SweepArmed);
+            }
+        }
     }
 
     /// Whether `session/cancel` stops the background workflows the interrupt
@@ -91,6 +301,11 @@ impl TurnMachine {
     /// affordance and no `asyncTasks` of its own).
     pub fn set_stops_workflows_on_cancel(&mut self, stops: bool) {
         self.stops_workflows_on_cancel = stops;
+    }
+
+    /// Whether `session/cancel` stops the spared background workflows.
+    pub fn stops_workflows_on_cancel(&self) -> bool {
+        self.stops_workflows_on_cancel
     }
 
     /// The live background workflows a cancel stops after its interrupt
@@ -183,6 +398,7 @@ impl TurnMachine {
         self.task_meta.iter().any(|(task_id, meta)| {
             meta.is_subagent
                 && meta.backgrounded
+                && meta.ended_per_level.is_none()
                 && meta.parent_tool_use_id.as_deref() == Some(agent_tool_use_id)
                 && self.live_subagents.contains_key(task_id)
         })
@@ -309,8 +525,10 @@ impl TurnMachine {
         }
     }
 
-    /// Forget the per-task facts of an ended task.
-    pub(super) fn forget_task_meta(&mut self, task_id: &str) {
-        self.task_meta.remove(task_id);
+    /// The task that spawned the live task `task_id` (`parentTaskId`).
+    pub fn parent_task_id(&self, task_id: &str) -> Option<&str> {
+        self.task_meta
+            .get(task_id)
+            .and_then(|meta| meta.parent_task_id.as_deref())
     }
 }

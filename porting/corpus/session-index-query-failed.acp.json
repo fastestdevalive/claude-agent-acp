@@ -1,0 +1,60 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {
+      "path": "projects/$CWD_SLUG/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee.jsonl",
+      "from": "seeds/t2fx-close.jsonl",
+      "mtime": 1767225600
+    }
+  ],
+  "steps": [
+    {
+      "call": "initialize",
+      "client_capabilities_meta": {
+        "jetbrains": {
+          "air": {
+            "version": 1,
+            "capabilities": [
+              "sessionIndex"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "call": "request",
+      "method": "session/resume",
+      "capture_session_id": true,
+      "params": {
+        "sessionId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "cwd": "$CWD",
+        "mcpServers": []
+      }
+    },
+    {
+      "call": "session/prompt",
+      "text": "dying turn",
+      "no_wait": true
+    },
+    {
+      "call": "session/prompt",
+      "text": "queued turn",
+      "no_wait": true
+    },
+    {
+      "call": "wait_recv",
+      "contains": "exited unexpectedly"
+    },
+    {
+      "call": "sleep",
+      "ms": 300
+    },
+    {
+      "call": "request",
+      "method": "session/list",
+      "params": {
+        "cwd": "$CWD"
+      }
+    }
+  ]
+}

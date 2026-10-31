@@ -367,6 +367,9 @@ pub fn ensure_tool_call_emitted(
     state: &mut MapState,
     cwd: Option<&std::path::Path>,
 ) -> Option<SessionUpdate> {
+    // "A permission request comes only for a tool call that is about to run"
+    // (`acp-agent.ts:9888-9889`): dispatched even when already emitted.
+    state.books.record_dispatched_call(tool_use_id);
     if state.has_emitted(tool_use_id) {
         return None;
     }
@@ -380,7 +383,7 @@ pub fn ensure_tool_call_emitted(
     // without its input diff, and for AIR the input without the file text that
     // the diff holds. The streamed refinement then carries the same `rawInput`,
     // so no extra update follows.
-    let shape = tools::tool_shape_full(
+    let mut shape = tools::tool_shape_full(
         tool_name,
         tool_input,
         cwd,
@@ -388,6 +391,7 @@ pub fn ensure_tool_call_emitted(
         false,
         state.diff_patch(),
     );
+    state.apply_terminal_content(tool_name, tool_use_id, &mut shape);
     let raw_input = state.raw_input(tool_name, tool_input);
     // 2.9 (X-7): a surfaced `tool_call` seeds the field tracker.
     state.seed_tool_tracker(
@@ -401,6 +405,7 @@ pub fn ensure_tool_call_emitted(
         ),
     );
     let mut meta = state.use_meta(tool_name, tool_input);
+    state.apply_terminal_info(tool_name, tool_use_id, &mut meta);
     if state.is_air() && tool_name.starts_with("mcp__") {
         meta.insert("is_mcp_tool_call".into(), Value::Bool(true));
     }
@@ -408,6 +413,9 @@ pub fn ensure_tool_call_emitted(
         if let Some(cc) = meta.get_mut("claudeCode").and_then(Value::as_object_mut) {
             cc.insert("parentToolUseId".into(), Value::String(parent.to_string()));
         }
+        // A call the permission flow surfaced for a subagent names its parent
+        // (`recordToolCallParent` in `sendUpdate`, `acp-agent.ts:4556-4571`).
+        state.record_tool_call_parent(tool_use_id, parent);
     }
     Some(SessionUpdate::ToolCall(
         ToolCall::new(tool_use_id.to_string(), shape.title)
@@ -511,7 +519,11 @@ pub fn allow_temporary_with_updates_control_response(
 /// A deny `control_response` that interrupts the turn (`interrupt:true`):
 /// Node's shape for ExitPlanMode's "keep planning" and clear-context choices
 /// (`effects.js` `deny(..., true)`). The R28 deny does NOT interrupt.
-pub fn deny_with_interrupt_control_response(request_id: &str, tool_use_id: &str) -> Value {
+pub fn deny_with_interrupt_control_response(
+    request_id: &str,
+    tool_use_id: &str,
+    message: &str,
+) -> Value {
     json!({
         "type": "control_response",
         "response": {
@@ -519,7 +531,7 @@ pub fn deny_with_interrupt_control_response(request_id: &str, tool_use_id: &str)
             "request_id": request_id,
             "response": {
                 "behavior": "deny",
-                "message": "User refused permission to run tool".to_string(),
+                "message": message,
                 "interrupt": true,
                 "toolUseID": tool_use_id,
                 "decisionClassification": "user_reject",
@@ -642,11 +654,11 @@ pub fn permission_control_response_with_fallback(
             (false, None) => allow_control_response(request_id, tool_use_id, input),
             (_, _) => deny_control_response(request_id, tool_use_id),
         },
-        Ok(SelectionOutcome::Deny { interrupt, .. }) => {
+        Ok(SelectionOutcome::Deny { interrupt, message }) => {
             // ExitPlanMode's "keep planning" / clear-context choices interrupt the
             // turn (Node `effects.js`); the plain R28 deny does not.
             if interrupt {
-                deny_with_interrupt_control_response(request_id, tool_use_id)
+                deny_with_interrupt_control_response(request_id, tool_use_id, &message)
             } else {
                 deny_control_response(request_id, tool_use_id)
             }

@@ -38,8 +38,9 @@ const TRACE_SLACK_NODES: usize = 40_000;
 
 /// The node list is allocated for exactly [`MAX_TRACE_NODES`] plus the slack
 /// at most: 12 B each is 30.5 MB (29.1 MiB), not the 48 MiB a doubling
-/// `Vec` reaches. It grows by at most this many nodes per reallocation (3 MiB),
-/// so the old and new buffers together stay within the bound plus 3 MiB.
+/// `Vec` reaches. It grows by at most this many nodes per reallocation (3 MiB);
+/// during the final reallocation the old (~26.1 MiB) and new (~29.1 MiB)
+/// buffers briefly coexist, reaching at most ~56 MiB peak memory.
 const TRACE_GROWTH_NODES: usize = 262_144;
 
 /// The number of recent line diffs that [`memoized_diff_hunks`] keeps.

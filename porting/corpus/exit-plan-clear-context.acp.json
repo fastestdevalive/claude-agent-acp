@@ -1,0 +1,24 @@
+{
+  "permission": {
+    "option_id": "exit-plan-clear-auto"
+  },
+  "env": {
+    "FAKE_CLAUDE_CURSOR": "/tmp/fake-claude-cursor-exit-plan-clear-context"
+  },
+  "steps": [
+    {
+      "call": "initialize"
+    },
+    {
+      "call": "session/new"
+    },
+    {
+      "call": "session/prompt",
+      "text": "plan then implement"
+    },
+    {
+      "call": "sleep",
+      "ms": 400
+    }
+  ]
+}

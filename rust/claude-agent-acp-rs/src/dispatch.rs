@@ -73,9 +73,8 @@ pub fn route(msg: &StreamMsg, _view: &TurnView) -> Route {
         "keep_alive" | "control_response" | "control_request" | "control_cancel_request" => {
             Route::Control
         }
-        "user" | "assistant" | "result" | "system" | "stream_event" | "rate_limit_event" => {
-            Route::Session
-        }
+        "user" | "assistant" | "result" | "system" | "stream_event" | "rate_limit_event"
+        | "tool_progress" | "conversation_reset" | "auth_status" => Route::Session,
         _ => Route::Ignore,
     }
 }
@@ -140,6 +139,19 @@ mod tests {
             self.seen.push((msg.frame_type().to_string(), route));
             ControlFlow::Continue
         }
+    }
+
+    /// N-20 / N-44 — `tool_progress` and `conversation_reset` are session
+    /// traffic (they were dropped as unknown before); unknown types still drop.
+    #[test]
+    fn t2a_progress_and_reset_frames_are_session_traffic() {
+        let view = TurnView::default();
+        for frame_type in ["tool_progress", "conversation_reset", "auth_status"] {
+            let msg = StreamMsg::new(serde_json::json!({ "type": frame_type }));
+            assert_eq!(route(&msg, &view), Route::Session, "{frame_type}");
+        }
+        let unknown = StreamMsg::new(serde_json::json!({ "type": "tool_use_summary" }));
+        assert_eq!(route(&unknown, &view), Route::Ignore);
     }
 
     /// 5.T1 (INV-13) — 1000 messages through `run_dispatch` arrive in send

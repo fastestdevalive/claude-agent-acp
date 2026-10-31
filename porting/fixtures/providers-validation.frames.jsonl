@@ -1,0 +1,25 @@
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$0","method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"auth":{"terminal":false}}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authStatus":{}},"promptCapabilities":{"image":true,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"auth":{"logout":{}},"providers":{},"loadSession":true,"sessionCapabilities":{"additionalDirectories":{},"close":{},"delete":{},"fork":{},"list":{},"resume":{},"systemPrompt":{"mode":{"override":{}}}}},"agentInfo":{"name":"@agentclientprotocol/claude-agent-acp","title":"Claude Agent","version":"0.94.0"},"authMethods":[],"_meta":{"steering":{"supported":true}}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","method":"_auth/status_update","params":{"authStatus":{"kind":"account","label":"Claude Pro","account":{"plan":"pro","email":"a@b.c","organization":"Org"}}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$1","method":"providers/list","params":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$1","result":{"providers":[{"providerId":"main","supported":["anthropic","bedrock","vertex"],"required":false,"current":{"apiType":"anthropic","baseUrl":"https://api.anthropic.com"}}]}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$2","method":"providers/set","params":{"providerId":"openai","apiType":"anthropic","baseUrl":"https://gateway.example"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$2","error":{"code":-32602,"message":"Invalid params: Unknown provider ID \"openai\"; expected \"main\".","data":{"providerId":"openai"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$3","method":"providers/set","params":{"providerId":"main","apiType":"openai","baseUrl":"https://gateway.example"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$3","error":{"code":-32602,"message":"Invalid params: Unsupported apiType \"openai\" for provider \"main\".","data":{"apiType":"openai","supported":["anthropic","bedrock","vertex"]}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$4","method":"providers/set","params":{"providerId":"main","apiType":"anthropic","baseUrl":"ftp://nope.example"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$4","error":{"code":-32602,"message":"Invalid params: baseUrl must be a non-empty absolute http(s) URL.","data":{"baseUrl":"ftp://nope.example"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$5","method":"providers/set","params":{"providerId":"main","apiType":"vertex","baseUrl":"https://vertex.example"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$5","error":{"code":-32602,"message":"Invalid params: vertex apiType requires non-empty `_meta.claudeCode.vertex.projectId` and `_meta.claudeCode.vertex.region`."}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$6","method":"providers/set","params":{"providerId":"main","apiType":"anthropic","baseUrl":"http://127.0.0.1:1"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$6","error":{"code":-32603,"message":"Internal error: Model discovery for provider \"main\" failed: Model listing GET /v1/models failed: fetch failed","data":{"providerId":"main","apiType":"anthropic","baseUrl":"http://127.0.0.1:1"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$7","method":"providers/set","params":{"providerId":"main","apiType":"bedrock","baseUrl":"https://user:secret@gateway.example","headers":{"authorization":"Bearer secret"}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$7","error":{"code":-32603,"message":"Internal error: Model discovery for provider \"main\" failed: Model listing GET /foundation-models cannot be sent: the base URL carries credentials","data":{"providerId":"main","apiType":"bedrock","baseUrl":"https://user:secret@gateway.example"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$8","method":"providers/list","params":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$8","result":{"providers":[{"providerId":"main","supported":["anthropic","bedrock","vertex"],"required":false,"current":{"apiType":"anthropic","baseUrl":"https://api.anthropic.com"}}]}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$9","method":"providers/disable","params":{"providerId":"openai"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$9","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$10","method":"providers/disable","params":{"providerId":"main"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$10","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$11","method":"providers/list","params":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$11","result":{"providers":[{"providerId":"main","supported":["anthropic","bedrock","vertex"],"required":false,"current":{"apiType":"anthropic","baseUrl":"https://api.anthropic.com"}}]}}}

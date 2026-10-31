@@ -1,0 +1,25 @@
+{
+  "permission": "allow",
+  "steps": [
+    {
+      "call": "initialize",
+      "client_capabilities_meta": {
+        "jetbrains": {
+          "air": {
+            "version": 1,
+            "capabilities": [
+              "sessionFailure"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "call": "session/new"
+    },
+    {
+      "call": "session/prompt",
+      "text": "shutting down turn"
+    }
+  ]
+}

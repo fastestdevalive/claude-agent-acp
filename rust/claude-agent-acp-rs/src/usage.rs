@@ -165,6 +165,10 @@ pub struct UsageState {
     pub authoritative: bool,
     /// Latest context used tokens (mirrors Node `session.contextUsedTokens`).
     pub used: u64,
+    /// Whether `used` was ever set: Node's `contextUsedTokens` starts
+    /// undefined, and the ExitPlanMode options only show a percentage once
+    /// there is a measurement.
+    pub used_known: bool,
     /// Stable identifier of the LLM backend the session's query was created
     /// against (F5b/B-70); scopes the cross-session context-window cache.
     pub provider_cache_key: String,
@@ -179,6 +183,7 @@ impl Default for UsageState {
             context_window: DEFAULT_CONTEXT_WINDOW,
             authoritative: false,
             used: 0,
+            used_known: false,
             provider_cache_key: String::new(),
         }
     }
@@ -190,6 +195,22 @@ impl UsageState {
         self.last_usage = None;
         self.last_total = None;
         self.last_model = None;
+    }
+
+    /// Record a context measurement (`session.contextUsedTokens = n`).
+    pub fn set_used(&mut self, tokens: u64) {
+        self.used = tokens;
+        self.used_known = true;
+    }
+
+    /// `contextUsedPercent` of the ExitPlanMode options: the used share of the
+    /// window, rounded and clamped to 0..=100; none before a measurement.
+    pub fn used_percent(&self) -> Option<u32> {
+        if !self.used_known || self.context_window == 0 {
+            return None;
+        }
+        let percent = (self.used as f64 / self.context_window as f64 * 100.0).round();
+        Some(percent.clamp(0.0, 100.0) as u32)
     }
 
     /// Try to update the context window from an authoritative `contextWindow` value.
@@ -488,5 +509,26 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// P-34 — the used share of the window is rounded and clamped, and unknown
+    /// until a measurement exists.
+    #[test]
+    fn t3a_used_percent_rounds_clamps_and_needs_a_measurement() {
+        let mut usage = UsageState::default();
+        assert_eq!(usage.used_percent(), None);
+        usage.context_window = 200_000;
+        usage.set_used(0);
+        assert_eq!(usage.used_percent(), Some(0));
+        usage.set_used(70_000);
+        assert_eq!(usage.used_percent(), Some(35));
+        usage.set_used(1_000);
+        assert_eq!(
+            usage.used_percent(),
+            Some(1),
+            "0.5% rounds up like Math.round"
+        );
+        usage.set_used(900_000);
+        assert_eq!(usage.used_percent(), Some(100));
     }
 }

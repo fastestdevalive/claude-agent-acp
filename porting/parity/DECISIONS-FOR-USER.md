@@ -102,3 +102,11 @@ nothing here blocks work.
 - **Why:** a hand-rolled parser mis-reads `https://evil.com\@trusted.com/` (WHATWG treats the backslash as a path separator, so the fetched host is `evil.com`; the earlier Rust code offered and saved `domain:trusted.com`). Opus review of Turn 1 rated this HIGH. Tabs/newlines, invalid ports and IDN (punycode) also need the real algorithm. The crate was already in the local cargo registry cache (resolved with `--offline`).
 - **Alternatives:** keep a hand-written parser that refuses anything unusual (no option offered) — smaller dependency tree, but then IDN and exotic URL forms diverge from upstream permanently. Say so and it is a contained follow-up (`permission_options.rs` only).
 - **Guard G10 is unaffected:** it covers only `agent-client-protocol`, which stays at 2.1.0.
+
+## D10 — `reqwest` with platform-native TLS is a direct dependency (gateway model listing, F33)
+
+- **What:** `claude-agent-acp-rs` depends on `reqwest = "0.12"` with `default-features = false, features = ["default-tls"]` (Security.framework on macOS, schannel on Windows, OpenSSL on Linux). It is used only by `gateway_models.rs`: `GET /v1/models` (Anthropic gateways, pagination) and `GET /foundation-models` (Bedrock), a 10 s timeout, exactly as upstream does with `fetch`.
+- **Why:** upstream needs an HTTPS client (gateways are usually https). A rustls-based client needs the `ring` crate, whose build script compiles C and fails the gate's `x86_64-pc-windows-gnu` cross-target check on this machine (no MinGW gcc); the platform-native backend passes both cross-target checks (verified) and also honours the system trust store.
+- **Cost:** about 420 extra lockfile lines; on Linux the system OpenSSL development libraries are needed at BUILD time (`libssl-dev` / `openssl-devel`), which this repo's own gate (macOS) does not exercise.
+- **Alternatives:** `rustls-tls` (pure Rust TLS but C compiler needed for ring/aws-lc on every target, including the Windows cross-check); shelling out to `curl` (no new crate, but header secrets in argv and a runtime dependency); HTTP-only listing (no TLS: diverges for https gateways). Say so and it is a contained change in `gateway_models.rs` + Cargo.toml.
+- **Guard G10 is unaffected** (it covers only `agent-client-protocol`).

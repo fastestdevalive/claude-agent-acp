@@ -1,0 +1,38 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {
+      "path": "projects/$CWD_SLUG/cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl",
+      "from": "seeds/session-failure-replay-usage-limit.jsonl"
+    }
+  ],
+  "steps": [
+    {
+      "call": "initialize",
+      "client_capabilities_meta": {
+        "jetbrains": {
+          "air": {
+            "version": 1,
+            "capabilities": [
+              "sessionFailure"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "call": "request",
+      "method": "session/load",
+      "capture_session_id": true,
+      "params": {
+        "sessionId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "cwd": "$CWD",
+        "mcpServers": []
+      }
+    },
+    {
+      "call": "session/prompt",
+      "text": "hello again"
+    }
+  ]
+}

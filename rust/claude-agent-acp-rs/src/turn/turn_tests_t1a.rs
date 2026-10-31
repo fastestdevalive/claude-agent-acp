@@ -581,6 +581,43 @@ fn f13_empty_interruption_diagnostic_is_swallowed() {
     assert!(machine.empty_interruption_commands.is_empty());
 }
 
+/// T2GA-2 — `result_is_swallowed_diagnostic` names exactly the results the
+/// swallow in `on_result_finish` consumes (read-only, so the session can skip
+/// the failure clear for them).
+#[test]
+fn t2ga_swallowed_diagnostic_predicate_matches_the_swallow() {
+    let diagnostic = |uuid: Option<&str>| {
+        let mut v = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "errors": ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],
+            "usage": { "output_tokens": 0, "input_tokens": 0 },
+        });
+        if let Some(uuid) = uuid {
+            v["user_message_uuid"] = serde_json::json!(uuid);
+        }
+        v
+    };
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.enqueue(Turn::new("p2".into(), false));
+    machine.cancel();
+    machine.enqueue(Turn::new("p3".into(), false));
+    machine.on_echo("p3");
+    machine.pending_orphan_results = 0;
+    assert!(machine.result_is_swallowed_diagnostic(&diagnostic(Some("p2"))));
+    assert!(machine.result_is_swallowed_diagnostic(&diagnostic(None)));
+    assert!(!machine.result_is_swallowed_diagnostic(&diagnostic(Some("pz"))));
+    let ordinary = serde_json::json!({"type": "result", "subtype": "success",
+        "is_error": false, "result": "ok", "user_message_uuid": "p2"});
+    assert!(!machine.result_is_swallowed_diagnostic(&ordinary));
+    machine.on_result(&diagnostic(Some("p2")), false);
+    assert!(
+        !machine.result_is_swallowed_diagnostic(&diagnostic(Some("p2"))),
+        "the token is spent"
+    );
+}
+
 /// A receipt that drops the swept turn also drops its diagnostic token.
 #[test]
 fn f13_receipt_drop_forgets_diagnostic_token() {

@@ -1,0 +1,3 @@
+{"type":"user","uuid":"e1000000-0000-4000-8000-000000000001","parentUuid":null,"sessionId":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","cwd":"$CWD","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"seeded prompt"}}
+{"type":"assistant","uuid":"e1000000-0000-4000-8000-000000000002","parentUuid":"e1000000-0000-4000-8000-000000000001","sessionId":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","cwd":"$CWD","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"seeded answer"}]}}
+{"type":"custom-title","customTitle":"Seeded title","sessionId":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","timestamp":"2026-01-01T00:00:02.000Z"}

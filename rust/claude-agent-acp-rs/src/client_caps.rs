@@ -83,6 +83,9 @@ pub struct ClientCapabilities {
     pub air_client: bool,
     /// AIR session failure extension (`jetbrains.air` `sessionFailure`).
     pub session_failure: bool,
+    /// The client takes plan operations (`clientCapabilities.plan` is present):
+    /// an approved ExitPlanMode plan is published as a markdown `plan_update`.
+    pub plan: bool,
     /// The client speaks ACP v2. Rust does not serve v2 yet (G10), so this is
     /// always `false`; it exists so the tool-call capability object has the
     /// same shape as Node's.
@@ -175,6 +178,7 @@ impl ClientCapabilities {
             auth_gateway: is_true(nested(capabilities, &["auth", "_meta", "gateway"])),
             air_client: air.is_some(),
             session_failure: air.as_ref().is_some_and(|a| a.supports("sessionFailure")),
+            plan: nested(capabilities, &["plan"]).is_some_and(|value| !value.is_null()),
             v2: false,
         }
     }
@@ -458,6 +462,14 @@ mod tests {
         assert!(caps.recommended_value);
         assert!(caps.load_replay_end);
         assert_eq!(caps.subagent_form, Some(SubagentForm::Air));
+    }
+
+    /// U-24 — plan operations follow the presence of `clientCapabilities.plan`.
+    #[test]
+    fn plan_operations_follow_the_plan_capability() {
+        assert!(!ClientCapabilities::from_value(Some(&json!({}))).plan);
+        assert!(!ClientCapabilities::from_value(Some(&json!({"plan": null}))).plan);
+        assert!(ClientCapabilities::from_value(Some(&json!({"plan": {}}))).plan);
     }
 
     #[test]

@@ -240,6 +240,12 @@ pub struct ClaudeOptions {
     pub permission_prompts: Option<String>,
     /// `perTaskStopAffordance` (O-84); `None` lets the RFD default apply.
     pub per_task_stop_affordance: Option<bool>,
+    /// `agentProgressSummaries` (O-153): the SDK sends it in `initialize` so the
+    /// CLI summarises a subagent's progress; undefined (`None`) is omitted.
+    pub agent_progress_summaries: Option<bool>,
+    /// `planModeInstructions` (O-154): replaces the CLI's plan-mode prompt; the
+    /// SDK sends it in `initialize`, undefined (`None`) is omitted.
+    pub plan_mode_instructions: Option<String>,
     /// `enableFileCheckpointing` (O-136); also set for an AIR
     /// `agentFileChangeReport` client. Reaches the CLI as the
     /// `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` env var.
@@ -948,6 +954,8 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         channels: opt_str_ary(&opts, "channels"),
         permission_prompts,
         per_task_stop_affordance: opts.get("perTaskStopAffordance").and_then(Value::as_bool),
+        agent_progress_summaries: opts.get("agentProgressSummaries").and_then(Value::as_bool),
+        plan_mode_instructions: opt_str(&opts, "planModeInstructions"),
         enable_file_checkpointing: opts.get("enableFileCheckpointing").and_then(Value::as_bool),
         forward_subagent_text: opts.get("forwardSubagentText").and_then(Value::as_bool),
         raw_sdk_messages: parse_raw_sdk_messages(
@@ -1767,6 +1775,8 @@ mod tests {
                     "channels": ["alpha"],
                     "permissionPrompts": "none",
                     "perTaskStopAffordance": false,
+                    "agentProgressSummaries": true,
+                    "planModeInstructions": "Plan with care.",
                     "enableFileCheckpointing": true,
                     "forwardSubagentText": true
                 }
@@ -1782,6 +1792,8 @@ mod tests {
         assert_eq!(o.channels, vec!["alpha".to_string()]);
         assert_eq!(o.permission_prompts.as_deref(), Some("none"));
         assert_eq!(o.per_task_stop_affordance, Some(false));
+        assert_eq!(o.agent_progress_summaries, Some(true));
+        assert_eq!(o.plan_mode_instructions.as_deref(), Some("Plan with care."));
         assert_eq!(o.enable_file_checkpointing, Some(true));
         assert_eq!(o.forward_subagent_text, Some(true));
         assert_eq!(

@@ -869,7 +869,14 @@ fn run_recorder_inner(
             if let Some(env) = script.get("env").and_then(Value::as_object) {
                 for (key, value) in env {
                     if let Some(value) = value.as_str() {
-                        command.env(key, value);
+                        // A multi-spawn script counts its spawns in a cursor file;
+                        // the committed path serves the one-off Node capture, and
+                        // a run keeps its own, so runs never share or inherit one.
+                        if key == "FAKE_CLAUDE_CURSOR" {
+                            command.env(key, home.join("fake-claude-cursor"));
+                        } else {
+                            command.env(key, value);
+                        }
                     }
                 }
             }

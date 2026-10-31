@@ -1,0 +1,12 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["sessionIndex"]}}}},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}},
+    {"call": "request", "method": "_session/rename", "params": {"sessionId": "$SESSION", "title": "Live name"}},
+    {"call": "request", "method": "_session/archive", "params": {"sessionId": "$SESSION"}},
+    {"call": "request", "method": "_session/archive", "expect_error": true, "params": {"sessionId": "$SESSION"}},
+    {"call": "request", "method": "_session/unarchive", "expect_error": true, "params": {"sessionId": "$SESSION"}}
+  ]
+}

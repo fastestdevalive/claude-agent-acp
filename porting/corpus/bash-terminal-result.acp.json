@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"terminal_output": true}},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "run three commands"}
+  ]
+}

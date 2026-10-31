@@ -1,0 +1,14 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "projects/$CWD_SLUG/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl", "from": "seeds/session-a.jsonl", "mtime": 1767225599}
+  ],
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["sessionIndex"]}}}},
+    {"call": "request", "method": "session/fork", "capture_session_id": true,
+     "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "cwd": "$CWD", "mcpServers": []}},
+    {"call": "request", "method": "session/list", "params": {"cwd": "$CWD"}},
+    {"call": "request", "method": "_session/rename", "params": {"sessionId": "$SESSION", "title": "Forked and renamed"}},
+    {"call": "request", "method": "session/list", "params": {"cwd": "$CWD", "_meta": {"jetbrains": {"air": {"version": 1, "list": {"archived": "all"}}}}}}
+  ]
+}

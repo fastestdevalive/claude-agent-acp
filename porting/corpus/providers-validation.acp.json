@@ -1,0 +1,25 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "wait_recv", "contains": "_auth/status_update"},
+    {"call": "request", "method": "providers/list", "params": {}},
+    {"call": "request", "method": "providers/set", "expect_error": true,
+     "params": {"providerId": "openai", "apiType": "anthropic", "baseUrl": "https://gateway.example"}},
+    {"call": "request", "method": "providers/set", "expect_error": true,
+     "params": {"providerId": "main", "apiType": "openai", "baseUrl": "https://gateway.example"}},
+    {"call": "request", "method": "providers/set", "expect_error": true,
+     "params": {"providerId": "main", "apiType": "anthropic", "baseUrl": "ftp://nope.example"}},
+    {"call": "request", "method": "providers/set", "expect_error": true,
+     "params": {"providerId": "main", "apiType": "vertex", "baseUrl": "https://vertex.example"}},
+    {"call": "request", "method": "providers/set", "expect_error": true,
+     "params": {"providerId": "main", "apiType": "anthropic", "baseUrl": "http://127.0.0.1:1"}},
+    {"call": "request", "method": "providers/set", "expect_error": true,
+     "params": {"providerId": "main", "apiType": "bedrock", "baseUrl": "https://user:secret@gateway.example",
+                "headers": {"authorization": "Bearer secret"}}},
+    {"call": "request", "method": "providers/list", "params": {}},
+    {"call": "request", "method": "providers/disable", "params": {"providerId": "openai"}},
+    {"call": "request", "method": "providers/disable", "params": {"providerId": "main"}},
+    {"call": "request", "method": "providers/list", "params": {}}
+  ]
+}

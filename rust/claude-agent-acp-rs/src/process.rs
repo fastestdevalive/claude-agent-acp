@@ -871,6 +871,41 @@ async fn signal_group_impl(child: &mut Child, _signal: Signal) -> Result<(), Spa
         .map_err(|e| SpawnError::Signal(std::io::Error::other(format!("child.kill: {e}"))))
 }
 
+/// Whether the process `pid` exists, as Node's `process.kill(pid, 0)` tells it
+/// (upstream `live-registry.ts:66-72`): `Some(true)` for a process that is there
+/// (`EPERM`: another user's, so alive), `Some(false)` for one that is gone
+/// (`ESRCH`), and `None` where the platform cannot tell. A caller treats `None`
+/// as alive, as upstream does when it cannot tell.
+///
+/// On Windows a real check needs `OpenProcess` + `GetExitCodeProcess`
+/// (`Win32_System_Threading`), which the crate's `windows-sys` features do not
+/// enable; the registry therefore fails open there instead of treating every
+/// record as dead as a `ps` spawn did.
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> Option<bool> {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // A pid above `i32::MAX` cannot exist; a negative one would name a process
+    // group.
+    let Ok(pid) = i32::try_from(pid) else {
+        return Some(false);
+    };
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) => Some(true),
+        Err(Errno::ESRCH) => Some(false),
+        Err(Errno::EPERM) => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// Windows has no liveness check here (see the unix function): unknown, which
+/// the registry treats as alive.
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
 /// The SDK version the pinned adapter embeds in the child env when the host
 /// does not set `CLAUDE_AGENT_SDK_VERSION` (`sdk.mjs` 0.3.303).
 pub const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.303";
@@ -1157,6 +1192,42 @@ pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::Fi
 #[cfg(not(unix))]
 pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     ensure_regular_file(std::fs::File::open(path)?)
+}
+
+/// Creates `path` and its missing parents with mode 0700 where the platform has
+/// modes (the CLI's `custom-title.json` directory; `session-index/service.ts`).
+#[cfg(unix)]
+pub fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// Creates a new file (it must not exist) for writing with mode 0600 where the
+/// platform has modes.
+#[cfg(unix)]
+pub fn create_new_file_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_new_file_private(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn ensure_regular_file(file: std::fs::File) -> std::io::Result<std::fs::File> {

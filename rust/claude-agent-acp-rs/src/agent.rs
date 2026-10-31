@@ -27,12 +27,15 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::air::AirClient;
-use crate::auth_status::{spawn_auth_actor, AuthCmd, AuthHandle, AuthPush};
+use crate::auth_status::{
+    spawn_auth_actor_with, AuthActorConfig, AuthCmd, AuthHandle, AuthPush, SessionAuthContext,
+};
 use crate::client_caps::ClientCapabilities;
 use crate::control::InitializeOptions;
 use crate::map;
 use crate::process::{SpawnOptions, Timings};
 use crate::session::{Session, SessionError, SessionOptions, SessionOutbound};
+use crate::session_index::connection::{IndexPaths, LoadedSession, SessionIndexConnection};
 use crate::session_methods;
 use crate::session_timing::SessionTiming;
 use crate::system_prompt;
@@ -205,6 +208,8 @@ fn initialize_response(
     env: &crate::env_snapshot::EnvSnapshot,
     executable: &str,
     argv: &[String],
+    index_capabilities: &[&str],
+    hide_claude_auth: bool,
 ) -> Value {
     let is_air = air.is_some();
     let mut session_caps = serde_json::Map::new();
@@ -220,18 +225,26 @@ fn initialize_response(
     }
 
     // WB-04 / F2a: the pure builder lives in `client_caps`; `--hide-claude-auth`
-    // (F34) will pass `true` here.
-    let auth_methods = crate::client_caps::auth_methods(caps, env, executable, argv, false);
+    // drops the claude.ai login method (O-07).
+    let auth_methods =
+        crate::client_caps::auth_methods(caps, env, executable, argv, hide_claude_auth);
 
     let mut meta = serde_json::Map::new();
     meta.insert("steering".into(), json!({ "supported": true }));
     if is_air {
+        // The session index capabilities follow the others, and only a client that
+        // declared `sessionIndex` gets them (`sessionIndex.capabilities()`).
+        let air_capabilities: Vec<&str> = AIR_CAPABILITIES
+            .iter()
+            .chain(index_capabilities)
+            .copied()
+            .collect();
         meta.insert(
             "jetbrains".into(),
             json!({
                 "air": {
                     "version": 1,
-                    "capabilities": AIR_CAPABILITIES,
+                    "capabilities": air_capabilities,
                     "goal": { "version": 1, "controlMethod": "_session/goal", "actions": ["set", "clear"] },
                 }
             }),
@@ -964,6 +977,20 @@ fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
                 Some(json!({"errorKind": "transport_lost"})),
             );
         }
+        // A plain `Error` thrown by the restart: `Internal error` with the
+        // message as its details.
+        SessionError::RestartFailed(message) => {
+            return (
+                "Internal error".to_string(),
+                Some(json!({"details": message})),
+            );
+        }
+        SessionError::WorkerShutdown => {
+            return (
+                "Internal error".to_string(),
+                Some(json!({"errorKind": "worker_shutdown"})),
+            );
+        }
         SessionError::Closed => (crate::turn::SESSION_ENDED_MESSAGE.to_string(), None),
         SessionError::Start(m) => (m.clone(), None),
     };
@@ -1027,7 +1054,23 @@ fn resumed_start_error(err: &SessionError, resumed: bool, session_id: &str) -> E
 
 /// Serve ACP over `transport` (D9). Runs until the transport closes.
 pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOptions) -> Result<()> {
-    serve_until(transport, opts, None).await
+    serve_until(transport, opts, None, process_hides_claude_auth()).await
+}
+
+/// [`serve`] with `--hide-claude-auth` on whatever the process argv says
+/// (`shouldHideClaudeAuth`): the claude.ai login is hidden and no session or turn
+/// may be paid by a subscription. For embedders and tests that cannot pass the
+/// flag on the command line.
+pub async fn serve_hiding_claude_auth(
+    transport: impl ConnectTo<Agent> + 'static,
+    opts: ServeOptions,
+) -> Result<()> {
+    serve_until(transport, opts, None, true).await
+}
+
+/// Whether the process was started with `--hide-claude-auth`.
+fn process_hides_claude_auth() -> bool {
+    crate::hide_claude_auth::should_hide_claude_auth(&process_entrypoint().1)
 }
 
 /// [`serve`], ending early when `shutdown` (if any) flips to `true`; either way
@@ -1036,12 +1079,13 @@ async fn serve_until(
     transport: impl ConnectTo<Agent> + 'static,
     opts: ServeOptions,
     shutdown: Option<watch::Receiver<bool>>,
+    hide_claude_auth: bool,
 ) -> Result<()> {
     // A `session/cancel` notification must reach the owning session actor. The
     // request handler owns the live registry; it publishes each new session's
     // handle (a cheap clone, not session state) over this channel so the
     // notification handler keeps its own copy — lock-free (guard G5).
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel::<(String, Session)>();
+    let (session_tx, session_rx) = mpsc::unbounded_channel::<(String, Session)>();
     // Every session this connection created, so that closing the connection can
     // tear each one down (`dispose`, `acp-agent.ts:8917-8920`, V-11).
     let (dispose_tx, mut dispose_rx) = mpsc::unbounded_channel::<Session>();
@@ -1050,7 +1094,7 @@ async fn serve_until(
     // session), so the connection's end can wait for or stop them before it
     // disposes the sessions.
     let (recreate_tx, mut recreate_rx) = mpsc::unbounded_channel::<RecreateTask>();
-    let mut registry = Registry {
+    let registry = Registry {
         recreating: std::collections::HashMap::new(),
         recreate_tx,
         sessions: std::collections::HashMap::new(),
@@ -1063,39 +1107,86 @@ async fn serve_until(
         fingerprints: std::collections::HashMap::new(),
         deferred_tx,
         deferred_rx,
+        index: session_index_connection(&opts),
+        provider: None,
+        gateway_auth: None,
+        creation_params: std::collections::HashMap::new(),
+        auth_contexts: std::collections::HashMap::new(),
+        guard_states: std::collections::HashMap::new(),
+        hide_claude_auth,
+        provider_gate: Arc::new(tokio::sync::Semaphore::new(GATE_PERMITS as usize)),
+        provider_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sessions_view: Arc::new(watch::channel(std::collections::HashMap::new()).0),
     };
+    // The connection's handlers only forward: the connection loop also carries
+    // the answers to the agent's own requests (permissions, `fs/*`, `terminal/*`),
+    // so no handler may wait for something those answers unblock. The registry
+    // actor owns the registry and parks the requests a provider update holds back.
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Incoming>();
+    let notification_tx = incoming_tx.clone();
+    let mut actor = tokio::spawn(run_registry_actor(registry, opts, incoming_rx, session_rx));
     let connected = Agent
         .builder()
         .name("claude-agent-acp-rs")
         .on_receive_request(
-            async move |req: UntypedMessage, responder, connection| {
-                handle_request(&mut registry, req, &opts, responder, connection).await
+            async move |req: UntypedMessage,
+                        responder: agent_client_protocol::Responder<Value>,
+                        connection: ConnectionTo<agent_client_protocol::Client>| {
+                let (served, ack) = oneshot::channel();
+                let request = Incoming::Request {
+                    request: Box::new((req, responder, connection)),
+                    served,
+                };
+                if incoming_tx.send(request).is_err() {
+                    return Err(Error::internal_error());
+                }
+                // A dropped sender means the actor is gone; `serve_until` ends the
+                // connection on that, so there is nothing left to answer.
+                let _ = ack.await;
+                Ok(())
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_notification(
-            {
-                // The notification handler keeps its own session-handle map,
-                // fed by the request handler's channel.
-                let mut sessions: std::collections::HashMap<String, Session> =
-                    std::collections::HashMap::new();
-                async move |notif: UntypedMessage, _connection| {
-                    while let Ok((sid, session)) = session_rx.try_recv() {
-                        sessions.insert(sid, session);
-                    }
-                    handle_notification(&notif, &sessions).await
+            async move |notif: UntypedMessage, _connection| {
+                if notification_tx.send(Incoming::Notification(notif)).is_err() {
+                    return Err(Error::internal_error());
                 }
+                Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_to(transport);
+    let mut actor_finished = false;
+    let mut actor_panic = None;
     let result = match shutdown {
         Some(mut shutdown) => tokio::select! {
             res = connected => res,
+            joined = &mut actor => {
+                actor_finished = true;
+                let (ended, panic) = actor_ended(joined);
+                actor_panic = panic;
+                ended
+            },
             _ = shutdown_requested(&mut shutdown) => Ok(()),
         },
-        None => connected.await,
+        None => tokio::select! {
+            res = connected => res,
+            joined = &mut actor => {
+                actor_finished = true;
+                let (ended, panic) = actor_ended(joined);
+                actor_panic = panic;
+                ended
+            },
+        },
     };
+    // The connection is gone, so nothing the actor serves can be delivered any
+    // more: stop it now instead of letting it start sessions (or wait out the
+    // gate) for a client that is no longer there.
+    if !actor_finished {
+        actor.abort();
+        let _ = actor.await;
+    }
     // The connection closed (or the owner asked to stop): tear down every session (cancel its work, interrupt
     // and end its actor, which drops the child) instead of relying on the drop
     // cascade, so each prompt in flight still gets its terminal state and each
@@ -1124,6 +1215,9 @@ async fn serve_until(
         sessions.push(session);
     }
     dispose_sessions(&sessions).await;
+    if let Some(panic) = actor_panic {
+        std::panic::resume_unwind(panic);
+    }
     result
 }
 
@@ -1194,7 +1288,7 @@ pub async fn serve_with_shutdown(
     opts: ServeOptions,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    serve_until(transport, opts, Some(shutdown)).await
+    serve_until(transport, opts, Some(shutdown), process_hides_claude_auth()).await
 }
 
 /// Resolve once `shutdown` is (or becomes) `true`.
@@ -1205,6 +1299,132 @@ async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
     while shutdown.changed().await.is_ok() {
         if *shutdown.borrow() {
             return;
+        }
+    }
+}
+
+/// The registry actor ended before the connection did: a panic there must end
+/// the connection (the old inline handler unwound through it) instead of leaving
+/// a client that waits for answers nobody will send.
+///
+/// The panic payload is handed back, not raised here: the caller tears the
+/// connection's sessions down first and then re-raises it.
+fn actor_ended(
+    joined: std::result::Result<(), tokio::task::JoinError>,
+) -> (Result<()>, Option<Box<dyn std::any::Any + Send>>) {
+    match joined {
+        Err(error) if error.is_panic() => (Err(Error::internal_error()), Some(error.into_panic())),
+        _ => (Err(Error::internal_error()), None),
+    }
+}
+
+/// What the connection's handlers forward to the registry actor.
+enum Incoming {
+    Request {
+        request: Box<ParkedRequest>,
+        /// Resolved once the actor has the request: served inline, or parked for
+        /// the provider update in flight. The handler waits for it so the
+        /// connection does not end before a request it read was served (a
+        /// `initialize` followed by EOF still answers), while a parked request
+        /// never holds the connection loop.
+        served: oneshot::Sender<()>,
+    },
+    /// Travels the same queue as the requests, so a `session/cancel` is served
+    /// after the `session/prompt` that preceded it.
+    Notification(UntypedMessage),
+}
+
+/// A request waiting for the provider update in flight.
+type ParkedRequest = (
+    UntypedMessage,
+    agent_client_protocol::Responder<Value>,
+    ConnectionTo<agent_client_protocol::Client>,
+);
+
+/// The requests that start or run a session's turn wait for a provider update in
+/// flight (`while (this.providerUpdate) await this.providerUpdate`). `steer` and
+/// `goal` do not: upstream's `steer()` never waits, and `goal` waits only where it
+/// starts its own turn.
+fn is_gated(method: &str) -> bool {
+    matches!(
+        method,
+        "session/new" | "session/load" | "session/resume" | "session/fork" | "session/prompt"
+    )
+}
+
+/// The registry actor: owns the registry and serves the forwarded requests one at
+/// a time. A gated request that meets a provider update in flight is parked instead
+/// of awaited, so the connection keeps delivering the permission answers and the
+/// `session/cancel` the update waits on; notifications are never parked.
+async fn run_registry_actor(
+    mut registry: Registry,
+    opts: ServeOptions,
+    mut incoming: mpsc::UnboundedReceiver<Incoming>,
+    mut session_rx: mpsc::UnboundedReceiver<(String, Session)>,
+) {
+    let mut parked: std::collections::VecDeque<ParkedRequest> = std::collections::VecDeque::new();
+    // The notification side keeps its own session-handle map, fed by the
+    // registry's channel.
+    let mut notified: std::collections::HashMap<String, Session> = std::collections::HashMap::new();
+    loop {
+        tokio::select! {
+            biased;
+            permit = registry.provider_gate.clone().acquire_owned(), if !parked.is_empty() => {
+                let Ok(permit) = permit else { break };
+                let Some((req, responder, connection)) = parked.pop_front() else {
+                    continue;
+                };
+                let _ = handle_request(
+                    &mut registry,
+                    req,
+                    &opts,
+                    responder,
+                    connection,
+                    Some(permit),
+                )
+                .await;
+            }
+            item = incoming.recv() => match item {
+                None => break,
+                Some(Incoming::Request { request, served }) => {
+                    let (req, responder, connection) = *request;
+                    let permit = if is_gated(req.method()) {
+                        if !parked.is_empty() {
+                            parked.push_back((req, responder, connection));
+                            // The request is parked; the connection loop may go on
+                            // (it is answered once the gate is free).
+                            let _ = served.send(());
+                            continue;
+                        }
+                        match registry.provider_gate.clone().try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                parked.push_back((req, responder, connection));
+                                let _ = served.send(());
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let _ = handle_request(
+                        &mut registry,
+                        req,
+                        &opts,
+                        responder,
+                        connection,
+                        permit,
+                    )
+                    .await;
+                    let _ = served.send(());
+                }
+                Some(Incoming::Notification(notif)) => {
+                    while let Ok((sid, session)) = session_rx.try_recv() {
+                        notified.insert(sid, session);
+                    }
+                    let _ = handle_notification(&notif, &notified).await;
+                }
+            },
         }
     }
 }
@@ -1229,8 +1449,12 @@ async fn handle_notification(
     Ok(())
 }
 
-/// The per-connection session registry, owned by the request handler (the
-/// connection dispatches requests sequentially, so no lock is needed).
+/// The permits of [`Registry::provider_gate`]: a provider update takes all of
+/// them, a session request one.
+pub(super) const GATE_PERMITS: u32 = 1 << 16;
+
+/// The per-connection session registry, owned by the registry actor (which serves
+/// the requests sequentially, so no lock is needed).
 struct Registry {
     sessions: std::collections::HashMap<String, Session>,
     /// Publishes each new session's handle to the notification handler.
@@ -1262,6 +1486,143 @@ struct Registry {
     /// Hands each spawned recreate to [`serve_until`], which stops them before
     /// it disposes the connection's sessions.
     recreate_tx: mpsc::UnboundedSender<RecreateTask>,
+    /// The session index of this connection (`SessionIndexConnection`).
+    index: SessionIndexConnection,
+    /// The `providers/set` routing of the `main` provider, if any
+    /// (`providerConfig`).
+    provider: Option<providers::ProviderConfig>,
+    /// The legacy gateway `authenticate` request (`gatewayAuthRequest`).
+    gateway_auth: Option<Value>,
+    /// The request each live session was created with (`creationParams`), so a
+    /// provider switch or a sign-out can recreate it.
+    creation_params: std::collections::HashMap<String, Value>,
+    /// The probe context of each live session (`authStatusSettings`).
+    auth_contexts: std::collections::HashMap<String, crate::auth_status::SessionAuthContext>,
+    /// The `--hide-claude-auth` guard state of each live session.
+    guard_states: std::collections::HashMap<String, crate::hide_claude_auth::GuardState>,
+    /// `--hide-claude-auth`.
+    hide_claude_auth: bool,
+    /// The gate of the provider update in flight (`providerUpdate`), a
+    /// reader/writer lock over [`GATE_PERMITS`] permits. A provider update runs
+    /// off this handler — it waits for the submitted turns and starts every
+    /// session anew — and holds every permit meanwhile; a session request that
+    /// follows is parked until it ends, as upstream's `while (this.providerUpdate)
+    /// await this.providerUpdate` does. A session request, and the recreate a
+    /// changed-params `load` runs, hold one permit, so they never exclude each
+    /// other, and the FIFO queue keeps a waiting update ahead of later requests.
+    provider_gate: Arc<tokio::sync::Semaphore>,
+    /// How many provider updates are queued or running (`providerUpdate !== null`
+    /// for `logout`'s `hadRoutingOverride`).
+    provider_updates: Arc<std::sync::atomic::AtomicUsize>,
+    /// The live sessions and their creation params, published for tasks that run
+    /// off this handler (a provider update recreates every session and cannot
+    /// read the registry).
+    sessions_view: Arc<watch::Sender<std::collections::HashMap<String, (Session, Value)>>>,
+}
+
+impl Registry {
+    /// `resolveProviderConfig`: `providers/set` first, else the legacy gateway.
+    fn resolve_provider(&self) -> Option<providers::ProviderConfig> {
+        self.provider
+            .clone()
+            .or_else(|| providers::gateway_request_to_provider_config(self.gateway_auth.as_ref()))
+    }
+
+    /// Tells the auth actor which routing is in force.
+    fn sync_routing(&self) {
+        if let Some(auth) = &self.auth {
+            auth.send(AuthCmd::SetRouting {
+                provider_override: self.provider.is_some(),
+                routing_active: self.resolve_provider().is_some(),
+            });
+        }
+    }
+
+    /// Forgets what the registry keeps of a session that is gone.
+    fn forget_session_state(&mut self, session_id: &str) {
+        self.creation_params.remove(session_id);
+        self.auth_contexts.remove(session_id);
+        self.guard_states.remove(session_id);
+        if let Some(auth) = &self.auth {
+            auth.send(AuthCmd::ForgetSession {
+                session_id: session_id.to_string(),
+            });
+        }
+    }
+
+    /// Publishes the live sessions and their creation params for the tasks that
+    /// run off this handler (a provider update recreates every session).
+    fn publish_sessions(&self) {
+        self.sessions_view.send_modify(|view| {
+            // A provider update inserts the session it started straight into the
+            // view, before its `Register` reaches the registry: the registry still
+            // holds the closed session it replaced, which must not overwrite it.
+            let started_meanwhile: Vec<_> = view
+                .iter()
+                .filter(|(id, (live, _))| {
+                    !live.command_sender().is_closed()
+                        && self
+                            .sessions
+                            .get(*id)
+                            .is_some_and(|held| held.command_sender().is_closed())
+                })
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect();
+            view.clear();
+            for (id, session) in &self.sessions {
+                if let Some(params) = self.creation_params.get(id) {
+                    view.insert(id.clone(), (session.clone(), params.clone()));
+                }
+            }
+            view.extend(started_meanwhile);
+        });
+    }
+
+    /// What a provider update needs of the registry, as cheap clones: it runs off
+    /// this handler, so it cannot borrow the registry. `routing_active` is the
+    /// routing the update installs, which the account guard of the sessions it
+    /// recreates reads (`resolveProviderConfig() !== null`).
+    fn provider_env(
+        &self,
+        opts: &ServeOptions,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        routing_active: bool,
+    ) -> recreate::ProviderUpdateEnv {
+        let mut auth_env = AuthEnv::of(self, opts);
+        auth_env.routing_active = routing_active;
+        recreate::ProviderUpdateEnv {
+            gate: self.provider_gate.clone(),
+            sessions: self.sessions_view.subscribe(),
+            board: self.index.board().clone(),
+            deferred_tx: self.deferred_tx.clone(),
+            session_tx: self.session_tx.clone(),
+            dispose_tx: self.dispose_tx.clone(),
+            auth: self.auth.clone(),
+            auth_env,
+            air: self.air.clone(),
+            caps: self.caps.clone(),
+            sessions_view: self.sessions_view.clone(),
+            cancel,
+        }
+    }
+}
+
+/// The session index of a connection over `opts`' environment: the projects root
+/// and the CLI's live registry under the configuration directory.
+fn session_index_connection(opts: &ServeOptions) -> SessionIndexConnection {
+    let config = crate::session_store::config_dir_with_env(&opts.env);
+    let logger = opts.logger.clone();
+    SessionIndexConnection::new(
+        IndexPaths {
+            projects_root: config.join("projects"),
+            registry_dir: config.join("sessions"),
+        },
+        Arc::new(move |message, error| {
+            if let Some(logger) = &logger {
+                logger.error(&format!("[session-index] {message}: {error}"));
+            }
+        }),
+    )
 }
 
 /// A recreate in flight: its cancel flag (checked between its steps) and a
@@ -1290,6 +1651,28 @@ impl Drop for RecreateEnding {
     }
 }
 
+/// Closes a session that [`Session::start`] returned but that never reached the
+/// dispose list ([`wire_session`]): the replay and `seed_task_state` that follow
+/// the start can still be running when the connection ends and the recreate task
+/// is aborted, and the `claude` child must not outlive that. Disarmed by
+/// [`wire_session`]'s caller right before the session is published.
+struct UnwiredSessionGuard(Option<mpsc::UnboundedSender<crate::session::Command>>);
+
+impl UnwiredSessionGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for UnwiredSessionGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let (reply, _closed) = oneshot::channel();
+            let _ = tx.send(crate::session::Command::Close { reply });
+        }
+    }
+}
+
 /// A spawned recreate, as [`serve_until`] tracks it.
 struct RecreateTask {
     cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -1312,6 +1695,27 @@ enum RegistryMsg {
         session_id: String,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
+    /// The session was torn down after a mutation that succeeded (`archive`
+    /// closes it only once its retitle did): forget its registry entries, as
+    /// upstream's `teardownSession` deletes it before answering.
+    Forget {
+        session_id: String,
+        /// The torn-down session's command channel, held weakly: a session
+        /// loaded under the id since stays.
+        husk: mpsc::WeakUnboundedSender<crate::session::Command>,
+    },
+    /// The provider update finished: adopt its routing (`providerConfig`).
+    SetProvider {
+        config: Option<providers::ProviderConfig>,
+    },
+}
+
+/// Whether the registered session is the one whose command channel `husk` holds.
+fn is_registered_instance(
+    live: &mpsc::UnboundedSender<crate::session::Command>,
+    husk: &mpsc::WeakUnboundedSender<crate::session::Command>,
+) -> bool {
+    husk.upgrade().is_some_and(|tx| tx.same_channel(live))
 }
 
 /// A registry entry a session start leaves for the request handler to apply.
@@ -1326,6 +1730,11 @@ struct RegistryUpdate {
     /// session is then closed instead of registered under an id the client
     /// already closed.
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The request the session was created with (`creationParams`).
+    creation_params: Value,
+    /// The probe context the session started in.
+    auth_context: SessionAuthContext,
+    guard: crate::hide_claude_auth::GuardState,
 }
 
 /// What a `load`/`resume` start needs of the registry, as cheap clones, so the
@@ -1342,12 +1751,21 @@ struct ResumeEnv {
     /// Set when the recreate this start belongs to is cancelled (a
     /// `session/close` of the id, or the connection ending).
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// What the session index knows of the sessions this connection runs.
+    board: crate::session_index::connection::OwnSessionBoard,
+    /// The routing in force when the start was requested (`resolveProviderConfig`).
+    provider: Option<providers::ProviderConfig>,
+    /// The account side of the start: auth actor, guard flag, routing.
+    auth_env: AuthEnv,
+    /// Publishes the started session for a provider update running off this
+    /// handler (`sessions_view`).
+    sessions_view: Arc<watch::Sender<std::collections::HashMap<String, (Session, Value)>>>,
 }
 
 #[allow(dead_code)]
 impl Registry {
     /// The clones a `load`/`resume` start needs.
-    fn resume_env(&self, live_mode: Option<String>) -> ResumeEnv {
+    fn resume_env(&self, live_mode: Option<String>, opts: &ServeOptions) -> ResumeEnv {
         ResumeEnv {
             air: self.air.clone(),
             caps: self.caps.clone(),
@@ -1357,6 +1775,10 @@ impl Registry {
             deferred_tx: self.deferred_tx.clone(),
             live_mode,
             cancel: None,
+            board: self.index.board().clone(),
+            provider: self.resolve_provider(),
+            auth_env: AuthEnv::of(self, opts),
+            sessions_view: self.sessions_view.clone(),
         }
     }
 
@@ -1372,6 +1794,7 @@ impl Registry {
                     {
                         // Cancelled after its last check: nobody can use the id.
                         let session = update.session;
+                        self.forget_session_state(&update.session_id);
                         tokio::spawn(async move { session.close().await });
                         continue;
                     }
@@ -1379,19 +1802,44 @@ impl Registry {
                         .insert(update.session_id.clone(), update.settings_manager);
                     self.fingerprints
                         .insert(update.session_id.clone(), update.fingerprint);
+                    self.creation_params
+                        .insert(update.session_id.clone(), update.creation_params);
+                    self.auth_contexts
+                        .insert(update.session_id.clone(), update.auth_context);
+                    self.guard_states
+                        .insert(update.session_id.clone(), update.guard);
                     self.sessions.insert(update.session_id, update.session);
                 }
                 RegistryMsg::Evict { session_id, husk } => {
                     // Only the husk itself: a newer session under the same id
                     // (a load after the death) stays.
-                    let is_husk = self.sessions.get(&session_id).is_some_and(|live| {
-                        husk.upgrade()
-                            .is_some_and(|tx| tx.same_channel(live.command_sender()))
-                    });
+                    let is_husk = self
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|live| is_registered_instance(live.command_sender(), &husk));
                     if is_husk {
                         self.sessions.remove(&session_id);
                         self.settings_managers.remove(&session_id);
                         self.fingerprints.remove(&session_id);
+                        self.forget_session_state(&session_id);
+                        // The dead session's row shows what the registry and the
+                        // transcript tell (`closeQueryStream` → `onOwnSessionChanged`).
+                        self.index.on_teardown(&session_id);
+                    }
+                }
+                RegistryMsg::Forget { session_id, husk } => {
+                    // The archive closed it already; only the maps remain. Only
+                    // the session it closed: one loaded under the id since stays.
+                    let is_husk = self
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|live| is_registered_instance(live.command_sender(), &husk));
+                    if is_husk {
+                        self.sessions.remove(&session_id);
+                        self.settings_managers.remove(&session_id);
+                        self.fingerprints.remove(&session_id);
+                        self.forget_session_state(&session_id);
+                        self.index.on_teardown(&session_id);
                     }
                 }
                 RegistryMsg::RecreateEnded { session_id, cancel } => {
@@ -1403,8 +1851,13 @@ impl Registry {
                         self.recreating.remove(&session_id);
                     }
                 }
+                RegistryMsg::SetProvider { config } => {
+                    self.provider = config;
+                    self.sync_routing();
+                }
             }
         }
+        self.publish_sessions();
     }
 
     /// Settings manager for a session, if registered.
@@ -1431,6 +1884,7 @@ impl Registry {
 /// forwards each changed status as an `_auth/status_update` ext notification.
 fn spawn_auth(
     opts: &ServeOptions,
+    hide_claude_auth: bool,
     connection: &ConnectionTo<agent_client_protocol::Client>,
 ) -> AuthHandle {
     let (push_tx, mut push_rx) = mpsc::unbounded_channel::<AuthPush>();
@@ -1460,36 +1914,223 @@ fn spawn_auth(
     // environment here would leak a managed `apiKeyHelper` into auth status.
     let env = opts.env.clone();
     let probe_env = env.clone();
-    let probe: crate::auth_status::ProbeFn = Box::new(move |cwd| {
+    let probe: crate::auth_status::ProbeFn = Box::new(move |request| {
         let claude_path = claude_path.clone();
         let extra_env = extra_env.clone();
         let env = probe_env.clone();
         Box::pin(async move {
-            crate::auth_status::probe_cli(claude_path.as_deref(), &cwd, &extra_env, &env).await
+            crate::auth_status::probe_cli_in(claude_path.as_deref(), &request, &extra_env, &env)
+                .await
         })
     });
-    spawn_auth_actor(
+    spawn_auth_actor_with(
         push_tx,
         probe,
         std::env::current_dir().unwrap_or_default(),
         env,
+        AuthActorConfig {
+            hide_claude_auth,
+            logger: opts.logger.clone(),
+        },
     )
 }
 
-/// Hand a created session's account and cwd to the auth actor (publish the
-/// session identity; re-probe when the cwd differs from the last probe's).
-fn publish_session_account(registry: &Registry, cwd: PathBuf, session: &Session) {
-    publish_account(registry.auth.as_ref(), cwd, session);
+/// What a session start hands the account side: the connection's auth actor, the
+/// routing in force and the `--hide-claude-auth` flag.
+#[derive(Clone)]
+struct AuthEnv {
+    auth: Option<AuthHandle>,
+    /// `resolveProviderConfig() !== null`: the subscription guard is off.
+    routing_active: bool,
+    hide_claude_auth: bool,
+    logger: Option<Arc<crate::logger::Logger>>,
 }
 
-/// [`publish_session_account`] given the auth-status actor directly.
-fn publish_account(auth: Option<&AuthHandle>, cwd: PathBuf, session: &Session) {
-    if let Some(auth) = auth {
-        auth.send(AuthCmd::SessionCreated {
-            cwd,
-            account: session.account().cloned(),
-        });
+impl AuthEnv {
+    fn of(registry: &Registry, opts: &ServeOptions) -> Self {
+        Self {
+            auth: registry.auth.clone(),
+            routing_active: registry.resolve_provider().is_some(),
+            hide_claude_auth: registry.hide_claude_auth,
+            logger: opts.logger.clone(),
+        }
     }
+
+    /// `claudeSubscriptionGuardActive`.
+    fn guard_active(&self) -> bool {
+        self.hide_claude_auth && !self.routing_active
+    }
+}
+
+/// The probe context of a session about to start (`useAuthStatusSettings`'s
+/// arguments): its settings manager's cwd, its apiKeyHelper, the programmatic
+/// settings and the launch env.
+fn session_auth_context(
+    cwd: PathBuf,
+    settings_arg: Option<&str>,
+    launch_env: &[(String, String)],
+    opts: &ServeOptions,
+) -> SessionAuthContext {
+    let settings_override = settings_arg.and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let api_key_helper =
+        crate::settings::load(&cwd, &opts.env).get_api_key_helper(settings_override.as_ref());
+    SessionAuthContext {
+        cwd,
+        api_key_helper,
+        settings_override,
+        launch_env: (!launch_env.is_empty()).then(|| launch_env.to_vec()),
+    }
+}
+
+/// B-91: the per-turn `--hide-claude-auth` guard on the account the CLI cached at
+/// `initialize`. The account is reported before the decision, so a refused turn
+/// still tells the client which account it was for. `Some` is the refusal.
+fn check_turn_guard(
+    registry: &mut Registry,
+    opts: &ServeOptions,
+    session_id: &str,
+    session: &Session,
+) -> Option<Error> {
+    if !AuthEnv::of(registry, opts).guard_active() {
+        return None;
+    }
+    let logger = opts.logger.clone();
+    let warn = move |message: &str| {
+        if let Some(logger) = &logger {
+            logger.error(message);
+        }
+    };
+    let auth = registry.auth.clone();
+    let helper = registry
+        .auth_contexts
+        .get(session_id)
+        .and_then(|context| context.api_key_helper.clone());
+    let cwd = registry
+        .auth_contexts
+        .get(session_id)
+        .map(|context| context.cwd.clone())
+        .unwrap_or_default();
+    let state = registry
+        .guard_states
+        .entry(session_id.to_string())
+        .or_default();
+    crate::hide_claude_auth::refuse_claude_subscription_turn(
+        session_id,
+        session.account(),
+        state,
+        &warn,
+        |account| {
+            if let Some(auth) = &auth {
+                auth.send(AuthCmd::SessionCreated {
+                    session_id: None,
+                    cwd,
+                    account: Some(account.clone()),
+                    api_key_helper: helper,
+                    epoch: None,
+                });
+            }
+        },
+    )
+}
+
+/// V-16: a session flagged for a recreate (a sign-out failed its last turn, or a
+/// probe found another kind of identity) is recreated now, keeping the husk
+/// addressable when creation refuses (`respawnSignedOutSession`). A live turn
+/// postpones it; a sign-out closed the query, so it recreates at once.
+///
+/// `Ok(None)`: no recreate was due. `Ok(Some(session))`: the session the caller
+/// must go on with. `Err`: the recreation's refusal.
+async fn respawn_signed_out_session(
+    registry: &mut Registry,
+    opts: &ServeOptions,
+    connection: &ConnectionTo<agent_client_protocol::Client>,
+    session_id: &str,
+) -> std::result::Result<Option<Session>, Error> {
+    if !registry.hide_claude_auth {
+        return Ok(None);
+    }
+    let flagged = match &registry.auth {
+        Some(auth) => auth.needs_respawn(session_id).await,
+        None => false,
+    };
+    if !flagged {
+        return Ok(None);
+    }
+    // `!session.queryClosed && turnQueue.some(!settled)`: a query the sign-out
+    // closed has no turn left to wait for, whatever the board still counts.
+    let running = match registry.sessions.get(session_id) {
+        Some(session) => {
+            !session.command_sender().is_closed()
+                && recreate::session_has_unsettled_turn(session, registry.index.board(), session_id)
+                    .await
+        }
+        None => false,
+    };
+    if running {
+        return Ok(None);
+    }
+    if let Some(logger) = &opts.logger {
+        logger.log(&format!(
+            "Recreating Claude session {session_id} after a sign-out"
+        ));
+    }
+    recreate::recreate_live_session(registry, opts, connection, session_id, true).await?;
+    match registry.sessions.get(session_id) {
+        Some(session) => Ok(Some(session.clone())),
+        None => Err(Error::internal_error().data(json!({ "details": "Session not found" }))),
+    }
+}
+
+/// The creation-time account step of a started session: publish the account the
+/// CLI reported (before the guard may refuse the session, so a refusal still tells
+/// the client which account it was for), then apply the `--hide-claude-auth` guard.
+/// `Err` is the refusal; the caller closes the session.
+fn account_at_creation(
+    env: &AuthEnv,
+    session_id: &str,
+    context: &SessionAuthContext,
+    epoch: u64,
+    session: &Session,
+    guard: &mut crate::hide_claude_auth::GuardState,
+) -> std::result::Result<(), Error> {
+    let session_message = |registered: bool| AuthCmd::SessionCreated {
+        session_id: registered.then(|| session_id.to_string()),
+        cwd: context.cwd.clone(),
+        account: session.account().cloned(),
+        api_key_helper: context.api_key_helper.clone(),
+        epoch: Some(epoch),
+    };
+    // The identity goes out first, whatever the guard decides.
+    if let Some(auth) = &env.auth {
+        auth.send(session_message(false));
+    }
+    if env.guard_active() {
+        let logger = env.logger.clone();
+        let warn = move |message: &str| {
+            if let Some(logger) = &logger {
+                logger.error(message);
+            }
+        };
+        match session.account() {
+            None => crate::hide_claude_auth::warn_guard_degraded(
+                session_id,
+                guard,
+                "the CLI reported no account at initialize",
+                &warn,
+            ),
+            // A refused session is never registered: a husk that is refused again
+            // keeps the flag that asks for its recreate.
+            Some(account) => {
+                if let Some(refusal) = crate::hide_claude_auth::decide(account) {
+                    return Err(refusal);
+                }
+            }
+        }
+    }
+    if let Some(auth) = &env.auth {
+        auth.send(session_message(true));
+    }
+    Ok(())
 }
 
 /// Validate a `session/new` / `session/load` `cwd` exactly as the adapter's
@@ -1568,6 +2209,8 @@ fn initialize_options_for(
         tool_config: opts.tool_config,
         forward_subagent_text,
         per_task_stop_affordance,
+        agent_progress_summaries: opts.agent_progress_summaries,
+        plan_mode_instructions: opts.plan_mode_instructions,
         enable_file_checkpointing,
         ..InitializeOptions::default()
     })
@@ -1588,27 +2231,76 @@ fn register_session(
         .sessions
         .insert(session_id.to_string(), session.clone());
     wire_session(
-        &registry.session_tx,
-        &registry.dispose_tx,
-        &registry.deferred_tx,
+        WireTargets {
+            session_tx: &registry.session_tx,
+            dispose_tx: &registry.dispose_tx,
+            deferred_tx: &registry.deferred_tx,
+            board: registry.index.board(),
+            is_air_client: registry.air.is_some(),
+        },
         session_id,
         session,
         update_rx,
         connection,
     );
+    registry.publish_sessions();
+}
+
+/// The connection's channels a session is wired to ([`wire_session`]).
+struct WireTargets<'a> {
+    session_tx: &'a mpsc::UnboundedSender<(String, Session)>,
+    dispose_tx: &'a mpsc::UnboundedSender<Session>,
+    deferred_tx: &'a mpsc::UnboundedSender<RegistryMsg>,
+    /// What the session index shows of the session: its cost comes from the usage
+    /// updates.
+    board: &'a crate::session_index::connection::OwnSessionBoard,
+    /// An AIR client shows an archived title without its archive prefix.
+    is_air_client: bool,
+}
+
+/// Writes a raw `session/update` through `send`; `false` when the client never got
+/// it (the message could not be built, or the write failed).
+fn write_raw_update<E>(value: Value, send: impl FnOnce(UntypedMessage) -> Result<(), E>) -> bool {
+    UntypedMessage::new("session/update", value)
+        .ok()
+        .is_some_and(|msg| send(msg).is_ok())
+}
+
+/// The `cost.amount` of a `usage_update` (`total_cost_usd` of the result).
+fn usage_update_cost(update: &Value) -> Option<f64> {
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("usage_update") {
+        return None;
+    }
+    update.pointer("/cost/amount").and_then(Value::as_f64)
 }
 
 /// [`register_session`] without the registry entry: publish the session to the
 /// notification handler and the dispose list, and start its update forwarder.
 fn wire_session(
-    session_tx: &mpsc::UnboundedSender<(String, Session)>,
-    dispose_tx: &mpsc::UnboundedSender<Session>,
-    deferred_tx: &mpsc::UnboundedSender<RegistryMsg>,
+    targets: WireTargets<'_>,
     session_id: &str,
     session: Session,
     update_rx: mpsc::UnboundedReceiver<SessionOutbound>,
     connection: &ConnectionTo<agent_client_protocol::Client>,
 ) {
+    let WireTargets {
+        session_tx,
+        dispose_tx,
+        deferred_tx,
+        board,
+        is_air_client,
+    } = targets;
+    // A title a stored record publishes reads as the client shows it: an AIR
+    // client gets an archived title without its archive prefix
+    // (`ClaudeAcpAgent.clientTitle`, `acp-agent.ts:3205`).
+    session.set_client_title(crate::session_titles::ClientTitle(Arc::new(move |raw| {
+        crate::session_index::connection::SessionIndexConnection::client_title(is_air_client, raw)
+    })));
+    let board = board.clone();
+    let board_session_id = session_id.to_string();
+    // This run of the session under its id: what it reports later is ignored once
+    // the id was closed or loaded again.
+    let incarnation = board.begin(session_id);
     let _ = session_tx.send((session_id.to_string(), session.clone()));
     // Weak, so this task (which lives as long as the actor's outbound channel)
     // does not keep the actor's command channel open.
@@ -1624,6 +2316,9 @@ fn wire_session(
     // for, so an answer arriving after a model switch is dropped (`stillCurrent`).
     let control = session.control().clone();
     let cmd_tx = session.command_sender().clone();
+    // Weak: the forwarder reports a failed write of a raw update back to the actor
+    // (U-75), and must not keep the actor's command channel open.
+    let write_failed_tx = session.command_sender().downgrade();
     let model_id = session.current_model_id().unwrap_or_default();
     tokio::spawn(async move {
         if let Ok(res) = control
@@ -1662,9 +2357,26 @@ fn wire_session(
                     // tool data is forwarded verbatim.
                     if let Some(update) = value.get_mut("update") {
                         crate::map::materialize_diff_old_text(update);
+                        // The cost of the result, for the session index.
+                        if let Some(cost) = usage_update_cost(update) {
+                            board.note_cost_of(&board_session_id, incarnation, cost);
+                        }
                     }
-                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                        let _ = connection.send_notification(msg);
+                    // A raw update the client never got (the write failed or the
+                    // message could not be built) is reported to the actor, which
+                    // rolls back the async-task fields it recorded as published.
+                    if !write_raw_update(value, |msg| connection.send_notification(msg)) {
+                        if let Some(tx) = write_failed_tx.upgrade() {
+                            let _ = tx.send(crate::session::Command::UpdateSendFailed);
+                        }
+                    }
+                }
+                // M-65: what the session index shows of this session (the CLI's
+                // state, a failed turn, a failed query). Ignored once the id was
+                // closed or loaded again.
+                SessionOutbound::Board(event) => {
+                    if board.current(&board_session_id) == Some(incarnation) {
+                        event.apply(&board, &board_session_id);
                     }
                 }
                 // U-10: the raw SDK message ext notification
@@ -1729,6 +2441,10 @@ fn wire_session(
                 }
             }
         }
+        // The actor ended (the stream died or the session closed): its row shows
+        // what the registry and the transcript tell from now on, as
+        // `closeQueryStream` does (`acp-agent.ts:2794`).
+        board.retire(&board_session_id, incarnation);
     });
 }
 
@@ -1865,7 +2581,7 @@ async fn start_resumed(
     };
     let cwd = cwd_str.map(PathBuf::from);
     let mut fresh = false;
-    let (start_result, replayed, auth_cwd) = loop {
+    let (start_result, replayed, auth_cwd, mut unwired, auth_context, auth_epoch) = loop {
         let (mut claude, permission_mode, allow_bypass) =
             match spawn_inputs(params, cwd.as_deref(), opts, Some(&session_id)) {
                 Ok(inputs) => inputs,
@@ -1876,6 +2592,8 @@ async fn start_resumed(
         timing.phase("resume-transcript", "");
         timing.phase("settings", "");
         let raw_sdk_messages = claude.raw_sdk_messages.clone();
+        let settings_arg = claude.settings_arg.clone();
+        let launch_env = claude.env.clone();
         let mut spawn = session_spawn_options(
             opts,
             cwd.clone(),
@@ -1895,12 +2613,20 @@ async fn start_resumed(
             spawn.session_id = None;
         }
         let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
+        let auth_context =
+            session_auth_context(auth_cwd.clone(), settings_arg.as_deref(), &launch_env, opts);
+        let auth_epoch = match &env.auth {
+            Some(auth) => auth.use_context(auth_context.clone()).await,
+            None => 0,
+        };
+        providers::apply_provider_to_spawn(&mut spawn, env.provider.as_ref());
         let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize.clone())
             .with_air(env.air.clone())
             .with_caps(env.caps.clone())
             .with_raw_sdk_messages(raw_sdk_messages)
             .with_env(opts.env.clone())
-            .with_logger(opts.logger.clone());
+            .with_logger(opts.logger.clone())
+            .with_gateway_models(providers::gateway_models_of(env.provider.as_ref()));
         // PC-2.2 / B-02: the replay runs while the CLI starts (Node
         // `createSessionWhileReplaying`) and reads the transcript off the async
         // runtime; the response waits for both, so the replay frames still
@@ -1908,9 +2634,24 @@ async fn start_resumed(
         let air = env.air.is_some();
         let replay_future = async {
             let messages = crate::transcript::session_messages_async(&opts.env, &session_id).await;
+            let mut failure_book = crate::session::failures::SessionFailures::default();
             let (notifications, task_state, last_published) =
-                crate::transcript::replay_with_task_state(&messages, &session_id, air);
+                crate::transcript::replay_with_failures(
+                    &messages,
+                    &session_id,
+                    air,
+                    env.caps.plan,
+                    env.air
+                        .as_ref()
+                        .is_some_and(|a| a.supports("sessionFailure"))
+                        .then_some(&mut failure_book),
+                );
             for mut value in notifications {
+                // A cancelled recreate stops replaying into a connection that is
+                // ending.
+                if recreate_cancelled(env) {
+                    break;
+                }
                 if let Some(update) = value.get_mut("update") {
                     crate::map::materialize_tool_call_defaults(update);
                     crate::map::materialize_diff_old_text(update);
@@ -1919,17 +2660,29 @@ async fn start_resumed(
                     let _ = connection.send_notification(msg);
                 }
             }
-            (task_state, last_published)
+            (task_state, last_published, failure_book)
         };
-        let no_replay: (Vec<(String, crate::hooks::TaskStateEntry)>, Option<String>) =
-            (Vec::new(), None);
-        let (start_result, replayed) = if replay {
-            tokio::join!(Session::start(sess_opts, session_id.clone()), replay_future)
+        let no_replay: (
+            Vec<(String, crate::hooks::TaskStateEntry)>,
+            Option<String>,
+            crate::session::failures::SessionFailures,
+        ) = (Vec::new(), None, Default::default());
+        // The guard is created the moment the start returns, so a session that is
+        // waiting for the replay to finish is already covered.
+        let start_future = async {
+            let result = Session::start(sess_opts, session_id.clone()).await;
+            let guard = UnwiredSessionGuard(
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|(session, _)| session.command_sender().clone()),
+            );
+            (result, guard)
+        };
+        let ((start_result, unwired), replayed) = if replay {
+            tokio::join!(start_future, replay_future)
         } else {
-            (
-                Session::start(sess_opts, session_id.clone()).await,
-                no_replay,
-            )
+            (start_future.await, no_replay)
         };
         if recreate_falls_back_to_fresh(env.live_mode.is_some(), fresh, &start_result) {
             // A live session may never have been prompted, so it may have no stored
@@ -1944,7 +2697,14 @@ async fn start_resumed(
             fresh = true;
             continue;
         }
-        break (start_result, replayed, auth_cwd);
+        break (
+            start_result,
+            replayed,
+            auth_cwd,
+            unwired,
+            auth_context,
+            auth_epoch,
+        );
     };
     match start_result {
         Ok((session, update_rx)) => {
@@ -1957,7 +2717,21 @@ async fn start_resumed(
                 session.close().await;
                 return responder.respond_with_error(session_rpc_error(&SessionError::Closed));
             }
-            publish_account(env.auth.as_ref(), auth_cwd.clone(), &session);
+            // The account is published before the guard may refuse the session
+            // (a refusal is when the client most needs to know the account).
+            let mut guard = crate::hide_claude_auth::GuardState::default();
+            if let Err(refusal) = account_at_creation(
+                &env.auth_env,
+                &session_id,
+                &auth_context,
+                auth_epoch,
+                &session,
+                &mut guard,
+            ) {
+                drop(update_rx);
+                session.close().await;
+                return responder.respond_with_error(refusal);
+            }
             // Phase 15 (Item 1): upstream sends a proactive
             // `available_commands_update` with the REAL command list right
             // after session/new / session/load
@@ -1975,8 +2749,9 @@ async fn start_resumed(
             // the Task* state it rebuilt into the live actor so a status-only
             // TaskUpdate after the load still applies.
             if replay {
-                let (task_state, last_published) = replayed;
+                let (task_state, last_published, failure_book) = replayed;
                 let _ = session.seed_task_state(task_state, last_published).await;
+                let _ = session.seed_failures(failure_book).await;
                 timing.phase("replay", "");
             }
             let mgr = Arc::new(crate::settings_manager::SettingsManager::new(
@@ -2001,11 +2776,30 @@ async fn start_resumed(
                     settings_manager: mgr,
                     fingerprint: compute_session_fingerprint(params),
                     cancel: env.cancel.clone(),
+                    creation_params: params.clone(),
+                    auth_context,
+                    guard,
                 })));
+            // Published to the dispose list below, which closes it from here on.
+            unwired.disarm();
+            // A provider update that runs meanwhile recreates this session too.
+            env.sessions_view.send_modify(|view| {
+                view.insert(session_id.clone(), (session.clone(), params.clone()));
+            });
+            // It resumed a stored conversation: it has a transcript, unlike a new
+            // session before its first turn (`resumedFromHistory`).
+            if !fresh {
+                env.board
+                    .update(&session_id, |own| own.resumed_from_history = true);
+            }
             wire_session(
-                &env.session_tx,
-                &env.dispose_tx,
-                &env.deferred_tx,
+                WireTargets {
+                    session_tx: &env.session_tx,
+                    dispose_tx: &env.dispose_tx,
+                    deferred_tx: &env.deferred_tx,
+                    board: &env.board,
+                    is_air_client: env.air.is_some(),
+                },
                 &session_id,
                 session,
                 update_rx,
@@ -2037,6 +2831,7 @@ async fn handle_request(
     opts: &ServeOptions,
     responder: agent_client_protocol::Responder<Value>,
     connection: ConnectionTo<agent_client_protocol::Client>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), Error> {
     let method = req.method().to_string();
     let params = req.params().clone();
@@ -2058,6 +2853,19 @@ async fn handle_request(
             // Parse the full capability set once (ROADMAP F2a): auth methods,
             // notices, config options and the tool-call choices all read it.
             registry.caps = ClientCapabilities::from_value(params.get("clientCapabilities"));
+            // The session index of a client that declared `sessionIndex`.
+            let notifier_connection = connection.clone();
+            registry.index.set_notifier(Arc::new(move |changes| {
+                let connection = notifier_connection.clone();
+                Box::pin(async move {
+                    let msg = UntypedMessage::new(
+                        crate::session_index::list_subscriptions::LIST_CHANGES_METHOD,
+                        changes,
+                    )?;
+                    connection.send_notification(msg)
+                })
+            }));
+            registry.index.negotiate(registry.air.as_ref());
             let (executable, argv) = process_entrypoint();
             responder.respond(initialize_response(
                 registry.air.as_ref(),
@@ -2065,18 +2873,25 @@ async fn handle_request(
                 &opts.env,
                 &executable,
                 &argv,
+                &registry.index.capabilities(),
+                registry.hide_claude_auth,
             ))?;
             // G2 (Decision 11): learn the auth identity in the background AFTER
             // the response (Node `initialize` never waits on the CLI probe);
             // `_auth/status_update` is pushed only when the read lands.
             let auth = registry
                 .auth
-                .get_or_insert_with(|| spawn_auth(opts, &connection))
+                .get_or_insert_with(|| spawn_auth(opts, registry.hide_claude_auth, &connection))
                 .clone();
             auth.probe(std::env::current_dir().unwrap_or_default(), false);
             Ok(())
         }
         "session/new" => {
+            // A provider update in flight recreates every session; a session
+            // created meanwhile must start under the routing it installs: the
+            // actor parked this request until the update ended and handed over
+            // the gate's permit (`while (this.providerUpdate) await ...`).
+            let _provider_update = permit;
             // Session timing (`session-timing.ts`, B-01): coarse phases at the
             // agent layer (validate-cwd/settings/register).
             let create_started = Instant::now();
@@ -2110,7 +2925,9 @@ async fn handle_request(
             }
             timing.phase("settings", "");
             let raw_sdk_messages = claude.raw_sdk_messages.clone();
-            let spawn = session_spawn_options(
+            let settings_arg = claude.settings_arg.clone();
+            let launch_env = claude.env.clone();
+            let mut spawn = session_spawn_options(
                 opts,
                 cwd,
                 session_id.clone(),
@@ -2120,15 +2937,46 @@ async fn handle_request(
                 true,
             );
             let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
+            // `useAuthStatusSettings`: a context that differs from the last probe's
+            // bumps the epoch and re-probes; the account read below is published
+            // only while that epoch is still the current one.
+            let auth_context =
+                session_auth_context(auth_cwd.clone(), settings_arg.as_deref(), &launch_env, opts);
+            let auth_epoch = match &registry.auth {
+                Some(auth) => auth.use_context(auth_context.clone()).await,
+                None => 0,
+            };
+            let provider = registry.resolve_provider();
+            providers::apply_provider_to_spawn(&mut spawn, provider.as_ref());
             let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
                 .with_air(registry.air.clone())
                 .with_caps(registry.caps.clone())
                 .with_raw_sdk_messages(raw_sdk_messages)
                 .with_env(opts.env.clone())
-                .with_logger(opts.logger.clone());
+                .with_logger(opts.logger.clone())
+                .with_gateway_models(providers::gateway_models_of(provider.as_ref()));
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
-                    publish_session_account(registry, auth_cwd.clone(), &session);
+                    let mut guard = crate::hide_claude_auth::GuardState::default();
+                    if let Err(refusal) = account_at_creation(
+                        &AuthEnv::of(registry, opts),
+                        &session_id,
+                        &auth_context,
+                        auth_epoch,
+                        &session,
+                        &mut guard,
+                    ) {
+                        drop(update_rx);
+                        session.close().await;
+                        return responder.respond_with_error(refusal);
+                    }
+                    registry
+                        .creation_params
+                        .insert(session_id.clone(), params.clone());
+                    registry
+                        .auth_contexts
+                        .insert(session_id.clone(), auth_context);
+                    registry.guard_states.insert(session_id.clone(), guard);
                     // Phase 15 (Item 1): upstream sends a proactive
                     // `available_commands_update` with the REAL command list right
                     // after session/new / session/load
@@ -2177,6 +3025,10 @@ async fn handle_request(
         // `session/resume` is `session/load` without the history replay, which
         // the Rust port never does — the same start path (G6).
         "session/load" | "session/resume" => {
+            // A provider update in flight recreates every session; this start was
+            // parked until it ended, and the spawned recreate below keeps its
+            // permit until it registers.
+            let provider_update = permit;
             let session_id = params
                 .get("sessionId")
                 .and_then(Value::as_str)
@@ -2223,12 +3075,17 @@ async fn handle_request(
                 registry.sessions.remove(&session_id);
                 registry.settings_managers.remove(&session_id);
                 registry.fingerprints.remove(&session_id);
+                registry.forget_session_state(&session_id);
+                // The old session is torn down, as upstream's recreate does
+                // (`teardownSession` → `onTeardown`); its row falls back to the
+                // transcript until the new session registers.
+                registry.index.on_teardown(&session_id);
                 // The teardown can take seconds (the close is bounded, not
                 // instant): it runs off the connection's sequential handler, so
                 // other requests and `session/cancel` are not held up, and the
                 // response is still sent after the old session is gone.
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let mut env = registry.resume_env(None);
+                let mut env = registry.resume_env(None, opts);
                 env.cancel = Some(cancel.clone());
                 let opts = opts.clone();
                 let connection = connection.clone();
@@ -2258,6 +3115,9 @@ async fn handle_request(
                     // Dropped however the task ends (a panic included), so the id
                     // never stays marked as being recreated.
                     let _ending = ending;
+                    // The provider update gate stays held until this session is
+                    // registered, so a switch that follows waits for it.
+                    let _provider_update = provider_update;
                     let mut env = env;
                     if let Some(session) = live {
                         let live_mode = match session.live_state().await {
@@ -2289,11 +3149,22 @@ async fn handle_request(
                 if replay {
                     let messages =
                         crate::transcript::session_messages_async(&opts.env, &session_id).await;
+                    let typed_failures = registry
+                        .air
+                        .as_ref()
+                        .is_some_and(|a| a.supports("sessionFailure"));
+                    let mut failure_book = if typed_failures {
+                        session.failures_snapshot().await.unwrap_or_default()
+                    } else {
+                        Default::default()
+                    };
                     let (notifications, task_state, last_published) =
-                        crate::transcript::replay_with_task_state(
+                        crate::transcript::replay_with_failures(
                             &messages,
                             &session_id,
                             registry.air.is_some(),
+                            registry.caps.plan,
+                            typed_failures.then_some(&mut failure_book),
                         );
                     for mut value in notifications {
                         if let Some(update) = value.get_mut("update") {
@@ -2308,6 +3179,9 @@ async fn handle_request(
                     // the live `taskState` with it; seed the rebuilt state so the
                     // live actor continues from it.
                     let _ = session.seed_task_state(task_state, last_published).await;
+                    if typed_failures {
+                        let _ = session.seed_failures(failure_book).await;
+                    }
                 }
                 // MAJOR 5 (acp-agent.js:8186-8190): return the actor's LIVE
                 // state — after `set_config_option mode plan` a resume must
@@ -2347,7 +3221,7 @@ async fn handle_request(
                 return Ok(());
             }
             start_resumed(
-                &registry.resume_env(None),
+                &registry.resume_env(None, opts),
                 session_id,
                 &params,
                 opts,
@@ -2362,6 +3236,9 @@ async fn handle_request(
             .await
         }
         "session/fork" => {
+            // A fork starts a session like a resumed one; it was parked until a
+            // provider update in flight ended.
+            let _provider_update = permit;
             // Node order: validate the systemPrompt, copy the transcript, then
             // start the new session like a resumed one (`unstable_forkSession`).
             if let Err(e) = initialize_options_for(&params, &registry.caps, registry.air.as_ref()) {
@@ -2388,12 +3265,20 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let new_id = match session_methods::fork_copy(fork_session_id, cwd, &opts.env).await {
-                Ok(id) => id,
-                Err(e) => return responder.respond_with_error(e),
-            };
-            start_resumed(
-                &registry.resume_env(None),
+            // The session list holds back this fork until its response is out
+            // (`SessionIndexConnection.forking`).
+            registry.index.fork_started(&fork_session_id);
+            let new_id =
+                match session_methods::fork_copy(fork_session_id.clone(), cwd, &opts.env).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        registry.index.fork_answered(&fork_session_id);
+                        return responder.respond_with_error(e);
+                    }
+                };
+            registry.index.on_fork_created(&fork_session_id, &new_id);
+            let started = start_resumed(
+                &registry.resume_env(None, opts),
                 new_id,
                 &params,
                 opts,
@@ -2401,7 +3286,9 @@ async fn handle_request(
                 &connection,
                 ResumedKind::Fork,
             )
-            .await
+            .await;
+            registry.index.fork_answered(&fork_session_id);
+            started
         }
         "session/close" => {
             // Idempotent: an unknown (or already closed) session answers `{}`.
@@ -2413,6 +3300,14 @@ async fn handle_request(
                 .to_string();
             registry.settings_managers.remove(&session_id);
             registry.fingerprints.remove(&session_id);
+            registry.forget_session_state(&session_id);
+            // Its row shows what the registry and the transcript tell from now
+            // on, as upstream's `teardownSession` (`acp-agent.ts:8886`); a failed
+            // query of it stays remembered.
+            registry.index.on_teardown(&session_id);
+            // The view a waiting provider update reads must not keep it.
+            let closed = registry.sessions.remove(&session_id);
+            registry.publish_sessions();
             // A session mid-recreate is in no map: closing it cancels the
             // recreate, and the close answers once that has ended (its new
             // child closed, or never started).
@@ -2422,7 +3317,7 @@ async fn handle_request(
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 recreating.ended
             });
-            match (registry.sessions.remove(&session_id), recreate_ended) {
+            match (closed, recreate_ended) {
                 (None, None) => responder.respond(json!({})),
                 (session, recreate_ended) => {
                     tokio::spawn(async move {
@@ -2513,9 +3408,16 @@ async fn handle_request(
             Ok(())
         }
         "session/list" => {
+            // A `sessionIndex` client gets the bounded, ordered index list.
+            let indexed = registry.index.list(params.clone());
             let env = opts.env.clone();
+            let is_air_client = registry.air.is_some();
             tokio::spawn(async move {
-                match session_methods::list(&params, &env).await {
+                let result = match indexed {
+                    Some(indexed) => indexed.await,
+                    None => session_methods::list(&params, &env, is_air_client).await,
+                };
+                match result {
                     Ok(result) => {
                         let _ = responder.respond(result);
                     }
@@ -2526,9 +3428,10 @@ async fn handle_request(
             });
             Ok(())
         }
-        // An AIR client archives with `session/delete` in Node; hard-deleting
-        // would destroy data Node keeps, so AIR keeps -32601 (Decision 22).
-        "session/delete" if registry.air.is_none() => {
+        // `session/delete`: a `sessionIndex` client deletes every copy; another AIR
+        // client archives instead (it uses delete to mark a session done); every
+        // other client gets the SDK delete.
+        "session/delete" => {
             let session_id = params
                 .get("sessionId")
                 .and_then(Value::as_str)
@@ -2536,13 +3439,27 @@ async fn handle_request(
                 .to_string();
             // Tear a loaded session down first so its transcript is not recreated.
             let loaded = registry.sessions.remove(&session_id);
+            registry.publish_sessions();
             registry.settings_managers.remove(&session_id);
+            registry.fingerprints.remove(&session_id);
+            registry.forget_session_state(&session_id);
+            registry.index.on_teardown(&session_id);
+            let was_loaded = loaded.is_some();
+            let indexed = registry.index.delete_session(
+                session_id.clone(),
+                was_loaded,
+                registry.air.is_some(),
+            );
             let env = opts.env.clone();
             tokio::spawn(async move {
                 if let Some(session) = loaded {
                     session.close().await;
                 }
-                match session_methods::delete(session_id, &env).await {
+                let result = match indexed {
+                    Some(indexed) => indexed.await,
+                    None => session_methods::delete(session_id, &env).await,
+                };
+                match result {
                     Ok(()) => {
                         let _ = responder.respond(json!({}));
                     }
@@ -2553,20 +3470,250 @@ async fn handle_request(
             });
             Ok(())
         }
-        "logout" => {
-            // G2 / 2.4: `claude auth logout`, then a fresh read of the store
-            // (pushed as `_auth/status_update` BEFORE the response, like Node).
+        "_session/list/subscribe" => match registry.index.subscribe_list(&params) {
+            Ok(subscription) => {
+                tokio::spawn(async move {
+                    match subscription.await {
+                        Ok(result) => {
+                            let _ = responder.respond(result);
+                        }
+                        Err(e) => {
+                            let _ = responder.respond_with_error(e);
+                        }
+                    }
+                });
+                Ok(())
+            }
+            Err(e) => responder.respond_with_error(e),
+        },
+        "_session/list/unsubscribe" => match registry.index.unsubscribe_list(&params) {
+            Ok(result) => responder.respond(result),
+            Err(e) => responder.respond_with_error(e),
+        },
+        "_session/rename" | "_session/archive" | "_session/unarchive" => {
+            let archive = method == "_session/archive";
+            let session_id = crate::session_index::service::parse_session_id_request(&params)
+                .ok()
+                .map(|request| request.session_id);
+            let loaded = session_id.as_ref().and_then(|id| {
+                let session = registry.sessions.get(id)?.clone();
+                let cwd = registry
+                    .settings_managers
+                    .get(id)
+                    .map(|manager| manager.get_cwd().to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                // The archive forgets the session it closed as soon as it is closed,
+                // not at the next request: nothing reaches the dead session, and a
+                // load of the id since is not forgotten with it.
+                let husk = session.command_sender().downgrade();
+                let deferred_tx = registry.deferred_tx.clone();
+                let sessions_view = registry.sessions_view.clone();
+                let forget_id = id.clone();
+                Some(LoadedSession {
+                    session,
+                    session_id: id.clone(),
+                    cwd,
+                    on_closed: Some(Arc::new(move || {
+                        // The view a waiting provider update reads must not keep
+                        // it either: upstream deletes the session from its map
+                        // before answering, so the update's identity check fails
+                        // and it is not recreated. Only the session this archive
+                        // closed, never a newer one loaded under the id.
+                        sessions_view.send_modify(|view| {
+                            if view.get(&forget_id).is_some_and(|(live, _)| {
+                                is_registered_instance(live.command_sender(), &husk)
+                            }) {
+                                view.remove(&forget_id);
+                            }
+                        });
+                        let _ = deferred_tx.send(RegistryMsg::Forget {
+                            session_id: forget_id.clone(),
+                            husk: husk.clone(),
+                        });
+                    })),
+                })
+            });
+            let was_loaded = loaded.is_some();
+            let husk = loaded
+                .as_ref()
+                .map(|loaded| loaded.session.command_sender().downgrade());
+            let publish = {
+                let connection = connection.clone();
+                Arc::new(move |value: Value| {
+                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                        let _ = connection.send_notification(msg);
+                    }
+                }) as Arc<dyn Fn(Value) + Send + Sync>
+            };
+            let prepared = match method.as_str() {
+                "_session/rename" => registry.index.rename(&params, loaded, publish),
+                "_session/archive" => registry.index.archive(&params, loaded, publish),
+                _ => registry.index.unarchive(&params, loaded, publish),
+            };
+            let operation = match prepared {
+                Ok(operation) => operation,
+                Err(e) => return responder.respond_with_error(e),
+            };
+            // The archive tears the session down only once its retitle succeeded
+            // (upstream `connection.ts:274-291`): a failed rename leaves it loaded
+            // and usable. The removal waits for the handler's next request, so the
+            // error or result is already out first.
+            let teardown = archive && was_loaded;
+            let deferred_tx = registry.deferred_tx.clone();
+            tokio::spawn(async move {
+                match operation.await {
+                    Ok(result) => {
+                        if teardown {
+                            if let (Some(id), Some(husk)) = (session_id, husk) {
+                                let _ = deferred_tx.send(RegistryMsg::Forget {
+                                    session_id: id,
+                                    husk,
+                                });
+                            }
+                        }
+                        let _ = responder.respond(result);
+                    }
+                    Err(e) => {
+                        let _ = responder.respond_with_error(e);
+                    }
+                }
+            });
+            Ok(())
+        }
+        "authenticate" => {
+            // The legacy gateway methods store a provider override that every later
+            // session reads. The payload is validated here with the same base URL
+            // rule as `providers/set`; a call that carries no gateway at all keeps
+            // its historical meaning of installing no override.
+            let method_id = params.get("methodId").and_then(Value::as_str);
+            if !matches!(method_id, Some("gateway" | "gateway-bedrock")) {
+                return responder.respond_with_error(
+                    Error::internal_error().data(json!({ "details": "Method not implemented." })),
+                );
+            }
+            if let Err(e) = providers::validate_gateway_payload(&params) {
+                return responder.respond_with_error(e);
+            }
+            let base_url =
+                providers::gateway_request_to_provider_config(Some(&params)).map(|c| c.base_url);
+            registry.gateway_auth = Some(params);
             let auth = registry
                 .auth
-                .get_or_insert_with(|| spawn_auth(opts, &connection))
+                .get_or_insert_with(|| spawn_auth(opts, registry.hide_claude_auth, &connection))
                 .clone();
+            // The gateway holds the credentials from here on: the epoch bump
+            // discards any probe that started before this login, and the gateway
+            // status replaces whatever the CLI store reported.
+            auth.send(AuthCmd::Authenticate { base_url });
+            registry.sync_routing();
+            let (done, flushed) = oneshot::channel();
+            auth.send(AuthCmd::Barrier { reply: done });
+            let _ = flushed.await;
+            responder.respond(json!({}))
+        }
+        "providers/list" => {
+            let overridden = registry.provider.is_some();
+            let config = registry.provider.clone().unwrap_or_else(|| {
+                providers::default_provider_config(&opts.env, registry.gateway_auth.as_ref())
+            });
+            if let Some(logger) = &opts.logger {
+                logger.log(&format!(
+                    "[providers/list] apiType={} baseUrl={} overridden={overridden}",
+                    config.api_type, config.base_url
+                ));
+            }
+            responder.respond(providers::list_providers_result(&config))
+        }
+        "providers/set" => {
+            let config = match providers::parse_set_provider(&params) {
+                Ok(config) => config,
+                Err(e) => return responder.respond_with_error(e),
+            };
+            if let Some(logger) = &opts.logger {
+                logger.log(&format!(
+                    "[providers/set] apiType={} baseUrl={} sessions={}",
+                    config.api_type,
+                    config.base_url,
+                    registry.sessions.len()
+                ));
+            }
+            // The update waits for the running turns and starts every session anew:
+            // it runs off this handler so permission answers, `fs/*`/`terminal/*`
+            // replies and `session/cancel` keep flowing while it waits
+            // (`enqueueProviderUpdate` awaits its promise, not the event loop).
+            recreate::spawn_provider_update(
+                registry,
+                opts,
+                &connection,
+                Some(config),
+                Some(responder),
+            );
+            Ok(())
+        }
+        "providers/disable" => {
+            // An unknown provider is an idempotent success.
+            if params.get("providerId").and_then(Value::as_str) == Some(providers::PROVIDER_ID) {
+                if let Some(logger) = &opts.logger {
+                    logger.log(&format!(
+                        "[providers/disable] sessions={}",
+                        registry.sessions.len()
+                    ));
+                }
+                recreate::spawn_provider_update(registry, opts, &connection, None, Some(responder));
+                return Ok(());
+            }
+            responder.respond(json!({}))
+        }
+        "logout" => {
+            // Clear the in-memory gateway credentials supplied via `authenticate`
+            // and any provider routing set via `providers/set`; neither touches the
+            // on-disk credential store.
+            let had_routing_override = registry.resolve_provider().is_some()
+                || registry
+                    .provider_updates
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0;
+            registry.gateway_auth = None;
+            registry.provider = None;
+            registry.sync_routing();
+            let auth = registry
+                .auth
+                .get_or_insert_with(|| spawn_auth(opts, registry.hide_claude_auth, &connection))
+                .clone();
+            // Any probe already running read the pre-logout world; the bump makes
+            // its answer unpublishable so it cannot resurrect the identity being
+            // cleared.
             auth.bump_epoch();
-            let claude_path = opts.claude_path.clone();
-            let extra_env = opts.extra_env.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    crate::auth_status::run_logout(claude_path.as_deref(), &extra_env).await
-                {
+            // F5b/B-69: 1M-context entitlement can differ per account/tier, so
+            // windows learned under one login must not seed sessions under the next.
+            crate::session_model::clear_context_window_cache();
+            // `claude auth logout` can take up to a minute, and the recreate that
+            // follows waits for the running turns: both run off this handler so the
+            // connection keeps answering the turns it waits for. The gate is taken
+            // only when the recreate starts (upstream enqueues the provider update
+            // in the `finally`), so a session started during the CLI call does not
+            // wait a minute for it.
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // The gateway credentials were cleared above, so the recreated
+            // sessions run on native routing (and the guard applies again).
+            let env = registry.provider_env(opts, cancel.clone(), registry.gateway_auth.is_some());
+            let opts = opts.clone();
+            let connection = connection.clone();
+            let handle = tokio::spawn(async move {
+                // The credentials of the native CLI store can only be cleared by the
+                // binary itself; `claude auth logout` is non-interactive and idempotent.
+                let logout =
+                    crate::auth_status::run_logout(opts.claude_path.as_deref(), &opts.extra_env)
+                        .await;
+                // The cleared routing is baked into the env of every live query, so
+                // recreate them the way `providers/disable` does. Done even when the
+                // CLI logout failed, because the override is already gone.
+                if had_routing_override {
+                    let _ =
+                        recreate::run_provider_update(env, None, None, None, &opts, &connection)
+                            .await;
+                }
+                if let Err(e) = logout {
                     let data = if e.stderr.is_empty() {
                         json!({})
                     } else {
@@ -2577,27 +3724,32 @@ async fn handle_request(
                     );
                     return;
                 }
-                let (reply, done) = tokio::sync::oneshot::channel();
+                // Re-read the store rather than assuming "none": an API key from the
+                // env or a key helper survives `auth logout`. The read starts after
+                // the credentials were cleared; an unreadable store reports "not
+                // logged in". The new status is pushed BEFORE the response, like Node.
+                let (reply, done) = oneshot::channel();
                 auth.send(AuthCmd::Logout {
                     cwd: std::env::current_dir().unwrap_or_default(),
                     reply,
                 });
                 let _ = done.await;
-                // F5b/B-69: 1M-context entitlement can differ per account/tier,
-                // so windows learned under one login must not seed sessions
-                // under the next.
-                crate::session_model::clear_context_window_cache();
                 let _ = responder.respond(json!({}));
             });
+            let _ = registry.recreate_tx.send(RecreateTask { cancel, handle });
             Ok(())
         }
         "session/prompt" => {
+            // A provider update in flight recreates every session; the turn was
+            // parked until it ended, like upstream's `startTurn`. The permit is
+            // held only until the prompt is enqueued on the session.
+            let _provider_update = permit;
             let session_id = params
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let session = match registry.sessions.get(&session_id) {
+            let mut session = match registry.sessions.get(&session_id) {
                 Some(s) => s.clone(),
                 // Node: `throw new Error("Session not found")` -> -32603 with
                 // `data:{details}` (a closed or unknown session).
@@ -2607,6 +3759,41 @@ async fn handle_request(
                     );
                 }
             };
+            // B-88: the one re-read of the identity per user prompt, fired here and
+            // never awaited: a prompt must not wait on a CLI process, and its result
+            // is pushed on change whenever it lands, mid-turn included. It runs
+            // BEFORE the guard on purpose: a refused prompt is exactly the one whose
+            // retry follows a sign-in in the terminal.
+            if let Some(auth) = registry.auth.clone() {
+                match registry.auth_contexts.get(&session_id) {
+                    Some(context) => {
+                        // The helper is read again: the settings may have changed on
+                        // disk since the session started (B-87).
+                        let mut context = context.clone();
+                        context.api_key_helper = registry
+                            .api_key_helper(&session_id, context.settings_override.as_ref());
+                        auth.use_context_detached(context.clone());
+                        auth.probe(context.cwd.clone(), false);
+                    }
+                    None => auth.probe(std::env::current_dir().unwrap_or_default(), false),
+                }
+            }
+            // V-16: a session flagged for a recreate (a sign-out failed its last
+            // turn, or a probe found another kind of identity) is recreated now,
+            // unless a turn is still running on its query. The recreation runs the
+            // full creation guard; a refusal keeps the closed husk addressable so
+            // the client can sign in and retry on the same session.
+            match respawn_signed_out_session(registry, opts, &connection, &session_id).await {
+                Ok(Some(fresh)) => session = fresh,
+                Ok(None) => {}
+                Err(refusal) => return responder.respond_with_error(refusal),
+            }
+            // B-91: the per-turn `--hide-claude-auth` guard, on the account the CLI
+            // cached at `initialize`. The account is reported before the decision,
+            // so a refused turn still tells the client which account it was for.
+            if let Some(refusal) = check_turn_guard(registry, opts, &session_id, &session) {
+                return responder.respond_with_error(refusal);
+            }
             let first_text = params
                 .get("prompt")
                 .and_then(Value::as_array)
@@ -2633,6 +3820,11 @@ async fn handle_request(
             // in flight (Node's `prompt()` returns immediately).
             let prompt_text = acp_prompt_text(&params);
             let mut reply_rx = session.send_prompt(uuid, frame, is_local_only, prompt_text);
+            // What the session index shows of a session this connection runs: the
+            // turn is running until its reply settles (`noteSessionState`).
+            let board = registry.index.board().clone();
+            let incarnation = board.turn_started(&session_id);
+            let board_session_id = session_id.clone();
             // F2c / M-52: Node's `runPromptWithCancellation`
             // (`acp-agent.ts:13528-13552`) listens for `$/cancel_request` on
             // this prompt's request signal and routes it to the same
@@ -2643,6 +3835,7 @@ async fn handle_request(
             let cancellation = responder.cancellation();
             let cancel_session = session.clone();
             let connection = connection.clone();
+            let sign_out_auth = registry.auth.clone().filter(|_| registry.hide_claude_auth);
             tokio::spawn(async move {
                 let first = tokio::select! {
                     reply = &mut reply_rx => Some(reply),
@@ -2656,6 +3849,31 @@ async fn handle_request(
                     }
                 }
                 .unwrap_or_else(|_| Err(SessionError::Closed.into()));
+                // The turn failed with an error (not a cancel, not a session that
+                // ended).
+                let failed = matches!(&reply, Err(failure) if !matches!(failure.error, SessionError::Closed));
+                // V-16: a turn that failed with `auth_required` means a sign-out
+                // (under `--hide-claude-auth`): the account cached at `initialize`
+                // is wrong, so the next prompt recreates the query.
+                if let Some(auth) = &sign_out_auth {
+                    let signed_out = matches!(&reply, Err(failure) if matches!(
+                        failure.error,
+                        SessionError::PromptFailed { kind: crate::turn::FailureKind::AuthRequired, .. }
+                    ));
+                    if signed_out {
+                        auth.send(AuthCmd::MarkRespawn {
+                            session_id: board_session_id.clone(),
+                        });
+                        // `markSessionForSignOutRespawn` closes the query at the
+                        // sign-out, so the stale CLI cannot keep accepting input;
+                        // the recreate at the next turn is idempotent with it.
+                        let session = cancel_session.clone();
+                        tokio::spawn(async move { session.close().await });
+                    }
+                }
+                if let Some(incarnation) = incarnation {
+                    board.turn_settled(&board_session_id, incarnation, failed);
+                }
                 match reply {
                     Ok(reply) => {
                         // Forward this turn's streaming updates (e.g. a
@@ -2728,6 +3946,9 @@ async fn handle_request(
                 Ok(steer) => steer,
                 Err(e) => return responder.respond_with_error(e),
             };
+            // No wait for a provider update in flight: a steer is what a client
+            // sends to a running turn, and upstream's `steer()` never awaits
+            // `providerUpdate` (`acp-agent.ts:4315-4375`).
             let session_id = steer.session_id;
             let session = match registry.sessions.get(&session_id) {
                 Some(s) => s.clone(),
@@ -2736,6 +3957,36 @@ async fn handle_request(
                         .respond_with_error(Error::internal_error().data("Session not found"));
                 }
             };
+            // V-16: a sign-out (or a probe's identity change) recreates the query
+            // before the steer decides, as upstream's `respawnSignedOutSession`
+            // does.
+            let session =
+                match respawn_signed_out_session(registry, opts, &connection, &session_id).await {
+                    Ok(Some(fresh)) => fresh,
+                    Ok(None) => session,
+                    Err(refusal) => return responder.respond_with_error(refusal),
+                };
+            // A query a sign-out closed answers "session ended", before the
+            // outcome is decided (`session.queryClosed`).
+            if session.command_sender().is_closed() {
+                return responder.respond_with_error(session_rpc_error(&SessionError::Closed));
+            }
+            // "A turn is running" = the session has an unsettled turn, which covers
+            // a steered turn and one submitted but not yet echoed (`turnQueue`).
+            let idle = !recreate::session_has_unsettled_turn(
+                &session,
+                registry.index.board(),
+                &session_id,
+            )
+            .await;
+            // A steer that would start a new turn runs the `--hide-claude-auth`
+            // guard here, so the refusal reaches the client instead of a detached
+            // prompt (`acp-agent.ts:4343-4349`).
+            if idle && !steer.prompt_required {
+                if let Some(refusal) = check_turn_guard(registry, opts, &session_id, &session) {
+                    return responder.respond_with_error(refusal);
+                }
+            }
             let first_text = steer
                 .prompt
                 .first()
@@ -2794,6 +4045,9 @@ async fn handle_request(
                 Ok(request) => request,
                 Err(e) => return responder.respond_with_error(e),
             };
+            // No wait here: `goal` steers first, and a steer never awaits a provider
+            // update in flight; the spawned task below waits for it only where the
+            // goal starts its own turn (`goal` → `steer` → `prompt` → `startTurn`).
             let Some(session) = registry.sessions.get(&request.session_id).cloned() else {
                 // Node's `steer` throws `new Error("Session not found")`; the
                 // SDK maps it to `internalError` with `data:{details}`.
@@ -2801,6 +4055,31 @@ async fn handle_request(
                     Error::internal_error().data(json!({ "details": "Session not found" })),
                 );
             };
+            // `goal()` runs `steer()` first, which respawns a signed-out session
+            // (`respawnSignedOutSession`).
+            let session =
+                match respawn_signed_out_session(registry, opts, &connection, &request.session_id)
+                    .await
+                {
+                    Ok(Some(fresh)) => fresh,
+                    Ok(None) => session,
+                    Err(refusal) => return responder.respond_with_error(refusal),
+                };
+            // `goal()` goes through `prompt()` → `startTurn()` only when the session
+            // is idle, and that runs the per-turn guard before it enqueues the turn.
+            let idle = !recreate::session_has_unsettled_turn(
+                &session,
+                registry.index.board(),
+                &request.session_id,
+            )
+            .await;
+            if idle {
+                if let Some(refusal) =
+                    check_turn_guard(registry, opts, &request.session_id, &session)
+                {
+                    return responder.respond_with_error(refusal);
+                }
+            }
             let command = request.command_text();
             let prompt_params = json!({
                 "sessionId": request.session_id,
@@ -2810,6 +4089,12 @@ async fn handle_request(
             let frame = prompt_to_claude(&prompt_params, &request.session_id, &steer_uuid);
             let is_local_only = is_local_only_command(&command);
             let steer_rx = session.steer(steer_uuid, frame.clone(), is_local_only, true);
+            // The goal's own turn is a running turn: a provider switch must wait
+            // for it instead of closing the session under it (`turnQueue`).
+            let board = registry.index.board().clone();
+            let session_id = request.session_id;
+            let gate = registry.provider_gate.clone();
+            let sessions_view = registry.sessions_view.subscribe();
             // The steer reply and the prompt's settlement are awaited off the
             // connection loop (INV-27); the response never overtakes the
             // goal's updates because the actor publishes them before either
@@ -2825,10 +4110,30 @@ async fn handle_request(
                 if outcome.get("outcome").and_then(Value::as_str) == Some("promptRequired") {
                     // Node's `prompt()` generates its own prompt uuid.
                     let prompt_uuid = uuid_v4();
-                    match session
-                        .prompt(prompt_uuid, frame, is_local_only, command)
+                    // `startTurn` waits for a provider update in flight. The turn
+                    // is counted on the board only once the gate is held, or the
+                    // update would wait for a turn that waits for the update.
+                    let permit = gate.acquire_owned().await.ok();
+                    // The update replaced the session: take the one it started.
+                    let session = sessions_view
+                        .borrow()
+                        .get(&session_id)
+                        .map(|(live, _)| live.clone())
+                        .unwrap_or(session);
+                    let incarnation = board.turn_started(&session_id);
+                    let reply_rx = session.send_prompt(prompt_uuid, frame, is_local_only, command);
+                    drop(permit);
+                    let reply = reply_rx
                         .await
-                    {
+                        .unwrap_or_else(|_| Err(SessionError::Closed.into()));
+                    let failed = matches!(
+                        &reply,
+                        Err(failure) if !matches!(failure.error, SessionError::Closed)
+                    );
+                    if let Some(incarnation) = incarnation {
+                        board.turn_settled(&session_id, incarnation, failed);
+                    }
+                    match reply {
                         Ok(reply) => {
                             if let Some(flush_rx) = reply.flush_rx {
                                 let _ = flush_rx.await;
@@ -2873,8 +4178,22 @@ pub fn resume_from_argv(argv: &[String]) -> Option<&str> {
     argv.iter().find_map(|a| a.strip_prefix("--resume="))
 }
 
+mod providers;
+mod recreate;
+
 #[cfg(test)]
 mod tests_t1ha;
+#[cfg(test)]
+mod tests_t2b;
+#[cfg(test)]
+mod tests_t3b;
+#[cfg(test)]
+mod tests_t3fb;
+#[cfg(test)]
+mod tests_t3fd;
+
+#[cfg(test)]
+mod tests_t2gb;
 
 #[cfg(test)]
 mod tests {
@@ -3474,7 +4793,8 @@ mod tests {
             env.iter().map(|(key, value)| (*key, *value)),
         );
         let argv = vec!["dist/index.js".to_string()];
-        initialize_response(None, &caps, &env, "/usr/bin/node", &argv)["authMethods"].clone()
+        initialize_response(None, &caps, &env, "/usr/bin/node", &argv, &[], false)["authMethods"]
+            .clone()
     }
 
     #[test]
@@ -3885,5 +5205,21 @@ mod tests {
             format_uri_as_link("custom-scheme://foo"),
             "custom-scheme://foo"
         );
+    }
+
+    /// Finding A: the registry actor ending before the connection does ends the
+    /// connection (the old inline handler unwound through it) instead of leaving
+    /// a client that waits for answers nobody will send. A panic is re-raised.
+    #[tokio::test]
+    async fn t3fe_actor_end_ends_the_connection() {
+        let (ended, panic) = actor_ended(Ok(()));
+        assert!(ended.is_err() && panic.is_none());
+
+        // A panic is handed back for `serve_until` to re-raise after the
+        // teardown (finding N3), not raised from here.
+        let panicked = tokio::spawn(async { panic!("registry actor panic") }).await;
+        let (ended, panic) = actor_ended(panicked);
+        assert!(ended.is_err());
+        assert!(panic.is_some(), "the actor panic payload is kept");
     }
 }

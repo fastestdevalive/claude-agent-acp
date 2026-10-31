@@ -1,0 +1,4 @@
+{"type":"user","uuid":"c1000000-0000-4000-8000-000000000001","parentUuid":null,"sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","cwd":"$CWD","timestamp":"2026-01-03T00:00:00.000Z","message":{"role":"user","content":"plan the migration"}}
+{"type":"assistant","uuid":"c1000000-0000-4000-8000-000000000002","parentUuid":"c1000000-0000-4000-8000-000000000001","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","cwd":"$CWD","timestamp":"2026-01-03T00:00:01.000Z","message":{"role":"assistant","model":"claude-sonnet-4-5","stop_reason":"end_turn","content":[{"type":"text","text":"Planned."}]}}
+{"type":"custom-title","customTitle":"[archived] Old migration plan","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc"}
+{"type":"agent-name","agentName":"[archived] Old migration plan","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc"}

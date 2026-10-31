@@ -30,19 +30,19 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | acp-subagents.ts | - | missing:F35b | AIR/RFD subagent event builders |
 | air-extension.ts | air.rs | merged:air.rs | AIR extension |
 | async-tasks.ts | async_tasks.rs | merged:async_tasks.rs | async task registry |
-| auth-status.ts | auth_status.rs | merged:auth_status.rs | auth status actor |
-| clear-context-coordinator.ts | - | missing:F22 | fresh-query clear-context hand-off |
+| auth-status.ts | auth_status.rs | 1:1 | auth status actor, epoch, probe context |
+| clear-context-coordinator.ts | session/clear_context.rs | 1:1 | fresh-query clear-context hand-off (B-74/B-75 PARTIAL: Fast-mode reconcile after restart waits for F11) |
 | client-system-prompt.ts | system_prompt.rs | 1:1 | client system prompt merge |
 | context-compaction-meta.ts | - | missing:F20 | compaction meta lifecycle |
 | context-compaction.ts | - | missing:F20 | compaction engine |
 | diff.ts | diff.rs | 1:1 | line diff (Myers, context 3, budget), diff memo, git patch formatting and ACP v2 diff content ported (T1C, F8) |
 | elicitation.ts | - | missing:F23a | ACP elicitation mapping |
-| exit-plan.ts | - | missing:F21 | ExitPlanMode hand-off |
+| exit-plan.ts | session/exit_plan.rs | 1:1 | ExitPlanMode hand-off, approved plan, keep-planning interrupt |
 | file-change-audit.ts | - | missing:AG-3 | file-change audit report |
 | fork-session.ts | session_methods.rs | merged:session_methods.rs | fork-session helpers |
-| gateway-models.ts | - | missing:F33 | gateway / Bedrock model listing |
+| gateway-models.ts | gateway_models.rs | 1:1 | gateway / Bedrock model listing over reqwest (D10) |
 | goal-extension.ts | - | missing:AG-1 | `_session/goal` |
-| hide-claude-auth.ts | - | missing:F34 | account identity / hide-claude-auth |
+| hide-claude-auth.ts | hide_claude_auth.rs | 1:1 | account predicates, refusal errors, per-turn guard |
 | index.ts | bin/claude-agent-acp-rs.rs | 1:1 | node entrypoint |
 | lib.ts | lib.rs | different:Rust crate exports differ from the TS public surface (FX-4) | public exports |
 | managed-policy.ts | - | missing:F5a | managed env tier and MDM/registry tiers |
@@ -59,35 +59,35 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | permissions/options/tools.ts | permission_options.rs | merged:permission_options.rs | tool option builders |
 | permissions/presentation.ts | - | missing:F10 | AIR permission presentation |
 | permissions/response.ts | permission.rs | merged:permission.rs | permission response mapping |
-| prompt-suggestions.ts | - | missing:F24 | promptSuggestions frame + publishing |
+| prompt-suggestions.ts | prompt_suggestions.rs | 1:1 | prompt suggestion text and meta (pure; wiring is F24 Turn 4) |
 | resumed-session.ts | resumed_session.rs | merged:resumed_session.rs | resumed-session state |
 | serve.ts | bin/claude-agent-acp-rs.rs | merged:bin/claude-agent-acp-rs.rs | serve entrypoint |
 | session-config-ids.ts | session_config.rs | merged:session_config.rs | config ids |
 | session-effort.ts | session_config.rs | merged:session_config.rs | effort config |
-| session-failure-extension.ts | - | missing:AG-2 | sessionFailure capability |
-| session-index/activity.ts | - | missing:F26b | activity tracking |
-| session-index/archive-title.ts | - | missing:F30 | title precedence and sanitize |
-| session-index/connection.ts | - | missing:F26b | delete and fork-point wrappers |
-| session-index/dir-listing.ts | - | missing:F26a | directory listing scanner |
-| session-index/explicit-title.ts | - | missing:F27a | explicit rename title |
-| session-index/first-prompt.ts | session_store.rs | merged:session_store.rs | first-prompt indexing |
-| session-index/list-subscriptions.ts | - | missing:F28 | session list subscriptions |
-| session-index/live-registry.ts | - | missing:F26b | live session registry |
-| session-index/project-dirs.ts | session_store.rs | merged:session_store.rs | project dirs |
-| session-index/service.ts | - | missing:F26b | list cursor and scope |
-| session-index/session-index.ts | session_store.rs | merged:session_store.rs | index core |
-| session-index/session-info.ts | - | missing:F26b | session-info rows and `_meta` |
-| session-index/transcript-scan.ts | session_store.rs | merged:session_store.rs | transcript scan |
-| session-index/worktrees.ts | - | missing:F26a | worktree listing |
+| session-failure-extension.ts | session_failure.rs | 1:1 | session failure controller, replay, advisory notices |
+| session-index/activity.ts | session_index/activity.rs | 1:1 | session activity board (running/idle/requires_action/error, cost); session-side producers partly lane-A hooks (M-65 PARTIAL) |
+| session-index/archive-title.ts | session_index/archive_title.rs | 1:1 | archive prefix, title precedence |
+| session-index/connection.ts | session_index/connection.rs | 1:1 | index connection wrappers: delete, fork holds, archive (Q-42 PARTIAL) |
+| session-index/dir-listing.ts | session_index/dir_listing.rs | 1:1 | directory listing caches |
+| session-index/explicit-title.ts | session_index/explicit_title.rs | 1:1 | custom-title sidecar, explicit title |
+| session-index/first-prompt.ts | session_index/first_prompt.rs | 1:1 | first-prompt title extraction |
+| session-index/list-subscriptions.ts | session_index/list_subscriptions.rs | 1:1 | list subscriptions and changes pushes |
+| session-index/live-registry.ts | session_index/live_registry.rs | 1:1 | live CLI registry reader |
+| session-index/project-dirs.ts | session_index/project_dirs.rs | 1:1 | project dir encoding and match (darwin NFC normalisation PARTIAL) |
+| session-index/service.ts | session_index/service.rs | 1:1 | list cursor and scope, rename/archive/delete service |
+| session-index/session-index.ts | session_index/mod.rs | 1:1 | index core, ordering, cwd filter |
+| session-index/session-info.ts | session_index/session_info.rs | 1:1 | session-info rows and `_meta` |
+| session-index/transcript-scan.ts | session_index/transcript_scan.rs | 1:1 | transcript scan, continued-in-session detection |
+| session-index/worktrees.ts | session_index/worktrees.rs | 1:1 | git worktree listing without spawning git |
 | session-mode.ts | permission_mode.rs | merged:permission_mode.rs | session mode |
 | session-model.ts | session_config.rs | merged:session_config.rs | session model |
 | session-notices.ts | - | missing:F2a | notice fallback |
 | session-timing.ts | - | missing:F2b | session timing log lines |
-| session-titles.ts | - | missing:F30 | title sanitisation |
+| session-titles.ts | session_titles.rs | 1:1 | title generation state, context ring, client-title guard |
 | settings.ts | settings.rs | merged:settings.rs | settings tiers |
 | subagent-history.ts | - | missing:F37 | subagent transcript reader |
 | subagent-replay.ts | - | missing:F37 | subagent replay |
-| tool-calls/background.ts | - | missing:F15 | backgrounded Bash tool-call shaping |
+| tool-calls/background.ts | tools/background.rs | 1:1 | backgrounded Bash tool-call shaping |
 | tool-calls/changed-meta-filter.ts | meta_filter.rs | 1:1 | changed-meta filter |
 | tool-calls/client-capabilities.ts | agent.rs | merged:agent.rs | client capabilities |
 | tool-calls/content.ts | map.rs | merged:map.rs | content rendering |
@@ -103,10 +103,10 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | tool-calls/reporters/read.ts | tools.rs | merged:tools.rs | read reporter |
 | tool-calls/reporters/search.ts | tools.rs | merged:tools.rs | search reporter |
 | tool-calls/reporters/web.ts | tools.rs | merged:tools.rs | web reporter |
-| tool-result-meta.ts | - | missing:F7a | tool result meta parsing |
+| tool-result-meta.ts | tool_meta.rs | 1:1 | tool result meta parsing |
 | tools.ts | tools.rs | merged:tools.rs | tool definitions |
 | turn-events.ts | turn.rs | merged:turn.rs | turn events |
-| usage-markdown.ts | - | missing:F24 | `/usage` markdown formatter |
+| usage-markdown.ts | usage_markdown.rs | 1:1 | `/usage` markdown formatter (pure; wiring is F24 Turn 4) |
 | utils.ts | - | missing:F31 | EventLoopYielder (B-17/B-55) |
 | v2/agent.ts | - | missing:F38b | ACP v2 surface |
 | v2/initialize.ts | - | missing:F38a | ACP v2 surface |

@@ -81,8 +81,8 @@ use serde_json::Value;
 use crate::quota::{self, ModelRows, SharedRows};
 
 mod stopped_work;
-pub use stopped_work::StoppedWorkVerdict;
 use stopped_work::{StoppedWorkState, TaskMeta};
+pub use stopped_work::{StoppedWorkVerdict, TaskPlacement};
 
 /// Verbatim upstream message for a turn that reached `idle` with no result
 /// (`acp-agent.js:54-55`).
@@ -152,6 +152,12 @@ pub enum FailureKind {
     /// "transport_lost")`, `acp-agent.ts:8275-8288`). Produced only by
     /// [`TurnMachine::fail_all_split`].
     TransportLost,
+    /// The worker announced its shutdown (`worker_shutting_down`) and the
+    /// stream then ended under the active turn: the turn ends with a
+    /// `worker_shutdown` failure (`failActiveWithSessionFailure(
+    /// "worker_shutdown")`, `acp-agent.ts:5750-5760`). Produced only by
+    /// [`TurnMachine::fail_active_worker_shutdown`].
+    WorkerShutdown,
     /// An `end_turn` settle left a dispatched tool call without a result
     /// (`errorKind: incomplete_tool_call`, E-12). Produced only by the
     /// session-level post-filter (`unfinished.rs`), never by the machine.
@@ -171,6 +177,7 @@ impl FailureKind {
             FailureKind::NoResult => TURN_NO_RESULT_MESSAGE,
             FailureKind::SessionEnded => SESSION_ENDED_MESSAGE,
             FailureKind::TransportLost => "The connection to Claude was lost.",
+            FailureKind::WorkerShutdown => "The Claude worker is shutting down.",
             FailureKind::IncompleteToolCall => {
                 "Claude ended the turn without returning results for tool calls"
             }
@@ -199,6 +206,16 @@ struct DeferredSettle {
     usage: Usage,
     /// The per-model rows snapshot taken with `usage` (`_meta.quota.model_usage`).
     models: SharedRows,
+}
+
+/// What the interruption result of an ExitPlanMode answer ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitPlanVerdict {
+    /// "No, keep planning": the turn ends `cancelled`.
+    KeepPlanning,
+    /// An accepted plan that continues in a fresh context: the turn leaves the
+    /// machine, carrying the usage it has earned (this result's included).
+    ContextReset,
 }
 
 /// Events the turn machine emits for the session actor to act on. These are
@@ -244,6 +261,16 @@ pub enum TurnEvent {
     /// frame (no `stream_event` deltas, no consolidated `assistant` message),
     /// so the actor must forward it as its own message. Emission is phase 7.
     FinalText { text: String },
+    /// The classifier's explanation of a refusal (`lastRefusalExplanation`),
+    /// streamed ahead of the refusing turn's settle. Unlike [`Self::FinalText`]
+    /// it goes out in order with the result's other updates (the usage update
+    /// precedes it on the wire), so the actor sends it on the update channel.
+    RefusalText { text: String },
+    /// A model cycle that Claude Code started on its own ended (at its result, or
+    /// at an idle no earlier result owes). Consumed by the unfinished-tool gate,
+    /// which closes the calls the cycle left open before its end is reported
+    /// (`closeCycleToolCalls`); never reaches the client.
+    CycleEnded,
 }
 
 /// One `session/prompt` in the machine — queued, active or settled.
@@ -278,6 +305,10 @@ pub struct Turn {
     /// Every steer this turn has taken, echoed or not (`Turn.steeredUuids`): a
     /// cancel abandons them all, and a stamped result naming one answers it.
     steered_uuids: Vec<String>,
+    /// The normalised text of every informational notice shown for this turn
+    /// (`Turn.noticeTexts`): a notice is not an answer, so the #453 fallback
+    /// skips a result that only repeats one (a hook-blocked turn's result).
+    notice_texts: Vec<String>,
     /// `command_lifecycle` `started` was seen for this turn's prompt
     /// (`Turn.commandStarted`): Claude Code dispatched it into a turn.
     command_started: bool,
@@ -293,6 +324,10 @@ pub struct Turn {
     /// `carriedModelUsage`): the next activation's scratch starts from it instead
     /// of zero, then forgets it.
     carried: Option<(Usage, ModelRows)>,
+    /// The user frame this prompt sent, kept while the turn is unsettled so a
+    /// clear-context restart can send it again to the fresh child when the
+    /// prompt was still queued behind the plan turn.
+    frame: Option<Value>,
 }
 
 /// The terminal `command_lifecycle` states (`Turn.commandFinished`).
@@ -363,10 +398,35 @@ impl Turn {
             steered_settle: None,
             steered_awaiting_result: false,
             steered_uuids: Vec::new(),
+            notice_texts: Vec::new(),
             command_started: false,
             command_finished: None,
             command_result_seen: false,
             carried: None,
+            frame: None,
+        }
+    }
+
+    /// Keep the frame this prompt sent (see the `frame` field).
+    pub fn with_frame(mut self, frame: Value) -> Self {
+        self.frame = Some(frame);
+        self
+    }
+
+    /// The kept prompt frame, once.
+    pub fn take_frame(&mut self) -> Option<Value> {
+        self.frame.take()
+    }
+
+    /// The event that ends a prompt a clear-context restart could not carry on:
+    /// it never ran, so it reports no usage (a swept queued turn's settle).
+    pub fn queued_settled(&self, stop_reason: StopReason) -> TurnEvent {
+        TurnEvent::Settled {
+            prompt_uuid: self.prompt_uuid.clone(),
+            stop_reason,
+            usage: Usage::default(),
+            had_usage: false,
+            model_rows: SharedRows::default(),
         }
     }
 
@@ -383,6 +443,21 @@ impl Turn {
     /// Whether this is a local-only command (result text is the command output).
     pub fn is_local_only_command(&self) -> bool {
         self.is_local_only_command
+    }
+
+    /// The event that ends a turn a clear-context restart took out of its
+    /// machine and could not hand on (`settleCancelledTurn`,
+    /// `acp-agent.ts:2800-2806`): it reports the usage the turn had earned
+    /// before the restart (`carriedUsage`).
+    pub fn restart_settled(&self, stop_reason: StopReason) -> TurnEvent {
+        let (usage, rows) = self.carried.clone().unwrap_or_default();
+        TurnEvent::Settled {
+            prompt_uuid: self.prompt_uuid.clone(),
+            stop_reason,
+            usage,
+            had_usage: true,
+            model_rows: Arc::new(rows),
+        }
     }
 }
 
@@ -427,6 +502,16 @@ pub struct TurnMachine {
     /// cancelled turns (`owedTrailingIdles`) — absorbed by `on_idle` so a
     /// lagging idle can't false-fail the next live turn (#825).
     owed_trailing_idles: usize,
+    /// The session recognised the result about to be finished as the
+    /// diagnostic of an ExitPlanMode "keep planning" interrupt
+    /// (`isExitPlanInterruptionResult`): the turn ends `cancelled` at it.
+    exit_plan_interruption: Option<ExitPlanVerdict>,
+    /// The turn a clear-context restart took out of the machine at its
+    /// interruption result, for the session to carry into the fresh context.
+    restart_turn: Option<Turn>,
+    /// The prompts that were queued behind that turn, in order: they go to the
+    /// fresh context with it (see [`Self::take_restart_queue`]).
+    restart_queue: Vec<Turn>,
     /// Whether the active turn was cancelled (its result is dropped; it settles
     /// `cancelled` at the next idle).
     cancelled: bool,
@@ -447,6 +532,11 @@ pub struct TurnMachine {
     /// The top-level assistant model of the current turn (`lastAssistantModel`),
     /// cleared at activation (`resetTurnScratch`).
     last_assistant_model: Option<String>,
+    /// The classifier's explanation of a refusal (`lastRefusalExplanation`),
+    /// seeded by the refused assistant frame's `stop_details` or the
+    /// `model_refusal_no_fallback` banner and streamed when the turn's result
+    /// reports the `refusal` stop reason. Cleared at activation.
+    refusal_explanation: Option<String>,
     /// The CLI advertised `msg_lifecycle_v1` at `system`/`init` (`msgLifecycleV1`):
     /// orphan accounting then runs through [`Self::orphan_commands`] instead of
     /// the coalescing-blind count. Never unlatched (init re-emits per turn).
@@ -474,6 +564,9 @@ pub struct TurnMachine {
     /// records), read to tell a running background subagent's output from the
     /// work a cancel stopped.
     task_meta: HashMap<String, TaskMeta>,
+    /// The settled subagents a later resume can register again, with the
+    /// Agent/Task call that started them (`resumableSubagents`), oldest first.
+    resumable_subagents: Vec<(String, Option<String>)>,
     /// The client gets a subagent's text (`forwardsSubagentText`).
     forwards_subagent_text: bool,
     /// A model cycle that Claude Code started on its own is the session's
@@ -506,6 +599,105 @@ impl TurnMachine {
     pub fn note_assistant_model(&mut self, model: &str) {
         if !model.is_empty() && model != "<synthetic>" {
             self.last_assistant_model = Some(model.to_string());
+        }
+    }
+
+    /// A refused top-level assistant frame (`stop_reason: "refusal"`) names the
+    /// explanation in `stop_details`; a frame without one keeps what an earlier
+    /// banner seeded (`acp-agent.ts:7873-7881`).
+    pub fn note_refusal_frame(&mut self, explanation: Option<&str>) {
+        if let Some(explanation) = explanation {
+            self.refusal_explanation = Some(explanation.to_string());
+        }
+    }
+
+    /// The `model_refusal_no_fallback` banner backs the explanation up when the
+    /// frame carried none. `refused_user_message_uuid` is explicitly `null` when
+    /// the refused turn was not human-authored: those must not pollute the user
+    /// turn's explanation (`acp-agent.ts:6710-6728`).
+    pub fn seed_refusal_explanation(&mut self, explanation: &str, not_human_authored: bool) {
+        let empty = self
+            .refusal_explanation
+            .as_deref()
+            .is_none_or(str::is_empty);
+        if empty && !not_human_authored {
+            self.refusal_explanation = Some(explanation.to_string());
+        }
+    }
+
+    /// The CLI's own "Please run /login" reply ends the active turn with the
+    /// auth-required rejection (`failActive(RequestError.authRequired())`,
+    /// `acp-agent.ts:5584-5588`). Nothing happens without an unsettled active turn.
+    pub fn fail_active_auth_required(&mut self, message: &str) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
+        self.fail_active(
+            FailureKind::AuthRequired,
+            message.to_string(),
+            false,
+            &mut events,
+        );
+        events
+    }
+
+    /// The stream ended after `worker_shutting_down`: an active turn that is not
+    /// held open for its background work fails with `worker_shutdown`. A held
+    /// turn already has its authoritative outcome and an absent one has nothing
+    /// to carry the failure, so both get no event here and the caller publishes
+    /// the session-scoped failure instead (`acp-agent.ts:5750-5767`).
+    pub fn fail_active_worker_shutdown(&mut self) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
+        if self.active.as_ref().is_some_and(is_held_turn) {
+            return events;
+        }
+        self.fail_active(
+            FailureKind::WorkerShutdown,
+            FailureKind::WorkerShutdown.default_message().to_string(),
+            false,
+            &mut events,
+        );
+        events
+    }
+
+    /// Mark the result about to be finished as the interruption of an
+    /// ExitPlanMode answer (`acp-agent.ts:7110-7141`, `7219-7238`): instead of
+    /// reading the error-shaped diagnostic as a provider failure, "keep
+    /// planning" ends the turn `cancelled` with the usage its own result
+    /// recorded, and an accepted clear-context plan hands the turn on.
+    pub fn note_exit_plan_interruption(&mut self, verdict: ExitPlanVerdict) {
+        self.exit_plan_interruption = Some(verdict);
+    }
+
+    /// The turn a [`ExitPlanVerdict::ContextReset`] result took out of the
+    /// machine, once.
+    pub fn take_restart_turn(&mut self) -> Option<Turn> {
+        self.restart_turn.take()
+    }
+
+    /// The unsettled prompts that were queued behind the restart turn, once.
+    pub fn take_restart_queue(&mut self) -> Vec<Turn> {
+        std::mem::take(&mut self.restart_queue)
+    }
+
+    /// Whether the active turn is held open for background work
+    /// (`isHeldOpen(session.activeTurn)`).
+    pub fn active_is_held(&self) -> bool {
+        self.active.as_ref().is_some_and(is_held_turn)
+    }
+
+    /// The `prompt_uuid` of the active unsettled turn (`session.activeTurn?.promptUuid`).
+    pub fn active_prompt_uuid(&self) -> Option<&str> {
+        self.active
+            .as_ref()
+            .filter(|t| !t.settled)
+            .map(|t| t.prompt_uuid.as_str())
+    }
+
+    /// Remember the text of an informational notice on the turn it belongs to
+    /// (`session.activeTurn ?? session.turnQueue?.[0]`): the #453 fallback skips
+    /// a result that only repeats it.
+    pub fn note_notice_text(&mut self, normalized: String) {
+        if let Some(turn) = self.active.as_mut().or_else(|| self.queue.front_mut()) {
+            turn.notice_texts.push(normalized);
         }
     }
 
@@ -607,8 +799,14 @@ impl TurnMachine {
     /// turns and no orphan, hold or cancel bookkeeping — the query it fed is gone.
     pub fn take_active_for_restart(&mut self) -> Option<Turn> {
         let mut turn = self.active.take().filter(|t| !t.settled)?;
+        // The fresh query has none of this one's background tasks, so a hold can
+        // never drain there: the continuation's own result settles the turn.
+        turn.deferred_settle = None;
         turn.carried = Some((self.accumulated_usage, self.accumulated_models.clone()));
-        self.queue.clear();
+        // Upstream drops the queue here (`oldSession.turnQueue = []`), leaving
+        // those prompts without a response; they are kept, so the fresh context
+        // can run and answer them.
+        self.restart_queue = self.queue.drain(..).filter(|t| !t.settled).collect();
         self.pending_orphan_results = 0;
         self.orphan_commands.clear();
         self.cancel_records.clear();
@@ -1114,7 +1312,7 @@ impl TurnMachine {
     /// here (review 04 #8). Returns no events.
     pub fn on_task_ended(&mut self, task_id: &str) -> Vec<TurnEvent> {
         self.live_subagents.remove(task_id);
-        self.forget_task_meta(task_id);
+        self.settle_live_task(task_id);
         Vec::new()
     }
 
@@ -1225,6 +1423,41 @@ impl TurnMachine {
         is_autonomous_result(result) && !self.answers_pending_prompt(result)
     }
 
+    /// Whether `on_result_finish` will swallow this user-lane result as the
+    /// empty-interruption diagnostic of a cancelled command
+    /// (`acp-agent.ts:7177-7197`): the swallow `break`s before
+    /// `clearFailuresFromEarlierTurns`. Read-only; mirrors the swallow check.
+    pub fn result_is_swallowed_diagnostic(&self, result: &Value) -> bool {
+        let is_error = result
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if self.cancelled
+            || !is_error
+            || !is_empty_user_interruption_diagnostic(result)
+            || self.empty_interruption_commands.is_empty()
+        {
+            return false;
+        }
+        match result.get("user_message_uuid").and_then(Value::as_str) {
+            None => true,
+            Some(stamp) => self.empty_interruption_commands.iter().any(|u| u == stamp),
+        }
+    }
+
+    /// Whether this result is the interrupted cycle's error diagnostic of a
+    /// steered turn that still has echoes pending (`acp-agent.ts:7259-7266`):
+    /// the turn keeps going, so the result does not fail it. Read-only.
+    pub fn result_is_steer_diagnostic(&self, result: &Value) -> bool {
+        result
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && self.active.as_ref().is_some_and(|t| {
+                is_steering_turn(t) && t.steered_echoes.as_ref().is_some_and(|s| !s.is_empty())
+            })
+    }
+
     fn answers_pending_prompt(&self, result: &Value) -> bool {
         let answered: Vec<&str> = match result.get("user_message_uuids").and_then(Value::as_array) {
             Some(uuids) => uuids.iter().filter_map(Value::as_str).collect(),
@@ -1283,8 +1516,41 @@ impl TurnMachine {
             // turn's (`ensure_active_turn` never looks at the map then).
             self.record_result_for_orphan_commands();
             self.ensure_active_turn(result, &mut events);
+            self.retire_named_steers(result);
         }
         ResultBegin { autonomous, events }
+    }
+
+    /// A result that names a steer consumed it, so the steered work is done:
+    /// retire its echo (the CLI may never have replayed it) and, with no other
+    /// steer outstanding, leave the steer lane so this result settles the turn
+    /// through the ordinary lanes and owes its trailing idle like any other. The
+    /// interrupted cycle's result names only the send it answered, so it stays
+    /// on the lane. A cancelled turn's steers are `cancel()`'s to account for
+    /// (`acp-agent.ts:6811-6853`, issue #1114).
+    fn retire_named_steers(&mut self, result: &Value) {
+        if self.cancelled {
+            return;
+        }
+        let Some(turn) = self.active.as_mut().filter(|t| is_steering_turn(t)) else {
+            return;
+        };
+        let mut answers_steer = false;
+        for uuid in result_stamps(result) {
+            if let Some(echoes) = turn.steered_echoes.as_mut() {
+                echoes.retain(|e| e != uuid);
+            }
+            if turn.steered_uuids.iter().any(|s| s == uuid) {
+                answers_steer = true;
+            }
+        }
+        let drained = turn.steered_echoes.as_ref().is_some_and(Vec::is_empty);
+        if answers_steer && drained {
+            turn.steered_echoes = None;
+            turn.steered_uuids.clear();
+            turn.steered_awaiting_result = false;
+            turn.steered_settle = None;
+        }
     }
 
     /// The second half of [`Self::on_result`] (see [`Self::on_result_begin`]).
@@ -1298,6 +1564,7 @@ impl TurnMachine {
             autonomous: is_autonomous,
             mut events,
         } = begin;
+        let exit_plan_interruption = self.exit_plan_interruption.take();
         let is_error = result
             .get("is_error")
             .and_then(Value::as_bool)
@@ -1334,9 +1601,12 @@ impl TurnMachine {
         // A model cycle that Claude Code started on its own ends at its result —
         // also after a cancel. A turn that Claude Code takes in takes the cycle
         // over, so a cycle that still runs owns this result, whatever its origin
-        // says (`acp-agent.ts:7026-7056`).
-        if !placeholder {
-            self.autonomous_cycle = false;
+        // says (`acp-agent.ts:7026-7056`). A held turn that continues an accepted
+        // plan in a fresh context takes the cycle over instead.
+        let continues_plan = exit_plan_interruption == Some(ExitPlanVerdict::ContextReset)
+            && self.active.as_ref().is_some_and(is_held_turn);
+        if !placeholder && !continues_plan && std::mem::take(&mut self.autonomous_cycle) {
+            events.push(TurnEvent::CycleEnded);
         }
         if is_autonomous {
             self.owed_trailing_idles += 1;
@@ -1350,6 +1620,22 @@ impl TurnMachine {
                 if self.active.as_ref().is_some_and(is_held_turn) && is_aborted_result(result) {
                     let (usage, rows) = self.cancelled_outcome_usage();
                     self.settle_with_usage(StopReason::Cancelled, usage, rows, &mut events);
+                }
+                return events;
+            }
+            // A held turn's follow-up can itself plan: the interrupted cycle's
+            // diagnostic carries that cycle's origin and lands here. "No, keep
+            // planning" ends the held turn `cancelled` with the usage its own
+            // result recorded, still held while other subagents it spawned are
+            // live (`acp-agent.ts:7108-7141`).
+            if let Some(verdict) =
+                exit_plan_interruption.filter(|_| self.active.as_ref().is_some_and(is_held_turn))
+            {
+                match verdict {
+                    ExitPlanVerdict::KeepPlanning => self.settle_held_cancelled(&mut events),
+                    ExitPlanVerdict::ContextReset => {
+                        self.restart_turn = self.take_active_for_restart()
+                    }
                 }
                 return events;
             }
@@ -1457,9 +1743,30 @@ impl TurnMachine {
         // unused hand-off token swallow a later turn's real interruption failure.
         self.empty_interruption_commands.clear();
 
+        // "No, keep planning" interrupts the turn: Claude represents the
+        // intentional stop as an error-shaped diagnostic, which ends the turn
+        // `cancelled` (`acp-agent.ts:7216-7238`).
+        if let Some(verdict) = exit_plan_interruption {
+            match verdict {
+                ExitPlanVerdict::KeepPlanning => {
+                    self.settle_or_defer(StopReason::Cancelled, &mut events)
+                }
+                ExitPlanVerdict::ContextReset => {
+                    self.restart_turn = self.take_active_for_restart();
+                }
+            }
+            return events;
+        }
+
         // A refusal can arrive on any result subtype (and may set is_error) —
         // handle it before the subtype switch (`ADP:2736-2753`).
         if stop_reason == "refusal" {
+            // The refused message carries no visible content: surface the
+            // classifier's explanation (when available) before the turn ends
+            // (`acp-agent.ts:7254-7263`).
+            if let Some(text) = self.refusal_explanation.clone().filter(|t| !t.is_empty()) {
+                events.push(TurnEvent::RefusalText { text });
+            }
             self.settle_or_defer(StopReason::Refusal, &mut events);
             return events;
         }
@@ -1479,12 +1786,16 @@ impl TurnMachine {
 
         // The subtype table, mirroring `ADP:2771-2848` case by case (review 04
         // #6): `max_tokens` is checked before `is_error` for success /
-        // error_during_execution only; /login applies to success regardless of
-        // is_error; the error_max_* subtypes fail on is_error with their
+        // error_during_execution only; /login applies to an error success result;
+        // the error_max_* subtypes fail on is_error with their
         // category, else map to max_turn_requests.
         match subtype {
             "success" => {
-                if result_text.contains("Please run /login") {
+                // B-119: only an error result is the CLI's sign-in prompt
+                // (`message.is_error && message.result.includes("Please run
+                // /login")`, `acp-agent.ts:7310`); a plain success that
+                // mentions the command is an ordinary answer.
+                if is_error && result_text.contains("Please run /login") {
                     self.fail_active(
                         FailureKind::AuthRequired,
                         result_text.to_string(),
@@ -1521,7 +1832,14 @@ impl TurnMachine {
                     .as_ref()
                     .map(Turn::is_local_only_command)
                     .unwrap_or(false);
-                if (is_local || (!assistant_text_delivered && output_tokens == 0))
+                // A notice is not an answer: a result that only repeats the
+                // informational text shown for this turn is not forwarded again.
+                let repeats_notice = self.active.as_ref().is_some_and(|turn| {
+                    turn.notice_texts
+                        .contains(&crate::notices::normalize_notice_text(result_text))
+                });
+                if (is_local
+                    || (!assistant_text_delivered && output_tokens == 0 && !repeats_notice))
                     && !result_text.is_empty()
                 {
                     events.push(TurnEvent::FinalText {
@@ -1683,8 +2001,8 @@ impl TurnMachine {
         // come (the stream dropped mid-cycle), so the cycle ends here. An owed idle
         // belongs to an earlier result: it can lag past the cycle's first output
         // (`acp-agent.ts:6110-6125`).
-        if self.owed_trailing_idles == 0 {
-            self.autonomous_cycle = false;
+        if self.owed_trailing_idles == 0 && std::mem::take(&mut self.autonomous_cycle) {
+            events.push(TurnEvent::CycleEnded);
         }
         if self.cancelled && self.active.as_ref().is_some_and(|t| !t.settled) {
             // A cancelled turn settles at idle (its result was dropped). A held
@@ -2039,9 +2357,15 @@ impl TurnMachine {
     /// Whether any subagent this turn spawned is still live — while true the
     /// turn's settlement stays deferred (`turnAwaitingSubagents`).
     fn turn_awaiting_subagents(&self, turn: &Turn) -> bool {
-        turn.spawned_task_ids
-            .iter()
-            .any(|id| self.live_subagents.get(id).copied().unwrap_or(false))
+        // A subagent the level signal ended is kept for attribution only: a hold
+        // must not wait on it (`record.isSubagent && !record.endedPerLevel`).
+        turn.spawned_task_ids.iter().any(|id| {
+            self.live_subagents.get(id).copied().unwrap_or(false)
+                && self
+                    .task_meta
+                    .get(id)
+                    .is_none_or(|meta| meta.ended_per_level.is_none())
+        })
     }
 
     /// Settle the active turn's stored deferred outcome once none of its
@@ -2106,6 +2430,33 @@ impl TurnMachine {
                 });
             }
         }
+    }
+
+    /// `settleOrDefer({ ...heldTurn.deferredSettle, stopReason: "cancelled" })`:
+    /// the held turn ends cancelled with the usage its own result recorded, or
+    /// keeps holding with that outcome while other subagents it spawned live.
+    fn settle_held_cancelled(&mut self, events: &mut Vec<TurnEvent>) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let Some(deferred) = active.deferred_settle.clone() else {
+            return;
+        };
+        if self.turn_awaiting_subagents(active) {
+            if let Some(active) = self.active.as_mut() {
+                active.deferred_settle = Some(DeferredSettle {
+                    stop_reason: StopReason::Cancelled,
+                    ..deferred
+                });
+            }
+            return;
+        }
+        self.settle_with_usage(
+            StopReason::Cancelled,
+            deferred.usage,
+            deferred.models,
+            events,
+        );
     }
 
     /// Settle the active turn exactly once and clear the active slot. Ports
@@ -2202,6 +2553,13 @@ impl TurnMachine {
         self.accumulated_usage = carried_usage;
         self.accumulated_models = carried_models;
         self.last_assistant_model = None;
+        self.refusal_explanation = None;
+        // Two-phase sweep of the entries the level signal ended. Local-only
+        // commands do not advance the clock: they interact with no tasks, and two
+        // quick `/context` calls would burn the whole grace period.
+        if !queued.is_local_only_command {
+            self.sweep_ended_tasks();
+        }
         let prompt_uuid = queued.prompt_uuid.clone();
         self.active = Some(queued);
         events.push(TurnEvent::Activated { prompt_uuid });
@@ -2316,3 +2674,7 @@ mod turn_tests;
 mod turn_tests_t1a;
 #[cfg(test)]
 mod turn_tests_t1fa;
+#[cfg(test)]
+mod turn_tests_t2a;
+#[cfg(test)]
+mod turn_tests_t3a;

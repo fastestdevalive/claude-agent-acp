@@ -1,0 +1,18 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "projects/$CWD_SLUG/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl", "from": "seeds/session-a.jsonl", "mtime": 1767225600},
+    {"path": "projects/$CWD_SLUG/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl", "from": "seeds/session-b.jsonl", "mtime": 1767312000}
+  ],
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["sessionIndex"]}}}},
+    {"call": "request", "method": "_session/list/subscribe", "expect_error": true, "params": {"cwd": "relative/path"}},
+    {"call": "request", "method": "_session/list/unsubscribe", "expect_error": true, "params": {}},
+    {"call": "request", "method": "_session/list/subscribe", "params": {"cwd": "$CWD", "ignored": true}},
+    {"call": "request", "method": "_session/rename", "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "title": "Pushed rename"}},
+    {"call": "wait_recv", "contains": "Pushed rename\",\"updatedAt"},
+    {"call": "request", "method": "_session/archive", "params": {"sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}},
+    {"call": "wait_recv", "contains": "\"archived\":true"},
+    {"call": "request", "method": "_session/list/unsubscribe", "params": {"subscriptionId": "00000000-0000-4000-8000-000000000000"}}
+  ]
+}

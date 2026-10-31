@@ -28,12 +28,19 @@ const STOPPED_BEFORE_RAN: &str = "Claude stopped this tool call before it ran.";
 /// Closing text for a dispatched tool call the turn ended without a result for.
 const ENDED_WITHOUT_RESULT: &str =
     "Claude ended the turn without returning a result for this tool.";
+/// Closing text for a tool call a `session/cancel` stopped before it returned.
+const CANCELLED_BEFORE_RESULT: &str =
+    "The turn was cancelled before this tool call returned a result.";
+
+/// `MAX_DISPATCHED_TOOL_CALLS` (`acp-agent.ts:12858`).
+const MAX_DISPATCHED_TOOL_CALLS: usize = 1000;
 
 /// Per-session books for the unfinished-tool check.
 #[derive(Debug, Default)]
 pub struct ToolBooks {
-    /// `tool_use` ids of complete assistant messages (`dispatchedToolCalls`).
-    dispatched: HashSet<String>,
+    /// `tool_use` ids of complete assistant messages (`dispatchedToolCalls`),
+    /// oldest first, at most [`MAX_DISPATCHED_TOOL_CALLS`].
+    dispatched: Vec<String>,
     /// Foreground tool-call ids surfaced while a turn was current, in
     /// insertion order, keyed by that turn's `prompt_uuid`.
     foreground: HashMap<String, Vec<String>>,
@@ -52,9 +59,25 @@ impl ToolBooks {
                 Some("tool_use" | "server_tool_use" | "mcp_tool_use")
             );
             if let (true, Some(id)) = (is_tool_use, block["id"].as_str()) {
-                self.dispatched.insert(id.to_string());
+                self.record_dispatched_call(id);
             }
         }
+    }
+
+    /// `recordDispatchedToolCall`: a repeated id moves to the end, the oldest is
+    /// dropped past the cap.
+    pub fn record_dispatched_call(&mut self, id: &str) {
+        self.dispatched.retain(|existing| existing != id);
+        self.dispatched.push(id.to_string());
+        if self.dispatched.len() > MAX_DISPATCHED_TOOL_CALLS {
+            self.dispatched.remove(0);
+        }
+    }
+
+    /// Whether Claude Code sent the tool call to the tool runner
+    /// (`dispatchedToolCalls.has`).
+    pub fn is_dispatched(&self, id: &str) -> bool {
+        self.dispatched.iter().any(|existing| existing == id)
     }
 
     /// Record a surfaced top-level `tool_call` under the current turn
@@ -75,7 +98,7 @@ impl ToolBooks {
         for ids in self.foreground.values_mut() {
             ids.retain(|existing| existing != id);
         }
-        self.dispatched.remove(id);
+        self.dispatched.retain(|existing| existing != id);
     }
 
     /// A background task registered for tool call `id` (`registerLiveTask`):
@@ -93,19 +116,121 @@ impl ToolBooks {
 }
 
 /// The closing `tool_call_update` for a tool call the turn ended without a
-/// result for (`AcpToolCallRenderer.unfinished`, v1 clients: `failed`).
-fn unfinished_update(id: &str, ran: bool) -> SessionUpdate {
-    let text = if ran {
-        ENDED_WITHOUT_RESULT
-    } else {
+/// result for (`AcpToolCallRenderer.unfinished`, v1 clients: `failed`), with
+/// the exit of its display terminal (`terminalExit`, T-84) and the Agent/Task
+/// call of the subagent that made it (`stampParentToolUseId`).
+///
+/// The report ends the call: it is forgotten here, before the update is sent,
+/// so a late hook or a second close cannot overwrite it (`closeToolCall`,
+/// `acp-agent.ts:5222-5235`).
+fn closing_report(state: &mut MapState, id: &str, ran: bool, cancelled: bool) -> SessionUpdate {
+    let text = if !ran {
         STOPPED_BEFORE_RAN
+    } else if cancelled {
+        CANCELLED_BEFORE_RESULT
+    } else {
+        ENDED_WITHOUT_RESULT
     };
+    // Read before the cache entry goes: it names the tool.
+    let tool_name = state
+        .tool_use_from_cache(id)
+        .and_then(|tool_use| tool_use.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let parent = state.tool_call_parent(id).map(str::to_string);
+    let mut meta = serde_json::Map::new();
+    if let Some(exit) = tool_name
+        .as_deref()
+        .and_then(|name| state.terminal_exit_meta(name, id))
+    {
+        meta.extend(exit);
+    }
+    crate::tool_meta::stamp_parent(&mut meta, parent.as_deref());
+    state.close_tool_call(id);
     let fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::Failed)
         .content(vec![ToolCallContent::from(ContentBlock::Text(
             TextContent::new(text),
         ))]);
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.to_string(), fields))
+    let mut update = ToolCallUpdate::new(id.to_string(), fields);
+    if !meta.is_empty() {
+        update = update.meta(meta);
+    }
+    SessionUpdate::ToolCallUpdate(update)
+}
+
+/// End the open tool calls that `include` accepts with the report of a call a
+/// cancel stopped and sent no result for (`closeOpenToolCalls`,
+/// `acp-agent.ts:5263-5278`). `include` gets the Agent/Task call of the subagent
+/// that made the tool call, if a subagent did.
+pub fn close_open_tool_calls(
+    state: &mut MapState,
+    include: &dyn Fn(&MapState, Option<&str>) -> bool,
+) -> Vec<SessionUpdate> {
+    let mut updates = Vec::new();
+    for id in state.emitted_ids() {
+        let parent = state.tool_call_parent(&id).map(str::to_string);
+        if !include(state, parent.as_deref()) {
+            continue;
+        }
+        let ran = state.books.is_dispatched(&id);
+        updates.push(closing_report(state, &id, ran, true));
+    }
+    updates
+}
+
+/// Whether the closing at the end of the work a cancel stopped takes a tool call
+/// made by the subagent of the Agent call `parent` (`None` for a call of the
+/// main conversation): not one of a running background subagent, which the
+/// cancel may not have stopped (`closedAtCancel`).
+fn closed_at_cancel(state: &MapState, parent: Option<&str>) -> bool {
+    parent.is_none_or(|parent| !state.runs_in_background(parent))
+}
+
+/// Close the tool calls the work a cancel stopped left open
+/// (`closeCancelledToolCalls`): a tool of a subagent (Claude Code writes its
+/// interrupted result only to the subagent's own transcript), a call Claude
+/// abandoned before it ran, and every call when the stream gives no results at
+/// all (the force-cancel backstop). A background subagent keeps its calls open.
+pub fn close_cancelled_tool_calls(state: &mut MapState) -> Vec<SessionUpdate> {
+    close_open_tool_calls(state, &closed_at_cancel)
+}
+
+/// The model cycle that Claude Code started on its own ends: close what it left
+/// open first (`closeCycleToolCalls`, `acp-agent.ts:5391-5404`). After a cancel
+/// that is [`close_cancelled_tool_calls`]; at any other end every call that ran
+/// has its result, so what is open is a call of the main conversation that
+/// Claude abandoned before it ran. A background subagent's calls are not the
+/// cycle's.
+pub fn close_cycle_tool_calls(state: &mut MapState) -> Vec<SessionUpdate> {
+    if state.is_stopped_work() {
+        return close_cancelled_tool_calls(state);
+    }
+    let mut updates = Vec::new();
+    for id in state.emitted_ids() {
+        if state.tool_call_parent(&id).is_some() || state.books.is_dispatched(&id) {
+            continue;
+        }
+        updates.push(closing_report(state, &id, false, false));
+    }
+    updates
+}
+
+/// Close the tool calls of the subagent that the Agent call `agent_tool_use_id`
+/// started, once the SDK reports it stopped after a cancel stopped it and the
+/// work that waited on it ended (`closeStoppedSubagentToolCalls`,
+/// `acp-agent.ts:5320-5326`). While the work still runs, the stopped subagent's
+/// calls get Claude Code's result, or [`close_cancelled_tool_calls`] at the
+/// work's end.
+pub fn close_stopped_subagent_tool_calls(
+    state: &mut MapState,
+    work_end_reported: bool,
+    agent_tool_use_id: &str,
+) -> Vec<SessionUpdate> {
+    if agent_tool_use_id.is_empty() || !state.is_stopped_work() || !work_end_reported {
+        return Vec::new();
+    }
+    close_open_tool_calls(state, &|_, parent| parent == Some(agent_tool_use_id))
 }
 
 /// Apply the check to one batch of events. Returns the (possibly rewritten)
@@ -138,16 +263,14 @@ pub fn gate_events(
                     .into_iter()
                     .partition(|id| state.books.dispatched.contains(id));
                 for id in &abandoned {
-                    updates.push(unfinished_update(id, false));
-                    state.close_tool_call(id);
+                    updates.push(closing_report(state, id, false, false));
                 }
                 if stuck.is_empty() {
                     out.push(event);
                     continue;
                 }
                 for id in &stuck {
-                    updates.push(unfinished_update(id, true));
-                    state.close_tool_call(id);
+                    updates.push(closing_report(state, id, true, false));
                 }
                 out.push(TurnEvent::Failed {
                     prompt_uuid: prompt_uuid.clone(),
@@ -161,8 +284,22 @@ pub fn gate_events(
                     is_structured_output_retries: false,
                 });
             }
-            // Cancelled / other settles and failures never run the check, but
-            // their turn's books must not leak.
+            // A turn a cancel stopped ends with every tool call the work left open
+            // closed, the client being told the work ended only after that
+            // (`settleActive`, `acp-agent.ts:5480-5484`). A turn swept from the
+            // queue (`had_usage: false`) never ran: it opened no call.
+            TurnEvent::Settled {
+                ref prompt_uuid,
+                stop_reason: StopReason::Cancelled,
+                had_usage: true,
+                ..
+            } if state.is_stopped_work() => {
+                state.books.take_turn(prompt_uuid);
+                updates.extend(close_cancelled_tool_calls(state));
+                out.push(event);
+            }
+            // Other settles and failures never run the check, but their turn's
+            // books must not leak.
             TurnEvent::Settled {
                 ref prompt_uuid, ..
             }
@@ -172,6 +309,9 @@ pub fn gate_events(
                 state.books.take_turn(prompt_uuid);
                 out.push(event);
             }
+            // The model cycle Claude Code started on its own ended: what it left
+            // open closes before its end is reported.
+            TurnEvent::CycleEnded => updates.extend(close_cycle_tool_calls(state)),
             other => out.push(other),
         }
     }

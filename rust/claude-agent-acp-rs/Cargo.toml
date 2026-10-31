@@ -17,6 +17,9 @@ thiserror = "1"
 # WHATWG URL parsing for the WebFetch "don't ask again for <hostname>" permission option
 # (upstream uses `new URL(..).hostname`); a hand-rolled parser mis-reads `https://evil.com\@trusted.com/`.
 url = "2"
+# Gateway model listing (GET /v1/models, GET /foundation-models; upstream `fetch`). Platform-native TLS (schannel / Security.framework /
+# OpenSSL): a rustls provider needs a C cross-compiler for ring/aws-lc (see DECISIONS D10).
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "user"] }

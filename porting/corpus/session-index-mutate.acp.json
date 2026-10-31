@@ -1,0 +1,26 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "projects/$CWD_SLUG/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl", "from": "seeds/session-a.jsonl", "mtime": 1767225600},
+    {"path": "projects/$CWD_SLUG/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl", "from": "seeds/session-b.jsonl", "mtime": 1767312000},
+    {"path": "projects/$CWD_SLUG/cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl", "from": "seeds/idx-archived.jsonl", "mtime": 1767398400}
+  ],
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["sessionIndex"]}}}},
+    {"call": "request", "method": "_session/rename", "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "title": "  Renamed   build\n explainer "}},
+    {"call": "request", "method": "_session/archive", "params": {"sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}},
+    {"call": "request", "method": "_session/archive", "params": {"sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}},
+    {"call": "request", "method": "_session/unarchive", "params": {"sessionId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"}},
+    {"call": "request", "method": "_session/unarchive", "params": {"sessionId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"}},
+    {"call": "request", "method": "_session/rename", "params": {"sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "title": "Kept archived"}},
+    {"call": "request", "method": "session/list", "params": {"_meta": {"jetbrains": {"air": {"version": 1, "list": {"archived": "all"}}}}}},
+    {"call": "request", "method": "session/list", "params": {}},
+    {"call": "request", "method": "_session/rename", "expect_error": true, "params": {"sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "title": "Nobody"}},
+    {"call": "request", "method": "_session/archive", "expect_error": true, "params": {"sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"}},
+    {"call": "request", "method": "_session/unarchive", "expect_error": true, "params": {"sessionId": "not-a-session-id"}},
+    {"call": "request", "method": "_session/archive", "expect_error": true, "params": {"sessionId": "  "}},
+    {"call": "request", "method": "_session/archive", "expect_error": true, "params": {}},
+    {"call": "request", "method": "_session/rename", "expect_error": true, "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "title": "   "}},
+    {"call": "request", "method": "_session/rename", "expect_error": true, "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}
+  ]
+}

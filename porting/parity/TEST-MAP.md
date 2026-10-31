@@ -42,7 +42,7 @@ src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > skips the initi
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > still calls setModel when the allowlist synthesizes a value the SDK has not surfaced | ported:tests/t1b_model.rs::allowlist_synthesized_value_still_calls_set_model | 
 src/tests/acp-agent.test.ts | task plan lifecycle > republishes the session task snapshot when a follow-up prompt starts | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task plan lifecycle > does not republish a completed plan on an unrelated follow-up | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | task plan lifecycle > clears the task plan on a conversation reset | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | task plan lifecycle > clears the task plan on a conversation reset | covered:frame-conversation-reset | plan cleared by the reset (corpus + session/tests_t2a.rs t2a_conversation_reset_clears_the_session_books)
 src/tests/acp-agent.test.ts | ACP subprocess integration > should connect to the ACP subprocess | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | ACP subprocess integration > should include available commands | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | ACP subprocess integration > /compact works | missing:T-UNCLASSIFIED | 
@@ -103,20 +103,20 @@ src/tests/acp-agent.test.ts | stripLocalCommandMetadata > returns null when ever
 src/tests/acp-agent.test.ts | stripLocalCommandMetadata > strips tags inside a text block while keeping the trailing prose | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stripLocalCommandMetadata > leaves non-text blocks alone | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stripLocalCommandMetadata > handles null/undefined/non-container shapes | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > keeps the expected experimental SDK response shape compile- and runtime-checked | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > renders limits, session totals, and MCP contributions from structured data | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > escapes and limits MCP contribution rows | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > recognizes only exact local usage commands | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > omits the limits section when every utilization is unavailable | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > replaces the exact SDK /usage turn output with structured Markdown | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > forwards a later diagnostic from the same local-command output lane | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > does not append usage Markdown to a model-generated /usage result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > runs the original command and preserves its raw output when %s | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage Markdown > cancels a turn while structured usage is pending without publishing fallback output | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | usage Markdown > keeps the expected experimental SDK response shape compile- and runtime-checked | ported:src/usage_markdown.rs::keeps_the_expected_experimental_sdk_response_shape | 
+src/tests/acp-agent.test.ts | usage Markdown > renders limits, session totals, and MCP contributions from structured data | ported:src/usage_markdown.rs::renders_limits_session_totals_and_mcp_contributions | 
+src/tests/acp-agent.test.ts | usage Markdown > escapes and limits MCP contribution rows | ported:src/usage_markdown.rs::escapes_and_limits_mcp_contribution_rows | 
+src/tests/acp-agent.test.ts | usage Markdown > recognizes only exact local usage commands | ported:src/usage_markdown.rs::recognizes_only_exact_local_usage_commands | 
+src/tests/acp-agent.test.ts | usage Markdown > omits the limits section when every utilization is unavailable | ported:src/usage_markdown.rs::omits_the_limits_section_when_every_utilization_is_unavailable | 
+src/tests/acp-agent.test.ts | usage Markdown > replaces the exact SDK /usage turn output with structured Markdown | missing:F24 | needs the /usage command in the session (S-01/N-10, Turn 4 lane A)
+src/tests/acp-agent.test.ts | usage Markdown > forwards a later diagnostic from the same local-command output lane | missing:F24 | needs local_command_output handling (N-10, Turn 4 lane A)
+src/tests/acp-agent.test.ts | usage Markdown > does not append usage Markdown to a model-generated /usage result | missing:F24 | needs the /usage command in the session (S-01/N-10, Turn 4 lane A)
+src/tests/acp-agent.test.ts | usage Markdown > runs the original command and preserves its raw output when %s | missing:F24 | needs the /usage command in the session (S-01/N-10, Turn 4 lane A)
+src/tests/acp-agent.test.ts | usage Markdown > cancels a turn while structured usage is pending without publishing fallback output | missing:F24 | needs cancel/pending wiring (S-01, Turn 4 lane A)
 src/tests/acp-agent.test.ts | isLocalCommandMetadata > is true when stripping leaves nothing | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | isLocalCommandMetadata > is false when real content survives stripping | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | synthetic login message (issue #863) > isSyntheticLoginMessage matches the CLI auth-error message | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | synthetic login message (issue #863) > isSyntheticLoginMessage does not match real assistant messages | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | synthetic login message (issue #863) > isSyntheticLoginMessage matches the CLI auth-error message | ported:src/session/tests_t2a.rs::t2a_synthetic_login_message_matching | matches the CLI auth-error message
+src/tests/acp-agent.test.ts | synthetic login message (issue #863) > isSyntheticLoginMessage does not match real assistant messages | ported:src/session/tests_t2a.rs::t2a_synthetic_login_message_matching | real assistant messages do not match
 src/tests/acp-agent.test.ts | synthetic login message (issue #863) > loadSession replay hands the client the prompt without the reminder appended to it | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | synthetic login message (issue #863) > loadSession replay skips the synthetic login message but keeps the rest | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > hides the notification and restores the task state like the live frame | missing:T-UNCLASSIFIED | 
@@ -132,12 +132,12 @@ src/tests/acp-agent.test.ts | task notification replay > restores the notified s
 src/tests/acp-agent.test.ts | task notification replay > keeps a task-notification delivery with a subkind as a prompt | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | meta messages from other agents, sessions and channels > isReplayHiddenMetaMessage matches only meta messages with an inter-agent origin | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | meta messages from other agents, sessions and channels > loadSession replay skips them but keeps the user's own prompt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage-limit failure replay > restores the latest synthetic usage limit as a typed failure | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage-limit failure replay > keeps a recovered historical failure as a typed transcript record | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage-limit failure replay > preserves the standard transcript for clients without the extension | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | usage-limit failure replay > restores the latest synthetic usage limit as a typed failure | ported:src/transcript.rs::t3a_replay_restores_usage_limit_failures_at_their_position | covered too by scenario session-failure-replay-usage-limit
+src/tests/acp-agent.test.ts | usage-limit failure replay > keeps a recovered historical failure as a typed transcript record | ported:src/transcript.rs::t3a_replay_limit_followed_by_a_real_answer_is_not_active | 
+src/tests/acp-agent.test.ts | usage-limit failure replay > preserves the standard transcript for clients without the extension | ported:src/transcript.rs::t3a_replay_restores_usage_limit_failures_at_their_position | plain-client half of the test
 src/tests/acp-agent.test.ts | usage-limit failure replay > clears the replayed failure after a successful follow-up | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > does not clear restored quota after a successful local command | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage-limit failure replay > replays every quota failure with its persisted turn id and keeps only the latest active | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | usage-limit failure replay > replays every quota failure with its persisted turn id and keeps only the latest active | covered:session-failure-replay-usage-limit | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > does not record a restored failure when publishing it fails | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > recognizes a sanitized raw transcript through the real SDK parser | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/list > returns one page and a cursor while more sessions exist | missing:T-UNCLASSIFIED | 
@@ -168,7 +168,7 @@ src/tests/acp-agent.test.ts | permission request cancellation > does not wait fo
 src/tests/acp-agent.test.ts | permission request cancellation > does not wait for $name when its client ignores cancellation | ported:src/session.rs::inv_27_no_inline_await | 
 src/tests/acp-agent.test.ts | permission request cancellation > observes a client rejection when the signal aborts during request creation | different:the permission request is enqueued synchronously on the outbound channel; there is no creation phase an abort can race | 
 src/tests/acp-agent.test.ts | permission request cancellation > does not wait for an eager tool-call update that ignores cancellation | different:the eager tool_call update is a channel send that never awaits the client | 
-src/tests/acp-agent.test.ts | permission request cancellation > clears pending ExitPlanMode state even after the query has closed | missing:F22 | ExitPlanMode pending state (B-75)
+src/tests/acp-agent.test.ts | permission request cancellation > clears pending ExitPlanMode state even after the query has closed | ported:src/session/tests_t3a.rs::t3a_cancel_forgets_the_pending_plan_markers | 
 src/tests/acp-agent.test.ts | permission request cancellation > does not emit or request permission for a pre-aborted tool call | missing:T-PORT | pre-aborted can_use_tool request; behaviour for a withdrawn request is the control.rs inflight abort
 src/tests/acp-agent.test.ts | permission request cancellation > allows a streamed tool call to retry after eager emission fails | missing:T-PORT | eager emission retry
 src/tests/acp-agent.test.ts | permission request cancellation > treats a cancelled permission outcome as an aborted tool use | ported:src/permission.rs::inv_21_deny_payload_and_continue | 
@@ -176,8 +176,8 @@ src/tests/acp-agent.test.ts | permission request cancellation > omits the durabl
 src/tests/acp-agent.test.ts | permission request cancellation > maps explicit reject to deny while retaining Claude classification | ported:src/permission.rs::inv_21_deny_payload_and_continue | 
 src/tests/acp-agent.test.ts | permission request cancellation > publishes the effective mode after %s approval | missing:F21 | ExitPlanMode mode publish / keep-planning interrupt
 src/tests/acp-agent.test.ts | permission request cancellation > keeps the plan approval when publishing the new mode fails | missing:F21 | ExitPlanMode mode publish / keep-planning interrupt
-src/tests/acp-agent.test.ts | permission request cancellation > interrupts the turn after an ExitPlanMode keep-planning rejection | missing:F21 | ExitPlanMode mode publish / keep-planning interrupt
-src/tests/acp-agent.test.ts | permission request cancellation > offers ExitPlanMode clear-context with measured usage and records the handoff | missing:F22 | ExitPlanMode clear-context
+src/tests/acp-agent.test.ts | permission request cancellation > interrupts the turn after an ExitPlanMode keep-planning rejection | covered:exit-plan-reject-interrupt | 
+src/tests/acp-agent.test.ts | permission request cancellation > offers ExitPlanMode clear-context with measured usage and records the handoff | covered:exit-plan-clear-context-label | also t3a_exit_plan_answers_record_the_pending_lanes
 src/tests/acp-agent.test.ts | permission request cancellation > maps Claude presentation fields without reconstructing provider text or changing input | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
 src/tests/acp-agent.test.ts | permission request cancellation > keeps concurrent permission requests independent even for the same tool call | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
 src/tests/acp-agent.test.ts | permission request cancellation > applies the exact representable provider updates described by the selected option | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
@@ -296,38 +296,38 @@ src/tests/acp-agent.test.ts | stop reason propagation > keeps the prior turn's c
 src/tests/acp-agent.test.ts | stop reason propagation > preserves live usage-limit prose for clients without typed failures | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > maps terminal subtype %s to %s | ported:src/turn/turn_tests.rs::result_subtype_grid | table-driven (.each/loop): every row of the table is asserted by the cited test
 src/tests/acp-agent.test.ts | stop reason propagation > rejects authentication_failed through ACP without an access update | covered:auth-required | 
-src/tests/acp-agent.test.ts | stop reason propagation > recovers auth_required internally after a successful auth_status | missing:F25 | session failure completion / auth recovery / worker shutdown
-src/tests/acp-agent.test.ts | stop reason propagation > keeps auth_required active when auth_status reports an error | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > recovers auth_required internally after a successful auth_status | ported:src/session/tests_t3a.rs::t3a_auth_status_frame_clears_auth_required_failures | 
+src/tests/acp-agent.test.ts | stop reason propagation > keeps auth_required active when auth_status reports an error | ported:src/session/tests_t3a.rs::t3a_auth_status_frame_clears_auth_required_failures | 
 src/tests/acp-agent.test.ts | stop reason propagation > does not republish auth_required when the result repeats the login text | missing:F25 | session failure completion / auth recovery / worker shutdown
-src/tests/acp-agent.test.ts | stop reason propagation > does not treat a successful answer mentioning /login as auth_required | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > does not treat a successful answer mentioning /login as auth_required | ported:src/turn/turn_tests_t3a.rs::t3a_login_text_without_is_error_is_an_ordinary_success | 
 src/tests/acp-agent.test.ts | stop reason propagation > rejects a later sign-out after a real model answer | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > publishes no retry warning for an authentication_failed api_retry | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > keeps the historical failure record unchanged after recovery | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > does not publish a clear record when the next turn is refused | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > does not publish clear records on repeated successful turns | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > logs loudly when a failure has no active turn to reject | missing:F25 | session failure completion / auth recovery / worker shutdown
-src/tests/acp-agent.test.ts | stop reason propagation > retains a replayed worker shutdown through later buffered activity | missing:F25 | session failure completion / auth recovery / worker shutdown
-src/tests/acp-agent.test.ts | stop reason propagation > returns an active-turn worker shutdown on PromptResponse only at live tail | missing:F25 | session failure completion / auth recovery / worker shutdown
-src/tests/acp-agent.test.ts | stop reason propagation > publishes an idle worker shutdown as a session update only | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > retains a replayed worker shutdown through later buffered activity | ported:src/session/tests_t3a.rs::t3a_worker_shutting_down_only_arms_the_signal | signal stays armed until the transport ends
+src/tests/acp-agent.test.ts | stop reason propagation > returns an active-turn worker shutdown on PromptResponse only at live tail | covered:session-failure-worker-shutdown | 
+src/tests/acp-agent.test.ts | stop reason propagation > publishes an idle worker shutdown as a session update only | covered:session-failure-worker-shutdown-idle | 
 src/tests/acp-agent.test.ts | stop reason propagation > ignores a late worker shutdown from a replaced query consumer | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > uses a fresh session-scoped failure identity for each query-stream consumer | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > publishes and returns a sanitized transport failure when the query iterator throws | ported:src/session/tests_t1ga.rs::t1ga_air_child_death_ends_the_active_turn_with_transport_lost | AIR active turn ends end_turn with transport_lost meta; also t1ga_air_child_death_without_an_active_turn_publishes_the_failure_on_the_session and the Node-captured process-death-active-air / process-death-reload-air
 src/tests/acp-agent.test.ts | stop reason propagation > forwards SDKAssistantMessage.error as structured data on internal errors | covered:session-failure-provider-error | 
 src/tests/acp-agent.test.ts | stop reason propagation > omits errorKind data when no SDKAssistantMessage.error was observed | covered:error-result | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > notifies the user and reconciles model state on model_refusal_fallback | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > includes the refusal explanation in the fallback notice when present | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > publishes the model fallback as a warning advisory for AIR clients | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > publishes the model fallback as a notice for clients on the notice contract | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > moves an over-long model fallback summary under a generic notice title | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > puts only a genuinely long model fallback explanation in details | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > tracks the raw model id when the fallback model is not among the options | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > skips the config update when the fallback equals the tracked model | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > surfaces the structured explanation when a refusal has no fallback | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > does not persist the swap for a turn-only fallback (direction revert) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > does not swap the session model for a local-scope fallback | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | model refusal fallback handling > notifies the user and reconciles model state on model_refusal_fallback | covered:frame-model-fallback | notice and model state sync
+src/tests/acp-agent.test.ts | model refusal fallback handling > includes the refusal explanation in the fallback notice when present | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_notice_and_transcript | explanation in the notice
+src/tests/acp-agent.test.ts | model refusal fallback handling > publishes the model fallback as a warning advisory for AIR clients | covered:frame-api-retry-air | warning advisory for AIR
+src/tests/acp-agent.test.ts | model refusal fallback handling > publishes the model fallback as a notice for clients on the notice contract | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_notice_and_transcript | notice on the notice contract
+src/tests/acp-agent.test.ts | model refusal fallback handling > moves an over-long model fallback summary under a generic notice title | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_long_text_layout | over-long summary under a generic title
+src/tests/acp-agent.test.ts | model refusal fallback handling > puts only a genuinely long model fallback explanation in details | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_advisory_for_air | long explanation only in details
+src/tests/acp-agent.test.ts | model refusal fallback handling > tracks the raw model id when the fallback model is not among the options | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_sync_skips_the_tracked_model | raw id tracked
+src/tests/acp-agent.test.ts | model refusal fallback handling > skips the config update when the fallback equals the tracked model | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_sync_skips_the_tracked_model | no update for the tracked model
+src/tests/acp-agent.test.ts | model refusal fallback handling > surfaces the structured explanation when a refusal has no fallback | covered:frame-refusal | structured explanation without a fallback
+src/tests/acp-agent.test.ts | model refusal fallback handling > does not persist the swap for a turn-only fallback (direction revert) | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_revert_and_local_do_not_sync | direction revert
+src/tests/acp-agent.test.ts | model refusal fallback handling > does not swap the session model for a local-scope fallback | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_revert_and_local_do_not_sync | local scope
 src/tests/acp-agent.test.ts | model refusal fallback handling > keeps the current permission modes when the fallback model is unknown | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > keeps the banner explanation when the refusal frame arrives after it without stop_details | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > ignores a non-human-authored refusal banner (refused_user_message_uuid null) | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | model refusal fallback handling > keeps the banner explanation when the refusal frame arrives after it without stop_details | ported:src/session/tests_t2a.rs::t2a_refusal_banner_survives_a_frame_without_details_and_does_not_taint_the_next_turn | banner kept
+src/tests/acp-agent.test.ts | model refusal fallback handling > ignores a non-human-authored refusal banner (refused_user_message_uuid null) | ported:src/session/tests_t2a.rs::t2a_refusal_explanation_streams_at_the_result | non-human-authored banner ignored
 src/tests/acp-agent.test.ts | terminal slash command filtering > latches init's terminal_slash_commands and re-advertises without them | covered:terminal-commands | corpus terminal-commands (T1-G9a) |
 src/tests/acp-agent.test.ts | terminal slash command filtering > does not re-advertise when a later init repeats the same latch | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | skill commands in available_commands_update > marks a skill with a SKILL.md on disk for an AIR client | missing:T-UNCLASSIFIED | 
@@ -434,15 +434,15 @@ src/tests/acp-agent.test.ts | assembled assistant text fallback > preserves the 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > emits a completed compaction tool call for a terminal-only result | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > uses compaction deltas as a single heartbeat without exposing the summary | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > does not let a previous turn's lagging idle reset the active compaction | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > marks informational notices with metadata | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > marks informational notices with metadata | covered:frame-informational | informational metadata
 src/tests/acp-agent.test.ts | assembled assistant text fallback > marks info-level notices even when their text has no severity prefix | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > delivers an informational frame as a notice and still owns the result text | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > delivers an informational frame as a notice and still owns the result text | ported:src/session/tests_t2a.rs::t2a_informational_notice_dedupes_and_owns_the_result_text | notice owns the result text
 src/tests/acp-agent.test.ts | assembled assistant text fallback > records the notice against the queued turn when the hook blocks before any echo | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > collapses repeated tool-use progress into one notice and drops transcript-only info | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > still forwards a replayed answer that an info notice merely preceded | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > maps the SDK's gray informational levels to info notices | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > maps the SDK's gray informational levels to info notices | covered:frame-informational-notice | gray levels as info notices
 src/tests/acp-agent.test.ts | assembled assistant text fallback > still forwards the result text after a turn failed without a result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > does not let a refusal explanation suppress the next turn's fallback | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > does not let a refusal explanation suppress the next turn's fallback | ported:src/session/tests_t2a.rs::t2a_refusal_banner_survives_a_frame_without_details_and_does_not_taint_the_next_turn | next turn fallback not suppressed
 src/tests/acp-agent.test.ts | assembled assistant text fallback > forwards the result text when the backend omits output_tokens | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > forwards the result text when only subagent content preceded it | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | emitRawSDKMessages > emits all raw messages when set to true | covered:raw-sdk-messages | `_claude/sdkMessage` before each mapped update, Node-captured |
@@ -456,9 +456,9 @@ src/tests/acp-agent.test.ts | result origin handling > forwards origin in usage_
 src/tests/acp-agent.test.ts | result origin handling > carries only the model in _meta when origin is absent | covered:cancel-stream-drop | 
 src/tests/acp-agent.test.ts | result origin handling > task-notification result with max_tokens does not override the user-turn stopReason | ported:src/turn/turn_tests.rs::autonomous_result_does_not_touch_live_turn | 
 src/tests/acp-agent.test.ts | result origin handling > user-prompted result with max_tokens still sets stopReason | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
-src/tests/acp-agent.test.ts | memory_recall handling > emits a synthetic tool_call for select mode with one location per memory | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | memory_recall handling > uses singular 'memory' in title when exactly one entry | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | memory_recall handling > emits synthesis content and no locations for synthesize mode | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | memory_recall handling > emits a synthetic tool_call for select mode with one location per memory | covered:frame-memory-recall | memory_recall select mode, one location per memory (corpus + frames.rs t2a_memory_recall_plain_lists_the_files)
+src/tests/acp-agent.test.ts | memory_recall handling > uses singular 'memory' in title when exactly one entry | ported:src/session/frames.rs::t2a_memory_recall_plain_lists_the_files | singular title
+src/tests/acp-agent.test.ts | memory_recall handling > emits synthesis content and no locations for synthesize mode | ported:src/session/frames.rs::t2a_memory_recall_synthesis_shows_the_text | synthesis content, no locations
 src/tests/acp-agent.test.ts | post-error recovery > drains a failed turn's trailing idle so the next prompt is not short-circuited | ported:src/turn/turn_tests.rs::lagging_idle_after_next_echo_absorbed | 
 src/tests/acp-agent.test.ts | post-error recovery > rejects only the failed turn; a queued prompt still runs | ported:src/turn/turn_tests.rs::result_for_active_turn_while_queued_settles_active | 
 src/tests/acp-agent.test.ts | post-error recovery > hands off to a queued prompt when the next turn starts without a trailing idle | ported:src/turn/turn_tests.rs::result_for_active_turn_while_queued_settles_active | 
@@ -507,14 +507,14 @@ src/tests/acp-agent.test.ts | output after a cancel > keeps dropping output afte
 src/tests/acp-agent.test.ts | output after a cancel > delivers the next prompt's answer once when its echo arrives in the middle of its stream | ported:src/turn/turn_tests_t1a.rs::f16b_dropped_stream_latches_until_message_start | 
 src/tests/acp-agent.test.ts | output after a cancel > delivers a follow-up that Claude Code runs before a prompt sent after the cancel | covered:cancel-held-live-followup | 
 src/tests/acp-agent.test.ts | output after a cancel > delivers what streams of a subagent's text once the window closes, for a client that gets it only streamed | ported:src/turn/turn_tests_t1a.rs::f16b_subagent_streams_and_background_exception | 
-src/tests/acp-agent.test.ts | terminal of a command in the background > ends the terminal when the command's task ends | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | terminal of a command in the background > ends the terminal when the command's task ends | ported:src/session/tests_t2a.rs::t2a_task_notification_settles_and_ends_the_background_terminal | end side only; the registry is filled by F15
 src/tests/acp-agent.test.ts | terminal of a command in the background > ends an AIR client's terminal at the Bash result, as before | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > holds the prompt open while a subagent is live and resolves at the followup's result | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > resumes a held turn's foreground work for a steer, and ends it again at the steered result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > ExitPlanMode answered inside a held turn's followup (issue #1167) > continues an accepted clear-context plan in a fresh query instead of ending the turn | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > ExitPlanMode answered inside a held turn's followup (issue #1167) > continues an accepted clear-context plan in a fresh query instead of ending the turn | ported:src/turn/turn_tests_t3a.rs::t3a_context_reset_in_a_held_follow_up_drops_the_hold | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > ExitPlanMode answered inside a held turn's followup (issue #1167) > shows a plan approved with clearing the context as the session's markdown plan | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > ExitPlanMode answered inside a held turn's followup (issue #1167) > keeps the turn as the session's foreground work across the clear-context restart | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > ExitPlanMode answered inside a held turn's followup (issue #1167) > cancels the held turn when the user keeps planning | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > ExitPlanMode answered inside a held turn's followup (issue #1167) > cancels the held turn when the user keeps planning | ported:src/turn/turn_tests_t3a.rs::t3a_exit_plan_interruption_in_a_held_follow_up_ends_the_held_turn_cancelled | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > ExitPlanMode answered inside a held turn's followup (issue #1167) > ends the follow-up cycle cancelled, not failed, when the user keeps planning | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > settles under the 2.1.270 cadence and sweeps the unpaid idle debt at the next running | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > holds through a coalesced completion's placeholder result until the real followup | missing:T-UNCLASSIFIED | 
@@ -522,11 +522,11 @@ src/tests/acp-agent.test.ts | deferred settlement for live background subagents 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > resolves at the result when the subagent already settled during the turn | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > resolves at the result for non-subagent background tasks (run_in_background Bash) | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > settles a deferred turn 'cancelled' immediately at cancel() | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > holds the SendMessage turn until the resumed subagent settles | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > attributes a permission request of the resumed subagent to its parent tool call | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > registers the subagent once for a repeated resume signal | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > holds the SendMessage turn until the resumed subagent settles | ported:src/turn/turn_tests_t2a.rs::t2a_resumed_subagent_holds_the_active_turn_again | resumed subagent registered live again
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > attributes a permission request of the resumed subagent to its parent tool call | ported:src/session/tests_t2a.rs::t2a_send_message_result_resumes_the_named_subagent | attribution map follows the resumed record
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > registers the subagent once for a repeated resume signal | ported:src/turn/turn_tests_t2a.rs::t2a_resumed_subagent_holds_the_active_turn_again | a repeated signal changes nothing
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > passes the SendMessage text as the prompt of the resumed generation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > ignores a late notification of the earlier run after the resume | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > ignores a late notification of the earlier run after the resume | ported:src/session/tests_t2a.rs::t2a_late_task_frames_of_an_earlier_run_are_ignored | run guard
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a failed subagent that SendMessage resumes > ends the hold of the SendMessage turn at cancel() | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > does not fail a held turn when a followup errors while another subagent is live | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > does not read a followup's lagged trailing idle as the next prompt being abandoned | missing:T-UNCLASSIFIED | 
@@ -536,11 +536,11 @@ src/tests/acp-agent.test.ts | deferred settlement for live background subagents 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > resolves a held turn and reports the dead session when the transport dies | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > resolves a held turn and reports the dead session on worker-shutdown EOF | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > absorbs the interrupt's lagged trailer after cancelling a held turn mid-followup | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > reconciles a leaked subagent entry via background_tasks_changed | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > reconciles a leaked subagent entry via background_tasks_changed | ported:src/session/tests_t2a.rs::t2a_background_tasks_changed_reconciles_the_live_set | level reconcile
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > keeps holding through a peer-origin autonomous result | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > closes the delivery stretch when a held turn is handed off by the next echo | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > re-arms the hold when a later level includes a previously absent task, and sweeps ended entries at activation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > rescues a sweep-armed entry when an inclusive level arrives mid-grace | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > re-arms the hold when a later level includes a previously absent task, and sweeps ended entries at activation | ported:src/turn/turn_tests_t2a.rs::t2a_activation_sweep_deletes_ended_entries_on_the_second_turn | un-end in t2a_level_signal_ends_and_unends_the_hold
+src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > rescues a sweep-armed entry when an inclusive level arrives mid-grace | ported:src/turn/turn_tests_t2a.rs::t2a_a_corrective_level_disarms_the_sweep | inclusive level mid-grace
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > absorbs the trailer when cancelling a hold blocked on a permission request | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > closes the stretch after autonomous prose so a replayed prompt still delivers | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > preserves a queued turn's streamed answer across an interleaved autonomous result | missing:T-UNCLASSIFIED | 
@@ -572,11 +572,11 @@ src/tests/acp-agent.test.ts | turn steering (_session/steering) > publishes an o
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not attribute a cancelled pending steer result to the next prompt | ported:src/turn/turn_tests.rs::steer_cancel_seeds_orphans_and_owes_trailer | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > keeps the turn open across the interrupt its own steer caused | covered:steer-error-result | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not fail the turn on the SDK diagnostic result emitted before a steered echo | ported:src/turn/turn_tests.rs::steer_error_result_with_pending_echo_stays_on_lane | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > maps the correlated ExitPlanMode interrupt diagnostic to cancellation | missing:F21 | ExitPlanMode interrupt diagnostic
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > continues an accepted plan in a fresh private query without exposing the internal reject | missing:F22 | clear-context fresh query
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects the pending turn if a fresh clear-context query cannot be created | missing:F22 | clear-context restart failure
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not resurrect a clear-context session closed while its replacement is created | missing:F22 | clear-context closed session
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not hide a diagnostic before the rejected ExitPlanMode tool result | missing:F21 | rejected ExitPlanMode tool result diagnostic
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > maps the correlated ExitPlanMode interrupt diagnostic to cancellation | ported:src/session/tests_t3a.rs::t3a_keep_planning_interrupt_ends_the_turn_cancelled | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > continues an accepted plan in a fresh private query without exposing the internal reject | covered:exit-plan-clear-context | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects the pending turn if a fresh clear-context query cannot be created | ported:tests/t3a_clear_context.rs::t3a_fresh_child_death_during_restart_fails_the_prompt | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not resurrect a clear-context session closed while its replacement is created | ported:tests/t3a_clear_context.rs::t3a_close_during_restart_leaves_no_child | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not hide a diagnostic before the rejected ExitPlanMode tool result | ported:src/session/tests_t3a.rs::t3a_interrupt_marker_needs_the_tool_result_and_never_leaks | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not fail a replacement prompt on the cancelled prompt's late SDK diagnostic | ported:src/turn/turn_tests_t1a.rs::f13_empty_interruption_diagnostic_is_swallowed | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > swallows a stamped interruption diagnostic that names the cancelled command | ported:src/turn/turn_tests_t1a.rs::f13_empty_interruption_diagnostic_is_swallowed | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not let a stale hand-off token swallow a live turn's stamped interruption diagnostic | ported:src/turn/turn_tests_t1a.rs::f13_empty_interruption_diagnostic_is_swallowed | 
@@ -584,8 +584,8 @@ src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not hide 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not settle a steered turn at an idle that precedes the steered echo | ported:src/turn/turn_tests.rs::steer_idle_before_echo_is_swallowed | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > hands a steered turn off to the next prompt with its recorded outcome | ported:src/turn/turn_tests.rs::steer_echo_handoff_uses_steered_settle | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > cancels a steered turn without false-failing the next prompt | ported:src/turn/turn_tests.rs::steer_cancel_seeds_orphans_and_owes_trailer | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steered turn at a result that names the steer, even with its echo missing | missing:F12 | result naming a steer retires its echo (R811-6) is not in this lane rows
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steer that joined the running cycle $name | missing:F12 | result naming a steer retires its echo (R811-6) is not in this lane rows
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steered turn at a result that names the steer, even with its echo missing | ported:src/turn/turn_tests_t2a.rs::t2a_result_naming_the_steer_settles_without_its_echo | R811-6 retire_named_steers
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steer that joined the running cycle $name | ported:src/turn/turn_tests_t2a.rs::t2a_steer_joined_the_running_cycle_settles_at_the_one_result | echo and no-echo variants in one loop
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a ready steered turn at an idle that owed-idle debt would absorb | ported:src/turn/turn_tests_t1a.rs::f12_steered_ready_settles_ahead_of_owed_debt | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not settle a steered turn on a lagged owed idle before the steered result | ported:src/turn/turn_tests.rs::steer_owed_idle_absorbed_before_lane | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > always injects at 'now' priority, ignoring any client-supplied priority | covered:steer-mid-turn | 
@@ -645,20 +645,20 @@ src/tests/acp-agent.test.ts | agent selection config option > switching the agen
 src/tests/acp-agent.test.ts | agent selection config option > switching the agent > clears the flag (agent: null) when switching back to default | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | agent selection config option > switching the agent > leaves tracked state untouched when the live switch is rejected | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | the SDK session id of a fresh Claude context > sends every update to the ACP session | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_progress heartbeats > reports every beat against the tool call it describes | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_progress heartbeats > drops a beat for a tool call that is not in flight | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_progress heartbeats > preserves the elapsed time | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_progress heartbeats > reports a subagent retry beat against the Agent call without native negotiation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_progress heartbeats > sends the parent tool name to AIR when a beat falls back to the parent call | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_progress heartbeats > leaves a beat that reports a real tool call alone | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_progress heartbeats > keeps a child tool beat in the legacy flattened transcript | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission_denied > marks the announced tool call failed with the denial reason | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | tool_progress heartbeats > reports every beat against the tool call it describes | ported:src/session/frames.rs::t2a_tool_progress_resolves_the_id_and_dedupes | beat against its own call
+src/tests/acp-agent.test.ts | tool_progress heartbeats > drops a beat for a tool call that is not in flight | ported:src/session/frames.rs::t2a_tool_progress_falls_back_to_the_parent_call | unannounced and finished calls dropped
+src/tests/acp-agent.test.ts | tool_progress heartbeats > preserves the elapsed time | ported:src/session/frames.rs::t2a_tool_progress_resolves_the_id_and_dedupes | elapsedTimeSeconds kept
+src/tests/acp-agent.test.ts | tool_progress heartbeats > reports a subagent retry beat against the Agent call without native negotiation | ported:src/session/frames.rs::t2a_tool_progress_falls_back_to_the_parent_call | subagentType and subagentRetry
+src/tests/acp-agent.test.ts | tool_progress heartbeats > sends the parent tool name to AIR when a beat falls back to the parent call | ported:src/session/frames.rs::t2a_tool_progress_falls_back_to_the_parent_call | AIR gets the parent tool name
+src/tests/acp-agent.test.ts | tool_progress heartbeats > leaves a beat that reports a real tool call alone | ported:src/session/frames.rs::t2a_tool_progress_inside_a_subagent_stamps_the_parent | real tool call id kept
+src/tests/acp-agent.test.ts | tool_progress heartbeats > keeps a child tool beat in the legacy flattened transcript | ported:src/session/frames.rs::t2a_tool_progress_inside_a_subagent_stamps_the_parent | parentToolUseId stamped for a live subagent
+src/tests/acp-agent.test.ts | permission_denied > marks the announced tool call failed with the denial reason | ported:src/session/frames.rs::t2a_permission_denied_fails_the_call_with_the_reason | failed with the denial reason
 src/tests/acp-agent.test.ts | permission_denied > replaces a pinned approval patch with the denial reason | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission_denied > falls back to the SDK's rejection message when there is no decision reason | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission_denied > drops a denial for a tool call that was never announced | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission_denied > drops a denial for a tool call that already resolved | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission_denied > attributes a legacy subagent denial to the Agent call that spawned it | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission_denied > still resolves a legacy subagent denial when the parent is unknown | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | permission_denied > falls back to the SDK's rejection message when there is no decision reason | ported:src/session/frames.rs::t2a_permission_denied_without_a_decision_reason_uses_the_message | message fallback
+src/tests/acp-agent.test.ts | permission_denied > drops a denial for a tool call that was never announced | ported:src/session/frames.rs::t2a_permission_denied_for_an_unknown_call_is_dropped | never announced
+src/tests/acp-agent.test.ts | permission_denied > drops a denial for a tool call that already resolved | ported:src/session/tests_t2a.rs::t2a_permission_denied_frame_fails_the_call | already resolved call not reopened
+src/tests/acp-agent.test.ts | permission_denied > attributes a legacy subagent denial to the Agent call that spawned it | ported:src/session/frames.rs::t2a_permission_denied_agent_scoped_lineage | lineage through the live subagent
+src/tests/acp-agent.test.ts | permission_denied > still resolves a legacy subagent denial when the parent is unknown | ported:src/session/frames.rs::t2a_permission_denied_agent_scoped_lineage | unknown parent still resolves for a client without subagents
 src/tests/acp-agent.test.ts | permission_denied > uses eager child ownership when native lineage has not arrived yet | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios-compare.test.ts | compareWithBaseline > accepts the baseline itself | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios-compare.test.ts | compareWithBaseline > accepts an update without a field that did not change | missing:T-UNCLASSIFIED | 
@@ -730,7 +730,7 @@ src/tests/acp-v2.test.ts | ACP v2 prompts > forks a session into one that the cl
 src/tests/acp-v2.test.ts | ACP v2 prompts > replays a Write without the v1 diff that v2 cannot take | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > replays a subagent's history to its own session, and clears each replayed message there first | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > ends a resume with replay with one end event for a client with loadReplayEnd | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > replays the plan of an approved ExitPlanMode as a markdown plan | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > replays the plan of an approved ExitPlanMode as a markdown plan | ported:src/transcript.rs::t3a_replay_publishes_the_approved_plan_for_plan_clients | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > reports Claude Code's warnings as live notices | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > replays a compaction as one completed compaction_update at its position | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > replays the history before it answers session/resume, clearing each message first | missing:T-UNCLASSIFIED | 
@@ -861,7 +861,7 @@ src/tests/async-tasks.test.ts | AsyncTaskRuntime > output path from the tool res
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > output path from the tool result of a known task > does not glue two paths on one line | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > output path from the tool result of a known task > reads a long text without a boundary in linear time | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > output path from the tool result of a known task > lets a structured output path win over the tool result | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > output path from the tool result of a known task > sends the output path of the terminal notification after a level close | missing:T-UNCLASSIFIED | 
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > output path from the tool result of a known task > sends the output path of the terminal notification after a level close | covered:async-task-level-recovery | outputFilePath rides the corrected state
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > does not infer a background task without an unambiguous Bash result | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > uses a structured result tool id to disambiguate batched Bash results | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > detects the negotiated AIR capability | missing:T-UNCLASSIFIED | 
@@ -869,19 +869,19 @@ src/tests/async-tasks.test.ts | AsyncTaskRuntime > publishes one durable lifecyc
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > waits until foreground shell work is backgrounded and excludes subagents | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > normalizes snake_case SDK task events and propagates a late output file | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps a terminal tombstone until a late Bash result proves the task was backgrounded | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends only the progress fields that changed | missing:T-UNCLASSIFIED | 
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends only the progress fields that changed | ported:src/async_tasks.rs::t2a_progress_dedupes_and_rolls_back | changedFields dedupe
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > retains a terminal task_updated tombstone until background promotion | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > publishes a mutable output path after an already announced task | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > holds the spawn until the Bash result brings the tool id | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > publishes a tool id that arrives after the turn released the spawn | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > reconciles foreground promotion and a lost terminal edge from the live task level | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > lets the terminal edge win when the live level is ordered before it | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > heals a lone lost terminal edge at the replace-level boundary | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > recovers a live task whose task_started edge was lost | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps level-only recovery panel-only when task_started arrives late | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends the changed fields again when a retry follows a failed send | missing:T-UNCLASSIFIED | 
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > reconciles foreground promotion and a lost terminal edge from the live task level | ported:src/async_tasks.rs::t2a_level_signal_handles_known_ignored_and_listed_tasks | level promotion and lost-edge close
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > lets the terminal edge win when the live level is ordered before it | ported:src/async_tasks.rs::t2a_level_recovery_is_panel_only_and_the_late_edge_corrects_it | late edge corrects the level state
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > heals a lone lost terminal edge at the replace-level boundary | covered:async-task-level-recovery | level closes the lost task
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > recovers a live task whose task_started edge was lost | covered:async-task-level-recovery | level-only recovery
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps level-only recovery panel-only when task_started arrives late | ported:src/async_tasks.rs::t2a_level_recovery_is_panel_only_and_the_late_edge_corrects_it | panel-only stays
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends the changed fields again when a retry follows a failed send | ported:src/async_tasks.rs::t2a_rollback_after_a_failed_send_repeats_the_changed_fields | journal rollback
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > finishes remaining tasks and can retry a task whose terminal publication failed | ported:src/async_tasks.rs::v18_finish_all_continues_and_retries_a_failed_terminal_publication | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps the updates of a held task behind its spawn | missing:T-UNCLASSIFIED | 
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps the updates of a held task behind its spawn | ported:src/async_tasks.rs::t2a_progress_usage_validation_and_held_beats | held beats follow the spawn
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends the spawn without a tool id when a held task ends first | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > takes the tool id of the terminal notification of a held task | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > finishes a held task at shutdown | missing:T-UNCLASSIFIED | 
@@ -905,67 +905,67 @@ src/tests/auth-status.test.ts | auth status mappers > lets a third-party backend
 src/tests/auth-status.test.ts | auth status mappers > reports unparseable CLI output as not known | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status mappers > merges a poorer read into the same identity and replaces a different one | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > pushes Central from the effective pre-session settings and suppresses duplicates | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > discards a late probe when programmatic settings replace the active helper | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > re-probes when a session switches to a Central helper after the initialize probe settled | missing:T-UNCLASSIFIED | 
+src/tests/auth-status.test.ts | auth status over ACP > discards a late probe when programmatic settings replace the active helper | ported:src/auth_status/tests_t3b.rs::t3b_a_context_change_discards_the_probe_of_the_old_context | 
+src/tests/auth-status.test.ts | auth status over ACP > re-probes when a session switches to a Central helper after the initialize probe settled | ported:src/auth_status/tests_t3b.rs::t3b_context_changes_reprobe_in_the_new_context | 
 src/tests/auth-status.test.ts | auth status over ACP > pushes the logged-out CLI verdict even though the probe exits non-zero | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > pushes nothing when the probe cannot be read | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > advertises the extension in agentCapabilities._meta | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > pushes the first identity after the initialize response, never before it | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > shares one in-flight probe between initialize and a start-of-prompt read | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > re-probes on every prompt, so an external logout is seen | missing:T-UNCLASSIFIED | 
+src/tests/auth-status.test.ts | auth status over ACP > re-probes on every prompt, so an external logout is seen | ported:tests/t3b_providers.rs::t3b_each_prompt_re_reads_the_identity | 
 src/tests/auth-status.test.ts | auth status over ACP > keeps richer stored fields when a poorer probe reports the same identity | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > lets a probe of a different identity replace the stored one wholesale | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > pushes _auth/status_update when the initialize probe resolves | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > upgrades the identity from AccountInfo on session create | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > keeps the probed API key when the session account carries %s | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > ignores the session account while a client provider override is active | missing:T-UNCLASSIFIED | 
+src/tests/auth-status.test.ts | auth status over ACP > ignores the session account while a client provider override is active | ported:src/auth_status/tests_t3b.rs::t3b_session_account_is_not_published_under_a_provider_override_or_gateway | 
 src/tests/auth-status.test.ts | auth status over ACP > still probes the agent's own login under a client provider override | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > pushes an unchanged identity once, however often it is read | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > pushes again as soon as a field of the payload changes | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > reads the store once per user prompt, at the start | missing:T-UNCLASSIFIED | 
+src/tests/auth-status.test.ts | auth status over ACP > reads the store once per user prompt, at the start | ported:tests/t3b_providers.rs::t3b_each_prompt_re_reads_the_identity | 
 src/tests/auth-status.test.ts | auth status over ACP > never makes a prompt wait for the probe | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > reports the gateway identity after gateway authentication | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > discards a probe that a gateway authenticate overtook | missing:T-UNCLASSIFIED | 
+src/tests/auth-status.test.ts | auth status over ACP > reports the gateway identity after gateway authentication | ported:src/auth_status/tests_t3b.rs::t3b_authenticate_reports_the_gateway_host | 
+src/tests/auth-status.test.ts | auth status over ACP > discards a probe that a gateway authenticate overtook | ported:src/auth_status/tests_t3b.rs::t3b_authenticate_discards_an_older_probe | 
 src/tests/auth-status.test.ts | auth status over ACP > ignores a pre-logout probe and pushes the fresh one | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > discards the pre-logout read even when it lands after the logout's own | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > keeps the last known state when a probe is readable but empty | missing:T-UNCLASSIFIED | 
 src/tests/auth-status.test.ts | auth status over ACP > drops a stale identity when the post-logout probe is unreadable | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > re-probes after logout and reports the resulting state | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > when the CLI never answers > bounds the probe at 5 s and keeps the last known state | missing:T-UNCLASSIFIED | 
-src/tests/auth-status.test.ts | auth status over ACP > when the CLI never answers > warns once however many probes time out | missing:T-UNCLASSIFIED | 
+src/tests/auth-status.test.ts | auth status over ACP > re-probes after logout and reports the resulting state | covered:authenticate-logout | 
+src/tests/auth-status.test.ts | auth status over ACP > when the CLI never answers > bounds the probe at 5 s and keeps the last known state | ported:src/auth_status/tests_t3b.rs::t3b_probe_timeout_keeps_the_state_and_warns_once | the 5 s bound is AUTH_STATUS_PROBE_TIMEOUT run by process::run_cli
+src/tests/auth-status.test.ts | auth status over ACP > when the CLI never answers > warns once however many probes time out | ported:src/auth_status/tests_t3b.rs::t3b_probe_timeout_keeps_the_state_and_warns_once | 
 src/tests/authorization.test.ts | authorization > gateway auth not offered without capability | ported:src/agent.rs::gateway_methods_are_gated_on_auth_meta_gateway | non-strict value does not opt in |
 src/tests/authorization.test.ts | authorization > gateway auth offered when client advertises auth._meta.gateway capability | ported:src/agent.rs::gateway_methods_are_gated_on_auth_meta_gateway | gateway + gateway-bedrock order |
 src/tests/authorization.test.ts | authorization > uses gateway env after anthropic gateway auth | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > uses gateway env after gateway auth | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > hide claude authentication without terminal-auth | missing:F34 | same: flag wiring is F34
-src/tests/authorization.test.ts | authorization > hide claude auth but still show console login when terminal-auth is set | missing:F34 | same: flag wiring is F34
-src/tests/authorization.test.ts | authorization > hide claude auth but still show console login with terminal capability | missing:F34 | same: flag wiring is F34
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > classifies apiKeySource %s | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > classifies apiProvider %s | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > bills the subscription when apiProvider and apiKeySource are absent | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > does not bill the subscription when a bearer token pays | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > is false without a subscription | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > refuses or allows $name | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > refuses or allows $name on loadSession | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > refuses or allows $name on resumeSession | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > allows a logged-out account while a provider override is active | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > allows a logged-out account without the flag | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > rejects like a logged-out agent, with the reason in data | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > reports the refused account before the refusal reaches the client | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > rejects loadSession the same way | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > rejects resumeSession the same way | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > allows a session without the flag | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > allows a session when an API key pays next to a stored subscription | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > hide claude authentication without terminal-auth | ported:tests/t3b_providers.rs::t3b_hide_claude_auth_hides_the_login_method | builder: tests/t1b_caps.rs::hide_claude_auth_drops_the_claude_ai_login_only
+src/tests/authorization.test.ts | authorization > hide claude auth but still show console login when terminal-auth is set | ported:tests/t3b_providers.rs::t3b_hide_claude_auth_hides_the_login_method | builder: tests/t1b_caps.rs::hide_claude_auth_drops_the_claude_ai_login_only
+src/tests/authorization.test.ts | authorization > hide claude auth but still show console login with terminal capability | ported:tests/t3b_providers.rs::t3b_hide_claude_auth_hides_the_login_method | builder: tests/t1b_caps.rs::hide_claude_auth_drops_the_claude_ai_login_only
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > classifies apiKeySource %s | ported:src/hide_claude_auth/tests.rs::t3b_classifies_every_api_key_source | each: every ApiKeySource member and an unknown future value, one loop
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > classifies apiProvider %s | ported:src/hide_claude_auth/tests.rs::t3b_classifies_every_api_provider | each: every apiProvider member, one loop
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > bills the subscription when apiProvider and apiKeySource are absent | ported:src/hide_claude_auth/tests.rs::t3b_bills_only_a_subscription_that_nothing_outranks | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > does not bill the subscription when a bearer token pays | ported:src/hide_claude_auth/tests.rs::t3b_bills_only_a_subscription_that_nothing_outranks | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > is false without a subscription | ported:src/hide_claude_auth/tests.rs::t3b_bills_only_a_subscription_that_nothing_outranks | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > refuses or allows $name | ported:tests/t3b_providers.rs::t3b_hide_claude_auth_creation_guard | verdict table: src/hide_claude_auth/tests.rs::t3b_the_creation_verdict_table
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > refuses or allows $name on loadSession | ported:tests/t3b_providers.rs::t3b_the_guard_covers_load_and_resume | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > refuses or allows $name on resumeSession | ported:tests/t3b_providers.rs::t3b_the_guard_covers_load_and_resume | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > allows a logged-out account while a provider override is active | ported:tests/t3b_providers.rs::t3b_a_provider_override_switches_the_guard_off | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > fails closed at session creation > allows a logged-out account without the flag | ported:tests/t3b_providers.rs::t3b_without_the_flag_every_account_is_allowed | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > rejects like a logged-out agent, with the reason in data | ported:tests/t3b_providers.rs::t3b_hide_claude_auth_creation_guard | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > reports the refused account before the refusal reaches the client | ported:tests/t3b_providers.rs::t3b_hide_claude_auth_creation_guard | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > rejects loadSession the same way | ported:tests/t3b_providers.rs::t3b_the_guard_covers_load_and_resume | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > rejects resumeSession the same way | ported:tests/t3b_providers.rs::t3b_the_guard_covers_load_and_resume | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > allows a session without the flag | ported:tests/t3b_providers.rs::t3b_without_the_flag_every_account_is_allowed | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > allows a session when an API key pays next to a stored subscription | ported:src/hide_claude_auth/tests.rs::t3b_classifies_every_api_key_source | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > allows a session after gateway authenticate | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > allows a session after providers/set | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > warns once when the CLI reports no account at all | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > accepts a call with no gateway payload and installs no override | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > keeps the guard on when no gateway payload was installed | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > rejects a present but unusable gateway payload | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > reports no identity for a gateway payload it rejected | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > rejects an empty baseUrl instead of disabling the guard | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > rejects a turn when the live account became a subscription | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > reports the account of a refused turn before the turn rejects | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > allows a session after providers/set | ported:tests/t3b_providers.rs::t3b_a_provider_override_switches_the_guard_off | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on session creation > warns once when the CLI reports no account at all | ported:src/hide_claude_auth/tests.rs::t3b_the_turn_guard_reports_the_account_first_and_fails_open | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > accepts a call with no gateway payload and installs no override | ported:src/agent/providers/tests.rs::t3b_gateway_payload_validation | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > keeps the guard on when no gateway payload was installed | ported:src/agent/providers/tests.rs::t3b_gateway_payload_validation | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > rejects a present but unusable gateway payload | ported:src/agent/providers/tests.rs::t3b_gateway_payload_validation | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > reports no identity for a gateway payload it rejected | covered:authenticate-gateway | rejected calls push no status in the captured frames
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > gateway authenticate validation > rejects an empty baseUrl instead of disabling the guard | covered:authenticate-gateway | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > rejects a turn when the live account became a subscription | ported:src/hide_claude_auth/tests.rs::t3b_the_turn_guard_reports_the_account_first_and_fails_open | decision; the recreate path: tests/t3b_providers.rs::t3b_a_sign_out_recreates_the_query_at_the_next_turn
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > reports the account of a refused turn before the turn rejects | ported:src/hide_claude_auth/tests.rs::t3b_the_turn_guard_reports_the_account_first_and_fails_open | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > does not publish an access failure for capable clients | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > gives a client without the capability the reason on the error only | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > does not publish a failure row for two concurrent prompts | missing:T-UNCLASSIFIED | 
@@ -973,43 +973,43 @@ src/tests/authorization.test.ts | authorization > --hide-claude-auth subscriptio
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > does not probe the account when a provider override is active | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > does not probe the account without the flag | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > lets the turn through when the live account is not a subscription | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > fails open when the CLI cannot answer accountInfo | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > fails open and warns once when the SDK has no accountInfo | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > refuses the next turn when the CLI now holds a subscription | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > fails open when the CLI cannot answer accountInfo | ported:src/hide_claude_auth/tests.rs::t3b_the_turn_guard_reports_the_account_first_and_fails_open | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on every prompt > fails open and warns once when the SDK has no accountInfo | ported:src/hide_claude_auth/tests.rs::t3b_the_turn_guard_reports_the_account_first_and_fails_open | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > refuses the next turn when the CLI now holds a subscription | ported:tests/t3b_providers.rs::t3b_a_sign_out_recreates_the_query_at_the_next_turn | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > proceeds when the CLI now holds a key, on a clean failure state | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > refuses with the plain error and no second row when still signed out | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > shares one respawn between two prompts | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > reports the identity the respawned session logged back in with | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > answers a cancel during the dead state | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > leaves the session alone without the flag | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > leaves the session alone without the flag | ported:src/auth_status/tests_t3b.rs::t3b_a_probe_of_another_kind_flags_the_session_for_the_next_turn | flag gates both the probe mark and the sign-out mark
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > starts a fresh query when the conversation was never persisted | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > refuses the fresh query when the guard rejects the new account | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > does not retry a resume that failed for another reason | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > recreates when the start-of-prompt probe finds another identity > lets the marked turn finish and recreates at the NEXT prompt | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > recreates when the start-of-prompt probe finds another identity > marks the session when the probe kind differs from the account | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > recreates when the start-of-prompt probe finds another identity > leaves the session alone when the probe finds the same kind | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > recreates when the start-of-prompt probe finds another identity > marks the session when the probe kind differs from the account | ported:src/auth_status/tests_t3b.rs::t3b_a_probe_of_another_kind_flags_the_session_for_the_next_turn | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > recreates when the start-of-prompt probe finds another identity > leaves the session alone when the probe finds the same kind | ported:src/auth_status/tests_t3b.rs::t3b_a_probe_of_another_kind_flags_the_session_for_the_next_turn | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > recreates when the start-of-prompt probe finds another identity > never marks a session without the flag | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > respawns after a mid-session sign-out > recreates when the start-of-prompt probe finds another identity > never marks a session whose account named no identity | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > auth refusal and existing failure state > does not add a subscription row while a plain sign-out is active | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > auth refusal and existing failure state > does not add a subscription row before a later sign-out | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on steer > rejects a steer that would start a new turn | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on providers/disable > keeps going when a session cannot be recreated | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on providers/disable > keeps going when a session cannot be recreated | ported:tests/t3b_providers.rs::t3b_a_provider_override_switches_the_guard_off | 
 src/tests/authorization.test.ts | authorization > SSH session falls back to single legacy login method | ported:tests/t1b_caps.rs::remote_environment_offers_the_tui_login_instead | WB-04
 src/tests/authorization.test.ts | authorization > CLAUDE_CODE_REMOTE falls back to single legacy login method | ported:tests/t1b_caps.rs::remote_environment_offers_the_tui_login_instead | WB-04
-src/tests/authorization.test.ts | authorization > remote environment respects hide-claude-auth | missing:F34 | builder takes hide_claude_auth (tests/t1b_caps.rs::hide_claude_auth_drops_the_claude_ai_login_only); the flag/guard is F34
+src/tests/authorization.test.ts | authorization > remote environment respects hide-claude-auth | ported:tests/t3b_providers.rs::t3b_hide_claude_auth_hides_the_login_method | builder: tests/t1b_caps.rs::hide_claude_auth_drops_the_claude_ai_login_only
 src/tests/authorization.test.ts | authorization > show claude authentication | ported:tests/t1b_caps.rs::terminal_capable_client_gets_both_logins_without_terminal_auth_meta | WB-04
 src/tests/authorization.test.ts | session failure reason field > carries reason only when the publisher passes one | missing:T-UNCLASSIFIED | 
-src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > moves the pending ACP turn and its session preferences to a fresh query | missing:T-UNCLASSIFIED | 
+src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > moves the pending ACP turn and its session preferences to a fresh query | covered:exit-plan-clear-context | Node-captured: restart, carried usage 20/10, mode publish
 src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > does not turn an automatic displayed effort into a pin during restart | missing:T-UNCLASSIFIED | 
-src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > does not resurrect original preferences after the session returns to defaults | missing:T-UNCLASSIFIED | 
+src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > does not resurrect original preferences after the session returns to defaults | ported:src/session/clear_context.rs::t3a_restart_spawn_is_a_fresh_conversation_with_the_live_pins | 
 src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > restores disabled Fast mode when a fresh session starts with it enabled | missing:T-UNCLASSIFIED | 
-src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > does not publish or continue a restart cancelled while creating the fresh session | missing:T-UNCLASSIFIED | 
+src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > does not publish or continue a restart cancelled while creating the fresh session | ported:tests/t3a_clear_context.rs::t3a_cancel_during_restart_settles_cancelled_and_leaves_no_child | 
 src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > rejects a stale session before closing its query | missing:T-UNCLASSIFIED | 
-src/tests/clear-context-coordinator.test.ts | ExitPlanCoordinator > owns cancellation cleanup for a replacement created after close | missing:T-UNCLASSIFIED | 
-src/tests/clear-context-coordinator.test.ts | ExitPlanCoordinator > settles a restart failure without classifying it as a query transport loss | missing:T-UNCLASSIFIED | 
+src/tests/clear-context-coordinator.test.ts | ExitPlanCoordinator > owns cancellation cleanup for a replacement created after close | ported:tests/t3a_clear_context.rs::t3a_close_during_restart_leaves_no_child | 
+src/tests/clear-context-coordinator.test.ts | ExitPlanCoordinator > settles a restart failure without classifying it as a query transport loss | ported:tests/t3a_clear_context.rs::t3a_fresh_child_death_during_restart_fails_the_prompt | 
 src/tests/clear-context-coordinator.test.ts | ExitPlanCoordinator > %s | missing:T-UNCLASSIFIED | 
-src/tests/clear-context-coordinator.test.ts | observeExitPlanToolResults > restores a rejected ExitPlanMode marker from authoritative stream metadata | missing:T-UNCLASSIFIED | 
-src/tests/clear-context-coordinator.test.ts | observeExitPlanToolResults > correlates an accepted plan result with its pending context reset | missing:T-UNCLASSIFIED | 
+src/tests/clear-context-coordinator.test.ts | observeExitPlanToolResults > restores a rejected ExitPlanMode marker from authoritative stream metadata | ported:src/session/exit_plan.rs::t3a_rejected_exit_plan_result_recreates_the_interruption | 
+src/tests/clear-context-coordinator.test.ts | observeExitPlanToolResults > correlates an accepted plan result with its pending context reset | ported:src/session/exit_plan.rs::t3a_tool_result_marks_the_interruption_seen_and_names_the_accepted_plan | 
 src/tests/context-compaction.test.ts | ContextCompactionLifecycle for a client that is not AIR > sends the upstream tool call fields and no AIR key | missing:T-UNCLASSIFIED | 
 src/tests/context-compaction.test.ts | ContextCompactionLifecycle for a client that is not AIR > sends compaction updates without _meta, and a summary that differs from the chunks | missing:T-UNCLASSIFIED | 
 src/tests/context-compaction.test.ts | clientSupportsCompactionUpdates > requires the v1 session.compaction object | missing:T-UNCLASSIFIED | 
@@ -1304,20 +1304,20 @@ src/tests/folded-prompt-scenario.test.ts | folded prompt (%s) > answers the fold
 src/tests/folded-prompt-scenario.test.ts | folded prompt (%s) > streams the folded prompt's output before its response | missing:T-UNCLASSIFIED | 
 src/tests/folded-prompt-scenario.test.ts | folded prompt (%s) > still delivers the background answer before the next prompt's response | missing:T-UNCLASSIFIED | 
 src/tests/folded-prompt-scenario.test.ts | folded prompt (%s) > keeps the background answer's tokens out of the next prompt | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listGatewayModels > lists /v1/models under the base URL with the chat request's auth | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listGatewayModels > sends the placeholder bearer token when the provider headers carry no Authorization | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listGatewayModels > follows has_more / last_id pagination | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listGatewayModels > throws a GatewayListingError on %s | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | gateways without a listing > returns undefined for a %s answer | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listing request guards > names an invalid provider header without its value | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listing request guards > refuses a base URL with credentials without repeating them | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listBedrockModels > lists the Anthropic ids of /foundation-models under the base URL | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | listBedrockModels > throws a GatewayListingError on a body without modelSummaries | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | selectBedrockRegion > reads the prefix of an id or an inference-profile ARN | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | selectBedrockRegion > prefers global over a prefix listed before it | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | selectBedrockRegion > keeps the ids of the first listed prefix without global | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | selectBedrockRegion > keeps the ids of global when listed | missing:T-UNCLASSIFIED | 
-src/tests/gateway-models.test.ts | selectBedrockRegion > keeps every id when none has a prefix | missing:T-UNCLASSIFIED | 
+src/tests/gateway-models.test.ts | listGatewayModels > lists /v1/models under the base URL with the chat request's auth | ported:src/gateway_models/tests.rs::t3b_lists_v1_models_under_the_base_url_with_the_chat_auth | 
+src/tests/gateway-models.test.ts | listGatewayModels > sends the placeholder bearer token when the provider headers carry no Authorization | ported:src/gateway_models/tests.rs::t3b_sends_the_placeholder_bearer_without_an_authorization_header | 
+src/tests/gateway-models.test.ts | listGatewayModels > follows has_more / last_id pagination | ported:src/gateway_models/tests.rs::t3b_follows_has_more_and_last_id_pagination | 
+src/tests/gateway-models.test.ts | listGatewayModels > throws a GatewayListingError on %s | ported:src/gateway_models/tests.rs::t3b_fails_on_a_5xx_an_unexpected_body_and_non_json | 5xx, unexpected body, non-JSON here; the network error is t3b_fails_on_a_network_error_without_naming_the_host
+src/tests/gateway-models.test.ts | gateways without a listing > returns undefined for a %s answer | ported:src/gateway_models/tests.rs::t3b_a_4xx_answer_means_no_listing | each: 400, 401, 403, 404, 405, 429 in one loop, both listings
+src/tests/gateway-models.test.ts | listing request guards > names an invalid provider header without its value | ported:src/gateway_models/tests.rs::t3b_names_an_invalid_header_without_its_value_and_sends_nothing | 
+src/tests/gateway-models.test.ts | listing request guards > refuses a base URL with credentials without repeating them | ported:src/gateway_models/tests.rs::t3b_refuses_a_base_url_with_credentials | 
+src/tests/gateway-models.test.ts | listBedrockModels > lists the Anthropic ids of /foundation-models under the base URL | ported:src/gateway_models/tests.rs::t3b_lists_the_anthropic_ids_of_foundation_models | 
+src/tests/gateway-models.test.ts | listBedrockModels > throws a GatewayListingError on a body without modelSummaries | ported:src/gateway_models/tests.rs::t3b_a_bedrock_body_without_summaries_is_unexpected | 
+src/tests/gateway-models.test.ts | selectBedrockRegion > reads the prefix of an id or an inference-profile ARN | ported:src/gateway_models/tests.rs::t3b_reads_the_region_prefix_of_an_id_or_an_arn | 
+src/tests/gateway-models.test.ts | selectBedrockRegion > prefers global over a prefix listed before it | ported:src/gateway_models/tests.rs::t3b_selects_the_bedrock_region | 
+src/tests/gateway-models.test.ts | selectBedrockRegion > keeps the ids of the first listed prefix without global | ported:src/gateway_models/tests.rs::t3b_selects_the_bedrock_region | 
+src/tests/gateway-models.test.ts | selectBedrockRegion > keeps the ids of global when listed | ported:src/gateway_models/tests.rs::t3b_selects_the_bedrock_region | 
+src/tests/gateway-models.test.ts | selectBedrockRegion > keeps every id when none has a prefix | ported:src/gateway_models/tests.rs::t3b_selects_the_bedrock_region | 
 src/tests/gateway-models.test.ts | narrowToGatewayModels > keeps the rows whose resolved model is listed in any spelling | ported:src/session_model.rs::f5b_narrow_to_gateway_models | listed-id normalization | 
 src/tests/gateway-models.test.ts | narrowToGatewayModels > keeps a default row without resolvedModel and checks a bare family alias by family | ported:src/session_model.rs::f5b_narrow_to_gateway_models | alias-only rows kept only when a row matches by model | 
 src/tests/gateway-models.test.ts | narrowToGatewayModels > drops rows resolved to another Bedrock region prefix | ported:src/session_model.rs::f5b_narrow_to_gateway_models | regionPrefix filter | 
@@ -1335,50 +1335,50 @@ src/tests/gateway-models.test.ts | getAvailableModels under a gateway listing > 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > fails the tool and prompt at %s even after the input stream closes | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > detects a tool emitted before the user echo | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > detects a permission tool whose streamed tool_use never arrived | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > allows a completed tool with a late PostToolUse hook | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > forgets the subagent of a tool call once the call ends | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > allows a tool explicitly handed off to a background task | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > does not claim a subagent's tool as a foreground tool | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > allows a completed tool with a late PostToolUse hook | ported:src/unfinished.rs::inv_41_result_and_final_update_forget_the_call | a result forgets the call
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > forgets the subagent of a tool call once the call ends | ported:src/session/tests_t2a.rs::t2a_permission_surfaced_subagent_call_records_its_parent | final status forgets the parent
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > allows a tool explicitly handed off to a background task | ported:src/unfinished.rs::inv_41_registered_background_task_forgets_the_call | handed-off call exempt
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > does not claim a subagent's tool as a foreground tool | ported:src/session/tests_t2a.rs::t2a_subagent_tool_call_is_not_foreground_work | B-66
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > does not treat a request to run in the background as a confirmed handoff | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > waits for deferred settlement before checking unfinished tools | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > fails every unfinished tool and allows a later prompt to succeed | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > preserves cancellation, and closes its unfinished tool with the cancelled turn, not the next one | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > preserves cancellation, and closes its unfinished tool with the cancelled turn, not the next one | ported:src/session/tests_t2a.rs::t2a_cancelled_turn_closes_its_open_tool_calls_before_the_response | closing at the cancelled settle
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > terminates unfinished tools when cancel settles a %s turn inline | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > does not duplicate tool terminals with %s cancellations | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > still interrupts the SDK when inline tool terminal publication fails | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > keeps cancellation authoritative when a checkpoint finishes during tool cleanup | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes each tool call once, before the response, when a cancel settles a held turn that the consumer is closing | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes a streamed tool_use that never reached a complete message without a failure | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes a tool_use that Claude abandoned in a cycle that Claude Code started, and leaves the rest | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes a tool_use that a cycle left when it ends at an idle with no result | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes a streamed tool_use that never reached a complete message without a failure | ported:src/unfinished.rs::inv_41_abandoned_streamed_tool_closes_without_failing | abandoned call
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes a tool_use that Claude abandoned in a cycle that Claude Code started, and leaves the rest | ported:src/session/tests_t2a.rs::t2a_autonomous_cycle_end_closes_abandoned_calls | cycle end
+src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes a tool_use that a cycle left when it ends at an idle with no result | ported:src/session/tests_t2a.rs::t2a_autonomous_cycle_end_closes_abandoned_calls | idle end
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes an abandoned tool_use and still fails the turn for an unfinished tool | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > closes a tool_use that Claude abandoned for a steering message | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | incomplete foreground tools > preserves an existing SDK failure | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > ends the terminal of a command that a cancel closes | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > gives an AIR client the number that it reads for a command that did not succeed | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > sends no terminal exit to a client that renders no terminals | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > sends no terminal exit for a tool that is not a command | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > ends the terminal of a command that ran, but got no result by the end of the turn | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > ends the terminal of a command that Claude abandoned before it ran | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > delivers Claude Code's interrupted result for a running tool before the cancelled response | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > delivers the result of an Agent call, and closes the tool call of its subagent, which Claude Code reports no result for | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > names the subagent of a tool call that only a later update attributed to it | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > leaves the tool call of a background subagent open, which the interrupt did not stop, and closes the foreground subagent's | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > closes every open tool call when the force-cancel backstop ends a turn that gets no results | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > ends the terminal of a command that a cancel closes | ported:src/session/tests_t2a.rs::t2a_closing_report_ends_the_display_terminal | T-84
+src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > gives an AIR client the number that it reads for a command that did not succeed | ported:src/session/tests_t2a.rs::t2a_closing_report_ends_the_display_terminal | AIR exit_code 1
+src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > sends no terminal exit to a client that renders no terminals | ported:src/session/tests_t2a.rs::t2a_closing_report_ends_the_display_terminal | no terminal client
+src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > sends no terminal exit for a tool that is not a command | ported:src/session/tests_t2a.rs::t2a_closing_report_ends_the_display_terminal | not a command
+src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > ends the terminal of a command that ran, but got no result by the end of the turn | ported:src/session/tests_t2a.rs::t2a_end_turn_closing_report_ends_the_terminal_too | ran without a result
+src/tests/incomplete-tools.test.ts | the display terminal of a command that ends without a result > ends the terminal of a command that Claude abandoned before it ran | ported:src/session/tests_t2a.rs::t2a_end_turn_closing_report_ends_the_terminal_too | abandoned before it ran
+src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > delivers Claude Code's interrupted result for a running tool before the cancelled response | covered:cancel-open-tool-closed | interrupted result and closing before the response
+src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > delivers the result of an Agent call, and closes the tool call of its subagent, which Claude Code reports no result for | covered:cancel-subagent-tool-closed | Agent result delivered, subagent command closed
+src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > names the subagent of a tool call that only a later update attributed to it | ported:src/session/tests_t2a.rs::t2a_permission_surfaced_subagent_call_records_its_parent | parent recorded by a later update
+src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > leaves the tool call of a background subagent open, which the interrupt did not stop, and closes the foreground subagent's | ported:src/session/tests_t2a.rs::t2a_cancel_closes_foreground_subagent_calls_and_keeps_background_ones | closedAtCancel
+src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > closes every open tool call when the force-cancel backstop ends a turn that gets no results | ported:src/session/tests_t2a.rs::t2a_force_cancel_closes_every_open_tool_call | force-cancel backstop
 src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > closes a tool call whose start streams in after the cancel | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > of a cycle that Claude Code started on its own, which v1 does not report > delivers Claude Code's interrupted result for the cycle's command | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > of a cycle that Claude Code started on its own, which v1 does not report > delivers the result of its Agent call, and closes the command of the subagent, which Claude Code reports no result for | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > of a cycle that Claude Code started on its own, which v1 does not report > closes a call that gets no result at the idle that ends the cycle, and drops what comes after | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > drops Claude Code's result for a tool call once the cancelled turn has ended | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > drops Claude Code's result for a tool call once the cancelled turn has ended | ported:src/session/tests_t2a.rs::t2a_interrupted_tool_result_is_delivered_before_the_cancelled_response | late result dropped
 src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > reports a tool that finished as the cancel landed as completed | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > sends nothing for a result of a tool call that the client does not hold open | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > sends nothing for a result of a tool call that the client does not hold open | ported:src/session/tests_t2a.rs::t2a_interrupted_tool_result_is_delivered_before_the_cancelled_response | result for an unknown call dropped
 src/tests/incomplete-tools.test.ts | tool calls of a cancelled turn > drops the result of a tool call that a prompt the cancel abandoned runs | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > closes the command of a subagent that the SDK reports stopped after the cancel (%s, %s) | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > closes the command of a subagent that the SDK reports stopped after the cancel (%s, %s) | ported:src/session/tests_t2a.rs::t2a_stopped_subagent_closes_its_calls_after_the_work_end | closeStoppedSubagentToolCalls
 src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > delivers the result of a command of a subagent that the cancel did not stop, which then completes (%s) | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > delivers what a subagent that the cancel did not stop does after the cancel was reported | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > lets a subagent that the cancel did not stop ask for permissions after the cancel was reported | missing:T-UNCLASSIFIED | 
 src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > still drops what a stopped subagent sends after its stop was reported | missing:T-UNCLASSIFIED | 
-src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > leaves a subagent that stopped without a cancel to Claude Code's result | missing:T-UNCLASSIFIED | 
+src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > leaves a subagent that stopped without a cancel to Claude Code's result | ported:src/session/tests_t2a.rs::t2a_stopped_subagent_closes_its_calls_after_the_work_end | no cancel, nothing closed
 src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a cancel stops > leaves the command of a subagent that stopped before the work's end to Claude Code's result | missing:T-UNCLASSIFIED | 
 src/tests/live-capability-events-audit.test.ts | live Claude SDK to ACP capability audit > observes a scheduled wake-up while the ACP session is idle | missing:T-UNCLASSIFIED | 
 src/tests/live-capability-events-audit.test.ts | live Claude SDK to ACP capability audit > records whether a real refusal produces retraction or fallback messages | missing:T-UNCLASSIFIED | 
@@ -1625,47 +1625,47 @@ src/tests/permission-presentation.test.ts | Claude permission presentation for a
 src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > shows the input of a network request that has no content | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > gives the prompt a title and description of its own, apart from the tool call | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > shows the exact preview patch, which the tool call does not show | missing:F10 | permission presentation owned by Turn 6
-src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > drops a prediction that says nothing | missing:T-UNCLASSIFIED | 
-src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > names no vendor and clears with an empty list | missing:T-UNCLASSIFIED | 
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > publishes the predicted prompt after the turn's result | missing:T-UNCLASSIFIED | 
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > clears the previous prediction when the next prompt arrives | missing:T-UNCLASSIFIED | 
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > does not publish a prediction that is only whitespace | missing:T-UNCLASSIFIED | 
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > drops a prediction the next prompt outran | missing:T-UNCLASSIFIED | 
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > sends nothing to a client that is not AIR | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > advertises the providers capability in initialize | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > lists one mutually exclusive provider slot with native routing | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > reflects apiType/baseUrl after set, and never echoes headers | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > rejects set for an unknown providerId | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > rejects set for an unsupported apiType | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > rejects set for an empty or non-http baseUrl | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > restores native routing after the last override is disabled | missing:T-UNCLASSIFIED | 
+src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > drops a prediction that says nothing | ported:src/prompt_suggestions.rs::drops_a_prediction_that_says_nothing | 
+src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > names no vendor and clears with an empty list | ported:src/prompt_suggestions.rs::names_no_vendor_and_clears_with_an_empty_list | 
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > publishes the predicted prompt after the turn's result | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > clears the previous prediction when the next prompt arrives | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > does not publish a prediction that is only whitespace | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > drops a prediction the next prompt outran | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > sends nothing to a client that is not AIR | missing:F24 | needs AIR capability gating in the session (Turn 4 lane A)
+src/tests/providers.test.ts | providers > advertises the providers capability in initialize | covered:providers-validation | initialize response carries providers:{}
+src/tests/providers.test.ts | providers > lists one mutually exclusive provider slot with native routing | covered:providers-validation | 
+src/tests/providers.test.ts | providers > reflects apiType/baseUrl after set, and never echoes headers | ported:src/agent/providers/tests.rs::t3b_list_never_echoes_headers | 
+src/tests/providers.test.ts | providers > rejects set for an unknown providerId | covered:providers-validation | 
+src/tests/providers.test.ts | providers > rejects set for an unsupported apiType | covered:providers-validation | 
+src/tests/providers.test.ts | providers > rejects set for an empty or non-http baseUrl | covered:providers-validation | 
+src/tests/providers.test.ts | providers > restores native routing after the last override is disabled | ported:tests/t3b_providers.rs::t3b_providers_list_set_disable | 
 src/tests/providers.test.ts | providers > replaces the active api type when the single slot is set again | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > treats disabling an unknown provider as an idempotent no-op | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > routes anthropic provider config into session env | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > keeps native session creation unchanged when the providers API is unused | missing:T-UNCLASSIFIED | 
+src/tests/providers.test.ts | providers > treats disabling an unknown provider as an idempotent no-op | covered:providers-validation | 
+src/tests/providers.test.ts | providers > routes anthropic provider config into session env | ported:src/agent/providers/tests.rs::t3b_routes_provider_config_into_the_env | env built by createEnvForProvider; the spawn carries it last: t3b_the_spawn_carries_the_route_last
+src/tests/providers.test.ts | providers > keeps native session creation unchanged when the providers API is unused | ported:src/agent/providers/tests.rs::t3b_the_spawn_carries_the_route_last | 
 src/tests/providers.test.ts | providers > recreates loaded sessions with the new provider between turns | missing:T-UNCLASSIFIED | 
 src/tests/providers.test.ts | providers > switches every loaded session through proxy replacements and back to native routing | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > overrides user routing settings while preserving unrelated settings | missing:T-UNCLASSIFIED | 
+src/tests/providers.test.ts | providers > overrides user routing settings while preserving unrelated settings | ported:src/agent/providers/tests.rs::t3b_the_route_overrides_user_routing_settings | 
 src/tests/providers.test.ts | providers > waits for an active turn before recreating its session | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > routes bedrock provider config into session env | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > accepts vertex config via _meta and routes it into session env | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > leaves the native Vertex base URL unset for the default endpoint | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > rejects vertex set without _meta project/region | missing:T-UNCLASSIFIED | 
+src/tests/providers.test.ts | providers > routes bedrock provider config into session env | ported:src/agent/providers/tests.rs::t3b_routes_provider_config_into_the_env | 
+src/tests/providers.test.ts | providers > accepts vertex config via _meta and routes it into session env | ported:src/agent/providers/tests.rs::t3b_routes_provider_config_into_the_env | 
+src/tests/providers.test.ts | providers > leaves the native Vertex base URL unset for the default endpoint | ported:src/agent/providers/tests.rs::t3b_routes_provider_config_into_the_env | 
+src/tests/providers.test.ts | providers > rejects vertex set without _meta project/region | ported:src/agent/providers/tests.rs::t3b_set_rejects_with_the_exact_messages | 
 src/tests/providers.test.ts | providers > providers/set takes precedence over gateway auth | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > clears provider config on logout | missing:T-UNCLASSIFIED | 
+src/tests/providers.test.ts | providers > clears provider config on logout | ported:tests/t3b_providers.rs::t3b_logout_clears_the_provider_override | 
 src/tests/providers.test.ts | providers > clears a providers/set that is still listing when logout arrives | missing:T-UNCLASSIFIED | 
 src/tests/providers.test.ts | providers > recreates live sessions without the cleared provider on logout | missing:T-UNCLASSIFIED | 
 src/tests/providers.test.ts | providers > leaves live sessions alone on logout without a routing override | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > offers only the models the gateway lists and switches off a dropped default | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > fails providers/set and keeps the current provider when the listing fails | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > lists nothing without providers/set or for a vertex provider | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > narrows a bedrock gateway to the region prefix of its first listed model | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > fails providers/set for a bedrock gateway whose listing fails | missing:T-UNCLASSIFIED | 
+src/tests/providers.test.ts | providers > gateway model discovery > offers only the models the gateway lists and switches off a dropped default | ported:tests/t3b_providers.rs::t3b_the_picker_is_narrowed_to_the_gateway_listing | the dropped-default switch is session_model.rs f5b_switch_to_listed_when_gateway_dropped_default
+src/tests/providers.test.ts | providers > gateway model discovery > fails providers/set and keeps the current provider when the listing fails | ported:tests/t3b_providers.rs::t3b_providers_set_validation | also covered:providers-validation
+src/tests/providers.test.ts | providers > gateway model discovery > lists nothing without providers/set or for a vertex provider | ported:src/agent/tests_t3b.rs::t3b_the_same_gateway_reuses_its_listing | the vertex half; native routing lists nothing by construction
+src/tests/providers.test.ts | providers > gateway model discovery > narrows a bedrock gateway to the region prefix of its first listed model | ported:src/gateway_models/tests.rs::t3b_selects_the_bedrock_region | the prefix reaches the CLI env: t3b_routes_provider_config_into_the_env
+src/tests/providers.test.ts | providers > gateway model discovery > fails providers/set for a bedrock gateway whose listing fails | covered:providers-validation | credentials URL refused for a bedrock set
 src/tests/providers.test.ts | providers > gateway model discovery > offers no model when the listing succeeds but matches none | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > sets a gateway that has no listing and narrows nothing | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > applies providers/set and providers/disable in the order they arrive while a listing runs | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > keeps the later providers/set when an earlier one lists slower | missing:T-UNCLASSIFIED | 
-src/tests/providers.test.ts | providers > gateway model discovery > drops the listing on providers/disable and reuses it when the same gateway is set again | missing:T-UNCLASSIFIED | 
+src/tests/providers.test.ts | providers > gateway model discovery > sets a gateway that has no listing and narrows nothing | ported:src/gateway_models/tests.rs::t3b_a_4xx_answer_means_no_listing | 
+src/tests/providers.test.ts | providers > gateway model discovery > applies providers/set and providers/disable in the order they arrive while a listing runs | different:requests are served in arrival order by the sequential handler; no listing runs concurrently with another request | 
+src/tests/providers.test.ts | providers > gateway model discovery > keeps the later providers/set when an earlier one lists slower | different:requests are served in arrival order by the sequential handler; no listing runs concurrently with another request | 
+src/tests/providers.test.ts | providers > gateway model discovery > drops the listing on providers/disable and reuses it when the same gateway is set again | ported:src/agent/tests_t3b.rs::t3b_the_same_gateway_reuses_its_listing | 
 src/tests/recommended-config-values.test.ts | recommended config value capability > is enabled through the common AIR capability list | ported:tests/t1b_config.rs::recommended_capability_is_enabled_through_the_common_air_capability_list | 
 src/tests/recommended-config-values.test.ts | recommended config value capability > keeps legacy behavior for omitted and malformed AIR metadata | ported:tests/t1b_config.rs::recommended_capability_keeps_legacy_behavior_for_omitted_and_malformed_air | 
 src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > retains default model and effort entries without the capability | ported:tests/t1b_config.rs::recommended_retains_default_entries_without_the_capability | 
@@ -1774,102 +1774,102 @@ src/tests/session-config-options.test.ts | session config options > auto mode av
 src/tests/session-config-options.test.ts | session config options > auto mode availability per model > falls back to Accept edits and emits current_mode_update on a Haiku switch | missing:F11 | P-06/R-01, Turn 5
 src/tests/session-hooks.test.ts | session hooks with the Claude Code binary > [dynamic-describe#1] > runs the user, project and IDE hooks of one event, only in their session | missing:T-UNCLASSIFIED | 
 src/tests/session-hooks.test.ts | session hooks with the Claude Code binary > [dynamic-describe#1] > replaces and removes IDE hooks on session/load | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | project directory encoding > matches the SDK encoding and never decodes | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | project directory encoding > matches a long path by its cut prefix, whatever the hash | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | project directory encoding > lists a path and its ancestors | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | project directory encoding > accepts only UUID session ids | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > reads a small transcript only up to the size it was stat'ed at | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > sees a finished turn at an assistant end_turn | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > sees a turn end at an interrupt, an API error, and the turn-end system records | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > sees an unfinished turn and keeps the previous turn end | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > ignores sidechain and meta records | missing:T-UNCLASSIFIED | 
+src/tests/session-index-units.test.ts | project directory encoding > matches the SDK encoding and never decodes | ported:src/session_index/project_dirs.rs::encoding_matches_the_sdk_and_never_decodes | 
+src/tests/session-index-units.test.ts | project directory encoding > matches a long path by its cut prefix, whatever the hash | ported:src/session_index/project_dirs.rs::a_long_path_is_matched_by_its_cut_prefix | 
+src/tests/session-index-units.test.ts | project directory encoding > lists a path and its ancestors | ported:src/session_index/project_dirs.rs::lists_a_path_and_its_ancestors | 
+src/tests/session-index-units.test.ts | project directory encoding > accepts only UUID session ids | ported:src/session_index/project_dirs.rs::accepts_only_uuid_session_ids | 
+src/tests/session-index-units.test.ts | transcript scan > reads a small transcript only up to the size it was stat'ed at | ported:src/session_index/transcript_scan.rs::reads_only_up_to_the_stat_size | 
+src/tests/session-index-units.test.ts | transcript scan > sees a finished turn at an assistant end_turn | ported:src/session_index/transcript_scan.rs::sees_a_finished_turn_at_an_assistant_end_turn | 
+src/tests/session-index-units.test.ts | transcript scan > sees a turn end at an interrupt, an API error, and the turn-end system records | ported:src/session_index/transcript_scan.rs::sees_turn_ends_at_interrupts_errors_and_system_records | 
+src/tests/session-index-units.test.ts | transcript scan > sees an unfinished turn and keeps the previous turn end | ported:src/session_index/transcript_scan.rs::sees_an_unfinished_turn_and_keeps_the_previous_turn_end | 
+src/tests/session-index-units.test.ts | transcript scan > ignores sidechain and meta records | ported:src/session_index/transcript_scan.rs::ignores_sidechain_and_meta_records | 
 src/tests/session-index-units.test.ts | transcript scan > reads no cost from a transcript | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > reports the head cwd and the last tail cwd, and a stub without messages | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > takes a prompt whose text is "tool_result" for a prompt | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | transcript scan > finds the model and cwd before a tail that is one large tool result | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | worktree-state records > reads the last record: an object without enteredExisting marks | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | worktree-state records > decides on a malformed latest record, and skips only lines that are no JSON | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | change signature > is the same for an unmarked row as without the agentWorktree field | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | activity > reports the SDK state of a session this connection runs | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | activity > is error after a turn that ended with an API error, until a new turn | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | activity > is idle when no live process holds the session | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | activity > uses the registry status of an interactive CLI newer than the transcript | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | activity > reads the tail for an SDK-driven CLI, whose registry stays busy | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | cost > is the SDK's amount of a session that runs here, and only a positive one | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | list request parsing > defaults and clamps the limit | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | list request parsing > takes includeWorktrees as a boolean and archived as a filter value, null as the default | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | list request parsing > round-trips a cursor and rejects one of another scope | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | list request parsing > validates and truncates a rename title | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | live registry > keeps live, matching records and applies the liveness rules | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | live registry > reads single records, never a .key file, and reuses a recent start time on request | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | live registry > is empty when the registry does not exist | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > keeps a slash command only as a fallback for a real prompt | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > skips tags, interrupts, meta, compact summaries and tool results | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > renders bash input, expands pasted content, and cuts at 200 characters | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > titles an image-only first prompt | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | continued-in > counts only a real prompt or a finished answer after it as a resume | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | row facts of the tail and head > takes lastPromptAt from the last real prompt only | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | row facts of the tail and head > takes the model of the last real assistant message | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | row facts of the tail and head > knows forkedFrom only from a fork's records | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | lastPromptAt of a media prompt > counts an image or a document as a prompt | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | lastPromptAt of a media prompt > does not count media in a tool result or a meta record | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | directory listings and stats > re-reads a listing when an entry is added or removed, not otherwise | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | directory listings and stats > re-reads a directory replaced by another with the same mtime | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | directory listings and stats > stats many files in order, bounded, and reports missing ones | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | session id lookup > matches a session id exactly, in no other case | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > tells an archived title by its prefix once normalized | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > stores the visible title normalized, with the prefix when archived, cut to 200 | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > writes the custom-title and agent-name records with AIR's fields | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > takes the custom title the SDK reports, never an agent name | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > reads the last top-level agent name of the tail, else of the head | missing:T-UNCLASSIFIED | 
-src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > decides the archive state by the agent name first, else the custom title | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | sessionIndex negotiation > is advertised with sessionArchive and sessionRename only to an AIR client that declares it | missing:T-UNCLASSIFIED | 
+src/tests/session-index-units.test.ts | transcript scan > reports the head cwd and the last tail cwd, and a stub without messages | ported:src/session_index/transcript_scan.rs::reports_cwds_and_a_stub_without_messages | 
+src/tests/session-index-units.test.ts | transcript scan > takes a prompt whose text is "tool_result" for a prompt | ported:src/session_index/transcript_scan.rs::a_prompt_whose_text_is_tool_result_is_a_prompt | 
+src/tests/session-index-units.test.ts | transcript scan > finds the model and cwd before a tail that is one large tool result | ported:src/session_index/transcript_scan.rs::grows_the_tail_to_find_the_last_message_and_prompt | 
+src/tests/session-index-units.test.ts | worktree-state records > reads the last record: an object without enteredExisting marks | ported:src/session_index/transcript_scan.rs::the_last_worktree_state_record_decides | 
+src/tests/session-index-units.test.ts | worktree-state records > decides on a malformed latest record, and skips only lines that are no JSON | ported:src/session_index/transcript_scan.rs::the_last_worktree_state_record_decides | 
+src/tests/session-index-units.test.ts | change signature > is the same for an unmarked row as without the agentWorktree field | ported:src/session_index/session_info.rs::the_signature_of_an_unmarked_row_has_no_worktree_field | 
+src/tests/session-index-units.test.ts | activity > reports the SDK state of a session this connection runs | ported:src/session_index/activity.rs::reports_the_sdk_state_of_a_session_that_runs_here | 
+src/tests/session-index-units.test.ts | activity > is error after a turn that ended with an API error, until a new turn | ported:src/session_index/activity.rs::is_error_after_an_api_error_until_a_new_turn | 
+src/tests/session-index-units.test.ts | activity > is idle when no live process holds the session | ported:src/session_index/activity.rs::is_idle_when_no_live_process_holds_the_session | 
+src/tests/session-index-units.test.ts | activity > uses the registry status of an interactive CLI newer than the transcript | ported:src/session_index/activity.rs::uses_the_registry_status_newer_than_the_transcript | 
+src/tests/session-index-units.test.ts | activity > reads the tail for an SDK-driven CLI, whose registry stays busy | ported:src/session_index/activity.rs::reads_the_tail_for_an_sdk_driven_cli | 
+src/tests/session-index-units.test.ts | cost > is the SDK's amount of a session that runs here, and only a positive one | ported:src/session_index/activity.rs::cost_is_the_sdks_positive_amount_of_a_session_that_runs_here | 
+src/tests/session-index-units.test.ts | list request parsing > defaults and clamps the limit | ported:src/session_index/service.rs::defaults_and_clamps_the_limit | 
+src/tests/session-index-units.test.ts | list request parsing > takes includeWorktrees as a boolean and archived as a filter value, null as the default | ported:src/session_index/service.rs::takes_include_worktrees_and_archived | 
+src/tests/session-index-units.test.ts | list request parsing > round-trips a cursor and rejects one of another scope | ported:src/session_index/service.rs::round_trips_a_cursor_and_rejects_one_of_another_scope | 
+src/tests/session-index-units.test.ts | list request parsing > validates and truncates a rename title | ported:src/session_index/service.rs::validates_and_truncates_a_rename_title | 
+src/tests/session-index-units.test.ts | live registry > keeps live, matching records and applies the liveness rules | ported:src/session_index/live_registry.rs::keeps_live_matching_records_and_applies_the_liveness_rules | 
+src/tests/session-index-units.test.ts | live registry > reads single records, never a .key file, and reuses a recent start time on request | ported:src/session_index/live_registry.rs::reads_single_records_and_reuses_a_recent_start_time_on_request | 
+src/tests/session-index-units.test.ts | live registry > is empty when the registry does not exist | ported:src/session_index/live_registry.rs::is_empty_when_the_registry_does_not_exist | 
+src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > keeps a slash command only as a fallback for a real prompt | ported:src/session_index/first_prompt.rs::a_slash_command_is_only_a_fallback | 
+src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > skips tags, interrupts, meta, compact summaries and tool results | ported:src/session_index/first_prompt.rs::skips_tags_interrupts_meta_summaries_and_tool_results | 
+src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > renders bash input, expands pasted content, and cuts at 200 characters | ported:src/session_index/first_prompt.rs::renders_bash_input_expands_pasted_content_and_cuts | 
+src/tests/session-index-units.test.ts | first prompt, as the SDK extracts it > titles an image-only first prompt | ported:src/session_index/first_prompt.rs::titles_an_image_only_first_prompt | 
+src/tests/session-index-units.test.ts | continued-in > counts only a real prompt or a finished answer after it as a resume | ported:src/session_index/transcript_scan.rs::continued_in_ends_at_a_prompt_or_a_finished_answer | 
+src/tests/session-index-units.test.ts | row facts of the tail and head > takes lastPromptAt from the last real prompt only | ported:src/session_index/transcript_scan.rs::last_prompt_at_is_the_last_real_prompt_only | 
+src/tests/session-index-units.test.ts | row facts of the tail and head > takes the model of the last real assistant message | ported:src/session_index/transcript_scan.rs::the_model_is_that_of_the_last_real_assistant_message | 
+src/tests/session-index-units.test.ts | row facts of the tail and head > knows forkedFrom only from a fork's records | ported:src/session_index/transcript_scan.rs::forked_from_comes_from_a_forks_records_only | 
+src/tests/session-index-units.test.ts | lastPromptAt of a media prompt > counts an image or a document as a prompt | ported:src/session_index/transcript_scan.rs::an_image_or_a_document_counts_as_a_prompt | 
+src/tests/session-index-units.test.ts | lastPromptAt of a media prompt > does not count media in a tool result or a meta record | ported:src/session_index/transcript_scan.rs::media_in_a_tool_result_or_a_meta_record_is_no_prompt | 
+src/tests/session-index-units.test.ts | directory listings and stats > re-reads a listing when an entry is added or removed, not otherwise | ported:src/session_index/dir_listing.rs::rereads_a_listing_only_when_an_entry_changes | 
+src/tests/session-index-units.test.ts | directory listings and stats > re-reads a directory replaced by another with the same mtime | ported:src/session_index/dir_listing.rs::rereads_a_replaced_directory_with_the_same_mtime | 
+src/tests/session-index-units.test.ts | directory listings and stats > stats many files in order, bounded, and reports missing ones | ported:src/session_index/dir_listing.rs::stats_many_files_in_order_and_reports_missing_ones | 
+src/tests/session-index-units.test.ts | session id lookup > matches a session id exactly, in no other case | ported:src/session_index/mod.rs::a_session_id_matches_exactly_in_no_other_case | 
+src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > tells an archived title by its prefix once normalized | ported:src/session_index/archive_title.rs::tells_an_archived_title_by_its_prefix | 
+src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > stores the visible title normalized, with the prefix when archived, cut to 200 | ported:src/session_index/archive_title.rs::stores_the_visible_title_normalized_and_cut | 
+src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > writes the custom-title and agent-name records with AIR's fields | ported:src/session_index/archive_title.rs::writes_the_records_with_airs_fields | 
+src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > takes the custom title the SDK reports, never an agent name | ported:src/session_index/transcript_scan.rs::the_sdk_reports_the_custom_title_never_an_agent_name | 
+src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > reads the last top-level agent name of the tail, else of the head | ported:src/session_index/transcript_scan.rs::the_last_agent_name_is_the_last_non_blank_one | 
+src/tests/session-index-units.test.ts | archive titles (AIR's Claude format) > decides the archive state by the agent name first, else the custom title | ported:src/session_index/archive_title.rs::the_agent_name_decides_the_archive_state_first | 
+src/tests/session-index.test.ts | sessionIndex negotiation > is advertised with sessionArchive and sessionRename only to an AIR client that declares it | ported:tests/t2b_index.rs::t2b_capabilities_are_advertised_only_after_negotiation | 
 src/tests/session-index.test.ts | sessionIndex negotiation > is not advertised under ACP v2 | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | sessionIndex negotiation > answers method-not-found to the new methods without the capability | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > orders by the last message time, honours the limit, and pages with a cursor | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > never returns a cursor to an empty page | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | sessionIndex negotiation > answers method-not-found to the new methods without the capability | ported:tests/t2b_index.rs::t2b_capabilities_are_advertised_only_after_negotiation | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > orders by the last message time, honours the limit, and pages with a cursor | ported:tests/t2b_index.rs::t2b_list_orders_newest_first_and_pages_with_an_opaque_cursor | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > never returns a cursor to an empty page | ported:tests/t2b_index.rs::t2b_list_orders_newest_first_and_pages_with_an_opaque_cursor | 
 src/tests/session-index.test.ts | session/list of a sessionIndex client > stops reading once the page is full and older transcripts cannot rank higher | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > lists unarchived sessions by default, archived ones only, or all in one order | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > lists unarchived sessions by default, archived ones only, or all in one order | ported:tests/t2b_index.rs::t2b_list_filters_by_archive_state | 
 src/tests/session-index.test.ts | session/list of a sessionIndex client > pages the archived sessions alone, and binds the cursor to that filter | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > lists a session copied to two project directories once, from its newest copy, as the SDK | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > includes the sessions of existing linked worktrees on request, with their own cwd | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > marks the rows of sessions in a worktree Claude Code made (agentWorktree) | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > lists a session copied to two project directories once, from its newest copy, as the SDK | ported:tests/t2b_index.rs::t2b_list_shows_a_session_copied_to_two_directories_once | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > includes the sessions of existing linked worktrees on request, with their own cwd | ported:tests/t2b_index.rs::t2b_list_includes_linked_worktrees_on_request | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > marks the rows of sessions in a worktree Claude Code made (agentWorktree) | ported:tests/t2b_index.rs::t2b_list_marks_a_worktree_claude_code_made | 
 src/tests/session-index.test.ts | session/list of a sessionIndex client > marks a session that made its worktree mid-session, and not after a malformed record | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > recovers the cwd of a session whose head has none | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > recovers the cwd of a session whose head has none | ported:tests/t2b_index.rs::t2b_list_uses_the_requested_path_for_a_row_without_a_cwd | 
 src/tests/session-index.test.ts | session/list of a sessionIndex client > recovers a cwd from a sibling that the archive filter leaves out | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/list of a sessionIndex client > reports the row fields of the RFDs, flat | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session/list of a sessionIndex client > reports the row fields of the RFDs, flat | ported:tests/t2b_index.rs::t2b_list_reports_the_row_fields | 
 src/tests/session-index.test.ts | session/list of a sessionIndex client > reports the live state and cost of a session this connection runs | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | session/list of a sessionIndex client > has no cost unless the SDK gave one for a session that runs here | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | old session/list path > calls the SDK exactly as before for a client without sessionIndex | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | old session/list path > hides a session with an archived title from AIR without sessionIndex only | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/rename > renames a session that is not loaded: title records and the sidecar | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/rename > refuses an unknown session | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | old session/list path > hides a session with an archived title from AIR without sessionIndex only | covered:session-delete-air-archive | 
+src/tests/session-index.test.ts | _session/rename > renames a session that is not loaded: title records and the sidecar | ported:tests/t2b_index.rs::t2b_rename_writes_the_records_and_the_private_sidecar | 
+src/tests/session-index.test.ts | _session/rename > refuses an unknown session | ported:tests/t2b_index.rs::t2b_rename_and_archive_refuse_an_unknown_session | 
 src/tests/session-index.test.ts | _session/rename > renames a session that another process holds, as the CLI does | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/rename > renames a session loaded here through its CLI and publishes the title | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/rename > renames a session loaded here through its CLI and publishes the title | covered:session-index-loaded | 
 src/tests/session-index.test.ts | _session/rename > waits for a title generation in flight, and the generated title never wins | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/archive and _session/unarchive > append AIR's archive title records, are idempotent and keep updatedAt | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/archive and _session/unarchive > read a session archived by AIR, and rename it with the prefix kept | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/archive and _session/unarchive > append AIR's archive title records, are idempotent and keep updatedAt | ported:tests/t2b_index.rs::t2b_archive_and_unarchive_are_idempotent_and_keep_updated_at | 
+src/tests/session-index.test.ts | _session/archive and _session/unarchive > read a session archived by AIR, and rename it with the prefix kept | ported:tests/t2b_index.rs::t2b_rename_of_an_archived_session_keeps_it_archived | 
 src/tests/session-index.test.ts | _session/archive and _session/unarchive > read the archive state from the agent name first, else the custom title, as AIR does | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/archive and _session/unarchive > cut the archived title to the CLI's 200 characters | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/archive and _session/unarchive > cut the archived title to the CLI's 200 characters | ported:tests/t2b_index.rs::t2b_archive_cuts_the_title_to_200_characters | 
 src/tests/session-index.test.ts | _session/archive and _session/unarchive > ignore a legacy archive marker file | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/archive and _session/unarchive > refuses an unknown session | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/delete per client > deletes the transcript for a sessionIndex client | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/archive and _session/unarchive > refuses an unknown session | ported:tests/t2b_index.rs::t2b_rename_and_archive_refuse_an_unknown_session | 
+src/tests/session-index.test.ts | session/delete per client > deletes the transcript for a sessionIndex client | ported:tests/t2b_index.rs::t2b_delete_removes_every_copy_and_the_session_directory | 
 src/tests/session-index.test.ts | session/delete per client > deletes a session that another process holds, as the CLI does | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/delete per client > archives instead of deleting for an AIR client without sessionIndex | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session/delete per client > archives instead of deleting for an AIR client without sessionIndex | ported:tests/t2b_index.rs::t2b_air_client_without_the_index_archives_on_delete | 
 src/tests/session-index.test.ts | session/delete per client > archives for an AIR client without sessionIndex a session held elsewhere | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | session/delete per client > deletes with the SDK for a client that is not AIR | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > takes an absolute cwd and ignores other parameters | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > answers method-not-found without sessionIndex | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > refuses the 129th subscription of a connection | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/list/subscribe > takes an absolute cwd and ignores other parameters | ported:src/session_index/list_subscriptions.rs::subscribe_takes_an_absolute_cwd_and_ignores_other_parameters | 
+src/tests/session-index.test.ts | _session/list/subscribe > answers method-not-found without sessionIndex | ported:tests/t2b_subscriptions.rs::t2b_subscribe_needs_the_capability | 
+src/tests/session-index.test.ts | _session/list/subscribe > refuses the 129th subscription of a connection | ported:tests/t2b_subscriptions.rs::t2b_subscription_refuses_the_129th | 
 src/tests/session-index.test.ts | _session/list/subscribe > sends the archive state by the agent name first, else the custom title | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > holds a fork back until the response of its session/fork is out | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > sends a created session, a prompt and a turn end, but not updatedAt alone | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > sends a state flip of the registry, a rename, archive, unarchive and a delete | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/list/subscribe > holds a fork back until the response of its session/fork is out | ported:tests/t2b_subscriptions.rs::t2b_subscription_holds_a_fork_back_until_the_fork_response_is_out | 
+src/tests/session-index.test.ts | _session/list/subscribe > sends a created session, a prompt and a turn end, but not updatedAt alone | ported:tests/t2b_subscriptions.rs::t2b_subscription_sends_a_created_session_a_prompt_and_a_turn_end | 
+src/tests/session-index.test.ts | _session/list/subscribe > sends a state flip of the registry, a rename, archive, unarchive and a delete | ported:tests/t2b_subscriptions.rs::t2b_subscription_sends_a_rename_and_an_archive | 
 src/tests/session-index.test.ts | _session/list/subscribe > sends the error state of a turn that ended with an API error, and clears it | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > keeps the error of a query that failed here after it closes | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > clears the failed turn of a session that runs here when a new turn starts | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > sends the SDK state of a session this connection runs at once, and its close | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > coalesces the changes of a session to one a second | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/list/subscribe > sends the SDK state of a session this connection runs at once, and its close | ported:tests/t2b_subscriptions.rs::t2b_subscription_sends_the_state_of_a_session_that_runs_here | 
+src/tests/session-index.test.ts | _session/list/subscribe > coalesces the changes of a session to one a second | ported:tests/t2b_subscriptions.rs::t2b_subscription_sends_a_session_at_most_once_per_interval | 
 src/tests/session-index.test.ts | _session/list/subscribe > shares one watcher between two subscriptions of a cwd, each notified | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > leaves no watcher or timer after the connection closes | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > covers the same subdirectory of every linked worktree | missing:T-UNCLASSIFIED | 
@@ -1880,7 +1880,7 @@ src/tests/session-index.test.ts | _session/list/subscribe > reads again a transc
 src/tests/session-index.test.ts | _session/list/subscribe > sends a registry change that lands while the registry is read first | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > sends the sessions of a worktree linked after subscribe that shares the directory | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > watches a project directory that was replaced | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | _session/list/subscribe > removes a session deleted after the first read took its row | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | _session/list/subscribe > removes a session deleted after the first read took its row | ported:tests/t2b_subscriptions.rs::t2b_subscription_removes_a_deleted_session | 
 src/tests/session-index.test.ts | _session/list/subscribe > sends a rename made while the first read runs | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > reads no transcript to subscribe, nor on a rescan of unchanged ones | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | _session/list/subscribe > sends the first change of a session in full, then not updatedAt alone | missing:T-UNCLASSIFIED | 
@@ -1900,21 +1900,21 @@ src/tests/session-index.test.ts | _session/list/subscribe > is not started by se
 src/tests/session-index.test.ts | _session/list/subscribe > sends a session that changed right after subscribe | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a session that another process holds > is renamed, archived, unarchived and deleted, also when its query closed here | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a session that another process holds > is deleted without waiting for a CLI child of this process to exit | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session/delete of an AIR client without sessionIndex > fails for an unknown session as the SDK delete did | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session/delete of an AIR client without sessionIndex > fails for an unknown session as the SDK delete did | ported:tests/t2b_index.rs::t2b_air_client_without_the_index_archives_on_delete | 
 src/tests/session-index.test.ts | session index service lifecycle > starts no watcher after dispose, also for a list in flight | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | rename of a session with several transcripts > titles every copy, and the list shows the new title at once | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | delete of a session with several transcripts > reports a copy it could not delete, and a retry deletes it | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | cwd recovery from a sibling transcript > does not depend on the batch the sibling is read in | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a last message longer than the tail window > keeps the session at its last message time after a metadata record | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | custom title sidecar > survives concurrent writes and leaves other temporary files alone | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | long project paths that share a prefix > lists only the directories whose transcripts belong to the path | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | long project paths that share a prefix > lists only the directories whose transcripts belong to the path | ported:tests/t2b_index.rs::t2b_list_finds_a_long_path_by_its_cut_prefix | 
 src/tests/session-index.test.ts | long project paths that share a prefix > does not change a subscription on a live record of another long path | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | session title after an explicit rename > never publishes the title a turn end read before the rename | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | session title after an explicit rename > never publishes a title read before a later client rename | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | session title after an explicit rename > adopts a title stored later by someone else, and generates none | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | worktrees after git worktree move > follows a moved linked worktree | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | empty transcripts on delete > deletes a session that has only an empty transcript, and its session directory | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | empty transcripts on delete > deletes a real and an empty copy of a session | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | empty transcripts on delete > deletes a session that has only an empty transcript, and its session directory | ported:tests/t2b_index.rs::t2b_delete_handles_a_session_with_only_an_empty_transcript | 
+src/tests/session-index.test.ts | empty transcripts on delete > deletes a real and an empty copy of a session | ported:tests/t2b_index.rs::t2b_delete_removes_every_copy_and_the_session_directory | 
 src/tests/session-index.test.ts | empty transcripts on delete > archives for an AIR client without sessionIndex only what the SDK delete would find | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a failing SDK delete > fails the request when the session directory could not be removed, and a retry finishes | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a failing SDK delete > removes a session directory that the SDK left behind | missing:T-UNCLASSIFIED | 
@@ -1933,23 +1933,23 @@ src/tests/session-index.test.ts | tail growth > does not search a transcript of 
 src/tests/session-index.test.ts | other copies on a running session's rename > titles a copy whose last line is torn after closing that line, as no process holds it | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | other copies on a running session's rename > succeeds once the CLI has the title, even when another copy fails | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | list metadata of the listed copy > takes the title from the listed transcript, not another copy | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | a continued session > is hidden once its successor has history, as in the SDK list | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | a project directory renamed in case > is the project directory of the cwd on a case-insensitive volume | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | a continued session > is hidden once its successor has history, as in the SDK list | ported:src/session_index/mod.rs::a_continued_session_is_hidden_once_its_successor_has_history | 
+src/tests/session-index.test.ts | a project directory renamed in case > is the project directory of the cwd on a case-insensitive volume | ported:src/session_index/mod.rs::a_differing_case_directory_is_the_project_directory_on_darwin_only | 
 src/tests/session-index.test.ts | delete of a session that runs here > tears it down and deletes it, also when another process holds it | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a cwd that differs in case from its directory > is recovered from the transcript | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | title of a listed copy that starts with a slash command > is the first real prompt, as the SDK titles it | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session ids in another case > do not match: a session id matches exactly | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | title of a listed copy that starts with a slash command > is the first real prompt, as the SDK titles it | ported:tests/t2b_index.rs::t2b_list_titles_by_the_first_real_prompt_after_a_slash_command | 
+src/tests/session-index.test.ts | session ids in another case > do not match: a session id matches exactly | ported:src/session_index/mod.rs::a_session_id_matches_exactly_in_no_other_case | 
 src/tests/session-index.test.ts | rename of a session that runs here and in another process > is renamed through the CLI that runs it here | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a transcript named by an upper-case id > is renamed, archived and deleted under the listed id and its own spelling | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | rename of a running session with a copy under another long path > titles the copy of the other path that shares the cut prefix | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | archive state (ACP RFD #2161) > stops a session loaded here: interrupts it, retitles it through its CLI, then closes it | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | archive state (ACP RFD #2161) > stops a session loaded here: interrupts it, retitles it through its CLI, then closes it | covered:session-index-loaded | 
 src/tests/session-index.test.ts | archive state (ACP RFD #2161) > is reported to a loaded session on unarchive, which keeps running | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | archive state (ACP RFD #2161) > archives and unarchives a running session whose transcript has an agent name | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | archive state (ACP RFD #2161) > is not reported for a session not loaded on this connection | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | archive state (ACP RFD #2161) > is not reported for a session not loaded on this connection | ported:tests/t2b_index.rs::t2b_connection_archive_of_an_unloaded_session_reports_nothing | 
 src/tests/session-index.test.ts | archive state (ACP RFD #2161) > never brings back a deleted session | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | archive state (ACP RFD #2161) > is unknown for an archived session whose transcript is gone | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | archive state (ACP RFD #2161) > is unknown for an archived session whose transcript is gone | ported:tests/t2b_index.rs::t2b_rename_and_archive_refuse_an_unknown_session | 
 src/tests/session-index.test.ts | archive state (ACP RFD #2161) > shows a session that an AIR client without sessionIndex marked done as archived | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session list extensions RFD > reports forkedFrom for a session the SDK forked | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session list extensions RFD > reports forkedFrom for a session the SDK forked | ported:tests/t2b_index.rs::t2b_list_reports_the_row_fields | 
 src/tests/session-index.test.ts | load and resume of a session that another process holds > opens it for a sessionIndex client, as the CLI does | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | load and resume of a session that another process holds > loads and prompts it for a sessionIndex client | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | load and resume of a session that another process holds > opens as before for a client without sessionIndex | missing:T-UNCLASSIFIED | 
@@ -1957,15 +1957,15 @@ src/tests/session-index.test.ts | paths that share a project directory > are lis
 src/tests/session-index.test.ts | paths that share a project directory > are listed together once the other path is gone, as the SDK lists them | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | paths that share a project directory > move a session from one path's subscription to the other's | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a relocation out of the project directory > keeps the session in a subscription, as the list keeps showing it | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | worktrees of a subdirectory cwd > are the same subdirectory in each existing worktree | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | list cursor scope > does not bind the limit | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | worktrees of a subdirectory cwd > are the same subdirectory in each existing worktree | ported:src/session_index/worktrees.rs::expands_a_subdirectory_into_every_worktree | 
+src/tests/session-index.test.ts | list cursor scope > does not bind the limit | ported:tests/t2b_index.rs::t2b_list_cursor_does_not_bind_the_limit | 
 src/tests/session-index.test.ts | open a session that runs here and that another process resumed > opens it for a sessionIndex client | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | archive of a loaded session without its transcript > is unknown once the session had history, and allowed for a new unwritten one | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a session relocated to a path with the same project directory > is listed under the cwd it was moved to | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | order by the last user activity > ranks by the last prompt, else updatedAt, and pages and merges archived on that key | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | order by the last user activity > ranks by the last prompt, else updatedAt, and pages and merges archived on that key | ported:tests/t2b_index.rs::t2b_list_ranks_by_the_last_prompt_not_the_last_message | 
 src/tests/session-index.test.ts | a last prompt followed by more than the tail window > is found by growing the tail, and kept while the transcript grows | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a session whose last prompt is an image or a document > is ordered by that prompt | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | session index cost > pages through a project reading each transcript once | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | session index cost > pages through a project reading each transcript once | ported:src/session_index/mod.rs::paging_reads_each_transcript_once | 
 src/tests/session-index.test.ts | session index cost > reads only the changed transcript for a subscription | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a transcript without a prompt in its last 4 MB > keeps what an earlier wide scan found when a small append has none of it | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | a transcript without a prompt in its last 4 MB > keeps an inherited turn end when a small append needs a wider tail | missing:T-UNCLASSIFIED | 
@@ -1986,7 +1986,7 @@ src/tests/session-index.test.ts | archive in AIR's title format, round two > kee
 src/tests/session-index.test.ts | archive in AIR's title format, round three > titles the copy of the unresolved cwd of a running session here | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | archive in AIR's title format, round three > keeps updatedAt of a session whose last message outgrows the tail search | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | archive of a long session > keeps a last prompt that only an earlier scan could see | missing:T-UNCLASSIFIED | 
-src/tests/session-index.test.ts | list subscriptions after this connection's own title changes > push a rename, archive, unarchive and delete at once, without the watcher | missing:T-UNCLASSIFIED | 
+src/tests/session-index.test.ts | list subscriptions after this connection's own title changes > push a rename, archive, unarchive and delete at once, without the watcher | ported:tests/t2b_subscriptions.rs::t2b_subscription_sends_a_rename_and_an_archive | 
 src/tests/session-index.test.ts | list subscriptions after this connection's own title changes > push a rename made by another process through the watcher | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | the pages of one list > enumerates the transcripts once for all its pages | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | the pages of one list > is as fresh after a cursor as a new enumeration | missing:T-UNCLASSIFIED | 
@@ -2011,7 +2011,7 @@ src/tests/session-mode.test.ts | session mode > rejects missing and closed sessi
 src/tests/session-mode.test.ts | session mode > omits bypassPermissions from the catalog when bypass capability is disabled | ported:src/session_config.rs::inv_62_mode_catalog | 
 src/tests/session-mode.test.ts | session mode > initializes the stable mode catalog and falls unsupported Auto back | missing:F11 | P-06: creation-time auto clamp, Turn 5
 src/tests/session-mode.test.ts | session mode > keeps mode state and its config option synchronized | covered:config-set-mode | 
-src/tests/session-mode.test.ts | session mode > remembers the mode the session left when it entered plan mode | missing:F11 | pre_plan_mode (session.rs) has no direct Rust test, Turn 5
+src/tests/session-mode.test.ts | session mode > remembers the mode the session left when it entered plan mode | ported:src/session/exit_plan.rs::t3a_pre_plan_mode_tracks_entry_and_exit | also t3a_enter_plan_mode_hook_remembers_the_previous_mode
 src/tests/session-mode.test.ts | session mode > reconciles Auto after a model switch | missing:F11 | R-01: PostModelSwitch mode reconcile, Turn 5
 src/tests/session-mode.test.ts | resolveInitialPermissionMode > uses defaultMode when nothing else is given | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
 src/tests/session-mode.test.ts | resolveInitialPermissionMode > continues in the mode of the resumed transcript instead of defaultMode | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
@@ -2027,17 +2027,17 @@ src/tests/session-notices.test.ts | session notices > shapes free-form text into
 src/tests/session-permission.test.ts | session permission updates > maps an ExitPlanMode choice to the selected session mode effect | missing:T-UNCLASSIFIED | 
 src/tests/session-permission.test.ts | session permission updates > falls an Auto permission effect back when the current model cannot use Auto | missing:T-UNCLASSIFIED | 
 src/tests/session-timing.test.ts | SessionTiming > includes work completed before construction when given a start time | ported:src/session_timing.rs::inv_timing_line_includes_preconstruction_work | exact line format |
-src/tests/session-titles.test.ts | sanitizeTitle > gives a long text the same title as a scan of the whole text | missing:T-UNCLASSIFIED | 
+src/tests/session-titles.test.ts | sanitizeTitle > gives a long text the same title as a scan of the whole text | ported:src/session_store.rs::t2b_sanitize_title_gives_a_long_text_the_title_of_a_full_scan | 
 src/tests/session-titles.test.ts | SDK title generation contract > SDK still ships generateSessionTitle and its control subtype | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | SDK title generation contract > keeps only the trailing title context | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > pushes a session_info_update when the SDK generates a title at turn-end | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > does not re-push session_info_update when the title is unchanged | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > generates a title at turn-end instead of publishing the raw prompt | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > adopts a stored title and never generates over it | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > generates once per session, and a later turn can't fall back to the prompt | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > releases the latch when generation yields no title | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > skips argument-less slash commands and bash openers when building the title context | missing:T-UNCLASSIFIED | 
-src/tests/session-titles.test.ts | session titles at turn-end > includes slash-command arguments in the title context | missing:T-UNCLASSIFIED | 
+src/tests/session-titles.test.ts | SDK title generation contract > keeps only the trailing title context | ported:src/session_titles.rs::inv_80_context_rolls_to_1000_chars | 1000-char ring
+src/tests/session-titles.test.ts | session titles at turn-end > pushes a session_info_update when the SDK generates a title at turn-end | covered:session-title | generated title published with updatedAt
+src/tests/session-titles.test.ts | session titles at turn-end > does not re-push session_info_update when the title is unchanged | ported:src/session_titles.rs::inv_80_publishes_once_per_title | unchanged title
+src/tests/session-titles.test.ts | session titles at turn-end > generates a title at turn-end instead of publishing the raw prompt | covered:session-title | generation first
+src/tests/session-titles.test.ts | session titles at turn-end > adopts a stored title and never generates over it | ported:src/session_titles.rs::inv_80_adopts_custom_title_and_latches | stored title latches
+src/tests/session-titles.test.ts | session titles at turn-end > generates once per session, and a later turn can't fall back to the prompt | covered:session-title-retry | settled session is not asked again
+src/tests/session-titles.test.ts | session titles at turn-end > releases the latch when generation yields no title | covered:session-title-retry | null title releases the latch
+src/tests/session-titles.test.ts | session titles at turn-end > skips argument-less slash commands and bash openers when building the title context | ported:src/session_titles.rs::t2a_prompt_arguments_are_in_the_title_context | too little text
+src/tests/session-titles.test.ts | session titles at turn-end > includes slash-command arguments in the title context | ported:src/session_titles.rs::t2a_prompt_arguments_are_in_the_title_context | arguments collected
 src/tests/settings-api-key-helper.test.ts | SettingsManager.getApiKeyHelper > prefers a managed helper over the --settings override | ported:src/settings.rs::o61_api_key_helper_precedence | managed > override > user/project/local | 
 src/tests/settings-api-key-helper.test.ts | SettingsManager.getApiKeyHelper > prefers the --settings override over a user helper | ported:src/settings.rs::o61_api_key_helper_precedence | override > user/project/local | 
 src/tests/settings.test.ts | SettingsManager > settings merging > should merge model setting with later sources taking precedence | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | later tier overrides earlier | 
@@ -2076,7 +2076,7 @@ src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the No
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports Grep and Glob hits without a path as content | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows the WebFetch prompt once to Zed and never to AIR | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows the WebFetch offset in the title | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports WebSearch hits from the structured result | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports WebSearch hits from the structured result | covered:search-agent-results | WebSearch hits from the structured result
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > marks an Agent as a subagent and shows its prompt only to Zed | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows a requested Agent effort in the title | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > does not show an effort for a fork, which runs at the parent's effort | missing:T-UNCLASSIFIED | 
@@ -2134,17 +2134,17 @@ src/tests/tools.test.ts | tool output in tool call updates > should not emit too
 src/tests/tools.test.ts | tool output in tool call updates > should convert Read tool base64 image content to ACP image format | ported:src/tools.rs::f6a_content_block_types | base64 image becomes an ACP image block
 src/tests/tools.test.ts | tool output in tool call updates > should handle Read tool with mixed text and image content | ported:src/tools.rs::f6a_read_result_document_and_image_blocks | text escaped, document/image via toAcpContentBlock
 
-src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return formatted content without _meta when supportsTerminalOutput is false | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return no content with _meta when supportsTerminalOutput is true | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return formatted content without _meta when supportsTerminalOutput is false | ported:src/session/tests_t2a.rs::t2a_plain_client_keeps_the_console_block | no terminal meta when unsupported
+src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return no content with _meta when supportsTerminalOutput is true | ported:src/session/tests_t2a.rs::t2a_terminal_client_gets_the_command_on_the_terminal_channel | terminal channel, no code block
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > keys the terminal metas off the tool_use id, which is what was announced | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > falls back to the result's tool_use_id when the tool_use is unavailable | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > renders a code block instead of a dangling terminal when no id is available | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > treats an empty tool_use id as no id and falls back to the result block | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > renders a code block when neither id is a usable string | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should include exit_code from return_code in terminal_exit | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should route failed commands through the terminal with the code their text names | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should include exit_code from return_code in terminal_exit | ported:src/tools/reporters.rs::t2a_bash_code_execution_block_return_code | return_code in terminal_exit
+src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should route failed commands through the terminal with the code their text names | ported:src/tools/reporters.rs::t2a_bash_exit_code_comes_from_the_failure_text | failed command exit code from its text
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should fall back to stderr when stdout is empty | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return no content with _meta when output is empty and supportsTerminalOutput is true | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return no content with _meta when output is empty and supportsTerminalOutput is true | covered:bash-terminal-result | empty output with terminal support
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return empty object when output is empty and supportsTerminalOutput is false | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should default supportsTerminalOutput to false when not provided | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should preserve trailing whitespace in _meta data when supportsTerminalOutput is true | missing:T-UNCLASSIFIED | 
@@ -2155,15 +2155,15 @@ src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with plain string tool_result (production format) > should return empty object for empty string content without terminal support | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with plain string tool_result (production format) > should return no content with _meta for empty string content with terminal support | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with plain string tool_result (production format) > should handle array content with text blocks | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with image array tool_result (local Bash image output path) > should surface image content as ACP image content (terminal disabled) | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with image array tool_result (local Bash image output path) > should bypass terminal _meta even when supportsTerminalOutput is true | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with image array tool_result (local Bash image output path) > should surface image content as ACP image content (terminal disabled) | ported:src/tools/reporters.rs::t2a_bash_image_output_is_content | image content surfaced
+src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with image array tool_result (local Bash image output path) > should bypass terminal _meta even when supportsTerminalOutput is true | ported:src/tools/reporters.rs::t2a_bash_image_output_is_content | image bypasses the terminal meta
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > with image array tool_result (local Bash image output path) > should still surface multi-block content with text + image mixed | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should include terminal _meta when client declares terminal_output support | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should include terminal _meta when client declares terminal_output support | ported:src/session/tests_t2a.rs::t2a_terminal_client_gets_the_command_on_the_terminal_channel | terminal meta when declared
 src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should prefer terminal_output_delta and omit full output when supported | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should not include terminal _meta when client does not declare terminal_output support | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should not include terminal _meta when client does not declare terminal_output support | ported:src/session/tests_t2a.rs::t2a_plain_client_keeps_the_console_block | no terminal meta when undeclared
 src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should not include terminal _meta when _meta.terminal_output is false | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should include formatted content only when terminal_output is not supported | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should preserve claudeCode in _meta alongside terminal_exit on completion notification | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should include formatted content only when terminal_output is not supported | ported:src/session/tests_t2a.rs::t2a_plain_client_keeps_the_console_block | formatted content only when unsupported
+src/tests/tools.test.ts | Bash terminal output > toAcpNotifications with clientCapabilities > should preserve claudeCode in _meta alongside terminal_exit on completion notification | ported:src/session/tests_t2a.rs::t2a_terminal_client_gets_the_command_on_the_terminal_channel | claudeCode kept next to terminal_exit
 src/tests/tools.test.ts | Bash terminal output > toolUseCache pruning > retains the tool_use entry until its result, then prunes it | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > should include content and locations from structuredPatch in hook update | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > should include multiple diff blocks for replaceAll with multiple hunks | missing:T-UNCLASSIFIED | 
@@ -2229,24 +2229,24 @@ src/tests/tools.test.ts | createTaskHook > is a no-op for unrelated hook events 
 src/tests/tools.test.ts | empty message content is not emitted > drops an empty string content instead of emitting an empty agent_message_chunk | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | empty message content is not emitted > still emits non-empty string content | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | empty message content is not emitted > drops an empty streamed text block but keeps a non-empty one | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > renders the structured subagent report instead of the raw trailer text | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > replaces the maxTurns partial-output note in the structured lane | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > renders the structured subagent report instead of the raw trailer text | covered:search-agent-results | structured subagent report instead of the raw trailer
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > replaces the maxTurns partial-output note in the structured lane | ported:src/tools/reporters.rs::t2a_agent_partial_output_note_is_relabelled | structured lane
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > replaces the note variant for an agent that produced no report | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > replaces the note paragraph in the raw fallback and still strips the trailer | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > unwraps the hand-back frame in the raw fallback and still strips the trailer | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > unwraps a frame without a trailer (Explore/Plan agents get none) | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > replaces the note paragraph in the raw fallback and still strips the trailer | ported:src/tools/reporters.rs::t2a_agent_partial_output_note_is_relabelled | raw fallback
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > unwraps the hand-back frame in the raw fallback and still strips the trailer | ported:src/tools/reporters.rs::t2a_agent_handback_frame_is_unwrapped | hand-back frame unwrapped
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > unwraps a frame without a trailer (Explore/Plan agents get none) | ported:src/tools/reporters.rs::t2a_agent_handback_frame_is_unwrapped | frame without a trailer
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > restores the maxTurns note above an unwrapped frame and replaces it | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > replaces the indented note-only variant, which the CLI emits without a header | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > does not split at a header the report quotes (never at column zero inside the frame) | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > leaves the structured lane alone when the raw text carries the frame | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > leaves the structured lane alone when the raw text carries the frame | ported:src/tools/reporters.rs::t2a_agent_completed_report_uses_the_structured_content | structured lane rendered as is
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > leaves a report that merely mentions the note text mid-block alone | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > strips the trailer from the raw fallback when tool_use_result is absent | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > strips only matching trailer parts and leaves unrecognized text alone | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > leaves malformed trailers alone | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > strips only the trailer when the report itself mentions <usage> | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > strips the trailer from the raw fallback when tool_use_result is absent | ported:src/tools/reporters.rs::t2a_agent_trailer_strip_is_tail_anchored | trailer strip without tool_use_result
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > strips only matching trailer parts and leaves unrecognized text alone | ported:src/tools/reporters.rs::t2a_agent_trailer_strip_is_tail_anchored | only matching parts stripped
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > leaves malformed trailers alone | ported:src/tools/reporters.rs::t2a_agent_trailer_strip_is_tail_anchored | malformed trailers left alone
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > strips only the trailer when the report itself mentions <usage> | ported:src/tools/reporters.rs::t2a_agent_trailer_strip_is_tail_anchored | report mentioning usage
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > handles adversarial trailer-shaped input in linear time | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > falls back (trailer-stripped) when tool_use_result is the async_launched variant | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > falls back (trailer-stripped) when the structured content array is empty | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > falls back (trailer-stripped) when tool_use_result is the async_launched variant | ported:src/tools/reporters.rs::t2a_agent_completed_report_uses_the_structured_content | async_launched variant falls back
+src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > falls back (trailer-stripped) when the structured content array is empty | ported:src/tools/reporters.rs::t2a_agent_completed_report_uses_the_structured_content | empty structured content falls back
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > threads options.toolUseResult through toAcpNotifications for a lone tool_result | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Agent/Task tool_result rendering from tool_use_result > ignores options.toolUseResult when several tool_result blocks are batched | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | tool_result_meta non-execution stamping > removes Claude's outer fence from a rejected ExitPlanMode explanation only | missing:T-UNCLASSIFIED | 
@@ -2271,10 +2271,10 @@ src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSea
 src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > Bash > falls back to the raw content array for image output | ported:src/tools.rs::inv_75_bash_structured_image_and_background_skip | image block kept
 src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > Bash > re-establishes the abort notice and no exit code for interrupted commands | ported:src/tools.rs::inv_75_bash_structured_interrupted | corpus bash-structured-interrupted
 src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > Bash > re-establishes the truncation note and persisted path for too-large outputs | ported:src/tools.rs::inv_75_bash_structured_persisted_output | 
-src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > renders hits as Title (url) lines from WebSearchOutput | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > falls back to the raw dump when tool_use_result is absent | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > skips off-spec hits instead of rendering undefined fields | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > falls back to the raw dump when every hit is off-spec | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > renders hits as Title (url) lines from WebSearchOutput | ported:src/tools/reporters.rs::t2a_web_search_hits_render_from_the_structured_output | Title (url) lines
+src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > falls back to the raw dump when tool_use_result is absent | ported:src/tools/reporters.rs::t2a_web_search_hits_render_from_the_structured_output | raw dump without a structured result
+src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > skips off-spec hits instead of rendering undefined fields | ported:src/tools/reporters.rs::t2a_web_search_hits_render_from_the_structured_output | off-spec hits skipped
+src/tests/tools.test.ts | structured tool_use_result rendering (Read/Bash/WebSearch) > WebSearch > falls back to the raw dump when every hit is off-spec | ported:src/tools/reporters.rs::t2a_web_search_hits_render_from_the_structured_output | raw dump when every hit is off-spec
 src/tests/tools.test.ts | Skill tool rendering > toolInfoFromToolUse > sets title to 'Load skill: <name>' and returns empty content | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > toolInfoFromToolUse > falls back to 'Load skill' when skill name is absent | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > toolInfoFromToolUse > does not throw when input is undefined | missing:T-UNCLASSIFIED | 
@@ -2320,8 +2320,8 @@ src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a name past the frontmatter the reader covers | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | NotebookEdit > shows the notebook, the cell, and the new source | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | NotebookEdit > does not send the result text that repeats the cell source | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the structured result, which includes the user's edits | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the input, trimmed, when there is no structured result, as on replay | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the structured result, which includes the user's edits | ported:src/session/exit_plan.rs::t3a_approved_plan_prefers_output_and_skips_subagent_and_empty | 
+src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the input, trimmed, when there is no structured result, as on replay | ported:src/session/exit_plan.rs::t3a_approved_plan_prefers_output_and_skips_subagent_and_empty | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the input when the structured result has none | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan after the tool call's result | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows nothing to a client without plan operations | missing:T-UNCLASSIFIED | 

@@ -1,0 +1,16 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "projects/$CWD_SLUG/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl", "from": "seeds/session-a.jsonl", "mtime": 1767225600},
+    {"path": "projects/$CWD_SLUG/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl", "from": "seeds/session-b.jsonl", "mtime": 1767312000},
+    {"path": "projects/-copy-two/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl", "from": "seeds/session-b.jsonl", "mtime": 1767312001}
+  ],
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["sessionIndex"]}}}},
+    {"call": "request", "method": "session/delete", "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}},
+    {"call": "request", "method": "session/delete", "expect_error": true, "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}},
+    {"call": "request", "method": "session/delete", "params": {"sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}},
+    {"call": "request", "method": "session/delete", "expect_error": true, "params": {"sessionId": "not-a-session-id"}},
+    {"call": "request", "method": "session/list", "params": {"_meta": {"jetbrains": {"air": {"version": 1, "list": {"archived": "all"}}}}}}
+  ]
+}

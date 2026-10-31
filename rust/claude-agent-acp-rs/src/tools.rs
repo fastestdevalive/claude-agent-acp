@@ -21,6 +21,9 @@ use agent_client_protocol::schema::v1::{
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod background;
+pub(crate) mod reporters;
+
 pub use display_path as to_display_path;
 pub use tool_shape as tool_info_from_tool_use;
 
@@ -663,6 +666,27 @@ fn human_text(value: &str, max_len: usize, single_line: bool) -> Option<String> 
     (!normalized.is_empty() && normalized.encode_utf16().count() <= max_len).then_some(normalized)
 }
 
+/// The subject a permission request names instead of the tool's own heading
+/// (`subjectTitle`, `permissions/presentation.ts:77-81`): the host of a sandbox
+/// network request, the display name of a computer-use call. Compacted to one
+/// line of at most 160 characters; `None` for any other tool.
+pub fn permission_subject(
+    tool_name: &str,
+    input: &Value,
+    display_name: Option<&str>,
+) -> Option<String> {
+    let compact = |value: Option<&str>| value.and_then(|text| human_text(text, 160, true));
+    if tool_name == "SandboxNetworkAccess" {
+        if let Some(host) = compact(input.get("host").and_then(Value::as_str)) {
+            return Some(host);
+        }
+    }
+    tool_name
+        .starts_with("mcp__computer-use__")
+        .then(|| compact(display_name))
+        .flatten()
+}
+
 /// The AIR-only permission presentation `_meta` of a `session/request_permission`
 /// (`buildClaudePermissionPresentation`, `permissions/presentation.ts:70-136`):
 /// the heading and the explanation of the prompt. `tool_call_title` is the
@@ -675,19 +699,8 @@ pub fn air_permission_meta(
     decision_reason: Option<&str>,
     default_to_no: bool,
 ) -> Value {
-    let compact = |value: Option<&str>| value.and_then(|text| human_text(text, 160, true));
-    let host = if tool_name == "SandboxNetworkAccess" {
-        compact(input.get("host").and_then(Value::as_str))
-    } else {
-        None
-    };
-    let subject = host.or_else(|| {
-        tool_name
-            .starts_with("mcp__computer-use__")
-            .then(|| compact(display_name))
-            .flatten()
-    });
-    let call_title = subject.unwrap_or_else(|| tool_call_title.to_string());
+    let call_title = permission_subject(tool_name, input, display_name)
+        .unwrap_or_else(|| tool_call_title.to_string());
     let permission_title = if tool_name == "ExitPlanMode" {
         "Ready to code?".to_string()
     } else {
@@ -1212,7 +1225,20 @@ pub fn tool_result_content(
         // PowerShell shares the Bash reporter, including its result
         // (`reporters/index.ts:23`).
         "Bash" | "PowerShell" => bash_result_content(structured, result_content, is_error),
-        "Agent" | "Task" => generic_content(result_content, is_error),
+        "Agent" | "Task" => {
+            if has_error_text(result_content, is_error) {
+                generic_content(result_content, true)
+            } else {
+                reporters::agent_result_content(structured, result_content, is_error)
+            }
+        }
+        "WebSearch" => {
+            if has_error_text(result_content, is_error) {
+                generic_content(result_content, true)
+            } else {
+                reporters::web_search_content(structured, result_content, is_error)
+            }
+        }
         // Edit / Write / Skill results are only a confirmation: the diff or
         // display copy already carries the change (`reporters/file-edit.ts`,
         // `reporters/interaction.ts:119-128`). An error result has no reporter
@@ -1316,80 +1342,37 @@ pub fn bash_result_content(
     raw: &Value,
     is_error: bool,
 ) -> Option<Vec<ToolCallContent>> {
-    if is_error {
+    if has_error_text(raw, is_error) {
         return generic_content(raw, true);
     }
-    let mut output = String::new();
-    let structured_used = match structured.filter(|value| value.is_object()) {
-        Some(structured) => {
-            let stdout = structured.get("stdout").and_then(Value::as_str);
-            let stderr = structured.get("stderr").and_then(Value::as_str);
-            let is_image = structured
-                .get("isImage")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let background = structured
-                .get("backgroundTaskId")
-                .is_some_and(|value| !value.is_null());
-            match (stdout, stderr) {
-                (Some(stdout), Some(stderr)) if !is_image && !background => {
-                    output = join_non_empty([stdout, stderr]);
-                    if structured.get("interrupted").and_then(Value::as_bool) == Some(true) {
-                        output = join_non_empty([
-                            output.as_str(),
-                            "[Command was aborted before completion]",
-                        ]);
-                    }
-                    if let Some(path) = structured
-                        .get("persistedOutputPath")
-                        .and_then(Value::as_str)
-                    {
-                        let size = structured
-                            .get("persistedOutputSize")
-                            .and_then(Value::as_u64)
-                            .map(|bytes| format!(" ({bytes} bytes total)"))
-                            .unwrap_or_default();
-                        output = join_non_empty([
-                            output.as_str(),
-                            &format!("[Output truncated{size}: full output saved to {path}]"),
-                        ]);
-                    }
-                    true
-                }
-                _ => false,
-            }
-        }
-        None => false,
-    };
-    if !structured_used {
-        if let Some(block) = raw.as_object().filter(|object| {
-            object.get("type").and_then(Value::as_str) == Some("bash_code_execution_result")
-        }) {
-            let stdout = block.get("stdout").and_then(Value::as_str).unwrap_or("");
-            let stderr = block.get("stderr").and_then(Value::as_str).unwrap_or("");
-            output = join_non_empty([stdout, stderr]);
-        } else if let Some(text) = raw.as_str() {
-            output = text.to_string();
-        } else if let Some(blocks) = raw.as_array().filter(|blocks| !blocks.is_empty()) {
-            let text_only = blocks
-                .iter()
-                .all(|block| block.get("text").and_then(Value::as_str).is_some());
-            if !text_only {
-                // Binary payloads cannot travel in the terminal channel.
-                return to_acp_content_update(raw, false);
-            }
-            output = blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n");
-        }
+    match reporters::bash_facts(structured, raw, is_error) {
+        reporters::BashFacts::Content(content) => content,
+        reporters::BashFacts::Command(command) => command_console_block(&command),
     }
-    let trimmed = output.trim_end();
+}
+
+/// The non-terminal rendering of a finished command: a non-empty output in a
+/// `console` fence (`renderer.ts:440-460`).
+pub(crate) fn command_console_block(
+    command: &crate::client_caps::CommandOutcome,
+) -> Option<Vec<ToolCallContent>> {
+    let trimmed = command.output.trim_end();
     if trimmed.trim().is_empty() {
         return None;
     }
     Some(vec![text_content(format!("```console\n{trimmed}\n```"))])
+}
+
+/// Whether an error result carries text to show (`hasErrorText`,
+/// `renderer.ts:366-372`): a non-empty string or array of blocks. Such a result
+/// goes through the reporter's `errorResult`, else the fenced generic text.
+pub(crate) fn has_error_text(raw: &Value, is_error: bool) -> bool {
+    is_error
+        && match raw {
+            Value::String(text) => !text.is_empty(),
+            Value::Array(blocks) => !blocks.is_empty(),
+            _ => false,
+        }
 }
 
 /// Join the non-empty strings of `parts` with a newline (`[a,b].filter(Boolean).join("\n")`).

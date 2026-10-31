@@ -69,6 +69,8 @@ pub struct SessionExt {
     pub titles: crate::session_titles::SessionTitles,
     /// Failure context recorded from assistant frames for the active turn (G9).
     pub failure_ctx: crate::session_failure::AssistantFailureCtx,
+    /// Turn 2 hazard-lane state: AIR failure lifecycle, notice books, run-loop effects.
+    pub t2a: crate::session::state::T2aState,
 }
 
 impl SessionExt {
@@ -98,6 +100,7 @@ impl SessionExt {
             goal: crate::goal::GoalState::default(),
             titles: crate::session_titles::SessionTitles::new(),
             failure_ctx: crate::session_failure::AssistantFailureCtx::default(),
+            t2a: crate::session::state::T2aState::default(),
         }
     }
 

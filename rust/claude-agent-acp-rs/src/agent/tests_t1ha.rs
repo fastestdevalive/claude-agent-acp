@@ -22,6 +22,16 @@ fn registry() -> Registry {
         fingerprints: std::collections::HashMap::new(),
         deferred_tx,
         deferred_rx,
+        index: session_index_connection(&ServeOptions::default()),
+        provider: None,
+        gateway_auth: None,
+        creation_params: std::collections::HashMap::new(),
+        auth_contexts: std::collections::HashMap::new(),
+        guard_states: std::collections::HashMap::new(),
+        hide_claude_auth: false,
+        provider_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        provider_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sessions_view: Arc::new(watch::channel(std::collections::HashMap::new()).0),
     }
 }
 
@@ -39,6 +49,9 @@ fn update(session: Session, cancel: Option<Arc<std::sync::atomic::AtomicBool>>) 
         settings_manager: Arc::new(manager),
         fingerprint: "fp".to_string(),
         cancel,
+        creation_params: Value::Null,
+        auth_context: SessionAuthContext::default(),
+        guard: crate::hide_claude_auth::GuardState::default(),
     }))
 }
 

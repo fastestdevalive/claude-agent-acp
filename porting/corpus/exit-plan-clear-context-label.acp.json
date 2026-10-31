@@ -1,0 +1,17 @@
+{
+  "permission": {
+    "option_id": "exit-plan-default"
+  },
+  "steps": [
+    {
+      "call": "initialize"
+    },
+    {
+      "call": "session/new"
+    },
+    {
+      "call": "session/prompt",
+      "text": "plan after a long chat"
+    }
+  ]
+}

@@ -1280,7 +1280,7 @@ pub fn exit_plan_mode(option_id: &str) -> Option<&'static str> {
 
 /// Node `exitPlanClearContextMode` (`effects.js`): the context-reset variants
 /// map to the mode the fresh query should resume in.
-fn exit_plan_clear_context_mode(option_id: &str) -> Option<&'static str> {
+pub fn exit_plan_clear_context_mode(option_id: &str) -> Option<&'static str> {
     match option_id {
         OPTION_EXIT_PLAN_CLEAR_AUTO => Some("auto"),
         OPTION_EXIT_PLAN_CLEAR_BYPASS => Some("bypassPermissions"),

@@ -110,6 +110,12 @@ impl HookRegistry {
         )
     }
 
+    /// Forget every callback (`clearHookCallbacks`): a conversation reset
+    /// mounts a fresh transcript whose tool calls the old ones cannot match.
+    pub fn clear(&mut self) {
+        self.callbacks.clear();
+    }
+
     /// Whether a callback is registered for `tool_use_id`.
     pub fn has(&self, tool_use_id: &str) -> bool {
         self.callbacks.contains_key(tool_use_id)

@@ -1,0 +1,32 @@
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$0","method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"auth":{"terminal":false},"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionIndex"]}}}}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authStatus":{}},"promptCapabilities":{"image":true,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"auth":{"logout":{}},"providers":{},"loadSession":true,"sessionCapabilities":{"additionalDirectories":{},"close":{},"delete":{},"fork":{},"list":{},"resume":{},"systemPrompt":{"mode":{"override":{}}},"subagents":{}}},"agentInfo":{"name":"@agentclientprotocol/claude-agent-acp","title":"Claude Agent","version":"0.94.0"},"authMethods":[],"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport","nativeSubagentSessions","asyncTasks","customInstructions","recommendedValue","diffPatch","planFile","sessionIndex","sessionArchive","sessionRename","sessionListSubscribe","sessionWorktrees"],"goal":{"version":1,"controlMethod":"_session/goal","actions":["set","clear"]}}},"steering":{"supported":true}}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$1","method":"_session/rename","params":{"sessionId":"$2","title":"  Renamed   build\n explainer "}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$1","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$3","method":"_session/archive","params":{"sessionId":"$4"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$3","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$5","method":"_session/archive","params":{"sessionId":"$4"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$5","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$6","method":"_session/unarchive","params":{"sessionId":"$7"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$6","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$8","method":"_session/unarchive","params":{"sessionId":"$7"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$8","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$9","method":"_session/rename","params":{"sessionId":"$4","title":"Kept archived"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$9","result":{}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$10","method":"session/list","params":{"_meta":{"jetbrains":{"air":{"version":1,"list":{"archived":"all"}}}}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$10","result":{"sessions":[{"sessionId":"$7","cwd":"$ROOT","title":"Old migration plan","updatedAt":"$11","_meta":{"jetbrains":{"air":{"version":1,"archived":false,"lastPromptAt":"$12","model":"claude-sonnet-4-5","state":"idle","lastTurnEndedAt":"$11"}}}},{"sessionId":"$4","cwd":"$ROOT","title":"Kept archived","updatedAt":"$13","_meta":{"jetbrains":{"air":{"version":1,"archived":true,"lastPromptAt":"$14","state":"idle"}}}},{"sessionId":"$2","cwd":"$ROOT","title":"Renamed build explainer","updatedAt":"$15","_meta":{"jetbrains":{"air":{"version":1,"archived":false,"lastPromptAt":"$16","state":"idle"}}}}]}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$17","method":"session/list","params":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$17","result":{"sessions":[{"sessionId":"$7","cwd":"$ROOT","title":"Old migration plan","updatedAt":"$11","_meta":{"jetbrains":{"air":{"version":1,"archived":false,"lastPromptAt":"$12","model":"claude-sonnet-4-5","state":"idle","lastTurnEndedAt":"$11"}}}},{"sessionId":"$2","cwd":"$ROOT","title":"Renamed build explainer","updatedAt":"$15","_meta":{"jetbrains":{"air":{"version":1,"archived":false,"lastPromptAt":"$16","state":"idle"}}}}]}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$18","method":"_session/rename","params":{"sessionId":"$19","title":"Nobody"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$18","error":{"code":-32002,"message":"Session not found: $19","data":{"sessionId":"$19"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$20","method":"_session/archive","params":{"sessionId":"$19"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$20","error":{"code":-32002,"message":"Session not found: $19","data":{"sessionId":"$19"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$21","method":"_session/unarchive","params":{"sessionId":"not-a-session-id"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$21","error":{"code":-32002,"message":"Session not found: not-a-session-id","data":{"sessionId":"not-a-session-id"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$22","method":"_session/archive","params":{"sessionId":"  "}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$22","error":{"code":-32602,"message":"Invalid params: params require a non-empty sessionId"}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$23","method":"_session/archive","params":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$23","error":{"code":-32602,"message":"Invalid params: params require a non-empty sessionId"}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$24","method":"_session/rename","params":{"sessionId":"$2","title":"   "}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$24","error":{"code":-32602,"message":"Invalid params: title must be a non-empty string"}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$25","method":"_session/rename","params":{"sessionId":"$2"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$25","error":{"code":-32602,"message":"Invalid params: title must be a non-empty string"}}}

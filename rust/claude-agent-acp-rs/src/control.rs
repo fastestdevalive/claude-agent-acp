@@ -116,6 +116,11 @@ enum Outbound {
     /// that still arrive are skipped, never answered. Outbound frames keep
     /// flowing until the handle is dropped.
     Close,
+    /// Continue on another child's stdin (a clear-context restart): the old
+    /// writer is dropped, which closes the old child's stdin, every request the
+    /// old child never answered fails, its in-flight inbound handlers are
+    /// aborted and inbound requests are answered again.
+    Rebind(Box<dyn AsyncWrite + Unpin + Send>),
 }
 
 /// A handle to the control channel. Cloneable: the session actor and any
@@ -176,6 +181,10 @@ pub struct InitializeOptions {
     pub forward_subagent_text: bool,
     /// `perTaskStopAffordance` (O-84): emitted only when `Some`.
     pub per_task_stop_affordance: Option<bool>,
+    /// `agentProgressSummaries` (O-153): emitted only when `Some`.
+    pub agent_progress_summaries: Option<bool>,
+    /// `planModeInstructions` (O-154): emitted only when `Some`.
+    pub plan_mode_instructions: Option<String>,
     /// `enableFileCheckpointing` (O-136). It is NOT part of the initialize
     /// request — the SDK turns it into the
     /// `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` env var — so it rides here
@@ -210,6 +219,12 @@ impl InitializeOptions {
                 Value::String(append.clone()),
             );
         }
+        if let Some(instructions) = &self.plan_mode_instructions {
+            request.insert(
+                "planModeInstructions".to_string(),
+                Value::String(instructions.clone()),
+            );
+        }
         if let Some(agents) = &self.agents {
             request.insert("agents".to_string(), agents.clone());
         }
@@ -228,6 +243,12 @@ impl InitializeOptions {
             "forwardSubagentText".to_string(),
             Value::Bool(self.forward_subagent_text),
         );
+        if let Some(summaries) = &self.agent_progress_summaries {
+            request.insert(
+                "agentProgressSummaries".to_string(),
+                Value::Bool(*summaries),
+            );
+        }
         if let Some(per_task_stop) = &self.per_task_stop_affordance {
             request.insert(
                 "perTaskStopAffordance".to_string(),
@@ -253,7 +274,13 @@ impl Control {
     ) -> Control {
         let (tx, rx) = mpsc::unbounded_channel::<Outbound>();
         let tx_for_tasks = tx.clone();
-        tokio::spawn(control_task(stdin, inbound, rx, tx_for_tasks, opts));
+        tokio::spawn(control_task(
+            Box::new(stdin),
+            inbound,
+            rx,
+            tx_for_tasks,
+            opts,
+        ));
         Control { tx }
     }
 
@@ -356,6 +383,20 @@ impl Control {
     pub fn close(&self) -> Result<(), ControlError> {
         self.tx
             .send(Outbound::Close)
+            .map_err(|_| ControlError::Closed)
+    }
+
+    /// Move every clone of this handle to another child's stdin. The previous
+    /// child's stdin is closed, what it never answered fails with
+    /// [`ControlError::Closed`], and inbound requests are answered again. The
+    /// inbound stream stays the one the session actor feeds, so it carries the
+    /// new child's control traffic once the actor reads that child.
+    pub fn rebind(
+        &self,
+        stdin: impl AsyncWrite + Unpin + Send + 'static,
+    ) -> Result<(), ControlError> {
+        self.tx
+            .send(Outbound::Rebind(Box::new(stdin)))
             .map_err(|_| ControlError::Closed)
     }
 
@@ -557,7 +598,7 @@ async fn write_frame(
 /// The single-writer control task. Owns the child's stdin, the outbound-request
 /// correlation map (`pending`) and the inbound-handler map (`inflight`).
 async fn control_task(
-    mut stdin: impl AsyncWrite + Unpin,
+    mut stdin: Box<dyn AsyncWrite + Unpin + Send>,
     mut inbound: mpsc::UnboundedReceiver<Value>,
     mut outbound: mpsc::UnboundedReceiver<Outbound>,
     outbound_tx: mpsc::UnboundedSender<Outbound>,
@@ -622,6 +663,14 @@ async fn control_task(
                     }
                     Outbound::Close => {
                         closed = true;
+                    }
+                    Outbound::Rebind(next) => {
+                        stdin = next;
+                        pending.clear();
+                        for (_, task) in inflight.drain() {
+                            task.abort();
+                        }
+                        closed = false;
                     }
                 }
             }
@@ -1480,6 +1529,37 @@ mod tests {
         assert!(absent.get("perTaskStopAffordance").is_none());
     }
 
+    /// O-154 — `planModeInstructions` is serialized only when the client set it.
+    #[test]
+    fn t3a_initialize_request_carries_plan_mode_instructions_only_when_set() {
+        let opts = InitializeOptions {
+            plan_mode_instructions: Some("Plan with care.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            opts.build_request()["planModeInstructions"],
+            json!("Plan with care.")
+        );
+        assert!(InitializeOptions::default()
+            .build_request()
+            .get("planModeInstructions")
+            .is_none());
+    }
+
+    /// O-153 — `agentProgressSummaries` is serialized only when the client set it.
+    #[test]
+    fn initialize_request_carries_agent_progress_summaries_only_when_set() {
+        let opts = InitializeOptions {
+            agent_progress_summaries: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(opts.build_request()["agentProgressSummaries"], json!(true));
+        assert!(InitializeOptions::default()
+            .build_request()
+            .get("agentProgressSummaries")
+            .is_none());
+    }
+
     /// O-155, O-161 — `toolAliases` and `toolConfig` are serialized into initialize payload when provided.
     #[test]
     fn initialize_request_carries_tool_aliases_and_tool_config() {
@@ -1495,5 +1575,51 @@ mod tests {
         let absent = InitializeOptions::default().build_request();
         assert!(absent.get("toolAliases").is_none());
         assert!(absent.get("toolConfig").is_none());
+    }
+
+    /// B-74 — `rebind` moves every clone to another child's stdin: frames follow
+    /// the new writer, a request the old child never answered fails, and the old
+    /// child's stdin is closed.
+    #[tokio::test]
+    async fn t3a_rebind_moves_the_writer_and_fails_unanswered_requests() {
+        let (control, mut first_lines, _inbound) = harness(ControlOptions::default());
+        let waiting = {
+            let control = control.clone();
+            tokio::spawn(async move { control.send_request(json!({"subtype": "probe"})).await })
+        };
+        let line = next_line(&mut first_lines).await;
+        assert_eq!(line["request"]["subtype"], "probe");
+
+        let (next_stdin, next_reader) = tokio::io::duplex(64 * 1024);
+        control.rebind(next_stdin).unwrap();
+        let outcome = timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the unanswered request settles")
+            .expect("join");
+        assert!(
+            matches!(outcome, Err(ControlError::Closed)),
+            "the old child's request fails: {outcome:?}"
+        );
+        // The old stdin was closed by the rebind.
+        assert!(
+            timeout(Duration::from_secs(5), first_lines.recv())
+                .await
+                .expect("the old reader ends")
+                .is_none(),
+            "no further line on the old stdin"
+        );
+
+        control
+            .send_user(json!({"type": "user", "message": {"content": "hi"}}))
+            .await
+            .unwrap();
+        let mut reader = tokio::io::BufReader::new(next_reader);
+        let mut line = String::new();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("a line on the new stdin")
+            .unwrap();
+        let written: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(written["type"], "user");
     }
 }

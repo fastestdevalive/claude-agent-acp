@@ -5,15 +5,15 @@
 use super::*;
 
 /// A `run_loop` actor without a child process.
-struct Rig {
-    tx: mpsc::UnboundedSender<Command>,
+pub(super) struct Rig {
+    pub(super) tx: mpsc::UnboundedSender<Command>,
     stream_tx: Option<mpsc::UnboundedSender<Value>>,
     update_rx: mpsc::UnboundedReceiver<SessionOutbound>,
     _writer: tokio::io::DuplexStream,
 }
 
 impl Rig {
-    fn spawn(air: Option<&[&str]>) -> Self {
+    pub(super) fn spawn(air: Option<&[&str]>) -> Self {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
@@ -52,7 +52,10 @@ impl Rig {
         }
     }
 
-    fn prompt(&self, uuid: &str) -> oneshot::Receiver<Result<PromptReply, PromptFailure>> {
+    pub(super) fn prompt(
+        &self,
+        uuid: &str,
+    ) -> oneshot::Receiver<Result<PromptReply, PromptFailure>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Command::Prompt {
@@ -66,23 +69,23 @@ impl Rig {
         reply_rx
     }
 
-    fn send(&self, frame: Value) {
+    pub(super) fn send(&self, frame: Value) {
         self.stream_tx.as_ref().unwrap().send(frame).unwrap();
     }
 
-    fn echo(&self, uuid: &str) {
+    pub(super) fn echo(&self, uuid: &str) {
         self.send(json!({"type":"user","uuid":uuid,"isReplay":true,
             "message":{"role":"user","content":[{"type":"text","text":"a"}]}}));
     }
 
-    fn end_stream(&mut self, abnormal: Option<bool>) {
+    pub(super) fn end_stream(&mut self, abnormal: Option<bool>) {
         if let Some(abnormal) = abnormal {
             self.send(child_exit_marker(abnormal));
         }
         self.stream_tx = None;
     }
 
-    async fn outbound_until_end(&mut self) -> Vec<SessionOutbound> {
+    pub(super) async fn outbound_until_end(&mut self) -> Vec<SessionOutbound> {
         let mut items = Vec::new();
         let drained = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(item) = self.update_rx.recv().await {
@@ -95,7 +98,7 @@ impl Rig {
     }
 }
 
-async fn reply_of(
+pub(super) async fn reply_of(
     rx: oneshot::Receiver<Result<PromptReply, PromptFailure>>,
 ) -> Result<PromptReply, SessionError> {
     tokio::time::timeout(Duration::from_secs(10), rx)

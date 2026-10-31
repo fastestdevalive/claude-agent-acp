@@ -1,0 +1,16 @@
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$0","method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"auth":{"terminal":false},"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionIndex"]}}}}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authStatus":{}},"promptCapabilities":{"image":true,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"auth":{"logout":{}},"providers":{},"loadSession":true,"sessionCapabilities":{"additionalDirectories":{},"close":{},"delete":{},"fork":{},"list":{},"resume":{},"systemPrompt":{"mode":{"override":{}}},"subagents":{}}},"agentInfo":{"name":"@agentclientprotocol/claude-agent-acp","title":"Claude Agent","version":"0.94.0"},"authMethods":[],"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport","nativeSubagentSessions","asyncTasks","customInstructions","recommendedValue","diffPatch","planFile","sessionIndex","sessionArchive","sessionRename","sessionListSubscribe","sessionWorktrees"],"goal":{"version":1,"controlMethod":"_session/goal","actions":["set","clear"]}}},"steering":{"supported":true}}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$1","method":"_session/list/subscribe","params":{"cwd":"relative/path"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$1","error":{"code":-32602,"message":"Invalid params: params require an absolute cwd","data":{"cwd":"relative/path"}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$2","method":"_session/list/unsubscribe","params":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$2","error":{"code":-32602,"message":"Invalid params: params require a subscriptionId"}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$3","method":"_session/list/subscribe","params":{"cwd":"$ROOT","ignored":true}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$3","result":{"subscriptionId":"$4"}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$5","method":"_session/rename","params":{"sessionId":"$6","title":"Pushed rename"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$5","result":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","method":"_session/list/changes","params":{"subscriptionId":"$4","sessions":[{"sessionId":"$6","cwd":"$ROOT","title":"Pushed rename","updatedAt":"$7","_meta":{"jetbrains":{"air":{"version":1,"archived":false,"lastPromptAt":"$8","state":"idle"}}}}],"removed":[]}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$9","method":"_session/archive","params":{"sessionId":"$10"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$9","result":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","method":"_session/list/changes","params":{"subscriptionId":"$4","sessions":[{"sessionId":"$10","cwd":"$ROOT","title":"Fix failing test","updatedAt":"$11","_meta":{"jetbrains":{"air":{"version":1,"archived":true,"lastPromptAt":"$12","state":"idle"}}}}],"removed":[]}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$13","method":"_session/list/unsubscribe","params":{"subscriptionId":"$14"}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$13","result":{}}}

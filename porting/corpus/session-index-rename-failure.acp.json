@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["sessionIndex"]}}}},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}},
+    {"call": "request", "method": "_session/rename", "expect_error": true, "params": {"sessionId": "$SESSION", "title": "Broken name"}},
+    {"call": "request", "method": "session/prompt", "params": {"sessionId": "$SESSION", "prompt": [{"type": "text", "text": "hello"}]}},
+    {"call": "wait_recv", "contains": "session_info_update"}
+  ]
+}

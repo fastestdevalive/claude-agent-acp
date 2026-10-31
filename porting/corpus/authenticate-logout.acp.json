@@ -1,0 +1,12 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "wait_recv", "contains": "_auth/status_update"},
+    {"call": "request", "method": "authenticate",
+     "params": {"methodId": "gateway-bedrock", "_meta": {"gateway": {"baseUrl": "https://gateway.example/bedrock"}}}},
+    {"call": "request", "method": "providers/list", "params": {}},
+    {"call": "request", "method": "logout", "params": {}},
+    {"call": "request", "method": "providers/list", "params": {}}
+  ]
+}

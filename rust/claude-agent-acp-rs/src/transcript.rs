@@ -754,14 +754,26 @@ fn is_tool_result_block(block: &Value) -> bool {
 /// state and publishes the `plan` update in the block's position (Node
 /// `toAcpNotifications` with `options.taskState`); every other block maps as
 /// before. `air` reproduces `changedTaskPlanEntries`' dedupe for AIR clients.
+/// What a replay knows about its client and the message it is mapping.
+#[derive(Clone, Copy)]
+struct ReplayFlags {
+    /// An AIR client: the plan dedupe applies.
+    air: bool,
+    /// The client takes plan operations (`clientCapabilities.plan`).
+    plan_ops: bool,
+    /// The message belongs to the main conversation (no parent tool call).
+    top_level: bool,
+}
+
 fn replay_content(
     content: &Value,
     role: MsgRole,
     state: &mut MapState,
     task_state: &mut Vec<(String, crate::hooks::TaskStateEntry)>,
-    air: bool,
+    flags: ReplayFlags,
     last_published: &mut Option<String>,
 ) -> Vec<Value> {
+    let air = flags.air;
     let Value::Array(blocks) = content else {
         return map_consolidated(content, role, state)
             .into_iter()
@@ -826,12 +838,30 @@ fn replay_content(
                 }
             }
         }
+        // U-24: an approved ExitPlanMode plan of the main conversation becomes
+        // the session's markdown plan. Replay has only the tool input: the SDK's
+        // `getSessionMessages` drops the structured output the transcript keeps.
+        let approved_plan = (flags.plan_ops && flags.top_level && is_tool_result_block(block))
+            .then(|| block.get("tool_use_id").and_then(Value::as_str))
+            .flatten()
+            .and_then(|id| state.tool_use_from_cache(id))
+            .filter(|tool_use| tool_use.get("name").and_then(Value::as_str) == Some("ExitPlanMode"))
+            .filter(|_| block.get("is_error").and_then(Value::as_bool) != Some(true))
+            .and_then(|tool_use| {
+                crate::session::exit_plan::approved_plan(
+                    tool_use.get("input").unwrap_or(&Value::Null),
+                    &Value::Null,
+                )
+            });
         for update in map_consolidated(&Value::Array(vec![block.clone()]), role, state) {
             if let Ok(mut value) = serde_json::to_value(update) {
                 crate::map::materialize_tool_call_defaults(&mut value);
                 crate::map::materialize_diff_old_text(&mut value);
                 out.push(value);
             }
+        }
+        if let Some(plan) = approved_plan {
+            out.push(crate::session::exit_plan::plan_mode_update(&plan));
         }
     }
     out
@@ -850,6 +880,32 @@ pub fn replay_with_task_state(
     Vec<(String, crate::hooks::TaskStateEntry)>,
     Option<String>,
 ) {
+    replay_with_failures(messages, session_id, air, false, None)
+}
+
+/// [`replay_with_task_state`] for a client that reads AIR session failures:
+/// `failures` is the session's failure book, and every synthetic usage-limit
+/// message of the history replays as a typed failure at its transcript
+/// position instead of as chat text (N-53 / V-15, `acp-agent.ts:9307-9343`).
+/// The record is named after the prompt it answered, so it recreates the live
+/// incident identity; only the latest limit not followed by a real model
+/// answer stays active in the book.
+pub fn replay_with_failures(
+    messages: &[Value],
+    session_id: &str,
+    air: bool,
+    plan_ops: bool,
+    mut failures: Option<&mut crate::session::failures::SessionFailures>,
+) -> (
+    Vec<Value>,
+    Vec<(String, crate::hooks::TaskStateEntry)>,
+    Option<String>,
+) {
+    let active_limit_uuid = failures
+        .as_ref()
+        .and_then(|_| crate::session_failure::active_usage_limit_message(messages))
+        .map(|(uuid, _)| uuid);
+    let mut replay_turn_id: Option<String> = None;
     let mut out = Vec::new();
     let mut state = MapState::default();
     let mut task_state: Vec<(String, crate::hooks::TaskStateEntry)> = Vec::new();
@@ -861,8 +917,40 @@ pub fn replay_with_task_state(
         }
         let role = message.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = message.get("message").cloned().unwrap_or(Value::Null);
+        let top_level = message.get("parent_tool_use_id").is_none_or(Value::is_null);
+        if role == "user" && top_level {
+            if let Some(uuid) = message
+                .get("uuid")
+                .and_then(Value::as_str)
+                .filter(|uuid| !uuid.is_empty())
+            {
+                replay_turn_id = Some(uuid.to_string());
+            }
+        }
         if role == "assistant" && is_synthetic_login_message(message) {
             continue;
+        }
+        if let Some(book) = failures.as_deref_mut() {
+            if role == "assistant"
+                && top_level
+                && crate::session_failure::is_synthetic_usage_limit_message(&payload)
+            {
+                if let Some(title) = crate::session_failure::assistant_message_text(&payload) {
+                    let uuid = message.get("uuid").and_then(Value::as_str).unwrap_or("");
+                    let id = match &replay_turn_id {
+                        Some(turn) => format!("{turn}:error"),
+                        None => format!("{session_id}:history-error:{uuid}"),
+                    };
+                    out.push(book.restore(
+                        session_id,
+                        &id,
+                        crate::session_failure::ClaudeFailureKind::QuotaExhausted,
+                        &title,
+                        active_limit_uuid.as_deref() == Some(uuid),
+                    ));
+                }
+                continue;
+            }
         }
         let mut content = payload.get("content").cloned().unwrap_or(Value::Null);
         if role == "assistant" && parent_tool_use_id_of(message).is_some() {
@@ -898,7 +986,11 @@ pub fn replay_with_task_state(
             msg_role,
             &mut state,
             &mut task_state,
-            air,
+            ReplayFlags {
+                air,
+                plan_ops,
+                top_level,
+            },
             &mut last_published,
         );
         let message_id = if message_id.is_empty() {
@@ -1395,5 +1487,128 @@ mod tests {
         assert_eq!(notif.len(), 1);
         assert_eq!(notif[0]["update"]["sessionUpdate"], json!("tool_call"));
         assert_eq!(notif[0]["update"]["name"], json!("Bash"));
+    }
+    fn limit_message(uuid: &str, text: &str) -> Value {
+        json!({"type":"assistant","uuid":uuid,"parent_tool_use_id":null,
+            "message":{"role":"assistant","model":"<synthetic>",
+                "content":[{"type":"text","text":text}]}})
+    }
+
+    fn user_message(uuid: &str, text: &str) -> Value {
+        json!({"type":"user","uuid":uuid,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"text","text":text}]}})
+    }
+
+    fn real_answer(uuid: &str) -> Value {
+        json!({"type":"assistant","uuid":uuid,"parent_tool_use_id":null,
+            "message":{"id":"msg_real","role":"assistant","model":"claude-sonnet-4-5",
+                "content":[{"type":"text","text":"fine"}]}})
+    }
+
+    /// N-53 / V-15 — a capable client gets each synthetic usage-limit message as
+    /// a typed failure at its position, named after the prompt it answered; only
+    /// the latest limit with no real answer after it stays active.
+    #[test]
+    fn t3a_replay_restores_usage_limit_failures_at_their_position() {
+        let msgs = vec![
+            user_message("u1", "first"),
+            limit_message("l1", "You've hit your limit"),
+            user_message("u2", "second"),
+            limit_message("l2", "You've hit your limit again"),
+        ];
+        let mut book = crate::session::failures::SessionFailures::default();
+        let (notifications, _, _) = replay_with_failures(&msgs, ID, false, false, Some(&mut book));
+        let kinds: Vec<&str> = notifications
+            .iter()
+            .map(|n| n["update"]["sessionUpdate"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user_message_chunk",
+                "session_info_update",
+                "user_message_chunk",
+                "session_info_update"
+            ]
+        );
+        let sf = |n: &Value| n["update"]["_meta"]["jetbrains"]["air"]["sessionFailure"].clone();
+        assert_eq!(sf(&notifications[1])["id"], "u1:error");
+        assert_eq!(sf(&notifications[1])["title"], "You've hit your limit");
+        assert_eq!(sf(&notifications[3])["id"], "u2:error");
+        assert_eq!(book.active().len(), 1, "only the latest limit stays active");
+        assert_eq!(book.active()[0].failure.id, "u2:error");
+        // A plain client keeps the legacy text.
+        let (plain, _, _) = replay_with_failures(&msgs, ID, false, false, None);
+        assert!(plain
+            .iter()
+            .all(|n| n["update"]["sessionUpdate"] != "session_info_update"));
+    }
+
+    /// N-53 — a real model answer after the limit proves recovery: the record
+    /// replays but is not left active.
+    #[test]
+    fn t3a_replay_limit_followed_by_a_real_answer_is_not_active() {
+        let msgs = vec![
+            user_message("u1", "first"),
+            limit_message("l1", "You've hit your limit"),
+            user_message("u2", "second"),
+            real_answer("a2"),
+        ];
+        let mut book = crate::session::failures::SessionFailures::default();
+        let (notifications, _, _) = replay_with_failures(&msgs, ID, false, false, Some(&mut book));
+        assert!(notifications
+            .iter()
+            .any(|n| n["update"]["sessionUpdate"] == "session_info_update"));
+        assert!(book.active().is_empty());
+    }
+
+    fn exit_plan_history(is_error: bool, parent: Option<&str>) -> Vec<Value> {
+        vec![
+            json!({"type":"assistant","uuid":"a1","parent_tool_use_id":parent,
+                "message":{"id":"msg_p","role":"assistant","model":"claude-sonnet-4-5",
+                    "content":[{"type":"tool_use","id":"toolu_P","name":"ExitPlanMode",
+                        "input":{"plan":"  step one\nstep two \n"}}]}}),
+            json!({"type":"user","uuid":"u1","parent_tool_use_id":parent,
+                "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_P",
+                    "is_error":is_error,"content":"approved"}]}}),
+        ]
+    }
+
+    /// U-24 — replay publishes an approved ExitPlanMode plan (from the tool
+    /// input, trimmed) as a markdown plan after the tool's result, for a client
+    /// with plan operations; not for one without, a failed result or a subagent.
+    #[test]
+    fn t3a_replay_publishes_the_approved_plan_for_plan_clients() {
+        let kinds = |notifications: &[Value]| -> Vec<String> {
+            notifications
+                .iter()
+                .map(|n| {
+                    n["update"]["sessionUpdate"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+        let (with_ops, _, _) =
+            replay_with_failures(&exit_plan_history(false, None), ID, false, true, None);
+        let kinds_with = kinds(&with_ops);
+        assert_eq!(
+            kinds_with.last().map(String::as_str),
+            Some("plan_update"),
+            "{kinds_with:?}"
+        );
+        assert_eq!(
+            with_ops.last().unwrap()["update"]["plan"],
+            json!({"type":"markdown","planId":"plan-mode","content":"step one\nstep two"})
+        );
+        for (history, plan_ops) in [
+            (exit_plan_history(false, None), false),
+            (exit_plan_history(true, None), true),
+            (exit_plan_history(false, Some("toolu_PARENT")), true),
+        ] {
+            let (out, _, _) = replay_with_failures(&history, ID, false, plan_ops, None);
+            assert!(!kinds(&out).contains(&"plan_update".to_string()));
+        }
     }
 }

@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "banner only refusal"},
+    {"call": "session/prompt", "text": "frame refusal"},
+    {"call": "session/prompt", "text": "background refusal"},
+    {"call": "session/prompt", "text": "fine"}
+  ]
+}

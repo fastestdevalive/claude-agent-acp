@@ -279,6 +279,19 @@ fn inv_24_tools() {
     }
 }
 
+/// Scenarios owned by `differential_t1fc.rs`: they need files seeded under
+/// `/tmp/acp-parity-t1fc/<scenario>/` (under an advisory lock) and so are run
+/// only there. `inv_24_full_corpus` skips them to stay independent of `/tmp`
+/// state; `t1fc_owned_scenarios_are_run_by_differential_t1fc` keeps this list
+/// in sync with that file.
+const T1FC_OWNED: [&str; 5] = [
+    "edit-diff-preview",
+    "write-diff-patch-client",
+    "write-diff-hook-patch",
+    "write-create-patch-client",
+    "write-air-no-diff-patch",
+];
+
 /// The full corpus: every `.acp.json` script under `porting/corpus/`. Phase 13
 /// (13.T1) requires ALL of them to diff clean against the committed Node
 /// fixtures, not just the subset each earlier phase exercised.
@@ -308,7 +321,41 @@ fn all_corpus_names() -> Vec<String> {
 #[test]
 fn inv_24_full_corpus() {
     for name in all_corpus_names() {
+        if T1FC_OWNED.contains(&name.as_str()) {
+            continue;
+        }
         run_and_diff(&name);
+    }
+}
+
+/// The scenarios `inv_24_full_corpus` skips are exactly the ones
+/// `differential_t1fc.rs` runs via `run_and_diff("<name>")`.
+#[test]
+fn t1fc_owned_scenarios_are_run_by_differential_t1fc() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/differential_t1fc.rs"),
+    )
+    .expect("read differential_t1fc.rs");
+    let marker = "run_and_diff(\"";
+    let mut called: Vec<String> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix(marker) {
+            if let Some(end) = rest.find('"') {
+                called.push(rest[..end].to_string());
+            }
+        }
+    }
+    called.sort();
+    let mut owned: Vec<String> = T1FC_OWNED.iter().map(|s| s.to_string()).collect();
+    owned.sort();
+    assert_eq!(
+        called, owned,
+        "T1FC_OWNED drifted from differential_t1fc.rs"
+    );
+    let corpus = all_corpus_names();
+    for n in &owned {
+        assert!(corpus.contains(n), "owned scenario {n} missing from corpus");
     }
 }
 

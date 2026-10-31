@@ -99,6 +99,26 @@ impl AirClient {
     }
 }
 
+/// The session index: a bounded, ordered `session/list` with row metadata, and
+/// `_session/rename`, `_session/archive`, `_session/unarchive` and the list
+/// subscription. Advertised only to a client that declares it
+/// (`AIR_SESSION_INDEX_CAPABILITY`, `air-extension.ts`).
+pub const AIR_SESSION_INDEX_CAPABILITY: &str = "sessionIndex";
+/// The agent supports `_session/archive` and `_session/unarchive`. Advertised
+/// exactly when [`AIR_SESSION_INDEX_CAPABILITY`] is.
+pub const AIR_SESSION_ARCHIVE_CAPABILITY: &str = "sessionArchive";
+/// The agent supports `_session/rename`. Advertised exactly when
+/// [`AIR_SESSION_INDEX_CAPABILITY`] is.
+pub const AIR_SESSION_RENAME_CAPABILITY: &str = "sessionRename";
+/// The agent supports `_session/list/subscribe`, `_session/list/unsubscribe` and
+/// `_session/list/changes`. Advertised exactly when
+/// [`AIR_SESSION_INDEX_CAPABILITY`] is.
+pub const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY: &str = "sessionListSubscribe";
+/// Session index rows carry `agentWorktree: true` when the session runs in a
+/// linked git worktree that Claude Code made for it. Advertised exactly when
+/// [`AIR_SESSION_INDEX_CAPABILITY`] is.
+pub const AIR_SESSION_WORKTREES_CAPABILITY: &str = "sessionWorktrees";
+
 /// The AIR capability that advertises a recommended select value
 /// (`AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY`, `air-extension.ts:4`).
 pub const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY: &str = "recommendedValue";
