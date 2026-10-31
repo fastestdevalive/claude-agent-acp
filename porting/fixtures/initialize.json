@@ -11,21 +11,36 @@
           ]
         }
       ],
-      "TaskCreated": [
+      "PostModelSwitch": [
         {
           "hookCallbackIds": [
             "hook_1"
           ]
         }
       ],
-      "TaskCompleted": [
+      "PostCompact": [
         {
           "hookCallbackIds": [
             "hook_2"
           ]
         }
+      ],
+      "TaskCreated": [
+        {
+          "hookCallbackIds": [
+            "hook_3"
+          ]
+        }
+      ],
+      "TaskCompleted": [
+        {
+          "hookCallbackIds": [
+            "hook_4"
+          ]
+        }
       ]
     },
+    "promptSuggestions": true,
     "forwardSubagentText": false
   }
 }

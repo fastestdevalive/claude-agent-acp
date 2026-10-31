@@ -1,0 +1,3 @@
+{"type":"user","uuid":"b1000000-0000-4000-8000-000000000001","parentUuid":null,"sessionId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","cwd":"$CWD","timestamp":"2026-01-02T00:00:00.000Z","message":{"role":"user","content":"fix the failing test"}}
+{"type":"assistant","uuid":"b1000000-0000-4000-8000-000000000002","parentUuid":"b1000000-0000-4000-8000-000000000001","sessionId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","cwd":"$CWD","timestamp":"2026-01-02T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}
+{"type":"ai-title","sessionId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","aiTitle":"Fix failing test"}

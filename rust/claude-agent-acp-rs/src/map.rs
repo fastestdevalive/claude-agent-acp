@@ -25,20 +25,23 @@
 //! processes each frame. Nothing here is async and nothing here holds a lock;
 //! it is a plain transformation unit, so it is exhaustively unit-tested.
 //!
-//! Source of truth (Node adapter `v0.70.0`, `dist/acp-agent.js`):
+//! Source of truth (Node adapter at the pinned version, `dist/acp-agent.js`):
 //! `toAcpNotifications` at lines 6383–6759, `streamEventToAcpNotifications` at
 //! 6760–6864, the partial-JSON lexer at 179–232.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock, ContentChunk,
     CurrentModeUpdate, ImageContent, MessageId, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
+    PlanEntryStatus, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput,
 };
 use serde_json::Value;
 
+use crate::meta_filter::ChangedMetaFilter;
 use crate::tools;
 
 /// Whether a consolidated message is the assistant's or the user's side.
@@ -69,9 +72,72 @@ pub struct MapState {
     /// so the streamed chunk updates that follow (whose delta events don't carry
     /// it) are all tagged with the same replay-stable id (`acp-agent.js:2889`).
     current_stream_message_id: String,
+    /// Per-tool-call "what the client holds", for the field tracker (2.9 /
+    /// X-7). Seeded when a `tool_call` is surfaced (map.rs + permission.rs);
+    /// each `tool_call_update` emits only fields whose value differs, then
+    /// updates the held state; the entry ends after the `tool_result`.
+    tool_tracker: HashMap<String, TrackedToolCall>,
+    /// Unfinished-tool books (3.7): dispatched ids + per-turn foreground set.
+    pub(crate) books: crate::unfinished::ToolBooks,
+    /// The client is AIR (rust-air-gaps G11): tool reports carry
+    /// `_meta.jetbrains.air.*`, the AIR-only `is_mcp_tool_call` flag, no
+    /// `rawInput` while the input still streams, the AIR `rawOutput` rule, and
+    /// pass through the [`ChangedMetaFilter`]. Off for every other client.
+    air: bool,
+    /// The session working directory (locates a Skill's `SKILL.md`), AIR only.
+    cwd: Option<PathBuf>,
+    /// True while a `content_block_start` tool_use block is mapped: its input
+    /// is still streaming (`inputComplete === false` in the Node renderer).
+    input_incomplete: bool,
+    /// The AIR changed-`_meta` filter (Decision 25).
+    meta_filter: ChangedMetaFilter,
 }
 
 impl MapState {
+    /// Mark the session as an AIR one (rust-air-gaps G11) with its working
+    /// directory. `MapState::default()` stays a non-AIR session.
+    pub(crate) fn configure_air(&mut self, cwd: PathBuf) {
+        self.air = true;
+        self.cwd = Some(cwd);
+    }
+
+    /// Whether the client is AIR (see [`MapState::configure_air`]).
+    pub(crate) fn is_air(&self) -> bool {
+        self.air
+    }
+
+    /// The `_meta` of a tool-use report: `{claudeCode:{toolName}}`, plus the AIR
+    /// keys for an AIR client.
+    pub(crate) fn use_meta(&self, name: &str, input: &Value) -> serde_json::Map<String, Value> {
+        if self.air {
+            tools::air_tool_meta(name, input, self.cwd.as_deref())
+        } else {
+            tools::tool_meta(name, input)
+        }
+    }
+
+    /// Run `updates` through the AIR changed-`_meta` filter (a no-op for any
+    /// other client).
+    pub(crate) fn filter_updates(&mut self, updates: Vec<SessionUpdate>) -> Vec<SessionUpdate> {
+        if !self.air {
+            return updates;
+        }
+        updates
+            .into_iter()
+            .filter_map(|update| self.meta_filter.apply(update))
+            .collect()
+    }
+
+    /// Forget a tool call the turn closed without a `tool_result` (3.7,
+    /// Node `closeToolCall`): the id is no longer emitted and its cache and
+    /// field-tracker entries go.
+    pub(crate) fn close_tool_call(&mut self, id: &str) {
+        self.emitted.remove(id);
+        self.tool_use_cache.remove(id);
+        self.tool_tracker.remove(id);
+        self.books.forget(id);
+    }
+
     /// Whether a tool-call id has already surfaced to the client (used by
     /// `permission::ensure_tool_call_emitted`, INV-20 / #851).
     pub(crate) fn has_emitted(&self, id: &str) -> bool {
@@ -83,6 +149,193 @@ impl MapState {
     pub(crate) fn mark_emitted(&mut self, id: String, block: Value) {
         self.emitted.insert(id.clone());
         self.tool_use_cache.insert(id, block);
+    }
+
+    /// Seed the field tracker for a freshly-surfaced `tool_call` (2.9 / X-7).
+    pub(crate) fn seed_tool_tracker(&mut self, id: String, tracked: TrackedToolCall) {
+        self.tool_tracker.insert(id, tracked);
+    }
+
+    /// Apply a `tool_call_update` candidate against what the client holds for
+    /// `id` (2.9 / X-7): returns the sub-set of fields that actually changed
+    /// (compared by value), updating the held state, or `None` when nothing
+    /// changed (`_meta` is always kept whole for non-AIR, so an unchanged
+    /// update is not sent).
+    pub(crate) fn track_tool_call_update(
+        &mut self,
+        id: &str,
+        fields: &ToolCallUpdateFields,
+    ) -> Option<ToolCallUpdateFields> {
+        match self.tool_tracker.get_mut(id) {
+            Some(entry) => {
+                let changed = entry.apply(fields);
+                if changed.is_empty() {
+                    None
+                } else {
+                    Some(changed.into_fields())
+                }
+            }
+            // No prior state for this id (X-7: the client holds nothing yet) —
+            // everything in the candidate is new, so emit it whole.
+            None => Some(fields.clone()),
+        }
+    }
+
+    /// End a tool call's field-tracker entry after its `tool_result` (2.9 /
+    /// X-7: "entry ends after the `tool_result`").
+    pub(crate) fn finish_tool_tracker(&mut self, id: &str) {
+        self.tool_tracker.remove(id);
+    }
+
+    /// Clear EVERY per-tool-call field-tracker entry (review follow-up
+    /// 3.17-D). Called on session cancel and when a turn settles, mirroring
+    /// Node clearing its field tracker on those boundaries — a tool call that
+    /// never gets a `tool_result` (interrupted / refused) must not leak its
+    /// tracker entry into the next turn.
+    /// Number of live field-tracker entries (diagnostics / tests).
+    #[cfg(test)]
+    pub(crate) fn tracked_tool_calls(&self) -> usize {
+        self.tool_tracker.len()
+    }
+
+    pub(crate) fn clear_tool_tracker(&mut self) {
+        self.tool_tracker.clear();
+    }
+}
+
+/// What the client is known to hold for a surfaced tool call (2.9 / X-7),
+/// mirroring `dist/tool-calls/field-tracker.js`: the last value sent for each
+/// of `status,kind,title,content,locations,rawInput,rawOutput`.
+#[derive(Debug, Clone)]
+pub(crate) struct TrackedToolCall {
+    status: ToolCallStatus,
+    kind: ToolKind,
+    title: String,
+    content: Vec<ToolCallContent>,
+    locations: Vec<ToolCallLocation>,
+    raw_input: Option<Value>,
+    raw_output: Option<Value>,
+}
+
+impl TrackedToolCall {
+    /// The tracker entry for a freshly-emitted `tool_call` (always `Pending`
+    /// status, never any raw output).
+    pub(crate) fn initial(
+        kind: ToolKind,
+        title: String,
+        content: Vec<ToolCallContent>,
+        locations: Vec<ToolCallLocation>,
+        raw_input: Option<Value>,
+    ) -> Self {
+        Self {
+            status: ToolCallStatus::Pending,
+            kind,
+            title,
+            content,
+            locations,
+            raw_input,
+            raw_output: None,
+        }
+    }
+
+    /// Compare `fields` against the held values; record and return the changed
+    /// subset (updating the held state).
+    fn apply(&mut self, fields: &ToolCallUpdateFields) -> Changed {
+        let mut changed = Changed::default();
+        if let Some(v) = &fields.status {
+            if v != &self.status {
+                changed.status = Some(*v);
+                self.status = *v;
+            }
+        }
+        if let Some(v) = &fields.kind {
+            if v != &self.kind {
+                changed.kind = Some(*v);
+                self.kind = *v;
+            }
+        }
+        if let Some(v) = &fields.title {
+            if v != &self.title {
+                changed.title = Some(v.clone());
+                self.title = v.clone();
+            }
+        }
+        if let Some(v) = &fields.content {
+            if v != &self.content {
+                changed.content = Some(v.clone());
+                self.content = v.clone();
+            }
+        }
+        if let Some(v) = &fields.locations {
+            if v != &self.locations {
+                changed.locations = Some(v.clone());
+                self.locations = v.clone();
+            }
+        }
+        if let Some(v) = &fields.raw_input {
+            if Some(v.clone()) != self.raw_input {
+                changed.raw_input = Some(v.clone());
+                self.raw_input = Some(v.clone());
+            }
+        }
+        if let Some(v) = &fields.raw_output {
+            if Some(v.clone()) != self.raw_output {
+                changed.raw_output = Some(v.clone());
+                self.raw_output = Some(v.clone());
+            }
+        }
+        changed
+    }
+}
+
+/// The subset of candidate fields that actually changed for a `tool_call_update`.
+#[derive(Debug, Default)]
+struct Changed {
+    status: Option<ToolCallStatus>,
+    kind: Option<ToolKind>,
+    title: Option<String>,
+    content: Option<Vec<ToolCallContent>>,
+    locations: Option<Vec<ToolCallLocation>>,
+    raw_input: Option<Value>,
+    raw_output: Option<Value>,
+}
+
+impl Changed {
+    /// Whether nothing changed.
+    fn is_empty(&self) -> bool {
+        self.status.is_none()
+            && self.kind.is_none()
+            && self.title.is_none()
+            && self.content.is_none()
+            && self.locations.is_none()
+            && self.raw_input.is_none()
+            && self.raw_output.is_none()
+    }
+
+    fn into_fields(self) -> ToolCallUpdateFields {
+        let mut f = ToolCallUpdateFields::new();
+        if let Some(v) = self.status {
+            f = f.status(v);
+        }
+        if let Some(v) = self.kind {
+            f = f.kind(v);
+        }
+        if let Some(v) = self.title {
+            f = f.title(v);
+        }
+        if let Some(v) = self.content {
+            f = f.content(v);
+        }
+        if let Some(v) = self.locations {
+            f = f.locations(v);
+        }
+        if let Some(v) = self.raw_input {
+            f = f.raw_input(v);
+        }
+        if let Some(v) = self.raw_output {
+            f = f.raw_output(v);
+        }
+        f
     }
 }
 
@@ -141,7 +394,9 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
                 // Task* tool_use is suppressed; its plan snapshot is emitted at
                 // tool_result time (Node `toAcpNotifications`, isTaskTool branch).
             } else {
-                out.push(tool_call_from_use(block, state));
+                if let Some(update) = tool_call_from_use(block, state) {
+                    out.push(update);
+                }
             }
         }
         Some("tool_result")
@@ -162,7 +417,9 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
                 // plan was already emitted at tool_use time).
                 state.tool_use_cache.remove(id);
             } else {
-                out.push(tool_update_from_result(block, state));
+                if let Some(update) = tool_update_from_result(block, state) {
+                    out.push(update);
+                }
             }
         }
         _ => {
@@ -177,7 +434,7 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
 /// refining `ToolCallUpdate` when the id was already emitted (7.7 dedupe).
 /// Phase 9: shapes `kind`/`title`/`locations`/`content` and the `_meta`
 /// `claudeCode` from `tools::tool_shape`/`tools::tool_meta`.
-fn tool_call_from_use(block: &Value, state: &mut MapState) -> SessionUpdate {
+fn tool_call_from_use(block: &Value, state: &mut MapState) -> Option<SessionUpdate> {
     let id = block["id"].as_str().unwrap_or("").to_string();
     let name = block["name"].as_str().unwrap_or("Other").to_string();
     let raw_input = block.get("input").cloned();
@@ -185,26 +442,51 @@ fn tool_call_from_use(block: &Value, state: &mut MapState) -> SessionUpdate {
     if state.emitted.contains(&id) {
         // Already surfaced (streamed block, or consolidated after streaming) —
         // refine rather than emit a duplicate ToolCall (7.7).
-        return tool_call_update_refine(id, &name, raw_input);
+        return tool_call_update_refine(id, &name, raw_input, state);
     }
     state.emitted.insert(id.clone());
     state.tool_use_cache.insert(id.clone(), block.clone());
 
     let input = raw_input.clone().unwrap_or(Value::Null);
     let shape = tools::tool_shape(&name, &input);
-    SessionUpdate::ToolCall(
+    // AIR gets `rawInput` once it is complete; every other client gets the
+    // input as it stands, also the empty input at the stream start.
+    let sent_raw_input = if state.air && state.input_incomplete {
+        None
+    } else {
+        raw_input.clone()
+    };
+    // 2.9 (X-7): seed the field tracker with what the client now holds.
+    state.seed_tool_tracker(
+        id.clone(),
+        TrackedToolCall::initial(
+            shape.kind,
+            shape.title.clone(),
+            shape.content.clone(),
+            shape.locations.clone(),
+            sent_raw_input.clone(),
+        ),
+    );
+    let mut meta = state.use_meta(&name, &input);
+    if state.air && name.starts_with("mcp__") {
+        meta.insert("is_mcp_tool_call".to_string(), Value::Bool(true));
+    }
+    Some(SessionUpdate::ToolCall(
         ToolCall::new(id, shape.title)
+            // E-9: the programmatic tool name (e.g. "Bash") is surfaced on the
+            // typed `tool_call` (feature `unstable_tool_call_name`).
+            .name(name.clone())
             .kind(shape.kind)
             .status(ToolCallStatus::Pending)
             .content(shape.content)
             .locations(shape.locations)
-            .raw_input(raw_input)
-            .meta(tools::tool_meta(&name, &input)),
-    )
+            .raw_input(sent_raw_input)
+            .meta(meta),
+    ))
 }
 
 /// 7.3 — a `tool_result` block becomes a completing `ToolCallUpdate`.
-fn tool_update_from_result(block: &Value, state: &mut MapState) -> SessionUpdate {
+fn tool_update_from_result(block: &Value, state: &mut MapState) -> Option<SessionUpdate> {
     let id = block["tool_use_id"].as_str().unwrap_or("").to_string();
     let name = state
         .tool_use_cache
@@ -225,27 +507,63 @@ fn tool_update_from_result(block: &Value, state: &mut MapState) -> SessionUpdate
     // The call is resolved — never emit it again, and drop the cache entry so
     // a long session doesn't retain every tool call.
     state.emitted.remove(&id);
-    state.tool_use_cache.remove(&id);
+    let use_input = state
+        .tool_use_cache
+        .remove(&id)
+        .and_then(|use_block| use_block.get("input").cloned())
+        .unwrap_or(Value::Null);
 
-    let raw_output = block.get("content").cloned();
+    let mut raw_output = block.get("content").cloned();
     let result_input = block.get("content").cloned().unwrap_or(Value::Null);
+    let mut content = tools::tool_result_content(&name, &result_input, is_error);
+    if state.air {
+        // AIR shows a read or a search that names a path as the list of viewed
+        // files, which does not show the text of the result: it stays out. AIR
+        // gets the raw tool_result only when no other field carries the result
+        // (`renderer.js` `result`).
+        let viewed_files = !is_error && tools::names_viewed_file(&name, &use_input);
+        if viewed_files {
+            content = content
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .filter(|item| !is_text_content(item))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty());
+            raw_output = None;
+        } else if content.is_some() {
+            raw_output = None;
+        }
+    }
     let mut fields = ToolCallUpdateFields::new().status(status);
-    if let Some(content) = tools::tool_result_content(&name, &result_input, is_error) {
+    if let Some(content) = content {
         fields = fields.content(content);
     }
     if let Some(raw_output) = raw_output {
         fields = fields.raw_output(raw_output);
     }
 
-    SessionUpdate::ToolCallUpdate(
+    // 2.9 (X-7): emit only fields the client does not already hold; the
+    // status always differs (Pending -> Completed/Failed) so this is `Some`.
+    let fields = state.track_tool_call_update(&id, &fields)?;
+    // Entry ends after the tool_result.
+    state.finish_tool_tracker(&id);
+    Some(SessionUpdate::ToolCallUpdate(
         ToolCallUpdate::new(id, fields).meta(tools::tool_meta(&name, &result_input)),
-    )
+    ))
 }
 
 /// 7.3/7.7 — a refining `ToolCallUpdate` for an already-surfaced tool call.
 /// Phase 9: applies the shape (`kind`/`title`/`content`/`locations`) plus the
-/// `_meta` `claudeCode`.
-fn tool_call_update_refine(id: String, name: &str, raw_input: Option<Value>) -> SessionUpdate {
+/// `_meta` `claudeCode`. 2.9 (X-7): only fields the client does not already
+/// hold are emitted; an update with nothing changed is not sent.
+fn tool_call_update_refine(
+    id: String,
+    name: &str,
+    raw_input: Option<Value>,
+    state: &mut MapState,
+) -> Option<SessionUpdate> {
     let input = raw_input.clone().unwrap_or(Value::Null);
     let shape = tools::tool_shape(name, &input);
     let mut fields = ToolCallUpdateFields::new()
@@ -258,9 +576,15 @@ fn tool_call_update_refine(id: String, name: &str, raw_input: Option<Value>) -> 
     if let Some(raw_input) = raw_input {
         fields = fields.raw_input(raw_input);
     }
-    SessionUpdate::ToolCallUpdate(
-        ToolCallUpdate::new(id, fields).meta(tools::tool_meta(name, &input)),
-    )
+    let fields = state.track_tool_call_update(&id, &fields)?;
+    Some(SessionUpdate::ToolCallUpdate(
+        ToolCallUpdate::new(id, fields).meta(state.use_meta(name, &input)),
+    ))
+}
+
+/// Whether a tool-call content item is a plain text content block.
+fn is_text_content(item: &ToolCallContent) -> bool {
+    matches!(item, ToolCallContent::Content(c) if matches!(c.content, ContentBlock::Text(_)))
 }
 
 /// 7.1 — a text/thinking/image block becomes a chunk update.
@@ -336,8 +660,11 @@ fn plan_from_todo_write(block: &Value) -> Option<SessionUpdate> {
 /// 7.5 — a `commands_changed` system frame becomes an `AvailableCommandsUpdate`.
 ///
 /// Port of `getAvailableSlashCommands` (`acp-agent.js:6046-6082`): drops
-/// terminal-bound commands, renames `(MCP)` names to `mcp:`, and filters the
-/// terminal-only unsupported list.
+/// terminal-bound commands, renames `(MCP)` names to `mcp:`, filters the
+/// terminal-only unsupported list, then appends the adapter's own `/mcp` and
+/// `/remote-control` entries (E-5): a CLI-provided `mcp` entry is dropped and
+/// replaced at the end (the adapter's), and `remote-control` is appended unless
+/// the CLI already offers a non-terminal one.
 pub fn map_commands_changed(
     commands: &Value,
     terminal_commands: &Value,
@@ -358,6 +685,7 @@ pub fn map_commands_changed(
         .unwrap_or_default();
 
     let mut avail = Vec::new();
+    let mut has_non_terminal_remote_control = false;
     if let Some(list) = commands.as_array() {
         for command in list {
             let Some(name) = command["name"].as_str() else {
@@ -372,6 +700,14 @@ pub fn map_commands_changed(
             };
             if UNSUPPORTED.contains(&final_name.as_str()) {
                 continue;
+            }
+            // E-5: the adapter's own `/mcp` replaces a CLI-provided one, so a
+            // CLI `mcp` entry is dropped (the adapter's is appended last).
+            if final_name == "mcp" {
+                continue;
+            }
+            if final_name == "remote-control" {
+                has_non_terminal_remote_control = true;
             }
             let description = command["description"].as_str().unwrap_or("").to_string();
             let mut built = AvailableCommand::new(final_name, description);
@@ -393,6 +729,26 @@ pub fn map_commands_changed(
             }
             avail.push(built);
         }
+    }
+    // E-5: append the adapter's `/mcp` then `/remote-control` (moved to the end
+    // so the adapter's management UI owns them).
+    avail.push(
+        AvailableCommand::new(
+            "mcp",
+            "Show the MCP servers and their status, or reconnect, enable, or disable a server",
+        )
+        .input(AvailableCommandInput::Unstructured(
+            UnstructuredCommandInput::new("[reconnect|enable|disable [<server>|all]]"),
+        )),
+    );
+    if !has_non_terminal_remote_control {
+        avail.push(AvailableCommand::new(
+            "remote-control",
+            "Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects",
+        )
+        .input(AvailableCommandInput::Unstructured(
+            UnstructuredCommandInput::new("[session name | off]"),
+        )));
     }
     AvailableCommandsUpdate::new(avail)
 }
@@ -420,14 +776,15 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
             // The block itself is mapped like a one-block consolidated
             // assistant message (7.1/7.3) — the tool_use becomes a ToolCall and
             // is marked emitted so the consolidated message dedupes (7.7).
-            apply_stream_message_id(
-                map_consolidated(
-                    &Value::Array(vec![block.clone()]),
-                    MsgRole::Assistant,
-                    state,
-                ),
-                &state.current_stream_message_id,
-            )
+            // The input of a streamed tool_use block is still incomplete here.
+            state.input_incomplete = is_tool_use_block(block);
+            let mapped = map_consolidated(
+                &Value::Array(vec![block.clone()]),
+                MsgRole::Assistant,
+                state,
+            );
+            state.input_incomplete = false;
+            apply_stream_message_id(mapped, &state.current_stream_message_id)
         }
         Some("content_block_delta") => {
             let delta = &event["delta"];
@@ -560,34 +917,45 @@ fn input_json_delta(
     let Some(input) = recovered_tool_input(&streamed.partial_json[..comma]) else {
         return Vec::new();
     };
+    // Capture the id/name for the refinement, and the meta input, before the
+    // mutable tracker borrow (can't hold the `streamed_inputs` borrow across
+    // `state.track_tool_call_update`).
+    let id = streamed.id.clone();
+    let name = streamed.name.clone();
     // Refine, never duplicate: this is a tool_call_update, not a tool_call.
-    vec![streamed_input_refinement(streamed, input)]
+    streamed_input_refinement(state, &id, &name, input)
+        .into_iter()
+        .collect()
 }
 
 /// Build a refining `ToolCallUpdate` for a partially-recovered tool input.
 /// Phase 9: applies `kind`/`title`/`locations` from the shape but never
 /// `content` (content built from partial input is misleading; the consolidated
 /// message supplies it moments later — mirrors `streamedInputRefinement`).
-fn streamed_input_refinement(streamed: &StreamedInput, input: Value) -> SessionUpdate {
-    let name = streamed.name.clone();
-    let shape = tools::tool_shape(&name, &input);
+fn streamed_input_refinement(
+    state: &mut MapState,
+    id: &str,
+    name: &str,
+    input: Value,
+) -> Option<SessionUpdate> {
+    let shape = tools::tool_shape(name, &input);
+    // The `_meta` reads the recovered partial input (`partialRefinement`).
+    let meta = state.use_meta(name, &input);
     let mut fields = ToolCallUpdateFields::new()
         .kind(shape.kind)
-        .title(shape.title)
-        .raw_input(input);
+        .title(shape.title);
+    // AIR gets no `rawInput` while the input streams; it goes out once complete.
+    if !state.air {
+        fields = fields.raw_input(input);
+    }
     if !shape.locations.is_empty() {
         fields = fields.locations(shape.locations);
     }
-    SessionUpdate::ToolCallUpdate(
-        ToolCallUpdate::new(streamed.id.clone(), fields)
-            .meta(tools::tool_meta(&name, &streamed_input_value(streamed))),
-    )
-}
-
-/// The accumulated partial input as a JSON value (best-effort; the shape's meta
-/// only needs the name/description fields, so an incomplete parse is fine).
-fn streamed_input_value(streamed: &StreamedInput) -> Value {
-    serde_json::from_str(&streamed.partial_json).unwrap_or(Value::Null)
+    // 2.9 (X-7): emit only fields the client does not already hold.
+    let fields = state.track_tool_call_update(id, &fields)?;
+    Some(SessionUpdate::ToolCallUpdate(
+        ToolCallUpdate::new(id.to_string(), fields).meta(meta),
+    ))
 }
 
 /// The incremental JSON-prefix lexer (7.4), ported from `scanStreamedToolInput`
@@ -874,6 +1242,230 @@ mod tests {
         assert_eq!(
             total_tool_calls, 1,
             "7.7: the block must be surfaced as exactly one ToolCall across both paths"
+        );
+    }
+
+    /// 2.5 (E-5) — `map_commands_changed` drops a CLI-provided `mcp` entry,
+    /// filters the unsupported terminal commands, and appends the adapter's
+    /// `/mcp` and `/remote-control` (E-5); a CLI that already offers a
+    /// non-terminal `remote-control` does not get a duplicate.
+    #[test]
+    fn inv_36_commands_append_mcp_and_remote_control() {
+        let names = |u: &AvailableCommandsUpdate| -> Vec<String> {
+            serde_json::to_value(u)
+                .ok()
+                .and_then(|v| v.get("availableCommands").cloned())
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|c| c.get("name").and_then(serde_json::Value::as_str))
+                .map(String::from)
+                .collect()
+        };
+
+        // The commands-proactive CLI list: a plain `mcp`, a `weather (MCP)`,
+        // and the unsupported `clear`/`cost`/`todos`.
+        let commands = json!([
+            {"name": "compact", "description": "Compress the conversation history"},
+            {"name": "config", "description": "Manage Claude Code configuration", "argumentHint": "[key] [value]"},
+            {"name": "doctor", "description": "Run a system diagnostics check"},
+            {"name": "help", "description": "Display help for commands"},
+            {"name": "memory", "description": "Manage Claude's memory"},
+            {"name": "model", "description": "Switch to a different model"},
+            {"name": "mcp", "description": "Manage MCP servers"},
+            {"name": "permissions", "description": "Manage permission settings"},
+            {"name": "status", "description": "Display session status"},
+            {"name": "weather (MCP)", "description": "Weather service via MCP"},
+            {"name": "clear", "description": "Clear the conversation"},
+            {"name": "cost", "description": "Show usage cost"},
+            {"name": "todos", "description": "Manage todos"},
+        ]);
+        let result = map_commands_changed(&commands, &json!([]));
+        assert_eq!(
+            names(&result),
+            vec![
+                "compact",
+                "config",
+                "doctor",
+                "help",
+                "memory",
+                "model",
+                "permissions",
+                "status",
+                "mcp:weather",
+                "mcp",
+                "remote-control",
+            ],
+            "CLI `mcp` is dropped and replaced at the end; unsupported commands filtered"
+        );
+
+        // Empty commands -> only the appended mcp + remote-control.
+        let empty = map_commands_changed(&json!([]), &json!([]));
+        assert_eq!(
+            names(&empty),
+            vec!["mcp", "remote-control"],
+            "empty list yields just the two appended commands (text-only fixture)"
+        );
+
+        // A CLI already offering a non-terminal remote-control -> no duplicate:
+        // the CLI's entry stays in place and only mcp is appended after it.
+        let with_rc = map_commands_changed(
+            &json!([{"name": "remote-control", "description": "already here"}]),
+            &json!([]),
+        );
+        assert_eq!(
+            names(&with_rc),
+            vec!["remote-control", "mcp"],
+            "must not append a second remote-control when the CLI already has one"
+        );
+        // But a terminal-bound remote-control is dropped and the adapter's appended.
+        let rc_terminal = map_commands_changed(
+            &json!([{"name": "remote-control", "description": "t"}]),
+            &json!([{"name": "remote-control", "description": "t"}]),
+        );
+        assert_eq!(
+            names(&rc_terminal),
+            vec!["mcp", "remote-control"],
+            "a terminal remote-control is replaced by the adapter's"
+        );
+    }
+
+    /// 2.9 (X-7) — the field tracker: a `tool_call_update` drops fields whose
+    /// value is unchanged since the client's last view. Mirrors
+    /// `streamed-partial-input`: after the initial `tool_call` (kind execute,
+    /// title "Terminal", rawInput {}), the streamed refine changes only the
+    /// title + rawInput (kind is dropped); a subsequent refine changes only
+    /// rawInput.
+    #[test]
+    fn inv_45_field_tracker_drops_unchanged() {
+        // Initial tool_call (seeds the tracker).
+        let mut state = MapState::default();
+        let start = json!([{
+            "type": "tool_use", "id": "toolu_01STREAM", "name": "Bash", "input": {}
+        }]);
+        let updates = map_consolidated(&start, MsgRole::Assistant, &mut state);
+        debug_assert!(matches!(&updates[0], SessionUpdate::ToolCall(_)));
+
+        // First streamed refine: kind unchanged (dropped), title + rawInput differ.
+        let refine = json!({
+            "type": "tool_use", "id": "toolu_01STREAM", "name": "Bash",
+            "input": {"command": "echo hi"}
+        });
+        let updates = map_consolidated(&Value::Array(vec![refine]), MsgRole::Assistant, &mut state);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("expected a tool_call_update");
+        };
+        let fields = &u.fields;
+        assert!(fields.title.is_some(), "title changed Terminal -> echo hi");
+        assert!(
+            fields.raw_input.is_some(),
+            "rawInput changed: empty -> command"
+        );
+        assert!(
+            fields.kind.is_none(),
+            "unchanged kind must be dropped (X-7)"
+        );
+        assert!(
+            fields.content.is_none(),
+            "unchanged content must be dropped"
+        );
+        assert!(fields.status.is_none(), "unchanged status must be dropped");
+
+        // Second streamed refine ({command,cwd}): only rawInput changes.
+        let refine2 = json!({
+            "type": "tool_use", "id": "toolu_01STREAM", "name": "Bash",
+            "input": {"command": "echo hi", "cwd": "/tmp"}
+        });
+        let updates =
+            map_consolidated(&Value::Array(vec![refine2]), MsgRole::Assistant, &mut state);
+        let SessionUpdate::ToolCallUpdate(u2) = &updates[0] else {
+            panic!("expected a second tool_call_update");
+        };
+        assert!(u2.fields.raw_input.is_some(), "rawInput changed again");
+        assert!(
+            u2.fields.title.is_none(),
+            "unchanged title (already 'echo hi') must be dropped"
+        );
+        assert!(u2.fields.kind.is_none(), "unchanged kind dropped again");
+
+        // A tool_result now emits only the completing fields.
+        let result = json!([{
+            "type": "tool_result", "tool_use_id": "toolu_01STREAM", "content": "ok"
+        }]);
+        let updates = map_consolidated(&result, MsgRole::User, &mut state);
+        let SessionUpdate::ToolCallUpdate(u3) = &updates[0] else {
+            panic!("expected a completing tool_call_update");
+        };
+        assert!(u3.fields.status.is_some(), "status Pending -> Completed");
+        assert!(u3.fields.raw_output.is_some(), "rawOutput appears");
+        assert!(u3.fields.content.is_some(), "content appears");
+    }
+
+    /// 2.9 (X-7) — `_meta` is kept whole for a non-AIR client even when only
+    /// some fields change (and an update with unchanged fields and unchanged
+    /// `_meta` is not sent).
+    #[test]
+    fn inv_45_field_tracker_keeps_meta() {
+        let mut state = MapState::default();
+        let start = json!([{
+            "type": "tool_use", "id": "toolu_META", "name": "Bash", "input": {"command": "ls"}
+        }]);
+        map_consolidated(&start, MsgRole::Assistant, &mut state);
+
+        // A result update carries the `_meta` {claudeCode:{toolName}} whole.
+        let result = json!([{
+            "type": "tool_result", "tool_use_id": "toolu_META", "content": "ok"
+        }]);
+        let updates = map_consolidated(&result, MsgRole::User, &mut state);
+        let SessionUpdate::ToolCallUpdate(u) = &updates[0] else {
+            panic!("expected a completing tool_call_update");
+        };
+        let meta = serde_json::to_value(u.meta.as_ref()).unwrap();
+        assert_eq!(meta, json!({"claudeCode": {"toolName": "Bash"}}));
+
+        // A replayed identical tool_use whose input is unchanged emits nothing.
+        let mut state2 = MapState::default();
+        map_consolidated(&start, MsgRole::Assistant, &mut state2);
+        let same = json!([{
+            "type": "tool_use", "id": "toolu_META", "name": "Bash", "input": {"command": "ls"}
+        }]);
+        let updates = map_consolidated(&same, MsgRole::Assistant, &mut state2);
+        assert!(
+            updates.is_empty(),
+            "an unchanged update must not be sent (X-7)"
+        );
+    }
+
+    /// Review follow-up 3.17-D — every per-tool-call field-tracker entry is
+    /// cleared on the turn-boundary / cancel, so a tool call that never got a
+    /// `tool_result` cannot leak its tracker state into the next turn.
+    #[test]
+    fn inv_45_field_tracker_clears_all_on_boundary() {
+        let mut state = MapState::default();
+        let start = json!([{
+            "type": "tool_use", "id": "toolu_ORPHAN", "name": "Bash", "input": {"command": "ls"}
+        }]);
+        let updates = map_consolidated(&start, MsgRole::Assistant, &mut state);
+        debug_assert!(matches!(&updates[0], SessionUpdate::ToolCall(_)));
+        assert!(!state.tool_tracker.is_empty(), "tracker is seeded");
+
+        // Turn settle / session cancel: clear every per-tool-call entry.
+        state.clear_tool_tracker();
+        assert!(
+            state.tool_tracker.is_empty(),
+            "all per-tool-call tracker entries cleared on the boundary"
+        );
+
+        // A tool_result for the now-orphaned id treats the call as fresh: it
+        // must still OBSERVE a changed status and emit a completing update
+        // (without any leaked prior tracker state suppressing it).
+        let result = json!([{
+            "type": "tool_result", "tool_use_id": "toolu_ORPHAN", "content": "ok"
+        }]);
+        let updates = map_consolidated(&result, MsgRole::User, &mut state);
+        assert!(
+            matches!(updates[0], SessionUpdate::ToolCallUpdate(_)),
+            "a completing tool_call_update is still emitted after the clear"
         );
     }
 }

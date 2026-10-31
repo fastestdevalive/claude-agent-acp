@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "capture_init": true,
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": []}}}},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "_meta": {"jetbrains": {"air": {"customInstructions": "Prefer tabs over spaces."}}}}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}

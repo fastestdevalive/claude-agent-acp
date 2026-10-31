@@ -16,6 +16,15 @@ use claude_agent_acp_rs::process::wait_for_shutdown_signal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    for arg in std::env::args().skip(1) {
+        if arg == "--version" || arg == "-V" || arg == "-v" {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            stdout.write_all(claude_agent_acp_rs::VERSION.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            return Ok(());
+        }
+    }
     let serve_future = serve(Stdio::new(), ServeOptions::from_env());
     tokio::pin!(serve_future);
     tokio::select! {

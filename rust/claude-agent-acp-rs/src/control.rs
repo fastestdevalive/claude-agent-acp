@@ -116,10 +116,16 @@ pub struct InitializeInfo {
 pub struct InitializeOptions {
     /// `systemPrompt`.
     pub system_prompt: Option<Value>,
+    /// `appendSystemPrompt` (client `systemPrompt` append mode and AIR
+    /// `customInstructions`, rust-air-gaps Decision 10).
+    pub append_system_prompt: Option<String>,
     /// `agents`.
     pub agents: Option<Value>,
     /// `hooks` (the `initHooksPayload`).
     pub hooks: Option<Value>,
+    /// `promptSuggestions` (2.7 / E-14): emitted only when `Some`; the live
+    /// agent leaves it `None`.
+    pub prompt_suggestions: Option<bool>,
     /// `skills`.
     pub skills: Option<Value>,
     /// `toolAliases`.
@@ -140,8 +146,20 @@ impl InitializeOptions {
         if let Some(hooks) = &self.hooks {
             request.insert("hooks".to_string(), hooks.clone());
         }
+        if let Some(prompt_suggestions) = &self.prompt_suggestions {
+            request.insert(
+                "promptSuggestions".to_string(),
+                Value::Bool(*prompt_suggestions),
+            );
+        }
         if let Some(system_prompt) = &self.system_prompt {
             request.insert("systemPrompt".to_string(), system_prompt.clone());
+        }
+        if let Some(append) = &self.append_system_prompt {
+            request.insert(
+                "appendSystemPrompt".to_string(),
+                Value::String(append.clone()),
+            );
         }
         if let Some(agents) = &self.agents {
             request.insert("agents".to_string(), agents.clone());
@@ -201,6 +219,33 @@ impl Control {
             })
             .map_err(|_| ControlError::Closed)?;
         reply_rx.await.map_err(|_| ControlError::Closed)?
+    }
+
+    /// Enqueue a `control_request` on the single unbounded writer WITHOUT
+    /// awaiting its response (2.13 / E-8). The request is given a fresh
+    /// `request_id`, and like every `Outbound::Request` the writer DOES register
+    /// a `pending` correlation entry (`control.rs:373`) — but its receiver is
+    /// dropped immediately (`oneshot::channel().0`), so the actor never awaits
+    /// the client round-trip inline (INV-27 holds). Used for the per-uuid
+    /// `cancel_async_message` frames sent before `interrupt` while a cancel
+    /// settles.
+    ///
+    /// Boundedness of the correlation entry (review follow-up 3.17-D): the entry
+    /// is removed the moment a `control_response` bearing the request_id arrives
+    /// (`route_inbound`, `pending.remove(id)`, with the dropped-receiver
+    /// `send` being an empty no-op); if the child never answers, the entry
+    /// simply lives in `pending` for the control task's lifetime and is dropped
+    /// with the map when the task ends (writer failure / all `Control` handles
+    /// dropped / inbound stream EOF). The set is small (one per abandoned uuid
+    /// from a cancel) and always bounded by the session/child lifetime — it
+    /// cannot grow without bound.
+    pub fn send_request_detached(&self, payload: Value) -> Result<(), ControlError> {
+        self.tx
+            .send(Outbound::Request {
+                payload,
+                reply: oneshot::channel().0,
+            })
+            .map_err(|_| ControlError::Closed)
     }
 
     /// Write a full `control_response` frame to the child's stdin.
@@ -665,13 +710,18 @@ mod tests {
 
         // Build an initialize request with the same hooks payload the fixture
         // captured (no optional systemPrompt/agents/skills/toolAliases set, so
-        // they are omitted — matching the isolated capture).
+        // they are omitted — matching the isolated capture). 2.7: the hooks are
+        // the 0.94.0 set (PostModelSwitch/PostCompact added) and
+        // `promptSuggestions` is set to match the regenerated fixture.
         let opts = InitializeOptions {
             hooks: Some(json!({
                 "PostToolUse": [{"hookCallbackIds": ["hook_0"]}],
-                "TaskCreated": [{"hookCallbackIds": ["hook_1"]}],
-                "TaskCompleted": [{"hookCallbackIds": ["hook_2"]}]
+                "PostModelSwitch": [{"hookCallbackIds": ["hook_1"]}],
+                "PostCompact": [{"hookCallbackIds": ["hook_2"]}],
+                "TaskCreated": [{"hookCallbackIds": ["hook_3"]}],
+                "TaskCompleted": [{"hookCallbackIds": ["hook_4"]}],
             })),
+            prompt_suggestions: Some(true),
             forward_subagent_text: false,
             ..Default::default()
         };

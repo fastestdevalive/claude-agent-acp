@@ -38,21 +38,25 @@
 //!   `Activated` / `Settled` events.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
+    ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCallStatus,
 };
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::air::AirClient;
+use crate::async_tasks::AsyncTaskRuntime;
 use crate::control::{Control, ControlOptions, InitializeOptions, RequestHandler};
 use crate::dispatch::{self, Route, StreamMsg};
 use crate::map::{self, MapState, MsgRole};
 use crate::permission;
 use crate::process::{self, SpawnOptions, Timings};
+use crate::session_ext::SessionExt;
 use crate::turn::{FailureKind, Turn, TurnEvent, TurnMachine};
 
 /// Errors produced by the session actor.
@@ -89,6 +93,10 @@ pub enum SessionError {
 pub enum SessionOutbound {
     /// A `session/update` notification to forward to the client.
     Update(SessionNotification),
+    /// An untyped AIR `session/update` (item 3.3), value = `{"sessionId",⋯,"update",{⋯}}`,
+    /// forwarded as `UntypedMessage::new("session/update", value)` (async-task
+    /// spawns/progress/state-updates).
+    RawUpdate(Value),
     /// A barrier: every `Update` sent before this has been forwarded. Resolving
     /// the `oneshot` signals the prompt task it may now write its response.
     Flush(oneshot::Sender<()>),
@@ -108,6 +116,10 @@ pub struct PromptReply {
     /// Token usage reported on the response (the fixture's
     /// `result.usage` shape).
     pub usage: Option<PromptUsage>,
+    /// The `_meta.quota` totals object (2.12 / E-6), `Some` iff `had_usage`
+    /// (never on the queued-sweep cancel). Written by the agent layer as
+    /// `result["_meta"]["quota"]`.
+    pub quota: Option<Value>,
     /// The turn's streaming updates (e.g. a `FinalText` `agent_message_chunk`)
     /// that must be forwarded to the client *before* the prompt response.
     pub updates: Vec<SessionNotification>,
@@ -122,6 +134,7 @@ impl std::fmt::Debug for PromptReply {
         f.debug_struct("PromptReply")
             .field("stop_reason", &self.stop_reason)
             .field("usage", &self.usage)
+            .field("quota", &self.quota)
             .field("updates", &self.updates)
             .field("flush_rx", &self.flush_rx.as_ref().map(|_| "<oneshot>"))
             .finish()
@@ -153,6 +166,13 @@ enum Command {
     /// Cancel the active prompt (8.9): `machine.cancel()` then send an
     /// `interrupt` control_request.
     Cancel,
+    /// `session/close` (rust-air-gaps G6, Decision 14): cancel like
+    /// `session/cancel`, send the `interrupt` (even when idle), then tear the
+    /// session down. `reply` resolves once the updates are on the wire.
+    Close { reply: oneshot::Sender<()> },
+    /// The close's `interrupt` was written (or timed out): settle what is left,
+    /// resolve `reply` behind a flush barrier and end the actor.
+    CloseDone { reply: oneshot::Sender<()> },
     /// The `interrupt` control_response receipt came back (phase 11): carry its
     /// `still_queued` (or `None` for a bare `{}` receipt) so the actor can
     /// reconcile the orphan-credit count (`machine.reconcile_orphan_receipt`,
@@ -176,6 +196,25 @@ enum Command {
         is_prompt_required: bool,
         reply: oneshot::Sender<Value>,
     },
+    /// `_session/async_task/stop` (rust-air-gaps G1, Decision 12): claim the
+    /// stop synchronously, then ask the CLI to `stop_task` from a spawned task.
+    /// `reply` resolves `Ok(true)` once the updates are on the wire, `Ok(false)`
+    /// for an unknown / unstoppable task, `Err(message)` when the CLI refused.
+    StopAsyncTask {
+        task_id: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// The CLI confirmed `stop_task` (re-entry from the spawned request).
+    TaskStopped {
+        task_id: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// The CLI failed `stop_task`: give the claim back and fail the request.
+    ReleaseStop {
+        task_id: String,
+        error: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
 }
 
 /// Configuration used to start a session (phase 8 / 8.2, 8.4).
@@ -187,6 +226,10 @@ pub struct SessionOptions {
     pub timings: Timings,
     /// The `initialize` control_request to send during handshake (phase 4).
     pub initialize: InitializeOptions,
+    /// The parsed AIR client declaration (Decision 11 / item 3.2), threaded from
+    /// the connection Registry. Async-task updates (item 3.5) run only when the
+    /// client advertised AIR `asyncTasks`.
+    pub air: Option<AirClient>,
 }
 
 impl SessionOptions {
@@ -196,7 +239,15 @@ impl SessionOptions {
             spawn,
             timings,
             initialize,
+            air: None,
         }
+    }
+
+    /// Set the parsed AIR client (item 3.2).
+    #[must_use]
+    pub fn with_air(mut self, air: Option<AirClient>) -> Self {
+        self.air = air;
+        self
     }
 }
 
@@ -212,6 +263,9 @@ pub struct Session {
     /// sent right after `session/new` / `session/load` (upstream
     /// `sendAvailableCommandsUpdate` → `session.query.supportedCommands()`).
     commands: Vec<Value>,
+    /// The `account` from the initialize response (the session account that
+    /// feeds the `authStatus` push).
+    account: Option<Value>,
 }
 
 impl Session {
@@ -256,6 +310,7 @@ impl Session {
         // alive for the session's lifetime — move it into the actor task. The
         // actor reads `process.lines` (the codec stream) and keeps `process`
         // alive until the task ends (then the child is killed on teardown).
+        let resumed = opts.spawn.resume.is_some();
         let mut process = process;
         let stream = std::mem::replace(&mut process.lines, mpsc::unbounded_channel().1);
         tokio::spawn(run(
@@ -269,6 +324,13 @@ impl Session {
             opts.timings,
             session_id.clone(),
             hw,
+            opts.air,
+            opts.spawn
+                .default_cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default(),
+            resumed,
         ));
 
         // Phase-4 initialize handshake. The actor loop is already running so it
@@ -287,6 +349,7 @@ impl Session {
                 high_water,
                 session_id,
                 commands: info.commands,
+                account: info.account,
             },
             update_rx,
         ))
@@ -301,6 +364,11 @@ impl Session {
     /// the proactive `available_commands_update` (phase 15, Item 1).
     pub fn commands(&self) -> &[Value] {
         &self.commands
+    }
+
+    /// The session account from the `initialize` handshake, if any.
+    pub fn account(&self) -> Option<&Value> {
+        self.account.as_ref()
     }
 
     /// Send a `session/prompt` request to the actor and await its settlement.
@@ -357,6 +425,31 @@ impl Session {
         reply_rx
     }
 
+    /// Stop one background task without cancelling the turn (`_session/async_task/stop`).
+    /// `Ok(false)` when the task is unknown or cannot be stopped.
+    pub async fn stop_async_task(&self, task_id: String) -> Result<bool, SessionError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::StopAsyncTask { task_id, reply })
+            .map_err(|_| SessionError::Closed)?;
+        match reply_rx.await {
+            Ok(Ok(stopped)) => Ok(stopped),
+            Ok(Err(message)) => Err(SessionError::Start(message)),
+            Err(_) => Err(SessionError::Closed),
+        }
+    }
+
+    /// Close the session (`session/close`): cancel, interrupt, end the actor
+    /// (which drops the child). Idempotent — a session that already ended
+    /// returns at once.
+    pub async fn close(&self) {
+        let (reply, reply_rx) = oneshot::channel();
+        if self.tx.send(Command::Close { reply }).is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), reply_rx).await;
+    }
+
     /// Send a `session/cancel` notification (8.9).
     pub async fn cancel(&self) -> Result<(), SessionError> {
         self.tx
@@ -394,13 +487,20 @@ fn build_permission_request_handler(
                 .unwrap_or("");
             if subtype == "can_use_tool" {
                 let (reply_tx, reply_rx) = oneshot::channel();
+                // 2.11 (E-11): the fallback deny carries the tool_use_id; read
+                // it before `frame` is moved into the command.
+                let tool_use_id = frame
+                    .pointer("/request/tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let _ = command_tx.send(Command::Permission {
                     frame,
                     reply: reply_tx,
                 });
-                reply_rx
-                    .await
-                    .unwrap_or_else(|_| permission::deny_control_response(&request_id))
+                reply_rx.await.unwrap_or_else(|_| {
+                    permission::deny_control_response(&request_id, &tool_use_id)
+                })
             } else {
                 json!({
                     "type": "control_response",
@@ -424,6 +524,9 @@ async fn run(
     timings: Timings,
     session_id: String,
     high_water: Arc<AtomicUsize>,
+    air: Option<AirClient>,
+    cwd: PathBuf,
+    resumed: bool,
 ) {
     // The `_process` handle is held only for its lifetime (it owns the child and
     // kills it on drop); the actor loop itself never touches it, so the core
@@ -441,6 +544,9 @@ async fn run(
         timings.force_cancel_grace,
         session_id,
         high_water,
+        air,
+        cwd,
+        resumed,
     )
     .await
 }
@@ -459,9 +565,22 @@ async fn run_loop(
     force_cancel_grace: Duration,
     session_id: String,
     high_water: Arc<AtomicUsize>,
+    air: Option<AirClient>,
+    cwd: PathBuf,
+    resumed: bool,
 ) {
+    let ext = SessionExt::new(air, cwd);
     let mut machine = TurnMachine::new();
+    if resumed {
+        machine.mark_resumed();
+    }
     let mut map_state = MapState::default();
+    if ext.air.is_some() {
+        map_state.configure_air(ext.cwd.clone());
+    }
+    // AIR async-task runtime (item 3.4/3.5): enabled only for a client that
+    // advertised the AIR `asyncTasks` capability.
+    let mut tasks = AsyncTaskRuntime::new(ext.air_supports("asyncTasks"));
     // uuid -> prompt reply oneshot (8.7).
     let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
         HashMap::new();
@@ -502,14 +621,15 @@ async fn run_loop(
                     // force the active turn to settle `cancelled` (INV-17, #680).
                     force_cancel_deadline = None;
                     let events = machine.force_cancel();
-                    handle_events(
-                        &events,
+                    settle_events(
+                        events,
+                        &mut map_state,
+                        &live_background,
                         &mut pending,
                         &update_tx,
                         &session_id,
                         &high_water,
-                        assistant_had_error,
-                    );
+                        assistant_had_error,                    );
                 }
             }
             cmd = commands.recv() => {
@@ -533,16 +653,21 @@ async fn run_loop(
                             handle.abort();
                         }
                         pending_permissions.clear();
+                        // Review follow-up 3.17-D: clear every per-tool-call field
+                        // tracker entry on cancel, so interrupted/refused tool calls
+                        // that never emit a tool_result do not leak tracker entries.
+                        map_state.clear_tool_tracker();
                         // 8.9: settle swept queued turns, then interrupt.
                         let events = machine.cancel();
-                        handle_events(
-                            &events,
-                            &mut pending,
-                            &update_tx,
-                            &session_id,
-                            &high_water,
-                            assistant_had_error,
-                        );
+                    settle_events(
+                        events,
+                        &mut map_state,
+                        &live_background,
+                        &mut pending,
+                        &update_tx,
+                        &session_id,
+                        &high_water,
+                        assistant_had_error,                    );
                         // Arm the force-cancel backstop at most once per turn
                         // (11.2, INV-22): if the interrupt below doesn't make the
                         // SDK yield (a wedged TaskOutput block, #680), the active
@@ -552,6 +677,23 @@ async fn run_loop(
                         if machine.has_active() && force_cancel_deadline.is_none() {
                             force_cancel_deadline =
                                 Some(tokio::time::Instant::now() + force_cancel_grace);
+                        }
+                        // 2.13 (E-8): one `cancel_async_message{message_uuid}`
+                        // per abandoned message — pending steered echoes then
+                        // swept queued turns, in `take_abandoned()`'s order —
+                        // BEFORE the `interrupt` (Node, `dist/acp-agent.js:6455-6457`).
+                        // Sent detached (synchronous enqueue on the single
+                        // unbounded writer; call order preserved; INV-27).
+                        for uuid in machine.take_abandoned() {
+                            if control
+                                .send_request_detached(json!({
+                                    "subtype": "cancel_async_message",
+                                    "message_uuid": uuid,
+                                }))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         // Send the `interrupt` on a spawned task: awaiting the
                         // correlated control_response here would block the actor's
@@ -581,6 +723,72 @@ async fn run_loop(
                             }
                         });
                     }
+                    Command::Close { reply } => {
+                        // Cancel exactly as `session/cancel` does (pending
+                        // permissions refuse, swept turns settle, abandoned
+                        // messages are cancelled), then interrupt.
+                        for handle in pending_permissions.values() {
+                            handle.abort();
+                        }
+                        pending_permissions.clear();
+                        map_state.clear_tool_tracker();
+                        let events = machine.cancel();
+                        settle_events(
+                            events,
+                            &mut map_state,
+                            &live_background,
+                            &mut pending,
+                            &update_tx,
+                            &session_id,
+                            &high_water,
+                            assistant_had_error,
+                        );
+                        for uuid in machine.take_abandoned() {
+                            if control
+                                .send_request_detached(json!({
+                                    "subtype": "cancel_async_message",
+                                    "message_uuid": uuid,
+                                }))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // The interrupt is written on a spawned task (INV-27) and
+                        // bounded, so the child is not killed before it is on the
+                        // wire; the actor keeps routing frames meanwhile.
+                        let control = control.clone();
+                        let command_tx = command_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(500),
+                                control.send_request(json!({"subtype": "interrupt"})),
+                            )
+                            .await;
+                            let _ = command_tx.send(Command::CloseDone { reply });
+                        });
+                    }
+                    Command::CloseDone { reply } => {
+                        let events = machine.on_stream_end();
+                        settle_events(
+                            events,
+                            &mut map_state,
+                            &live_background,
+                            &mut pending,
+                            &update_tx,
+                            &session_id,
+                            &high_water,
+                            assistant_had_error,
+                        );
+                        emit_raw_updates(tasks.finish_all("stopped"), &update_tx, &session_id);
+                        let (flush_tx, flush_rx) = oneshot::channel();
+                        let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
+                        tokio::spawn(async move {
+                            let _ = flush_rx.await;
+                            let _ = reply.send(());
+                        });
+                        break;
+                    }
                     Command::InterruptReceipt { still_queued } => {
                         // 11.3 / 11.4: reconcile the orphan count against the
                         // receipt. A bare `{}` receipt (field absent) is handled
@@ -598,6 +806,7 @@ async fn run_loop(
                         handle_permission(
                             frame,
                             reply,
+                            machine.foreground_target(),
                             &mut map_state,
                             &mut live_background,
                             &update_tx,
@@ -637,7 +846,16 @@ async fn run_loop(
                                 // push the user message on the same stdin writer
                                 // (D6), pre-empting the current generation (R32).
                                 let mut injected = frame;
-                                injected["priority"] = json!("now");
+                                // 3.12 (R71-10/R86-6): while a permission is
+                                // awaiting the user, `later` — interrupting that
+                                // callback would cancel the ACP request
+                                // (`openUserInputs`, `dist/acp-agent.js:2646`).
+                                pending_permissions.retain(|_, h| !h.is_finished());
+                                injected["priority"] = if pending_permissions.is_empty() {
+                                    json!("now")
+                                } else {
+                                    json!("later")
+                                };
                                 // R2: mark the running turn steered so the
                                 // injected echo feeds `machine.on_echo`'s steer
                                 // lane instead of settling the turn outright.
@@ -658,20 +876,81 @@ async fn run_loop(
                         }
                         let _ = reply.send(outcome);
                     }
+                    Command::StopAsyncTask { task_id, reply } => {
+                        if !tasks.claim_stop(&task_id) {
+                            let _ = reply.send(Ok(false));
+                        } else {
+                            // The CLI round-trip runs on a spawned task (INV-27);
+                            // it re-enters the actor with the outcome.
+                            let control = control.clone();
+                            let command_tx = command_tx.clone();
+                            tokio::spawn(async move {
+                                let outcome = control
+                                    .send_request(json!({
+                                        "subtype": "stop_task",
+                                        "task_id": task_id,
+                                    }))
+                                    .await;
+                                let failure = match outcome {
+                                    Ok(receipt) => control_response_error(&receipt),
+                                    Err(e) => Some(e.to_string()),
+                                };
+                                let command = match failure {
+                                    None => Command::TaskStopped { task_id, reply },
+                                    Some(error) => Command::ReleaseStop { task_id, error, reply },
+                                };
+                                // A gone actor drops `reply`: the caller sees Closed.
+                                let _ = command_tx.send(command);
+                            });
+                        }
+                    }
+                    Command::TaskStopped { task_id, reply } => {
+                        let stopped = tasks.task_stopped(&task_id);
+                        emit_raw_updates(stopped.updates, &update_tx, &session_id);
+                        if let Some(name) = stopped.notice_name {
+                            // The only acknowledgement the user gets: the SDK
+                            // injects nothing for a stopped task. Rust has no
+                            // `notices`, so it lands in the transcript.
+                            let notice = SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(format!(
+                                        "**Task stopped by user:** {name}."
+                                    ))),
+                                )),
+                            );
+                            let _ = update_tx.send(SessionOutbound::Update(notice));
+                        }
+                        // The response must not overtake its updates: resolve it
+                        // behind a Flush barrier (INV-20).
+                        let (flush_tx, flush_rx) = oneshot::channel();
+                        let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
+                        tokio::spawn(async move {
+                            let _ = flush_rx.await;
+                            let _ = reply.send(Ok(true));
+                        });
+                    }
+                    Command::ReleaseStop { task_id, error, reply } => {
+                        tasks.release_stop(&task_id);
+                        let _ = reply.send(Err(error));
+                    }
                 }
             }
             msg = stream.recv() => {
                 let Some(line) = msg else {
                     // Stream EOF / codec death (8.9): settle/reject every turn.
                     let events = machine.on_stream_end();
-                    handle_events(
-                        &events,
+                    settle_events(
+                        events,
+                        &mut map_state,
+                        &live_background,
                         &mut pending,
                         &update_tx,
                         &session_id,
                         &high_water,
-                        assistant_had_error,
-                    );
+                        assistant_had_error,                    );
+                    // 3.5: close every live async task at teardown (`finish_all`).
+                    emit_raw_updates(tasks.finish_all("stopped"), &update_tx, &session_id);
                     break;
                 };
                 dispatch_stream(
@@ -686,7 +965,7 @@ async fn run_loop(
                     &update_tx,
                     &session_id,
                     &high_water,
-                )
+                    &mut tasks,                )
                 .await;
             }
         }
@@ -716,6 +995,7 @@ async fn dispatch_stream(
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     high_water: &AtomicUsize,
+    tasks: &mut AsyncTaskRuntime,
 ) {
     let view = dispatch::TurnView::default();
     match dispatch::route(&msg, &view) {
@@ -734,6 +1014,7 @@ async fn dispatch_stream(
                 update_tx,
                 session_id,
                 high_water,
+                tasks,
             );
         }
         Route::Ignore => {}
@@ -753,6 +1034,7 @@ fn handle_session_frame(
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     high_water: &AtomicUsize,
+    tasks: &mut AsyncTaskRuntime,
 ) {
     let frame_type = line.get("type").and_then(Value::as_str).unwrap_or("");
     match frame_type {
@@ -761,8 +1043,10 @@ fn handle_session_frame(
         "user" => {
             if let Some(uuid) = line.get("uuid").and_then(Value::as_str) {
                 let events = machine.on_echo(uuid);
-                handle_events(
-                    &events,
+                settle_events(
+                    events,
+                    map_state,
+                    live_background,
                     pending,
                     update_tx,
                     session_id,
@@ -792,18 +1076,34 @@ fn handle_session_frame(
             };
             if !is_echo {
                 let updates = map::map_consolidated(&content, MsgRole::User, map_state);
-                emit_updates(&updates, update_tx, session_id);
+                note_tool_updates(&updates, true, machine.foreground_target(), map_state);
+                emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
             }
         }
         "result" => {
+            // Decided BEFORE `on_result` (a folded-prompt result names a pending
+            // turn that `on_result` may promote or settle).
+            let autonomous = machine.result_is_autonomous(&line);
             let events = machine.on_result(&line, *emitted_assistant_text);
             // Upstream clears emittedAssistantText in the result finally for
             // non-autonomous results.
-            if !is_autonomous(&line) {
+            if !autonomous {
                 *emitted_assistant_text = false;
             }
-            handle_events(
-                &events,
+            // 3.5: release any held async task without a tool-call id when the
+            // prompt result ends the model turn, BEFORE the flush barrier (the
+            // Settled arm enqueues the flush after these spawns).
+            emit_raw_updates(tasks.release_held(), update_tx, session_id);
+            // Review follow-up 3.17-D: a turn's result is its settle boundary —
+            // clear every per-tool-call tracker entry so a tool call that never
+            // got a tool_result in this turn does not leak into the next.
+            if !autonomous {
+                map_state.clear_tool_tracker();
+            }
+            settle_events(
+                events,
+                map_state,
+                live_background,
                 pending,
                 update_tx,
                 session_id,
@@ -818,6 +1118,11 @@ fn handle_session_frame(
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
                     let is_subagent = line.get("subagent_type").is_some();
                     machine.on_task_started(task_id, is_subagent);
+                    // 3.7: a task registered for a tool call takes that call out
+                    // of the turn's foreground work (`registerLiveTask`).
+                    if let Some(parent) = line.get("tool_use_id").and_then(Value::as_str) {
+                        map_state.books.forget_foreground(parent);
+                    }
                     // Subagent attribution (10.5): record the Agent/Task tool
                     // call (`tool_use_id`) that spawned this task, so a
                     // subagent's `can_use_tool` is attributed to it.
@@ -826,19 +1131,41 @@ fn handle_session_frame(
                             live_background.insert(task_id.to_string(), parent.to_string());
                         }
                     }
+                    // 3.5: async-task runtime for AIR `asyncTasks` clients.
+                    // Subagent / monitor tasks are ignored inside the runtime.
+                    emit_raw_updates(tasks.task_started(&line), update_tx, session_id);
+                }
+                "task_progress" => {
+                    // 3.5: async-task progress (AIR `asyncTasks` clients only).
+                    emit_raw_updates(tasks.task_progress(&line), update_tx, session_id);
                 }
                 "task_notification" | "task_updated" => {
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
                     if is_terminal_task_update(&line) {
                         let events = machine.on_task_ended(task_id);
                         live_background.remove(task_id);
-                        handle_events(
-                            &events,
+                        settle_events(
+                            events,
+                            map_state,
+                            live_background,
                             pending,
                             update_tx,
                             session_id,
                             high_water,
                             *assistant_had_error,
+                        );
+                    }
+                    // 3.5: async-task terminal / update. A `task_notification`
+                    // releases a held task (spawn + deferred progress + state in
+                    // Node order); a `task_updated` feeds the patch.
+                    if subtype == "task_notification" {
+                        emit_raw_updates(tasks.task_notification(&line), update_tx, session_id);
+                    } else {
+                        let patch = line.get("patch").cloned().unwrap_or(Value::Null);
+                        emit_raw_updates(
+                            tasks.task_updated(task_id, &patch),
+                            update_tx,
+                            session_id,
                         );
                     }
                 }
@@ -847,8 +1174,10 @@ fn handle_session_frame(
                     machine.on_session_state(state);
                     if state == "idle" {
                         let events = machine.on_idle();
-                        handle_events(
-                            &events,
+                        settle_events(
+                            events,
+                            map_state,
+                            live_background,
                             pending,
                             update_tx,
                             session_id,
@@ -869,6 +1198,27 @@ fn handle_session_frame(
             // the turn's failure can attach `data.errorKind` only when present.
             if frame_type == "assistant" && line.get("error").is_some() {
                 *assistant_had_error = true;
+            }
+            // `lastAssistantModel` (top-level only): the resumed session's first
+            // per-model quota row is keyed by it (`acp-agent.js:5436,5741`).
+            if line.get("parent_tool_use_id").is_none_or(Value::is_null) {
+                let model = if frame_type == "assistant" {
+                    line.pointer("/message/model")
+                } else if line.pointer("/event/type").and_then(Value::as_str)
+                    == Some("message_start")
+                {
+                    line.pointer("/event/message/model")
+                } else {
+                    None
+                };
+                if let Some(model) = model.and_then(Value::as_str) {
+                    machine.note_assistant_model(model);
+                }
+            }
+            if frame_type == "assistant" {
+                if let Some(content) = line.pointer("/message/content") {
+                    map_state.books.record_dispatched(content);
+                }
             }
             let updates = if frame_type == "stream_event" {
                 map::map_stream_event(&line, map_state)
@@ -902,7 +1252,11 @@ fn handle_session_frame(
                     *emitted_assistant_text = true;
                 }
             }
-            emit_updates(&updates, update_tx, session_id);
+            // 3.7: a subagent's output (`parent_tool_use_id` set) is not this
+            // turn's foreground work.
+            let top_level = line.get("parent_tool_use_id").is_none_or(Value::is_null);
+            note_tool_updates(&updates, top_level, machine.foreground_target(), map_state);
+            emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
         }
         _ => {}
     }
@@ -914,9 +1268,11 @@ fn handle_session_frame(
 /// INV-20 / #851), then spawns a task (D14) that sends `session/request_permission`,
 /// maps the outcome to the `control_response` (10.3 / 10.4) and resolves `reply`.
 /// The actor never awaits the client round-trip inline (INV-27).
+#[allow(clippy::too_many_arguments)]
 fn handle_permission(
     frame: Value,
     reply: oneshot::Sender<Value>,
+    turn: Option<&str>,
     map_state: &mut MapState,
     live_background: &mut HashMap<String, String>,
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
@@ -941,8 +1297,18 @@ fn handle_permission(
         parent.as_deref(),
         map_state,
     ) {
-        let notif = SessionNotification::new(session_id.to_string(), update);
-        let _ = update_tx.send(SessionOutbound::Update(notif));
+        // 3.7: a permission-surfaced top-level call is foreground work.
+        note_tool_updates(
+            std::slice::from_ref(&update),
+            parent.is_none(),
+            turn,
+            map_state,
+        );
+        emit_updates(
+            &map_state.filter_updates(vec![update]),
+            update_tx,
+            session_id,
+        );
     }
 
     // Build the `request_permission` params (10.1) before moving `can` into the
@@ -953,12 +1319,10 @@ fn handle_permission(
         &can.tool_use_id,
         parent.as_deref(),
     );
-    let params = permission::build_request_permission(
-        session_id,
-        tool_call,
-        &can.tool_name,
-        &can.suggestions,
-    );
+    // 3.9: the durable Bash choice, when Node can describe the suggestions.
+    let durable =
+        permission::durable_bash(&can.tool_name, &can.suggestions, can.no_persistent_rule);
+    let params = permission::build_request_permission(session_id, tool_call, durable.as_ref());
 
     // Spawn the round-trip (D14): ask the agent layer to send
     // `session/request_permission` and await the outcome, map it, resolve `reply`
@@ -970,23 +1334,32 @@ fn handle_permission(
         let _ = update_tx.send(SessionOutbound::RequestPermission { params, reply: ptx });
         let response = match prx.await {
             Ok(Ok(value)) => match permission::map_outcome(&value) {
-                permission::Outcome::Allow => {
-                    permission::allow_control_response(&can.request_id, &can.tool_input)
-                }
-                permission::Outcome::AllowAlways => permission::allow_always_control_response(
+                permission::Outcome::Allow => permission::allow_control_response(
                     &can.request_id,
+                    &can.tool_use_id,
                     &can.tool_input,
-                    &can.tool_name,
-                    &can.suggestions,
                 ),
+                // The durable choice counts only if it was actually offered.
+                permission::Outcome::AllowWithUpdates => match &durable {
+                    Some(d) => permission::allow_with_updates_control_response(
+                        &can.request_id,
+                        &can.tool_use_id,
+                        &can.tool_input,
+                        &d.updates,
+                    ),
+                    None => permission::deny_control_response(&can.request_id, &can.tool_use_id),
+                },
+                // Deny and Cancelled both refuse the tool.
                 permission::Outcome::Deny | permission::Outcome::Cancelled => {
-                    permission::deny_control_response(&can.request_id)
+                    permission::deny_control_response(&can.request_id, &can.tool_use_id)
                 }
             },
             // The request errored or the round-trip was dropped (e.g. the client
             // closed / cancelled): refuse the tool (R28 deny) so the turn settles
             // on the next `result` (INV-21).
-            Ok(Err(_)) | Err(_) => permission::deny_control_response(&can.request_id),
+            Ok(Err(_)) | Err(_) => {
+                permission::deny_control_response(&can.request_id, &can.tool_use_id)
+            }
         };
         let _ = reply.send(response);
     });
@@ -1022,13 +1395,19 @@ fn handle_events(
                 stop_reason,
                 usage,
                 had_usage,
+                model_rows,
             } => {
                 high_water.fetch_max(1, Ordering::Relaxed);
                 if let Some(reply) = pending.remove(prompt_uuid) {
-                    let total_tokens = usage.input_tokens
-                        + usage.output_tokens
-                        + usage.cached_read_tokens
-                        + usage.cached_write_tokens;
+                    // Capture the raw usage values before `usage` is shadowed
+                    // below (2.12 also needs them for `_meta.quota`).
+                    let (u_i, u_o, u_cr, u_cw) = (
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_read_tokens,
+                        usage.cached_write_tokens,
+                    );
+                    let total_tokens = u_i + u_o + u_cr + u_cw;
                     // Phase 15 (Item 2): upstream distinguishes the two cancel
                     // settlements by WHICH CODE PATH produced them, not by
                     // whether the accumulated usage happens to be zero. A turn
@@ -1043,12 +1422,33 @@ fn handle_events(
                         None
                     } else {
                         Some(PromptUsage {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cached_read_tokens: usage.cached_read_tokens,
-                            cached_write_tokens: usage.cached_write_tokens,
+                            input_tokens: u_i,
+                            output_tokens: u_o,
+                            cached_read_tokens: u_cr,
+                            cached_write_tokens: u_cw,
                             total_tokens,
                         })
+                    };
+                    // 2.12 (E-6): `_meta.quota` totals on every settle that
+                    // reported usage (never on the queued-sweep cancel), with
+                    // the per-model rows snapshotted by the turn machine
+                    // (`model_usage`, rust-air-gaps Decision 19).
+                    let quota = if *had_usage {
+                        Some(json!({
+                            "quota": {
+                                "token_count": {
+                                    "totalTokens": total_tokens,
+                                    "inputTokens": u_i,
+                                    "cachedInputTokens": u_cr,
+                                    "cachedWriteTokens": u_cw,
+                                    "outputTokens": u_o,
+                                    "reasoningOutputTokens": 0,
+                                },
+                                "model_usage": model_rows.to_json(),
+                            }
+                        }))
+                    } else {
+                        None
                     };
                     let (flush_tx, flush_rx) = oneshot::channel();
                     // Phase 9 flush barrier: enqueued after every update this
@@ -1060,6 +1460,7 @@ fn handle_events(
                     let _ = reply.send(Ok(PromptReply {
                         stop_reason: stop_reason.as_str().to_string(),
                         usage,
+                        quota,
                         updates: std::mem::take(&mut final_texts),
                         flush_rx: Some(flush_rx),
                     }));
@@ -1071,11 +1472,24 @@ fn handle_events(
                 message,
             } => {
                 if let Some(reply) = pending.remove(prompt_uuid) {
-                    let _ = reply.send(Err(SessionError::PromptFailed {
+                    let err = SessionError::PromptFailed {
                         kind: *kind,
                         message: message.clone(),
                         assistant_had_error,
-                    }));
+                    };
+                    if *kind == FailureKind::IncompleteToolCall {
+                        // E-12: the closing `tool_call_update`s (and the turn's
+                        // `tool_call`) must reach the wire BEFORE the error
+                        // response, so reject only after the flush barrier.
+                        let (flush_tx, flush_rx) = oneshot::channel();
+                        let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
+                        tokio::spawn(async move {
+                            let _ = flush_rx.await;
+                            let _ = reply.send(Err(err));
+                        });
+                    } else {
+                        let _ = reply.send(Err(err));
+                    }
                 }
             }
             TurnEvent::Activated { .. } => {
@@ -1083,21 +1497,6 @@ fn handle_events(
             }
         }
     }
-}
-
-/// Whether a result frame carries an autonomous origin (mirrors `turn.rs`).
-fn is_autonomous(result: &Value) -> bool {
-    let Some(kind) = result
-        .get("origin")
-        .and_then(|o| o.get("kind"))
-        .and_then(Value::as_str)
-    else {
-        return false;
-    };
-    matches!(
-        kind,
-        "task-notification" | "peer" | "coordinator" | "observer" | "observer-activity"
-    )
 }
 
 /// Whether a `task_updated` frame carries a terminal status.
@@ -1128,6 +1527,67 @@ fn is_top_level_text(update: &SessionUpdate, line: &Value) -> bool {
     matches!(update, SessionUpdate::AgentMessageChunk(_))
 }
 
+/// Keep the unfinished-tool books (3.7) in step with the updates just mapped:
+/// a surfaced top-level `tool_call` is foreground work of the current turn
+/// (`recordForegroundToolCall`); a final-status `tool_call_update`, or a
+/// subagent's call, no longer is (`forgetForegroundToolCall`).
+fn note_tool_updates(
+    updates: &[SessionUpdate],
+    top_level: bool,
+    turn: Option<&str>,
+    map_state: &mut MapState,
+) {
+    for update in updates {
+        match update {
+            SessionUpdate::ToolCall(call) => {
+                let id = call.tool_call_id.to_string();
+                if top_level {
+                    map_state.books.record_foreground(turn, &id);
+                } else {
+                    map_state.books.forget(&id);
+                }
+            }
+            SessionUpdate::ToolCallUpdate(upd)
+                if matches!(
+                    upd.fields.status,
+                    Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                ) =>
+            {
+                map_state.books.forget(&upd.tool_call_id.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Run the unfinished-tool post-filter (3.7, Decision 7) over a batch of turn
+/// events, send its closing `tool_call_update`s, then hand the (possibly
+/// rewritten) events to [`handle_events`].
+#[allow(clippy::too_many_arguments)]
+fn settle_events(
+    events: Vec<TurnEvent>,
+    map_state: &mut MapState,
+    live_background: &HashMap<String, String>,
+    pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    high_water: &AtomicUsize,
+    assistant_had_error: bool,
+) {
+    let background: std::collections::HashSet<&str> =
+        live_background.values().map(String::as_str).collect();
+    let (events, closing) = crate::unfinished::gate_events(events, map_state, &background);
+    emit_updates(&map_state.filter_updates(closing), update_tx, session_id);
+    handle_events(
+        &events,
+        pending,
+        update_tx,
+        session_id,
+        high_water,
+        assistant_had_error,
+    );
+}
+
 /// Emit a `commands_changed` system frame as an `AvailableCommandsUpdate`.
 fn emit_commands_changed(
     line: &Value,
@@ -1156,6 +1616,37 @@ fn emit_updates(
     for update in updates {
         let notif = SessionNotification::new(session_id.to_string(), update.clone());
         let _ = update_tx.send(SessionOutbound::Update(notif));
+    }
+}
+
+/// The error text of a `control_response` whose `response.subtype` is `error`
+/// (the CLI refused the request), else `None`.
+fn control_response_error(receipt: &Value) -> Option<String> {
+    let response = receipt.get("response")?;
+    if response.get("subtype").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    Some(
+        response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("control request failed")
+            .to_string(),
+    )
+}
+
+/// Send a batch of untyped AIR async-task updates (item 3.4/3.5), each wrapped
+/// as `{"sessionId":…,"update":{…}}` in a `RawUpdate` (item 3.3).
+fn emit_raw_updates(
+    updates: Vec<Value>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    for update in updates {
+        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+            "sessionId": session_id,
+            "update": update,
+        })));
     }
 }
 
@@ -1287,6 +1778,7 @@ mod tests {
                 stop_reason: crate::turn::StopReason::Cancelled,
                 usage: crate::turn::Usage::default(),
                 had_usage,
+                model_rows: Default::default(),
             }];
             handle_events(&events, &mut pending, update_tx, "s1", hw, false);
             reply_rx.await.expect("reply sent").expect("prompt ok")
@@ -1303,11 +1795,82 @@ mod tests {
         assert_eq!(u.cached_write_tokens, 0);
         assert_eq!(u.total_tokens, 0);
 
-        // Queued turn swept by cancel: `had_usage = false` -> None.
+        // 2.12 (E-6): an active turn's settle carries `_meta.quota`; the shape
+        // is totals-only (`model_usage: []`, Decision 20).
+        let aq = active
+            .quota
+            .expect("an active turn's settle must carry _meta.quota");
+        assert_eq!(
+            aq,
+            json!({
+                "quota": {
+                    "token_count": {
+                        "totalTokens": 0,
+                        "inputTokens": 0,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                        "outputTokens": 0,
+                        "reasoningOutputTokens": 0,
+                    },
+                    "model_usage": [],
+                }
+            }),
+            "2.12: quota is totals-only with model_usage []"
+        );
+
+        // Queued turn swept by cancel: `had_usage = false` -> None (both usage
+        // and quota).
         let queued = settle(&update_tx, &hw, false).await;
         assert!(
             queued.usage.is_none(),
             "a queued turn swept by cancel must report no usage"
+        );
+        assert!(
+            queued.quota.is_none(),
+            "2.12: a queued turn swept by cancel must carry no _meta.quota (inv_37_queued_sweep_has_no_quota)"
+        );
+    }
+
+    /// 2.12 (inv_37_quota_meta_shape) — the quota totals equal the summed
+    /// usage for a non-zero settle, with `cached*`/`reasoning` fields in place.
+    #[tokio::test]
+    async fn inv_37_quota_meta_shape() {
+        let (update_tx, _update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pending.insert("p1".to_string(), reply_tx);
+        let events = vec![TurnEvent::Settled {
+            prompt_uuid: "p1".to_string(),
+            stop_reason: crate::turn::StopReason::EndTurn,
+            usage: crate::turn::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_read_tokens: 3,
+                cached_write_tokens: 2,
+            },
+            had_usage: true,
+            model_rows: Default::default(),
+        }];
+        handle_events(&events, &mut pending, &update_tx, "s1", &hw, false);
+        let reply = reply_rx.await.expect("reply sent").expect("prompt ok");
+        let quota = reply.quota.expect("quota present");
+        assert_eq!(
+            quota,
+            json!({
+                "quota": {
+                    "token_count": {
+                        "totalTokens": 20, // 10 + 5 + 3 + 2
+                        "inputTokens": 10,
+                        "cachedInputTokens": 3,
+                        "cachedWriteTokens": 2,
+                        "outputTokens": 5,
+                        "reasoningOutputTokens": 0,
+                    },
+                    "model_usage": [],
+                }
+            })
         );
     }
 
@@ -1397,6 +1960,7 @@ mod tests {
             &utx,
             "s",
             &hw,
+            &mut AsyncTaskRuntime::new(false),
         );
 
         // Cancel the held turn: only if the routed state is "running" (not the
@@ -1464,6 +2028,7 @@ mod tests {
             &utx,
             "s",
             &hw,
+            &mut AsyncTaskRuntime::new(false),
         );
 
         // The tool executes and the CLI emits a `user` frame carrying the
@@ -1489,6 +2054,7 @@ mod tests {
             &utx,
             "s",
             &hw,
+            &mut AsyncTaskRuntime::new(false),
         );
 
         // Read the outbound updates and find the terminal completing update.
@@ -1518,6 +2084,271 @@ mod tests {
             completed_seen,
             "a plain top-level Read tool turn must emit a terminal tool_call_update{{status:completed}}"
         );
+    }
+
+    /// 3.7 (E-12) wiring through the real frame path: a streamed-only tool_use
+    /// (never in a complete assistant message) is closed `failed` at the
+    /// `end_turn` result and the prompt still resolves `end_turn`; a dispatched
+    /// one (complete assistant message, no `tool_result`) fails the prompt.
+    #[tokio::test]
+    async fn inv_41_frame_path_abandoned_vs_dispatched() {
+        for dispatched in [false, true] {
+            let mut machine = TurnMachine::new();
+            let mut map_state = MapState::default();
+            let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+                HashMap::new();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            pending.insert("p1".into(), reply_tx);
+            let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+            let hw = Arc::new(AtomicUsize::new(0));
+            let (mut text, mut err) = (false, false);
+            let mut bg: HashMap<String, String> = HashMap::new();
+            machine.enqueue(Turn::new("p1".into(), false));
+            machine.on_echo("p1");
+            let mut frames = vec![
+                json!({"type":"stream_event","event":{"type":"content_block_start",
+                "index":0,"content_block":{"type":"tool_use","id":"toolu_X","name":"Bash","input":{}}}}),
+            ];
+            if dispatched {
+                frames.push(
+                    json!({"type":"assistant","message":{"role":"assistant","content":[
+                    {"type":"tool_use","id":"toolu_X","name":"Bash","input":{"command":"ls"}}]}}),
+                );
+            }
+            frames.push(json!({"type":"result","subtype":"success","is_error":false,
+                "stop_reason":"end_turn","result":"ok","usage":{}}));
+            for f in frames {
+                handle_session_frame(
+                    f,
+                    &mut machine,
+                    &mut map_state,
+                    &mut bg,
+                    &mut pending,
+                    &mut text,
+                    &mut err,
+                    &utx,
+                    "s",
+                    &hw,
+                    &mut AsyncTaskRuntime::new(false),
+                );
+            }
+            let mut closing = None;
+            while let Ok(item) = urx.try_recv() {
+                if let SessionOutbound::Update(n) = item {
+                    let j = serde_json::to_value(&n.update).unwrap();
+                    if j["sessionUpdate"] == "tool_call_update" && j["status"] == "failed" {
+                        closing = Some(j);
+                    }
+                }
+            }
+            let closing = closing.expect("the unfinished call is closed failed");
+            let text = closing["content"][0]["content"]["text"]
+                .as_str()
+                .unwrap_or("");
+            let reply = reply_rx.await.expect("prompt resolved");
+            if dispatched {
+                assert!(text.contains("without returning a result"));
+                assert!(matches!(
+                    reply,
+                    Err(SessionError::PromptFailed {
+                        kind: FailureKind::IncompleteToolCall,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(text.contains("before it ran"));
+                assert!(matches!(reply, Ok(ref r) if r.stop_reason == "end_turn"));
+            }
+        }
+    }
+
+    /// An autonomous result must not wipe the live user turn's field tracker.
+    #[tokio::test]
+    async fn autonomous_result_keeps_tool_tracker() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, _urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let (mut text, mut err) = (false, false);
+        let mut bg: HashMap<String, String> = HashMap::new();
+        machine.enqueue(Turn::new("p1".into(), false));
+        machine.on_echo("p1");
+        let mut frame = |f: Value, m: &mut TurnMachine, ms: &mut MapState| {
+            handle_session_frame(
+                f,
+                m,
+                ms,
+                &mut bg,
+                &mut pending,
+                &mut text,
+                &mut err,
+                &utx,
+                "s",
+                &hw,
+                &mut AsyncTaskRuntime::new(false),
+            );
+        };
+        frame(
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,
+                "content_block":{"type":"tool_use","id":"toolu_X","name":"Bash","input":{}}}}),
+            &mut machine,
+            &mut map_state,
+        );
+        assert_eq!(map_state.tracked_tool_calls(), 1);
+        frame(
+            json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn",
+                "origin":{"kind":"task-notification"},"usage":{}}),
+            &mut machine,
+            &mut map_state,
+        );
+        assert_eq!(
+            map_state.tracked_tool_calls(),
+            1,
+            "autonomous result keeps the tracker"
+        );
+        frame(
+            json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","usage":{}}),
+            &mut machine,
+            &mut map_state,
+        );
+        assert_eq!(
+            map_state.tracked_tool_calls(),
+            0,
+            "the user turn's result clears it"
+        );
+    }
+
+    /// 3.12 (R71-10 / R86-6): a steer sent while a permission is awaiting the
+    /// user goes out at `priority:"later"` (else `"now"`), and the steered turn
+    /// then settles on the steer lane exactly like a `now` steer (echo, result,
+    /// idle).
+    #[tokio::test]
+    async fn inv_43_steer_later_while_permission_open() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::timeout;
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(a, control_in_rx, ControlOptions { on_request: None });
+        let (update_tx, _update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx,
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            std::env::temp_dir(),
+            false,
+        ));
+        let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = ltx.send(line.trim().to_string());
+                    }
+                }
+            }
+        });
+        let (preply_tx, mut preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type":"user","uuid":"p1","message":{}}),
+            is_local_only: false,
+            reply: preply_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type":"user","uuid":"p1","isReplay":true,
+                "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+            .unwrap();
+        // Steer #1 with NO permission open -> "now".
+        let steer = |uuid: &str| {
+            let (sreply_tx, sreply_rx) = oneshot::channel();
+            tx.send(Command::Steer {
+                uuid: uuid.into(),
+                frame: json!({"type":"user","uuid":uuid,"message":{}}),
+                is_local_only: false,
+                is_prompt_required: false,
+                reply: sreply_tx,
+            })
+            .unwrap();
+            sreply_rx
+        };
+        assert_eq!(steer("s1").await.unwrap()["outcome"], "injected");
+        // A permission now awaits the user (its request is never answered).
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        tx.send(Command::Permission {
+            frame: json!({"type":"control_request","request_id":"permreq1","request":{
+                "subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},
+                "tool_use_id":"toolu_P","permission_suggestions":[]}}),
+            reply: reply_tx,
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(steer("s2").await.unwrap()["outcome"], "injected");
+
+        let mut priorities = Vec::new();
+        while priorities.len() < 2 {
+            let line = timeout(Duration::from_secs(5), lrx.recv())
+                .await
+                .expect("a user frame is written")
+                .expect("stdin open");
+            let v: Value = serde_json::from_str(&line).expect("JSON");
+            if matches!(v["uuid"].as_str(), Some("s1" | "s2")) {
+                priorities.push((
+                    v["uuid"].as_str().unwrap().to_string(),
+                    v["priority"].clone(),
+                ));
+            }
+        }
+        assert_eq!(
+            priorities,
+            vec![
+                ("s1".to_string(), json!("now")),
+                ("s2".to_string(), json!("later"))
+            ]
+        );
+
+        // The steer lane is the same as for `now`: both echoes, a result and
+        // the idle settle p1 end_turn (not at the result).
+        for uuid in ["s1", "s2"] {
+            stream_tx
+                .send(json!({"type":"user","uuid":uuid,"isReplay":true,
+                    "message":{"role":"user","content":[{"type":"text","text":"x"}]}}))
+                .unwrap();
+        }
+        stream_tx
+            .send(json!({"type":"result","subtype":"success","is_error":false,
+                "stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            preply_rx.try_recv().is_err(),
+            "settles at idle, not at the result"
+        );
+        stream_tx
+            .send(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        let reply = timeout(Duration::from_secs(5), preply_rx)
+            .await
+            .expect("settles at the steer idle")
+            .expect("resolved")
+            .expect("Ok");
+        assert_eq!(reply.stop_reason, "end_turn");
     }
 
     /// 10.T3 (INV-27, Unit — `session`): a permission round-trip is spawned, not
@@ -1560,6 +2391,9 @@ mod tests {
             Duration::from_secs(30),
             "s1".into(),
             hw,
+            None,
+            std::env::temp_dir(),
+            false,
         ));
 
         // Reader: turn the duplex "stdin" (b) into whole lines.
@@ -1664,6 +2498,131 @@ mod tests {
         );
     }
 
+    /// Review follow-up 3.17-D — the cancel's `cancel_async_message` frames go
+    /// out in `take_abandoned()` ORDER with the EXACT uuid VALUES on the wire
+    /// (2.13 / E-8), and the `interrupt` follows all of them for 2+ uuids.
+    /// Drives the REAL actor + Control over a duplex stdin (like `inv_27`): an
+    /// active echoed turn plus two queued turns, then a cancel.
+    #[tokio::test]
+    async fn inv_38_cancel_async_message_wire_order() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::timeout;
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(a, control_in_rx, ControlOptions { on_request: None });
+        let (update_tx, _update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx.clone(),
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            hw,
+            None,
+            std::env::temp_dir(),
+            false,
+        ));
+
+        // Reader: turn the duplex "stdin" (b) into whole lines.
+        let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim().to_string();
+                        if !trimmed.is_empty() {
+                            let _ = ltx.send(trimmed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Active turn p1 (echoed), then two queued turns A and B (FIFO).
+        let (r_p1, _) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type":"user","uuid":"p1","message":{}}),
+            is_local_only: false,
+            reply: r_p1,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type":"user","uuid":"p1","message":{}}))
+            .unwrap();
+        let (r_a, _) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "A".into(),
+            frame: json!({"type":"user","uuid":"A","message":{}}),
+            is_local_only: false,
+            reply: r_a,
+        })
+        .unwrap();
+        let (r_b, _) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "B".into(),
+            frame: json!({"type":"user","uuid":"B","message":{}}),
+            is_local_only: false,
+            reply: r_b,
+        })
+        .unwrap();
+        // Give the actor a beat to enqueue A and B before the cancel lands.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tx.send(Command::Cancel).unwrap();
+
+        // Collect the `cancel_async_message` uuids in wire order, then confirm
+        // the `interrupt` follows all of them.
+        let mut uuids: Vec<String> = Vec::new();
+        let saw_interrupt;
+        loop {
+            let line = timeout(Duration::from_secs(5), lrx.recv())
+                .await
+                .expect("a control_request is written to stdin")
+                .expect("stream open");
+            let v: Value = serde_json::from_str(&line).expect("line is JSON");
+            if v.get("type").and_then(Value::as_str) != Some("control_request") {
+                continue;
+            }
+            let subtype = v
+                .pointer("/request/subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if subtype == "cancel_async_message" {
+                let mu = v
+                    .pointer("/request/message_uuid")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                uuids.push(mu);
+            } else if subtype == "interrupt" {
+                saw_interrupt = true;
+                break;
+            }
+        }
+        assert_eq!(
+            uuids,
+            vec!["A".to_string(), "B".to_string()],
+            "the cancel_async_message message_uuids must go out in take_abandoned() order (FIFO queued sweep)"
+        );
+        assert!(
+            saw_interrupt,
+            "the interrupt must follow all of the cancel_async_message frames on the wire"
+        );
+    }
+
     /// Read stdin lines until the R28 deny `control_response` is seen.
     async fn find_deny_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
         use std::time::Duration;
@@ -1712,6 +2671,7 @@ mod tests {
             &utx,
             "s",
             &hw,
+            &mut AsyncTaskRuntime::new(false),
         );
 
         // A permission request from inside that subagent.
@@ -1732,6 +2692,7 @@ mod tests {
         handle_permission(
             frame,
             reply_tx,
+            None,
             &mut map_state,
             &mut live_background,
             &utx,
@@ -1782,6 +2743,9 @@ mod tests {
             grace,
             "s1".into(),
             hw.clone(),
+            None,
+            std::env::temp_dir(),
+            false,
         ));
         // Drain the child stdin so the duplex never fills up (the actor writes
         // the prompt user frame and the interrupt request to it).
@@ -1849,6 +2813,47 @@ mod tests {
             elapsed >= GRACE - Duration::from_millis(100),
             "the force-cancel backstop must wait the grace before settling \
              (elapsed {elapsed:?}, grace {GRACE:?})"
+        );
+    }
+
+    /// rust-air-gaps 2.3 (`inv_52_close_with_turn_in_flight`) — `session/close`
+    /// with an active turn settles that turn `cancelled`, answers behind the
+    /// flush barrier and ends the actor (a later command finds it gone).
+    #[tokio::test]
+    async fn inv_52_close_with_turn_in_flight() {
+        use tokio::time::timeout;
+        let (tx, stream_tx, _hw) = spawn_actor(Duration::from_secs(60));
+        let (preply_tx, preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type": "user", "uuid": "p1", "message": {}}),
+            is_local_only: false,
+            reply: preply_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p1", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (close_tx, close_rx) = oneshot::channel();
+        tx.send(Command::Close { reply: close_tx }).unwrap();
+        let reply = timeout(Duration::from_secs(5), preply_rx)
+            .await
+            .expect("the in-flight prompt settles at close")
+            .expect("prompt reply resolved")
+            .expect("the turn settles Ok");
+        assert_eq!(reply.stop_reason, "cancelled");
+        timeout(Duration::from_secs(5), close_rx)
+            .await
+            .expect("close answers")
+            .expect("close reply sent");
+        // The actor has ended: its command channel is closed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (late_tx, _late_rx) = oneshot::channel();
+        assert!(
+            tx.send(Command::Close { reply: late_tx }).is_err(),
+            "the actor must have ended after close"
         );
     }
 

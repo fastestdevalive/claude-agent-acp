@@ -6,6 +6,7 @@
 use std::process::ExitCode;
 
 use acp_recorder::frames::Frame;
+use acp_recorder::placeholders::Placeholders;
 use acp_recorder::Script;
 
 /// Parse the three positional CLI arguments. Returns `None` on a usage error.
@@ -52,6 +53,27 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if !script.seed_files.is_empty() {
+        let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR") else {
+            eprintln!("script `{script_path}` has seed_files but CLAUDE_CONFIG_DIR is not set");
+            return ExitCode::FAILURE;
+        };
+        let corpus_dir = std::path::Path::new(script_path)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let placeholders = Placeholders::new(None);
+        if let Err(error) = acp_recorder::placeholders::seed(
+            &script.seed_files,
+            &corpus_dir,
+            std::path::Path::new(&config_dir),
+            &placeholders,
+        ) {
+            eprintln!("failed to seed files: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let frames = match acp_recorder::record(agent_cmd, &script).await {
         Ok(frames) => frames,

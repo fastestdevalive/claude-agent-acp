@@ -21,7 +21,7 @@ Every implementer phase follows, in order:
 ## Skill mapping
 
 - `rust-coding` §1–5, 7, 9, 10 apply.
-- §6 wire truth = the Node adapter's ACP frames at `v0.70.0` (the compiled `dist/acp-agent.js`), **not** `daemon/src/types.ts`.
+- §6 wire truth = the Node adapter's ACP frames at the pinned upstream version (`porting/UPSTREAM_VERSION`, currently 0.94.0; the npm-installed `dist/acp-agent.js`), **not** `daemon/src/types.ts`.
 - §8 (rusqlite) is not applicable.
 
 ## Rules

@@ -185,6 +185,62 @@ fn records_argv_to_arg_out() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 2.6/2.14 — the 0.94+ auth probe (`argv ["auth", ...]`) never clobbers the
+/// session argv record: `record_argv_env` keeps exactly one argv record (the
+/// session spawn) whether the probe runs before or after the session.
+#[test]
+fn auth_probe_does_not_clobber_session_argv() {
+    let dir = std::env::temp_dir().join(format!("fake-claude-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_argv = vec![
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--resume=sess-1234-abcd".to_string(),
+    ];
+    let probe_argv = vec![
+        "auth".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ];
+
+    // Probe first, then session: the final record is the session.
+    let out1 = dir.join("argv-a.json");
+    fake_claude::record_argv_env(&out1, &probe_argv).unwrap();
+    fake_claude::record_argv_env(&out1, &session_argv).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out1).unwrap()).unwrap();
+    assert_eq!(
+        v["argv"][1], "stream-json",
+        "the session argv must be the record even when the probe ran first"
+    );
+    assert!(
+        v["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "--resume=sess-1234-abcd"),
+        "probe-then-session must record the session argv (--resume=...)"
+    );
+
+    // Session first, then probe: the probe must NOT overwrite the session record.
+    let out2 = dir.join("argv-b.json");
+    fake_claude::record_argv_env(&out2, &session_argv).unwrap();
+    fake_claude::record_argv_env(&out2, &probe_argv).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out2).unwrap()).unwrap();
+    assert_eq!(
+        v["argv"][0], "--output-format",
+        "a later auth probe must not clobber the session argv record"
+    );
+
+    // A probe alone records nothing.
+    let out3 = dir.join("argv-c.json");
+    fake_claude::record_argv_env(&out3, &probe_argv).unwrap();
+    assert!(!out3.exists(), "the auth probe alone must record nothing");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The binary records the `initialize` control_request to `FAKE_CLAUDE_INIT_OUT`.
 #[test]
 fn records_initialize_to_init_out() {
@@ -225,6 +281,86 @@ fn records_initialize_to_init_out() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 1.15 — a `control_request` whose subtype is `get_context_usage` (sent by the
+/// 0.94+ adapter after session creation) that does NOT match the current step's
+/// `expect` is auto-acked (Decision 5) WITHOUT consuming a transcript step; the
+/// replay then continues and consumes the real expected step.
+#[test]
+fn auto_acks_get_context_usage_without_consuming_a_step() {
+    let transcript = mk_transcript(
+        r#"{"expect":{"type":"user"},"emit":[{"type":"result","subtype":"success"}]}"#,
+    );
+    let mut out = Vec::new();
+    let steps = replay(
+        &transcript,
+        &[],
+        None,
+        None,
+        Cursor::new(
+            b"{\"type\":\"control_request\",\"request_id\":\"r1\",\"request\":{\"subtype\":\"get_context_usage\"}}\n{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{}}\n"
+                .to_vec(),
+        ),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(
+        steps, 1,
+        "auto-acked get_context_usage must not consume a transcript step"
+    );
+    let stdout = String::from_utf8(out).unwrap();
+    let mut lines = stdout.lines();
+    let auto_ack: serde_json::Value =
+        serde_json::from_str(lines.next().expect("first stdout line is the auto-ack")).unwrap();
+    assert_eq!(auto_ack["type"], "control_response");
+    assert_eq!(auto_ack["response"]["subtype"], "success");
+    assert_eq!(auto_ack["response"]["request_id"], "r1");
+    assert_eq!(auto_ack["response"]["response"], serde_json::json!({}));
+    // The transcript's own emit follows the auto-ack.
+    let emit: serde_json::Value =
+        serde_json::from_str(lines.next().expect("second stdout line is the step emit")).unwrap();
+    assert_eq!(emit["type"], "result");
+    assert_eq!(emit["subtype"], "success");
+    assert!(lines.next().is_none(), "no further frames expected");
+}
+
+/// 1.15 — when the transcript EXPLICITLY expects the `get_context_usage` as a
+/// step, the auto-ack must NOT fire: the frame is consumed normally as the
+/// step, its emit is written exactly once, and no extra auto-ack response is
+/// produced. Non-vacuous: the step's emit carries content that DISTINGUISHES it
+/// from the auto-ack (which always writes `response:{}`), so the assertion
+/// fails if the auto-ack path fired instead of the explicit step.
+#[test]
+fn explicit_expect_wins_over_auto_ack() {
+    let transcript = mk_transcript(
+        r#"{"expect":{"type":"control_request","request":{"subtype":"get_context_usage"}},"emit":[{"type":"control_response","response":{"subtype":"success","request_id":"$REQ","response":{"marker":"explicit-step"}}}]}"#,
+    );
+    let mut out = Vec::new();
+    let steps = replay(
+        &transcript,
+        &[],
+        None,
+        None,
+        Cursor::new(
+            b"{\"type\":\"control_request\",\"request_id\":\"rid\",\"request\":{\"subtype\":\"get_context_usage\"}}\n"
+                .to_vec(),
+        ),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(steps, 1, "the explicit step must be consumed exactly once");
+    let stdout = String::from_utf8(out).unwrap();
+    let emitted: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("exactly one emitted frame");
+    assert_eq!(
+        emitted["response"]["request_id"], "rid",
+        "$REQ must substitute the matched frame's request_id"
+    );
+    assert_eq!(
+        emitted["response"]["response"]["marker"], "explicit-step",
+        "the step's own emit (with its distinguishing content) is written — NOT a bare auto-ack (which would write an empty response object)"
+    );
+}
+
 /// Path to the compiled `fake-claude` binary, building it on demand.
 fn fake_claude_binary() -> std::path::PathBuf {
     let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/fake-claude");
@@ -237,4 +373,83 @@ fn fake_claude_binary() -> std::path::PathBuf {
         assert!(status.success(), "cargo build --bin fake-claude failed");
     }
     bin
+}
+
+/// rust-air-gaps 1.1 — `auth status` prints the transcript's special line
+/// (exit 0); `auth logout` drops a marker so the next `status` reports
+/// `{"loggedIn":false}` with exit 1; no transcript line means exit 1, silent.
+#[test]
+fn auth_logout_flips_status() {
+    let dir = std::env::temp_dir().join(format!("fake-claude-auth-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let transcript = mk_transcript(
+        "{\"auth_status_stdout\":{\"loggedIn\":true,\"email\":\"a@b.c\"}}\n{\"expect\":{\"type\":\"user\"},\"emit\":[]}\n",
+    );
+    assert_eq!(transcript.steps.len(), 1, "the auth line is not a step");
+    let status = vec![
+        "auth".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ];
+    let logout = vec!["auth".to_string(), "logout".to_string()];
+
+    let first = fake_claude::run_auth(&status, Some(&transcript), Some(&dir));
+    assert_eq!(first.code, 0);
+    let value: serde_json::Value = serde_json::from_str(first.stdout.trim()).unwrap();
+    assert_eq!(value["email"], "a@b.c");
+
+    let out = fake_claude::run_auth(&logout, Some(&transcript), Some(&dir));
+    assert_eq!(out.code, 0);
+    let after = fake_claude::run_auth(&status, Some(&transcript), Some(&dir));
+    assert_eq!(after.code, 1);
+    assert_eq!(after.stdout.trim(), "{\"loggedIn\":false}");
+
+    let bare = mk_transcript("{\"expect\":{},\"emit\":[]}\n");
+    let silent = fake_claude::run_auth(&status, Some(&bare), Some(&dir.join("other")));
+    assert_eq!((silent.code, silent.stdout.as_str()), (1, ""));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// rust-air-gaps 1.1 — `$REQ.1` resolves to the `request_id` of the frame the
+/// previous step matched, so a later step can answer a deferred request.
+#[test]
+fn req_prev_placeholder_answers_deferred_request() {
+    let transcript = mk_transcript(concat!(
+        r#"{"expect":{"type":"control_request","request":{"subtype":"rewind_files"}},"emit":[]}"#,
+        "\n",
+        r#"{"expect":{"type":"control_request","request":{"subtype":"interrupt"}},"emit":[{"type":"control_response","response":{"subtype":"success","request_id":"$REQ"}},{"type":"control_response","response":{"subtype":"success","request_id":"$REQ.1"}}]}"#,
+        "\n"
+    ));
+    let stdin = concat!(
+        r#"{"type":"control_request","request_id":"rid-rewind","request":{"subtype":"rewind_files"}}"#,
+        "\n",
+        r#"{"type":"control_request","request_id":"rid-int","request":{"subtype":"interrupt"}}"#,
+        "\n"
+    );
+    let (out, result) = run_replay(&transcript, stdin);
+    assert_eq!(result.unwrap(), 2);
+    let frames: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(frames[0]["response"]["request_id"], "rid-int");
+    assert_eq!(frames[1]["response"]["request_id"], "rid-rewind");
+}
+
+/// rust-air-gaps 1.1 — `$CWD` expands (inside longer strings too) to the
+/// canonical current directory.
+#[test]
+fn cwd_placeholder_expands() {
+    let transcript = mk_transcript(
+        r#"{"expect":{"type":"user"},"emit":[{"path":"$CWD/a.txt","bare":"$CWD","n":1}]}"#,
+    );
+    let (out, result) = run_replay(&transcript, "{\"type\":\"user\"}\n");
+    assert_eq!(result.unwrap(), 1);
+    let frame: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let cwd = cwd.to_string_lossy().into_owned();
+    assert_eq!(frame["bare"], cwd.as_str());
+    assert_eq!(frame["path"], format!("{cwd}/a.txt"));
+    assert_eq!(frame["n"], 1);
 }

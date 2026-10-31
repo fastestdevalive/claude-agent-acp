@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "capture_init": true,
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "systemPrompt": {"mode": "override", "content": [{"type": "text", "text": "You are a terse pirate."}]}}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}

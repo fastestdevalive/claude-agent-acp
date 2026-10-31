@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod frames;
+pub mod placeholders;
 pub mod recorder;
 pub mod script;
 

@@ -1,0 +1,9 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "expect_error": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "systemPrompt": {"mode": "append", "content": [{"type": "text", "text": "ok"}, {"type": "image", "data": "AAAA", "mimeType": "image/png"}]}}}
+  ]
+}

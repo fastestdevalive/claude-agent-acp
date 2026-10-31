@@ -1,0 +1,746 @@
+## cancel-mid-turn.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## cancel-mid-turn.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [9] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":5,"reasoningOutputTokens":0},"model_usage"…
+## cancel-queued-echo-less.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## cancel-queued-echo-less.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 13 -> 12)
+## commands-proactive.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## commands-proactive.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.6.name: "mcp" -> "permissions"
+  [4] frame.params.update.availableCommands.6.description: "Manage MCP servers" -> "Manage permission settings"
+  [4] frame.params.update.availableCommands.7.name: "permissions" -> "status"
+  [4] frame.params.update.availableCommands.7.description: "Manage permission settings" -> "Display session status"
+  [4] frame.params.update.availableCommands.8.name: "status" -> "mcp:weather"
+  [4] frame.params.update.availableCommands.8.description: "Display session status" -> "Weather service via MCP"
+  [4] frame.params.update.availableCommands.9.name: "mcp:weather" -> "mcp"
+  [4] frame.params.update.availableCommands.9.description: "Weather service via MCP" -> "Show the MCP servers and their status, or reconnect, enable, or disable a server"
+  [4] frame.params.update.availableCommands.9.input: null -> {"hint":"[reconnect|enable|disable [<server>|all]]"}
+  [4] frame.params.update.availableCommands.10: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [6] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":5,"reasoningOutputTokens":0},"model_usage"…
+## context-echo-less.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## context-echo-less.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [7] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":2,"inputTokens":2,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"model_usage":[…
+## eof-mid-turn.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## eof-mid-turn.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [6] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":0,"inputTokens":0,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"model_usage":[…
+## error-result.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## error-result.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+## idle-without-result.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## idle-without-result.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+## lagging-idle.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## lagging-idle.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [6] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":10,"inputTokens":5,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":5,"reasoningOutputTokens":0},"model_usage":…
+  [8] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":12,"inputTokens":6,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":6,"reasoningOutputTokens":0},"model_usage":…
+## multi-tool.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## multi-tool.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 9 -> 11)
+## permission-allow.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## permission-allow.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 10 -> 11)
+## permission-deny.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## permission-deny.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 10 -> 11)
+## resume-load.argv.json
+  argv.0: "--output-format" -> "auth"
+  argv.1: "stream-json" -> "status"
+  argv.2: "--verbose" -> "--json"
+  argv.3: "--input-format" -> undefined
+  argv.4: "stream-json" -> undefined
+  argv.5: "--permission-prompt-tool" -> undefined
+  argv.6: "stdio" -> undefined
+  argv.7: "--resume=sess-1234-abcd" -> undefined
+  argv.8: "--disallowedTools" -> undefined
+  argv.9: "AskUserQuestion" -> undefined
+  argv.10: "--tools" -> undefined
+  argv.11: "default" -> undefined
+  argv.12: "--setting-sources=user,project,local" -> undefined
+  argv.13: "--permission-mode" -> undefined
+  argv.14: "default" -> undefined
+  argv.15: "--allow-dangerously-skip-permissions" -> undefined
+  argv.16: "--include-partial-messages" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+  env.CLAUDE_CODE_ENTRYPOINT: "$ENTRYPOINT" -> undefined
+  env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" -> undefined
+## resume-load.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+## single-tool.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## single-tool.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 8 -> 9)
+## steer-error-result.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## steer-error-result.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [11] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":30,"inputTokens":22,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":8,"reasoningOutputTokens":0},"model_usage"…
+## steer-mid-turn.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## steer-mid-turn.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [11] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":30,"inputTokens":22,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":8,"reasoningOutputTokens":0},"model_usage"…
+## streamed-partial-input.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## streamed-partial-input.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 10 -> 11)
+## subagent-drain.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## subagent-drain.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 8 -> 9)
+## subagent-followup.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## subagent-followup.frames.jsonl
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true}},"prompt…
+  [1] {"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authSta…
+  (length 8 -> 9)
+## text-only.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## text-only.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [6] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":5,"reasoningOutputTokens":0},"model_usage"…
+## tool-result-echo.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## tool-result-echo.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [6] frame.params.update.name: undefined -> "Read"
+  [8] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":23,"inputTokens":15,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":8,"reasoningOutputTokens":0},"model_usage"…
+## tool-then-text.argv.json
+  argv.5: "--permission-prompt-tool" -> "--permission-prompt-tool=stdio"
+  argv.6: "stdio" -> "--disallowedTools=AskUserQuestion"
+  argv.7: "--disallowedTools" -> "--tools=default"
+  argv.8: "AskUserQuestion" -> "--setting-sources=user,project,local"
+  argv.9: "--tools" -> "--permission-mode=default"
+  argv.10: "default" -> "--allow-dangerously-skip-permissions"
+  argv.11: "--setting-sources=user,project,local" -> "--include-partial-messages"
+  argv.12: "--permission-mode" -> "--session-id=$0"
+  argv.13: "default" -> "--replay-user-messages"
+  argv.14: "--allow-dangerously-skip-permissions" -> ""
+  argv.15: "--include-partial-messages" -> undefined
+  argv.16: "--session-id=$0" -> undefined
+  argv.17: "--replay-user-messages" -> undefined
+  argv.18: "" -> undefined
+## tool-then-text.frames.jsonl
+  [1] frame.result.agentCapabilities._meta.authStatus: undefined -> {}
+  [1] frame.result.agentCapabilities.sessionCapabilities.systemPrompt: undefined -> {"mode":{"override":{}}}
+  [1] frame.result.agentInfo.version: "0.70.0" -> "0.94.0"
+  [1] frame.result._meta.jetbrains: {"air":{"version":1,"capabilities":["sessionFailure","agentFileChangeReport"]}} -> undefined
+  [1] frame.result._meta.goal: {"version":1,"controlMethod":"_session/goal","actions":["set","clear"]} -> undefined
+  [3] frame.result.modes.availableModes.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.modes.availableModes.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.modes.availableModes.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.modes.availableModes.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.modes.availableModes.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.modes.availableModes.3.id: "dontAsk" -> "auto"
+  [3] frame.result.modes.availableModes.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.modes.availableModes.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.modes.availableModes.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.modes.availableModes.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [3] frame.result.configOptions.0.options.0.description: "Standard behavior, prompts for dangerous operations" -> "Always ask before making changes"
+  [3] frame.result.configOptions.0.options.1.name: "Accept Edits" -> "Accept edits"
+  [3] frame.result.configOptions.0.options.1.description: "Auto-accept file edit operations" -> "Automatically accept all file edits"
+  [3] frame.result.configOptions.0.options.2.name: "Plan Mode" -> "Plan"
+  [3] frame.result.configOptions.0.options.2.description: "Planning mode, no actual tool execution" -> "Create a plan before making changes"
+  [3] frame.result.configOptions.0.options.3.value: "dontAsk" -> "auto"
+  [3] frame.result.configOptions.0.options.3.name: "Don't Ask" -> "Auto"
+  [3] frame.result.configOptions.0.options.3.description: "Don't prompt for permissions, deny if not pre-approved" -> "Claude handles permission decisions"
+  [3] frame.result.configOptions.0.options.4.name: "Bypass Permissions" -> "Bypass permissions"
+  [3] frame.result.configOptions.0.options.4.description: "Bypass all permission checks" -> "Accepts all permissions"
+  [4] frame.params.update.availableCommands.0: undefined -> {"name":"mcp","description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<serv…
+  [4] frame.params.update.availableCommands.1: undefined -> {"name":"remote-control","description":"Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects","input":{"hint":"[session name | …
+  [6] frame.params.update.name: undefined -> "Read"
+  [8] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":23,"inputTokens":15,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":8,"reasoningOutputTokens":0},"model_usage"…
+  [10] frame.result._meta: undefined -> {"quota":{"token_count":{"totalTokens":7,"inputTokens":5,"cachedInputTokens":0,"cachedWriteTokens":0,"outputTokens":2,"reasoningOutputTokens":0},"model_usage":[…
+## initialize.json
+  request.hooks.TaskCreated.0.hookCallbackIds.0: "hook_1" -> "hook_3"
+  request.hooks.TaskCompleted.0.hookCallbackIds.0: "hook_2" -> "hook_4"
+  request.hooks.PostModelSwitch: undefined -> [{"hookCallbackIds":["hook_1"]}]
+  request.hooks.PostCompact: undefined -> [{"hookCallbackIds":["hook_2"]}]
+  request.promptSuggestions: undefined -> true

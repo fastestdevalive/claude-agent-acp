@@ -11,9 +11,14 @@
 
 use std::process::ExitCode;
 
-use fake_claude::{load_transcript, replay};
+use fake_claude::{load_transcript, replay, run_auth};
 
 fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `claude auth ...` mode: never touches the argv record or the pid file.
+    if argv.first().map(String::as_str) == Some("auth") {
+        return auth_main(&argv);
+    }
     let Some(script) = std::env::var("FAKE_CLAUDE_SCRIPT").ok() else {
         eprintln!("fake-claude: FAKE_CLAUDE_SCRIPT is not set");
         return ExitCode::FAILURE;
@@ -37,7 +42,6 @@ fn main() -> ExitCode {
         }
     };
 
-    let argv: Vec<String> = std::env::args().skip(1).collect();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
@@ -63,5 +67,20 @@ fn main() -> ExitCode {
             eprintln!("fake-claude: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Serve a `claude auth ...` invocation.
+fn auth_main(argv: &[String]) -> ExitCode {
+    let transcript = std::env::var("FAKE_CLAUDE_SCRIPT")
+        .ok()
+        .and_then(|path| load_transcript(std::path::Path::new(&path)).ok());
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
+    let outcome = run_auth(argv, transcript.as_ref(), config_dir.as_deref());
+    print!("{}", outcome.stdout);
+    if outcome.code == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

@@ -1,0 +1,10 @@
+{
+  "permission": "allow",
+  "capture_init": true,
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/load", "capture_session_id": true,
+     "params": {"sessionId": "sess-1234-abcd", "cwd": "$CWD", "mcpServers": [],
+                "systemPrompt": {"mode": "override", "content": [{"type": "text", "text": "Reply only in haiku."}]}}}
+  ]
+}

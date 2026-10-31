@@ -1,0 +1,6 @@
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$0","method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"auth":{"terminal":false}}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"claudeCode":{"promptQueueing":true},"authStatus":{}},"promptCapabilities":{"image":true,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"auth":{"logout":{}},"providers":{},"loadSession":true,"sessionCapabilities":{"additionalDirectories":{},"close":{},"delete":{},"fork":{},"list":{},"resume":{},"systemPrompt":{"mode":{"override":{}}}}},"agentInfo":{"name":"@agentclientprotocol/claude-agent-acp","title":"Claude Agent","version":"0.94.0"},"authMethods":[],"_meta":{"steering":{"supported":true}}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","method":"_auth/status_update","params":{"authStatus":{"kind":"account","label":"Claude Pro","account":{"plan":"pro","email":"a@b.c","organization":"Org"}}}}}
+{"direction":"send","frame":{"jsonrpc":"2.0","id":"$1","method":"logout","params":{}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","method":"_auth/status_update","params":{"authStatus":{"kind":"none","label":"Not logged in"}}}}
+{"direction":"recv","frame":{"jsonrpc":"2.0","id":"$1","result":{}}}

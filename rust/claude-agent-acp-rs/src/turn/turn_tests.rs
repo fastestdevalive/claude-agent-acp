@@ -1586,3 +1586,331 @@ fn steer_unsteered_idle_still_fails_825() {
         "an un-steered idle without a result still #825-fails"
     );
 }
+
+/// 2.13 (E-8, HIGH RISK) — a cancel's `take_abandoned()` yields the abandoned
+/// messages in Node's order: the active turn's pending steered echoes FIRST
+/// (insertion order), then the swept queued turns FIFO
+/// (`dist/acp-agent.js:6253-6264`). The session actor sends one
+/// `cancel_async_message{message_uuid}` per uuid in this exact order before the
+/// `interrupt`, so a wrong sequence here is a loud fake-claude failure (the
+/// `cancel-queued-echo-less` transcript expects it).
+#[test]
+fn inv_38_cancel_async_message_sequence_precedes_interrupt() {
+    let mut machine = TurnMachine::new();
+    // Active, steered turn with two pending echoes in insertion order.
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.mark_steered("s1");
+    machine.mark_steered("s2");
+    // Queued turns A and B (FIFO).
+    machine.enqueue(Turn::new("A".into(), false));
+    machine.enqueue(Turn::new("B".into(), false));
+
+    let _ = machine.cancel();
+    let abandoned = machine.take_abandoned();
+    assert_eq!(
+        abandoned,
+        vec!["s1", "s2", "A", "B"],
+        "take_abandoned() must be steered echoes (insertion order) then swept queue FIFO"
+    );
+    assert!(
+        machine.take_abandoned().is_empty(),
+        "take_abandoned() drains (idempotent after a single cancel)"
+    );
+    assert_eq!(
+        machine.pending_orphan_results, 4,
+        "two steered echoes + two swept queued turns seed 4 orphan credits"
+    );
+
+    // A cancel with neither steers nor queued turns abandons nothing.
+    let mut noab = TurnMachine::new();
+    noab.enqueue(Turn::new("p1".into(), false));
+    noab.on_echo("p1");
+    let _ = noab.cancel();
+    assert!(
+        noab.take_abandoned().is_empty(),
+        "an active un-steered turn with no queue abandons no messages (no cancel_async_message)"
+    );
+}
+
+/// An autonomous-origin result stamped with `uuids`.
+fn stamped_autonomous_result(uuids: &[&str]) -> Value {
+    let mut r = autonomous_result("success");
+    r["user_message_uuids"] = serde_json::json!(uuids);
+    r
+}
+
+/// 3.8 (R87-1) — a `task-notification` result that names the queue head's
+/// prompt uuid answers that prompt: it settles with this result's stop reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_42_folded_prompt_settles() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p2".into(), false)); // folded: never echoed
+    let events = machine.on_result(&stamped_autonomous_result(&["p2"]), false);
+    assert_eq!(
+        settled_events(&events),
+        vec![("p2", StopReason::EndTurn)],
+        "the folded prompt is answered by the stamped autonomous result"
+    );
+    // The fallback single-uuid field names it too.
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p2".into(), false));
+    let mut r = autonomous_result("success");
+    r["user_message_uuid"] = serde_json::json!("p2");
+    assert_eq!(
+        settled_events(&machine.on_result(&r, false)),
+        vec![("p2", StopReason::EndTurn)]
+    );
+}
+
+/// 3.8 — an un-stamped or non-matching autonomous result is still skipped as
+/// another cycle's (byte-for-byte as before); the held-turn case is
+/// `inv_42_held_turn_naming_result_stays_autonomous`.
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_42_unmatched_autonomous_result_still_skipped() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p2".into(), false));
+    for result in [
+        autonomous_result("success"),
+        stamped_autonomous_result(&["someone-else"]),
+        stamped_autonomous_result(&[]),
+    ] {
+        let events = machine.on_result(&result, false);
+        assert!(
+            settled_events(&events).is_empty() && machine.result_is_autonomous(&result),
+            "unmatched autonomous results must stay on the autonomous lane"
+        );
+    }
+    assert!(!machine.has_active(), "p2 must not have been promoted");
+}
+
+/// 3.8 — a held turn (result in, waiting for its subagent) that an autonomous
+/// result names is NOT answered by it: the result stays autonomous.
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_42_held_turn_naming_result_stays_autonomous() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.on_task_started("sub", true);
+    machine.on_result(&result_frame("success", false), false); // p1 now held
+    let r = stamped_autonomous_result(&["p1"]);
+    assert!(
+        machine.result_is_autonomous(&r),
+        "a held turn already has its result; a result naming it does not answer it"
+    );
+}
+
+// ---- rust-air-gaps 2.1 (Decision 19): per-model quota rows -----------------
+
+fn model_result(model_usage: Value, usage: Value) -> Value {
+    serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "usage": usage,
+        "modelUsage": model_usage,
+    })
+}
+
+fn model_entry(i: u64, o: u64) -> Value {
+    serde_json::json!({"inputTokens": i, "outputTokens": o,
+        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0})
+}
+
+/// The `(model, total)` rows of the (single) `Settled` event for `uuid`.
+fn settled_rows(events: &[TurnEvent], uuid: &str) -> Option<Vec<(String, i64)>> {
+    events.iter().find_map(|e| match e {
+        TurnEvent::Settled {
+            prompt_uuid,
+            model_rows,
+            ..
+        } if prompt_uuid == uuid => Some(
+            model_rows
+                .rows()
+                .iter()
+                .map(|(m, t)| (m.clone(), t.total()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_48_machine_user_result_settles_with_rows() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    let r = model_result(
+        serde_json::json!({"m1": model_entry(10, 5)}),
+        serde_json::json!({"input_tokens": 10, "output_tokens": 5}),
+    );
+    let events = machine.on_result(&r, false);
+    assert_eq!(
+        settled_rows(&events, "p1"),
+        Some(vec![("m1".to_string(), 15)])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_48_machine_second_turn_reports_only_its_increment() {
+    let mut machine = TurnMachine::new();
+    for (uuid, cumulative, expected) in [("p1", 15, 15), ("p2", 40, 25)] {
+        machine.enqueue(Turn::new(uuid.into(), false));
+        machine.on_echo(uuid);
+        let r = model_result(
+            serde_json::json!({"m1": model_entry(cumulative, 0)}),
+            serde_json::json!({"input_tokens": expected}),
+        );
+        let events = machine.on_result(&r, false);
+        assert_eq!(
+            settled_rows(&events, uuid),
+            Some(vec![("m1".to_string(), expected)])
+        );
+        machine.on_idle();
+    }
+}
+
+/// An autonomous result advances the session-long reading (so the next turn
+/// does not pay for it) but never folds into a user turn's tally.
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_48_machine_autonomous_advances_reading_not_tally() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.on_result(
+        &model_result(
+            serde_json::json!({"m1": model_entry(10, 0)}),
+            serde_json::json!({"input_tokens": 10}),
+        ),
+        false,
+    );
+    machine.on_idle();
+    // Autonomous cycle spends 100 more (reading 110).
+    let auto = serde_json::json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "stop_reason": "end_turn", "origin": {"kind": "task-notification"},
+        "usage": {"input_tokens": 100},
+        "modelUsage": {"m1": model_entry(110, 0)},
+    });
+    let events = machine.on_result(&auto, false);
+    assert!(settled_events(&events).is_empty());
+    machine.on_idle();
+    // p2 spends 7 (reading 117): its rows are 7, not 107.
+    machine.enqueue(Turn::new("p2".into(), false));
+    machine.on_echo("p2");
+    let events = machine.on_result(
+        &model_result(
+            serde_json::json!({"m1": model_entry(117, 0)}),
+            serde_json::json!({"input_tokens": 7}),
+        ),
+        false,
+    );
+    assert_eq!(
+        settled_rows(&events, "p2"),
+        Some(vec![("m1".to_string(), 7)])
+    );
+}
+
+/// The reading is session-long: it survives a turn boundary (activation
+/// resets only the tally).
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_48_machine_reading_is_not_reset_per_turn() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.on_result(
+        &model_result(
+            serde_json::json!({"m1": model_entry(50, 0)}),
+            serde_json::json!({}),
+        ),
+        false,
+    );
+    machine.on_idle();
+    machine.enqueue(Turn::new("p2".into(), false));
+    machine.on_echo("p2");
+    // A rewound total (below the previous reading) is its own increment.
+    let events = machine.on_result(
+        &model_result(
+            serde_json::json!({"m1": model_entry(20, 0)}),
+            serde_json::json!({}),
+        ),
+        false,
+    );
+    assert_eq!(
+        settled_rows(&events, "p2"),
+        Some(vec![("m1".to_string(), 20)])
+    );
+}
+
+/// A resumed session's first result only seeds the baseline: its rows come
+/// from the result's own per-turn `usage`, keyed by the turn's assistant model.
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_48_machine_resumed_first_result_uses_usage_and_assistant_model() {
+    let mut machine = TurnMachine::new();
+    machine.mark_resumed();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.note_assistant_model("claude-x");
+    let events = machine.on_result(
+        &model_result(
+            serde_json::json!({"claude-x[1m]": model_entry(9000, 1000)}),
+            serde_json::json!({"input_tokens": 4, "output_tokens": 2}),
+        ),
+        false,
+    );
+    assert_eq!(
+        settled_rows(&events, "p1"),
+        Some(vec![("claude-x[1m]".to_string(), 6)]),
+        "the matching modelUsage spelling keys the row; history is not charged"
+    );
+    machine.on_idle();
+    // The seeded reading is the baseline for the next turn.
+    machine.enqueue(Turn::new("p2".into(), false));
+    machine.on_echo("p2");
+    let events = machine.on_result(
+        &model_result(
+            serde_json::json!({"claude-x[1m]": model_entry(9005, 1000)}),
+            serde_json::json!({"input_tokens": 5}),
+        ),
+        false,
+    );
+    assert_eq!(
+        settled_rows(&events, "p2"),
+        Some(vec![("claude-x[1m]".to_string(), 5)])
+    );
+}
+
+/// A held turn settles with the rows its own result recorded, not rows the
+/// later accumulator would hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_48_machine_held_turn_keeps_its_snapshot() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.on_task_started("sub", true);
+    machine.on_result(
+        &model_result(
+            serde_json::json!({"m1": model_entry(10, 0)}),
+            serde_json::json!({"input_tokens": 10}),
+        ),
+        false,
+    ); // held
+    machine.on_task_ended("sub");
+    let events = machine.on_idle();
+    assert_eq!(
+        settled_rows(&events, "p1"),
+        Some(vec![("m1".to_string(), 10)])
+    );
+}
+
+/// The queued-sweep cancel never ran: no rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn inv_48_machine_swept_cancel_has_no_rows() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.enqueue(Turn::new("p2".into(), false));
+    let events = machine.cancel();
+    assert_eq!(settled_rows(&events, "p2"), Some(vec![]));
+}

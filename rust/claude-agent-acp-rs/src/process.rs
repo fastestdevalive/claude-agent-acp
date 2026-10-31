@@ -164,8 +164,12 @@ impl Default for SpawnOptions {
 
 /// Build the child argv for the given options (B2 table).
 ///
-/// Order reproduces the SDK's `ProcessTransport` argv at `v0.70.0` (verified
-/// against `porting/fixtures/*.argv.json` by 3.T1).
+/// Order reproduces the SDK's `ProcessTransport` argv at `0.94.0` (verified
+/// against `porting/fixtures/*.argv.json` by 3.T1). Valued flags use
+/// `--flag=value` (E-13): `--model=`, `--permission-prompt-tool=stdio`,
+/// `--disallowedTools=<csv>`, `--tools=<csv|default>` (empty -> `--tools=`),
+/// `--permission-mode=<m>`; `--resume=`, `--setting-sources=`, `--session-id=`
+/// and the trailing `""` after `--replay-user-messages` are unchanged.
 pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "--output-format".into(),
@@ -176,13 +180,11 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
     ];
 
     if let Some(model) = &opts.model {
-        argv.push("--model".into());
-        argv.push(model.clone());
+        argv.push(format!("--model={model}"));
     }
 
     if opts.permission_prompt_tool {
-        argv.push("--permission-prompt-tool".into());
-        argv.push("stdio".into());
+        argv.push("--permission-prompt-tool=stdio".into());
     }
 
     if let Some(resume) = &opts.resume {
@@ -190,22 +192,21 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
     }
 
     if !opts.disallowed_tools.is_empty() {
-        argv.push("--disallowedTools".into());
-        argv.push(opts.disallowed_tools.join(","));
+        argv.push(format!(
+            "--disallowedTools={}",
+            opts.disallowed_tools.join(",")
+        ));
     }
 
     match &opts.tools {
         Some(tools) if tools.is_empty() => {
-            argv.push("--tools".into());
-            argv.push(String::new());
+            argv.push("--tools=".into());
         }
         Some(tools) => {
-            argv.push("--tools".into());
-            argv.push(tools.join(","));
+            argv.push(format!("--tools={}", tools.join(",")));
         }
         None => {
-            argv.push("--tools".into());
-            argv.push("default".into());
+            argv.push("--tools=default".into());
         }
     }
 
@@ -215,8 +216,7 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
     ));
 
     if let Some(mode) = &opts.permission_mode {
-        argv.push("--permission-mode".into());
-        argv.push(mode.clone());
+        argv.push(format!("--permission-mode={mode}"));
     }
 
     if opts.allow_dangerously_skip_permissions {
@@ -448,6 +448,13 @@ fn apply_claude_env(cmd: &mut Command, extra_env: &[(String, String)]) {
     }
     cmd.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
     cmd.env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1");
+    // SDK 0.3.303 (E-15 / S-3): the SDK tells the CLI it reads session state —
+    // but ONLY when the parent does not already define it (the SDK sets it only
+    // when absent). The child inherits the parent env, so a pre-existing value
+    // must be preserved. Never print env values.
+    if std::env::var_os("CLAUDE_CODE_SDK_READS_SESSION_STATE").is_none() {
+        cmd.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
+    }
     cmd.env_remove("NODE_OPTIONS");
 }
 
@@ -479,6 +486,71 @@ pub async fn spawn(opts: &SpawnOptions) -> Result<Process, SpawnError> {
     )?;
     let argv = build_argv(opts);
     spawn_raw(binary, argv, opts).await
+}
+
+/// Resolve the `claude` binary for a one-shot CLI call (`auth status`,
+/// `auth logout`) with the same precedence as [`spawn`].
+pub fn resolve_claude(claude_path: Option<&Path>) -> Result<PathBuf, ResolveError> {
+    resolve_binary(
+        claude_path,
+        std::env::var("CLAUDE_CODE_EXECUTABLE").ok().as_deref(),
+        &std::env::var("PATH").unwrap_or_default(),
+        current_os(),
+    )
+}
+
+/// The outcome of a one-shot `claude <args>` run ([`run_cli`]).
+#[derive(Debug, Clone)]
+pub struct CliRun {
+    /// Captured stdout (lossy UTF-8).
+    pub stdout: String,
+    /// Captured stderr (lossy UTF-8).
+    pub stderr: String,
+    /// Whether the process exited with status 0.
+    pub success: bool,
+    /// Whether the run was killed at the time limit (output then discarded).
+    pub timed_out: bool,
+}
+
+/// Run `binary args…` once with stdin closed and a time limit; the child is
+/// killed on timeout. The parent environment is inherited (plus `extra_env`).
+pub async fn run_cli(
+    binary: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    extra_env: &[(String, String)],
+    limit: Duration,
+) -> std::io::Result<CliRun> {
+    let mut cmd = Command::new(binary);
+    cmd.args(args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn()?;
+    match timeout(limit, child.wait_with_output()).await {
+        Ok(output) => {
+            let output = output?;
+            Ok(CliRun {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                success: output.status.success(),
+                timed_out: false,
+            })
+        }
+        Err(_) => Ok(CliRun {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            timed_out: true,
+        }),
+    }
 }
 
 /// Low-level spawn used by [`spawn`] and by tests that need an arbitrary child.

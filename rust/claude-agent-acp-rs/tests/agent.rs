@@ -154,14 +154,12 @@ async fn inv_session_new_model_permission_and_uuid() {
 
     let argv = read_argv(&argv_out);
     assert!(
-        argv.windows(2)
-            .any(|w| w == ["--model", "claude-sonnet-4-5"]),
-        "model -> --model in argv: {argv:?}"
+        argv.iter().any(|a| a == "--model=claude-sonnet-4-5"),
+        "model -> --model=claude-sonnet-4-5 in argv: {argv:?}"
     );
     assert!(
-        argv.windows(2)
-            .any(|w| w == ["--permission-mode", "acceptEdits"]),
-        "permission mode -> --permission-mode in argv: {argv:?}"
+        argv.iter().any(|a| a == "--permission-mode=acceptEdits"),
+        "permission mode -> --permission-mode=acceptEdits in argv: {argv:?}"
     );
     let session_arg = argv.iter().find_map(|a| a.strip_prefix("--session-id="));
     assert_eq!(

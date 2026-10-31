@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "sleep", "ms": 600},
+    {"call": "request", "method": "logout", "params": {}}
+  ]
+}

@@ -74,8 +74,11 @@
 //! pending, so their absence is intentional, not a silent drift.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use serde_json::Value;
+
+use crate::quota::{self, ModelRows, SharedRows};
 
 /// Verbatim upstream message for a turn that reached `idle` with no result
 /// (`acp-agent.js:54-55`).
@@ -139,6 +142,10 @@ pub enum FailureKind {
     NoResult,
     /// The stream ended and the turn never ran (`SESSION_ENDED_MESSAGE`).
     SessionEnded,
+    /// An `end_turn` settle left a dispatched tool call without a result
+    /// (`errorKind: incomplete_tool_call`, E-12). Produced only by the
+    /// session-level post-filter (`unfinished.rs`), never by the machine.
+    IncompleteToolCall,
 }
 
 impl FailureKind {
@@ -153,6 +160,9 @@ impl FailureKind {
             FailureKind::ContextExhausted => "The context window was exhausted.",
             FailureKind::NoResult => TURN_NO_RESULT_MESSAGE,
             FailureKind::SessionEnded => SESSION_ENDED_MESSAGE,
+            FailureKind::IncompleteToolCall => {
+                "Claude ended the turn without returning results for tool calls"
+            }
         }
     }
 }
@@ -172,10 +182,12 @@ pub struct Usage {
 /// `ADP:1788-1805`). A held turn's result has already recorded its stop reason
 /// and the usage accumulated up to that result; the hold settles with this
 /// snapshot, not the live accumulator (`ADP:3059`, `ADP:3574`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeferredSettle {
     stop_reason: StopReason,
     usage: Usage,
+    /// The per-model rows snapshot taken with `usage` (`_meta.quota.model_usage`).
+    models: SharedRows,
 }
 
 /// Events the turn machine emits for the session actor to act on. These are
@@ -201,6 +213,9 @@ pub enum TurnEvent {
         stop_reason: StopReason,
         usage: Usage,
         had_usage: bool,
+        /// Per-model quota rows (`_meta.quota.model_usage`), snapshotted with
+        /// `usage`; empty for the queued-sweep cancel.
+        model_rows: SharedRows,
     },
     /// A turn failed. The actor rejects that prompt's oneshot with the mapped
     /// JSON-RPC error.
@@ -234,7 +249,10 @@ pub struct Turn {
     /// The steer uuids whose echoes are still pending for this turn — `Some`
     /// when a `_session/steering` injected a `priority:"now"` message mid-turn
     /// (`Turn.steeredEchoes`). `is_steering_turn` is the R1 predicate.
-    steered_echoes: Option<HashSet<String>>,
+    ///
+    /// 2.13 (E-8): insertion-ordered so a cancel's `take_abandoned()` yields the
+    /// pending steered echoes in the order they were injected (`dist/acp-agent.js:6253-6264`).
+    steered_echoes: Option<Vec<String>>,
     /// The outcome (and usage snapshot) recorded by a steered turn's result,
     /// settled by the steer idle lane rather than by the result itself
     /// (`Turn.steeredSettle`). Later results overwrite it.
@@ -299,6 +317,12 @@ pub struct TurnMachine {
     /// (`still_queued` absent), so a stale credit can't swallow a later
     /// echo-less result (INV-23, `acp-agent.js:3608-3648`).
     orphaned_uuids: Vec<String>,
+    /// The uuids of the messages a `session/cancel` abandons, in Node's order:
+    /// pending steered echoes first (insertion order), then the swept queued
+    /// turns FIFO (E-8, `dist/acp-agent.js:6253-6264`). The actor sends one
+    /// `cancel_async_message{message_uuid}` per uuid before the `interrupt`
+    /// (2.13). Drained by [`Self::take_abandoned`].
+    abandoned_uuids: Vec<String>,
     /// Number of trailing `idle` frames still owed by settled/autonomous/
     /// cancelled turns (`owedTrailingIdles`) — absorbed by `on_idle` so a
     /// lagging idle can't false-fail the next live turn (#825).
@@ -312,12 +336,65 @@ pub struct TurnMachine {
     /// Per-active-turn token accumulator (`accumulatedUsage`), reset at
     /// activation and snapshot into every [`TurnEvent::Settled`].
     accumulated_usage: Usage,
+    /// The same tally split by model (`accumulatedModelUsage`), reset at the
+    /// same statements as `accumulated_usage`.
+    accumulated_models: ModelRows,
+    /// The session-long `result.modelUsage` reading (`lastModelUsageReading`):
+    /// NEVER reset per turn. `awaiting_resume_seed` stands for Node's
+    /// `undefined` (a resumed session's first result has no predecessor).
+    last_model_reading: ModelRows,
+    awaiting_resume_seed: bool,
+    /// The top-level assistant model of the current turn (`lastAssistantModel`),
+    /// cleared at activation (`resetTurnScratch`).
+    last_assistant_model: Option<String>,
 }
 
 impl TurnMachine {
     /// A fresh machine with no turns.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mark the session as resumed (`creationOpts.resume !== undefined`): its
+    /// first `result.modelUsage` reading already holds the pre-resume history,
+    /// so it only seeds the baseline (`lastModelUsageReading: undefined`).
+    pub fn mark_resumed(&mut self) {
+        self.awaiting_resume_seed = true;
+    }
+
+    /// Record the top-level assistant model of the current turn
+    /// (`lastAssistantModel`). `<synthetic>` and empty models are ignored.
+    pub fn note_assistant_model(&mut self, model: &str) {
+        if !model.is_empty() && model != "<synthetic>" {
+            self.last_assistant_model = Some(model.to_string());
+        }
+    }
+
+    /// A snapshot of the turn's per-model rows.
+    fn models_snapshot(&self) -> SharedRows {
+        Arc::new(self.accumulated_models.clone())
+    }
+
+    /// Advance the session-long `modelUsage` reading for one `result` and
+    /// return its per-model increment (`acp-agent.js:4946-4962`). Runs for
+    /// autonomous results too; only a user result folds it into the tally.
+    fn advance_model_reading(&mut self, result: &Value) -> ModelRows {
+        let reading = quota::normalize(result.get("modelUsage"));
+        let inc = if self.awaiting_resume_seed {
+            self.awaiting_resume_seed = false;
+            let matched = self
+                .last_assistant_model
+                .as_deref()
+                .and_then(|m| quota::matching_key(&reading, m));
+            quota::resumed_first(
+                result.get("usage"),
+                matched.as_deref().or(self.last_assistant_model.as_deref()),
+            )
+        } else {
+            quota::increment(&reading, &self.last_model_reading)
+        };
+        self.last_model_reading = reading;
+        inc
     }
 
     /// Whether there is an active, unsettled turn.
@@ -331,6 +408,18 @@ impl TurnMachine {
     /// `acp-agent.js:1141`), used by `_session/steering`.
     pub fn has_unsettled(&self) -> bool {
         self.has_active() || self.queue.iter().any(|t| !t.settled)
+    }
+
+    /// The `prompt_uuid` of the turn a newly surfaced foreground tool call
+    /// belongs to: the active unsettled turn, else the first unsettled queued
+    /// turn (Node `recordForegroundToolCall`, `session.activeTurn ??
+    /// turnQueue.find(!settled)`). Read-only; touches no debt book (3.7).
+    pub fn foreground_target(&self) -> Option<&str> {
+        self.active
+            .as_ref()
+            .filter(|t| !t.settled)
+            .or_else(|| self.queue.iter().find(|t| !t.settled))
+            .map(|t| t.prompt_uuid.as_str())
     }
 
     /// Mark a `_session/steering` injected `priority:"now"` message as steered
@@ -351,8 +440,8 @@ impl TurnMachine {
             return false;
         };
         turn.steered_echoes
-            .get_or_insert_with(HashSet::new)
-            .insert(uuid.to_string());
+            .get_or_insert_with(Vec::new)
+            .push(uuid.to_string());
         if turn.deferred_settle.is_some() {
             turn.steered_settle = turn.deferred_settle.take();
         }
@@ -380,15 +469,19 @@ impl TurnMachine {
         // echo so their late results are skipped, not attributed to the next
         // head (count lane; `acp-agent.js:3459-3463`). Do NOT push these uuids
         // into `orphaned_uuids` — reconcile touches only swept turns (INV-23).
+        // 2.13 (E-8): they are the first abandoned uuids in Node's order
+        // (`dist/acp-agent.js:6253-6264`).
         if self.active.as_ref().is_some_and(is_steering_turn) {
             if let Some(echoes) = self.active.as_ref().and_then(|t| t.steered_echoes.as_ref()) {
                 self.pending_orphan_results += echoes.len();
+                self.abandoned_uuids.extend(echoes.iter().cloned());
             }
         }
 
         // Sweep queued turns that haven't started yet (no echo): settle them
         // now and seed an orphan per turn so their late results are skipped,
-        // not attributed to the next head (`ADP:3471-3526`).
+        // not attributed to the next head (`ADP:3471-3526`). Their prompt uuids
+        // are the abandoned tail in FIFO order (2.13 / E-8).
         let mut remaining = VecDeque::new();
         for turn in self.queue.drain(..) {
             if turn.settled {
@@ -396,11 +489,13 @@ impl TurnMachine {
             } else {
                 self.pending_orphan_results += 1;
                 self.orphaned_uuids.push(turn.prompt_uuid.clone());
+                self.abandoned_uuids.push(turn.prompt_uuid.clone());
                 events.push(TurnEvent::Settled {
                     prompt_uuid: turn.prompt_uuid,
                     stop_reason: StopReason::Cancelled,
                     usage: Usage::default(),
                     had_usage: false,
+                    model_rows: SharedRows::default(),
                 });
             }
         }
@@ -421,15 +516,16 @@ impl TurnMachine {
                     // A held turn's cancel reports the usage its result already
                     // recorded (`deferredSettle.usage`), not the live accumulator
                     // (`ADP:3574`; review-05 minor).
-                    let usage = active
-                        .deferred_settle
-                        .map(|d| d.usage)
-                        .unwrap_or(self.accumulated_usage);
+                    let (usage, model_rows) = match &active.deferred_settle {
+                        Some(d) => (d.usage, d.models.clone()),
+                        None => (self.accumulated_usage, self.models_snapshot()),
+                    };
                     events.push(TurnEvent::Settled {
                         prompt_uuid,
                         stop_reason: StopReason::Cancelled,
                         usage,
                         had_usage: true,
+                        model_rows,
                     });
                 }
             }
@@ -443,12 +539,22 @@ impl TurnMachine {
             && self
                 .active
                 .as_ref()
-                .and_then(|t| t.steered_settle)
+                .and_then(|t| t.steered_settle.as_ref())
                 .is_some()
         {
             self.owed_trailing_idles += 1;
         }
         events
+    }
+
+    /// Drain the uuids a `cancel()` abandoned, in Node's order: pending steered
+    /// echoes first (insertion order), then swept queued turns FIFO (E-8,
+    /// `dist/acp-agent.js:6253-6264`). The actor sends one
+    /// `cancel_async_message{message_uuid}` per uuid before the `interrupt`
+    /// (2.13). Idempotent: drains whatever was recorded by the most recent
+    /// `cancel()`.
+    pub fn take_abandoned(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.abandoned_uuids)
     }
 
     /// Force-cancel the active turn and clear the active slot, seeding one
@@ -467,6 +573,7 @@ impl TurnMachine {
                     stop_reason: StopReason::Cancelled,
                     usage: self.accumulated_usage,
                     had_usage: true,
+                    model_rows: self.models_snapshot(),
                 });
             }
         }
@@ -553,7 +660,8 @@ impl TurnMachine {
             if self.active.as_ref().is_some_and(is_steering_turn) {
                 if let Some(active) = self.active.as_mut() {
                     if let Some(echoes) = active.steered_echoes.as_mut() {
-                        echoes.remove(uuid);
+                        // 2.13: insertion-ordered Vec — remove by identity.
+                        echoes.retain(|u| u != uuid);
                     }
                 }
             }
@@ -567,19 +675,23 @@ impl TurnMachine {
         };
         if let Some(prev) = self.active.take() {
             if !prev.settled {
-                let (outcome, usage) = if self.cancelled {
+                let (outcome, usage, model_rows) = if self.cancelled {
                     // A cancel is pending for the previous turn (its trailing
                     // idle hasn't arrived yet): settle it `cancelled` and record
                     // the interrupt's trailer debt so that lagged idle is
                     // absorbed, not read as the freshly-activated turn ending
                     // (`ADP:3034-3050`).
                     self.owed_trailing_idles += 1;
-                    (StopReason::Cancelled, self.accumulated_usage)
-                } else if let Some(deferred) = prev.deferred_settle {
+                    (
+                        StopReason::Cancelled,
+                        self.accumulated_usage,
+                        self.models_snapshot(),
+                    )
+                } else if let Some(deferred) = prev.deferred_settle.clone() {
                     // A held turn hands off with its recorded outcome and usage
                     // snapshot, not a guessed end_turn (`ADP:3051-3060`).
-                    (deferred.stop_reason, deferred.usage)
-                } else if let Some(steered) = prev.steered_settle {
+                    (deferred.stop_reason, deferred.usage, deferred.models)
+                } else if let Some(steered) = prev.steered_settle.clone() {
                     // R8: the user moving on outranks a steered continuation, but
                     // its last result's stop reason stands. The steer lane normally
                     // pays for that result's trailing idle by settling on it; this
@@ -587,9 +699,13 @@ impl TurnMachine {
                     // arrives un-owed against the fresh turn and false-fails it
                     // (#825) (`acp-agent.js:3062-3079`).
                     self.owed_trailing_idles += 1;
-                    (steered.stop_reason, steered.usage)
+                    (steered.stop_reason, steered.usage, steered.models)
                 } else {
-                    (StopReason::EndTurn, self.accumulated_usage)
+                    (
+                        StopReason::EndTurn,
+                        self.accumulated_usage,
+                        self.models_snapshot(),
+                    )
                 };
                 let mut prev = prev;
                 prev.settled = true;
@@ -599,11 +715,50 @@ impl TurnMachine {
                     stop_reason: outcome,
                     usage,
                     had_usage: true,
+                    model_rows,
                 });
             }
         }
         self.activate(queued, &mut events);
         events
+    }
+
+    /// Whether `result` is an autonomous cycle's (not a user prompt's): an
+    /// autonomous origin (`AUTONOMOUS_RESULT_ORIGINS`) that does NOT name a
+    /// pending prompt. Claude Code folds a prompt sent while an autonomous
+    /// (`task-notification`) turn runs into that turn; the result is still
+    /// origin-marked but lists the uuids it answered in `user_message_uuids`
+    /// (fallback `user_message_uuid`), and then takes the user lane
+    /// (`answersPendingPrompt`, `dist/acp-agent.js:3205-3228`, R87-1). A turn
+    /// held for its subagents already has its result and is not answered.
+    /// Un-stamped and non-matching results are unchanged. Read-only.
+    pub fn result_is_autonomous(&self, result: &Value) -> bool {
+        is_autonomous_result(result) && !self.answers_pending_prompt(result)
+    }
+
+    fn answers_pending_prompt(&self, result: &Value) -> bool {
+        let answered: Vec<&str> = match result.get("user_message_uuids").and_then(Value::as_array) {
+            Some(uuids) => uuids.iter().filter_map(Value::as_str).collect(),
+            None => result
+                .get("user_message_uuid")
+                .and_then(Value::as_str)
+                .into_iter()
+                .collect(),
+        };
+        answered.iter().any(|uuid| {
+            let active = self
+                .active
+                .as_ref()
+                .filter(|t| t.prompt_uuid == *uuid && !t.settled);
+            match active {
+                // Held open: already has its result, so this one does not answer it.
+                Some(turn) => !is_held_turn(turn),
+                None => self
+                    .queue
+                    .iter()
+                    .any(|t| t.prompt_uuid == *uuid && !t.settled),
+            }
+        })
     }
 
     /// A `result` frame for the user's turn. Ports the full `ADP:2532-2884`
@@ -615,7 +770,7 @@ impl TurnMachine {
     /// client before this result (the actor tracks `emittedAssistantText`).
     pub fn on_result(&mut self, result: &Value, assistant_text_delivered: bool) -> Vec<TurnEvent> {
         let mut events = Vec::new();
-        let is_autonomous = is_autonomous_result(result);
+        let is_autonomous = self.result_is_autonomous(result);
         let is_error = result
             .get("is_error")
             .and_then(Value::as_bool)
@@ -632,6 +787,11 @@ impl TurnMachine {
         // trailing idle and may drain a held turn, but must never touch the
         // user-turn lifecycle — orphan accounting, failActive, the fallback or
         // the stop reason (`ADP:2532-2539`, `2713-2727`; review 04 #4).
+        // The per-model reading advances for EVERY result (it is the baseline
+        // the next increment is measured from) but only a user result folds
+        // its increment into the tally (`acp-agent.js:4946-4965`). It does not
+        // touch `owed_trailing_idles` or any other lane.
+        let model_increment = self.advance_model_reading(result);
         if is_autonomous {
             self.owed_trailing_idles += 1;
             self.settle_deferred_if_drained(&mut events);
@@ -680,6 +840,7 @@ impl TurnMachine {
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
         }
+        self.accumulated_models = quota::add(&self.accumulated_models, &model_increment);
 
         // A cancelled turn's result is dropped; it settles at idle.
         if self.cancelled {
@@ -896,14 +1057,22 @@ impl TurnMachine {
         let mut events = Vec::new();
         if let Some(active) = self.active.take() {
             if !active.settled {
-                let (outcome, usage) = if self.cancelled {
-                    (StopReason::Cancelled, self.accumulated_usage)
+                let (outcome, usage, model_rows) = if self.cancelled {
+                    (
+                        StopReason::Cancelled,
+                        self.accumulated_usage,
+                        self.models_snapshot(),
+                    )
                 } else if let Some(deferred) = active.deferred_settle {
                     // A held turn's result already recorded its outcome and usage
                     // snapshot — the hold settles with those (`ADP:3059`).
-                    (deferred.stop_reason, deferred.usage)
+                    (deferred.stop_reason, deferred.usage, deferred.models)
                 } else {
-                    (StopReason::EndTurn, self.accumulated_usage)
+                    (
+                        StopReason::EndTurn,
+                        self.accumulated_usage,
+                        self.models_snapshot(),
+                    )
                 };
                 let prompt_uuid = active.prompt_uuid.clone();
                 events.push(TurnEvent::Settled {
@@ -911,6 +1080,7 @@ impl TurnMachine {
                     stop_reason: outcome,
                     usage,
                     had_usage: true,
+                    model_rows,
                 });
             }
         }
@@ -941,6 +1111,7 @@ impl TurnMachine {
                         stop_reason: deferred.stop_reason,
                         usage,
                         had_usage: true,
+                        model_rows: deferred.models,
                     });
                 } else {
                     events.push(TurnEvent::Failed {
@@ -978,8 +1149,13 @@ impl TurnMachine {
             if !is_held_turn(active) {
                 return;
             }
-            if let Some(deferred) = active.deferred_settle {
-                self.settle_with_usage(deferred.stop_reason, deferred.usage, events);
+            if let Some(deferred) = active.deferred_settle.clone() {
+                self.settle_with_usage(
+                    deferred.stop_reason,
+                    deferred.usage,
+                    deferred.models,
+                    events,
+                );
             }
         }
         if self.pending_orphan_results > 0 {
@@ -1023,9 +1199,14 @@ impl TurnMachine {
         if awaiting {
             return;
         }
-        let deferred = self.active.as_ref().and_then(|t| t.deferred_settle);
+        let deferred = self.active.as_ref().and_then(|t| t.deferred_settle.clone());
         if let Some(deferred) = deferred {
-            self.settle_with_usage(deferred.stop_reason, deferred.usage, events);
+            self.settle_with_usage(
+                deferred.stop_reason,
+                deferred.usage,
+                deferred.models,
+                events,
+            );
         }
     }
 
@@ -1042,6 +1223,7 @@ impl TurnMachine {
                 active.steered_settle = Some(DeferredSettle {
                     stop_reason: outcome,
                     usage: self.accumulated_usage,
+                    models: Arc::new(self.accumulated_models.clone()),
                 });
             }
             return;
@@ -1061,6 +1243,7 @@ impl TurnMachine {
                 active.deferred_settle = Some(DeferredSettle {
                     stop_reason: outcome,
                     usage: self.accumulated_usage,
+                    models: Arc::new(self.accumulated_models.clone()),
                 });
             }
         }
@@ -1070,7 +1253,12 @@ impl TurnMachine {
     /// `settleActive` (`ADP:1579-1610`), including `activeTurn = null` (review
     /// 04 #5). Reports the live per-turn accumulator (`accumulatedUsage`).
     fn settle(&mut self, outcome: StopReason, events: &mut Vec<TurnEvent>) {
-        self.settle_with_usage(outcome, self.accumulated_usage, events);
+        self.settle_with_usage(
+            outcome,
+            self.accumulated_usage,
+            self.models_snapshot(),
+            events,
+        );
     }
 
     /// Settle the active turn with an explicit usage snapshot — used by the
@@ -1080,6 +1268,7 @@ impl TurnMachine {
         &mut self,
         outcome: StopReason,
         usage: Usage,
+        model_rows: SharedRows,
         events: &mut Vec<TurnEvent>,
     ) {
         let Some(active) = self.active.as_mut() else {
@@ -1096,6 +1285,7 @@ impl TurnMachine {
             stop_reason: outcome,
             usage,
             had_usage: true,
+            model_rows,
         });
     }
 
@@ -1125,6 +1315,8 @@ impl TurnMachine {
         self.pending_orphan_results = 0;
         self.orphaned_uuids.clear();
         self.accumulated_usage = Usage::default();
+        self.accumulated_models = ModelRows::default();
+        self.last_assistant_model = None;
         let prompt_uuid = queued.prompt_uuid.clone();
         self.active = Some(queued);
         events.push(TurnEvent::Activated { prompt_uuid });

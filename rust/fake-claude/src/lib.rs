@@ -65,6 +65,9 @@ pub struct Transcript {
     /// Periodically inject `keep_alive` while idle on stdin.
     #[serde(default)]
     pub keep_alive_every_ms: Option<u64>,
+    /// The `claude auth status --json` stdout (special transcript line
+    /// `{"auth_status_stdout": {...}}`); never replayed as a step.
+    pub auth_status_stdout: Option<Value>,
     /// The ordered steps.
     pub steps: Vec<Step>,
 }
@@ -74,6 +77,7 @@ impl Transcript {
     pub fn parse(text: &str) -> Result<Self, TranscriptError> {
         let mut steps = Vec::new();
         let mut keep_alive_every_ms = None;
+        let mut auth_status_stdout = None;
         for (idx, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() {
@@ -87,6 +91,10 @@ impl Transcript {
                 keep_alive_every_ms = Some(ka);
                 continue;
             }
+            if let Some(auth) = value.get("auth_status_stdout") {
+                auth_status_stdout = Some(auth.clone());
+                continue;
+            }
             let step: Step = serde_json::from_value(value).map_err(|e| TranscriptError::Parse {
                 line: idx,
                 source: e,
@@ -95,6 +103,7 @@ impl Transcript {
         }
         Ok(Self {
             keep_alive_every_ms,
+            auth_status_stdout,
             steps,
         })
     }
@@ -138,9 +147,11 @@ pub fn load_transcript(path: &Path) -> Result<Transcript, TranscriptError> {
 /// env (no `.env_clear()`), matching the crate's `apply_claude_env`
 /// (`process.rs`) and the Node adapter's `{ ...process.env, ...providerEnv }`.
 /// Do not read this list as the set of env vars forwarded to `claude`.
-const ARGV_ENV_ALLOWLIST: [&str; 2] = [
+const ARGV_ENV_ALLOWLIST: [&str; 4] = [
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS",
+    "CLAUDE_CODE_SDK_READS_SESSION_STATE",
+    "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
 ];
 
 /// Record the argv and the allow-listed env we were launched with to `out`.
@@ -156,7 +167,19 @@ const ARGV_ENV_ALLOWLIST: [&str; 2] = [
 /// deterministic-capture invariant). It is therefore recorded only as
 /// `"$ENTRYPOINT"` — the committed argv fixture is byte-stable across
 /// environments even though the value is not.
+///
+/// Exactly one argv record is kept per capture script: the SESSION spawn. The
+/// 0.94+ Node adapter also spawns a probe process (`claude auth status --json`,
+/// argv `["auth", ...]`) sharing `$FAKE_CLAUDE_ARGV_OUT`; a probe invocation
+/// must never clobber the session record, and the record is written (overwriting
+/// any stale probe file) only on a non-probe spawn.
 pub fn record_argv_env(out: &Path, argv: &[String]) -> std::io::Result<()> {
+    let is_auth_probe = argv.first().map(String::as_str) == Some("auth");
+    if is_auth_probe {
+        // The `claude auth status --json` probe is not the spawn this fixture
+        // records — keep the session argv record (or no record) untouched.
+        return Ok(());
+    }
     let mut env_map = serde_json::Map::new();
     for key in ARGV_ENV_ALLOWLIST {
         if env::var_os(key).is_some() {
@@ -190,6 +213,45 @@ fn write_json(out: &Path, value: &Value) -> std::io::Result<()> {
     std::fs::write(out, text)
 }
 
+/// Control-request subtypes `fake-claude` auto-acks (Decision 5): emitted by
+/// the 0.94+ Node adapter after session creation (`get_context_usage`), these
+/// are answered without consuming a transcript step.
+const AUTO_ACK_SUBTYPES: [&str; 1] = ["get_context_usage"];
+
+/// If `frame` is a `control_request` whose `request.subtype` is in
+/// [`AUTO_ACK_SUBTYPES`], return the Decision-5 success `control_response` to
+/// write back. `None` for every other frame.
+fn auto_ack_response(frame: &Value) -> Option<Value> {
+    let is_control_request = frame.get("type").and_then(Value::as_str) == Some("control_request");
+    if !is_control_request {
+        return None;
+    }
+    let subtype = frame
+        .get("request")
+        .and_then(|r| r.get("subtype"))
+        .and_then(Value::as_str)?;
+    if !AUTO_ACK_SUBTYPES.contains(&subtype) {
+        return None;
+    }
+    let request_id = frame.get("request_id").cloned().unwrap_or(Value::Null);
+    Some(serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {}
+        }
+    }))
+}
+
+/// Write one JSON frame to `stdout`, followed by a newline, and flush.
+fn write_frame(stdout: &mut impl Write, value: &Value) -> std::io::Result<()> {
+    let mut text = serde_json::to_string(value)?;
+    text.push('\n');
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
+}
+
 /// True when every field of `expect` is present in `frame` with an equal value
 /// (a subset match).
 pub fn subset_match(expect: &Value, frame: &Value) -> bool {
@@ -209,25 +271,102 @@ pub fn subset_match(expect: &Value, frame: &Value) -> bool {
 }
 
 /// Substitute `$REQ` (== `$MATCH.request_id`) and `$MATCH.<field>` in `value`
-/// using the matched stdin frame.
+/// using the matched stdin frame. `$CWD` expands inside any string.
 pub fn substitute(value: &Value, matched: &Value) -> Value {
+    substitute_with(value, matched, None)
+}
+
+/// As [`substitute`], additionally resolving `$REQ.1` to the `request_id` of
+/// the frame the PREVIOUS transcript step matched (`prev`), so a step can
+/// answer a request that an earlier step deliberately left unanswered.
+pub fn substitute_with(value: &Value, matched: &Value, prev: Option<&Value>) -> Value {
     match value {
         Value::String(s) => {
             if s == "$REQ" {
                 field_of(matched, "request_id")
+            } else if s == "$REQ.1" {
+                prev.map(|p| field_of(p, "request_id"))
+                    .unwrap_or(Value::Null)
             } else if let Some(rest) = s.strip_prefix("$MATCH.") {
                 field_of(matched, rest)
+            } else if s.contains("$CWD") {
+                Value::String(s.replace("$CWD", &canonical_cwd()))
             } else {
                 Value::String(s.clone())
             }
         }
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), substitute(v, matched)))
+                .map(|(k, v)| (k.clone(), substitute_with(v, matched, prev)))
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(|v| substitute(v, matched)).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| substitute_with(v, matched, prev))
+                .collect(),
+        ),
         other => other.clone(),
+    }
+}
+
+/// The canonical current directory, as text (`$CWD`).
+fn canonical_cwd() -> String {
+    let cwd = env::current_dir().unwrap_or_else(|_| "/".into());
+    cwd.canonicalize()
+        .unwrap_or(cwd)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// File whose presence makes `auth status` report logged-out.
+const LOGGED_OUT_MARKER: &str = ".fake-claude-logged-out";
+
+/// Result of an `auth` invocation: stdout text and the exit code.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuthOutcome {
+    pub stdout: String,
+    pub code: i32,
+}
+
+/// Emulate `claude auth ...` (`argv[0] == "auth"`). `status` prints the
+/// transcript's `auth_status_stdout` line (exit 0), or exits 1 with no output
+/// when the transcript has none. `logout` creates the marker under `config_dir`
+/// (exit 0); while it exists `status` prints `{"loggedIn":false}` and exits 1.
+pub fn run_auth(
+    argv: &[String],
+    transcript: Option<&Transcript>,
+    config_dir: Option<&Path>,
+) -> AuthOutcome {
+    let marker = config_dir.map(|dir| dir.join(LOGGED_OUT_MARKER));
+    let fail = AuthOutcome {
+        stdout: String::new(),
+        code: 1,
+    };
+    match argv.get(1).map(String::as_str) {
+        Some("logout") => match marker {
+            Some(path) if std::fs::write(&path, b"").is_ok() => AuthOutcome {
+                stdout: String::new(),
+                code: 0,
+            },
+            _ => fail,
+        },
+        Some("status") => {
+            if marker.is_some_and(|path| path.exists()) {
+                return AuthOutcome {
+                    stdout: "{\"loggedIn\":false}\n".to_string(),
+                    code: 1,
+                };
+            }
+            match transcript.and_then(|t| t.auth_status_stdout.as_ref()) {
+                Some(value) => AuthOutcome {
+                    stdout: format!("{value}\n"),
+                    code: 0,
+                },
+                None => fail,
+            }
+        }
+        _ => fail,
     }
 }
 
@@ -266,6 +405,8 @@ pub fn replay(
 
     let mut matched_init = false;
     let mut step_index = 0usize;
+    // `request_id` source for `$REQ.1`: the frame the previous step matched.
+    let mut prev_frame: Option<Value> = None;
     let mut reader = BufReader::new(stdin);
 
     loop {
@@ -284,6 +425,16 @@ pub fn replay(
             let line = line.trim();
             if std::env::var_os("FAKE_CLAUDE_LOG_FRAMES").is_some() && !line.is_empty() {
                 eprintln!("[fake-claude drain] {line}");
+            }
+            // After the transcript is spent, still auto-ack a late
+            // get_context_usage so the host never blocks on an unanswered
+            // control_request (Decision 5).
+            if !line.is_empty() {
+                if let Ok(frame) = serde_json::from_str::<Value>(line) {
+                    if let Some(response) = auto_ack_response(&frame) {
+                        write_frame(&mut stdout, &response)?;
+                    }
+                }
             }
             continue;
         }
@@ -318,6 +469,14 @@ pub fn replay(
 
         let step = &transcript.steps[step_index];
         if !subset_match(&step.expect, &frame) {
+            // Not the expected step: if it is an auto-ackable control_request
+            // (e.g. `get_context_usage`), respond without consuming a step
+            // rather than failing (Decision 5). The incoming frame was already
+            // logged under FAKE_CLAUDE_LOG_FRAMES above.
+            if let Some(response) = auto_ack_response(&frame) {
+                write_frame(&mut stdout, &response)?;
+                continue;
+            }
             return Err(ReplayError::Mismatch {
                 expected: serde_json::to_string(&step.expect).unwrap_or_default(),
                 actual: line.to_string(),
@@ -341,7 +500,7 @@ pub fn replay(
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 continue;
             }
-            let resolved = substitute(emit, &frame);
+            let resolved = substitute_with(emit, &frame, prev_frame.as_ref());
             let mut text = serde_json::to_string(&resolved)?;
             text.push('\n');
             stdout.write_all(text.as_bytes())?;
@@ -351,6 +510,7 @@ pub fn replay(
         }
         stdout.flush()?;
         step_index += 1;
+        prev_frame = Some(frame);
         if step.exit {
             // The transcript asks us to die here (e.g. mid-turn before a
             // `result`): return so main exits and stdout closes, letting the

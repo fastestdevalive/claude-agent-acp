@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "capture_init": true,
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "systemPrompt": {"mode": "append", "content": [{"type": "text", "text": "Always answer in French."}, {"type": "text", "text": "Keep it short."}]}}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}

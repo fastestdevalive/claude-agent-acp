@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// How the recorder answers `session/request_permission` requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -15,6 +16,10 @@ pub enum PermissionPolicy {
     Allow,
     /// Select the first reject-kind option, or cancel if none is offered.
     Deny,
+    /// Select the first `allow_always`-kind option (the durable choice, item
+    /// 3.9), falling back to the `allow_once` option when none is offered.
+    #[serde(rename = "allow_always")]
+    AllowAlways,
 }
 
 /// One ACP call to issue.
@@ -23,7 +28,13 @@ pub enum PermissionPolicy {
 pub enum Step {
     /// `initialize`
     #[serde(rename = "initialize")]
-    Initialize,
+    Initialize {
+        /// Optional `clientCapabilities._meta` to advertise (item 3.1): the
+        /// AIR scripts declare `{"jetbrains":{"air":{...}}}` here so the agent
+        /// under test treats this recorder run as an AIR client.
+        #[serde(default)]
+        client_capabilities_meta: Option<Value>,
+    },
     /// `session/new`
     #[serde(rename = "session/new")]
     NewSession {
@@ -65,6 +76,39 @@ pub enum Step {
     /// Await the responses of every `no_wait` prompt issued so far.
     #[serde(rename = "session/wait")]
     WaitPrompts,
+    /// Any ACP request with arbitrary params (rust-air-gaps Decision 1). String
+    /// values in `params` expand `$SESSION`, `$CWD`, `$CWD_SLUG`.
+    #[serde(rename = "request")]
+    Request {
+        method: String,
+        #[serde(default)]
+        params: Value,
+        /// Hold the request until an agent line containing this text arrived.
+        #[serde(default)]
+        after_recv_contains: Option<String>,
+        /// Adopt `result.sessionId` as the current session.
+        #[serde(default)]
+        capture_session_id: bool,
+        /// An error response is expected and is not a script failure.
+        #[serde(default)]
+        expect_error: bool,
+    },
+    /// Pause the script.
+    #[serde(rename = "sleep")]
+    Sleep { ms: u64 },
+}
+
+/// A file the recorder writes under `CLAUDE_CONFIG_DIR` before the agent is
+/// spawned, so both adapters see an identical transcript store.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SeedFile {
+    /// Destination relative to `CLAUDE_CONFIG_DIR` (`$CWD`/`$CWD_SLUG`/`$SESSION` expand).
+    pub path: String,
+    /// Source relative to `porting/corpus/` (same expansions apply to content).
+    pub from: String,
+    /// Explicit mtime in seconds since the epoch.
+    #[serde(default)]
+    pub mtime: Option<u64>,
 }
 
 /// A full recording script.
@@ -75,6 +119,12 @@ pub struct Script {
     pub permission: PermissionPolicy,
     /// The ordered ACP calls to issue.
     pub steps: Vec<Step>,
+    /// Files seeded under `CLAUDE_CONFIG_DIR` before the agent starts.
+    #[serde(default)]
+    pub seed_files: Vec<SeedFile>,
+    /// Capture the first `initialize` control_request into `<name>.init.json`.
+    #[serde(default)]
+    pub capture_init: bool,
 }
 
 fn default_permission() -> PermissionPolicy {
@@ -109,7 +159,12 @@ mod tests {
 
         assert_eq!(script.permission, PermissionPolicy::Deny);
         assert_eq!(script.steps.len(), 4);
-        assert_eq!(script.steps[0], Step::Initialize);
+        assert_eq!(
+            script.steps[0],
+            Step::Initialize {
+                client_capabilities_meta: None
+            }
+        );
         assert_eq!(
             script.steps[1],
             Step::NewSession {
@@ -222,5 +277,61 @@ mod tests {
     #[test]
     fn rejects_unknown_call() {
         assert!(Script::parse(r#"{"steps": [{"call": "session/bogus"}]}"#).is_err());
+    }
+
+    #[test]
+    fn parses_initialize_with_client_meta() {
+        let script = Script::parse(
+            r#"{"steps": [{"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.steps[0],
+            Step::Initialize {
+                client_capabilities_meta: Some(serde_json::json!({
+                    "jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}
+                }))
+            }
+        );
+    }
+
+    #[test]
+    fn parses_request_sleep_seed_and_capture_init() {
+        let script = Script::parse(
+            r#"{"capture_init": true,
+                "seed_files": [{"path": "projects/$CWD_SLUG/a.jsonl", "from": "seeds/a.jsonl", "mtime": 5}],
+                "steps": [
+                  {"call": "request", "method": "session/new", "params": {"cwd": "$CWD"}, "capture_session_id": true},
+                  {"call": "request", "method": "m", "after_recv_contains": "x", "expect_error": true},
+                  {"call": "sleep", "ms": 10}
+                ]}"#,
+        )
+        .unwrap();
+        assert!(script.capture_init);
+        assert_eq!(script.seed_files[0].mtime, Some(5));
+        assert!(matches!(
+            &script.steps[0],
+            Step::Request {
+                capture_session_id: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &script.steps[1],
+            Step::Request {
+                expect_error: true,
+                after_recv_contains: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(script.steps[2], Step::Sleep { ms: 10 });
+    }
+
+    #[test]
+    fn parses_permission_allow_always() {
+        let script =
+            Script::parse(r#"{"permission": "allow_always", "steps": [{"call": "initialize"}]}"#)
+                .unwrap();
+        assert_eq!(script.permission, PermissionPolicy::AllowAlways);
     }
 }

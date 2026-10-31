@@ -1,0 +1,12 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "projects/$CWD_SLUG/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl", "from": "seeds/session-a.jsonl", "mtime": 1767225600}
+  ],
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/fork", "capture_session_id": true,
+     "params": {"sessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "cwd": "$CWD", "mcpServers": []}},
+    {"call": "request", "method": "session/list", "params": {"cwd": "$CWD"}}
+  ]
+}

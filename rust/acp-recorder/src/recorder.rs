@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, TextContent,
+    CancelNotification, ClientCapabilities, ContentBlock, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -24,6 +24,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::frames::{Direction, Frame};
+use crate::placeholders::Placeholders;
 use crate::script::{PermissionPolicy, Script, Step};
 
 /// How long [`record`] waits for a `cancel_after_updates` threshold before
@@ -53,6 +54,9 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
     let frame_tx = tx.clone();
+    // Second, lock-free channel carrying every raw agent line, so a script step
+    // can wait for a wire condition (`after_recv_contains`).
+    let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
     let agent = agent.with_debug(move |line, direction| {
         let frame_direction = match direction {
             LineDirection::Stdin => Direction::Send,
@@ -64,6 +68,9 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
                 return;
             }
         };
+        if frame_direction == Direction::Recv {
+            let _ = line_tx.send(line.to_string());
+        }
         let Ok(json) = serde_json::from_str(line) else {
             return;
         };
@@ -100,7 +107,7 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
             let update_count = update_count.clone();
             move |connection: ConnectionTo<agent_client_protocol::Agent>| {
                 let update_count = update_count.clone();
-                async move { run_script(connection, script, update_count).await }
+                async move { run_script(connection, script, update_count, line_rx).await }
             }
         })
         .await;
@@ -143,12 +150,32 @@ fn reply_permission(
 ) -> RequestPermissionResponse {
     match policy {
         PermissionPolicy::Allow => {
+            // 2.11/3.9: `permission:"allow"` always picks the `allow_once`
+            // option (by kind, never by id), so it maps to a one-shot allow.
             let option = request
                 .options
                 .iter()
-                .find(|o| {
-                    o.kind == PermissionOptionKind::AllowOnce
-                        || o.kind == PermissionOptionKind::AllowAlways
+                .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+                .or_else(|| request.options.first());
+            match option {
+                Some(option) => RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                    SelectedPermissionOutcome::new(option.option_id.clone()),
+                )),
+                None => RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
+            }
+        }
+        PermissionPolicy::AllowAlways => {
+            // 3.9: the durable choice, by kind; a request that offers none
+            // degrades to the one-shot allow.
+            let option = request
+                .options
+                .iter()
+                .find(|o| o.kind == PermissionOptionKind::AllowAlways)
+                .or_else(|| {
+                    request
+                        .options
+                        .iter()
+                        .find(|o| o.kind == PermissionOptionKind::AllowOnce)
                 })
                 .or_else(|| request.options.first());
             match option {
@@ -178,7 +205,10 @@ async fn run_script(
     connection: ConnectionTo<agent_client_protocol::Agent>,
     script: &Script,
     update_count: Arc<AtomicUsize>,
+    mut line_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<(), agent_client_protocol::Error> {
+    // Every agent line seen so far (drained lazily from `line_rx`).
+    let mut recv_lines: Vec<String> = Vec::new();
     let mut session_id: Option<agent_client_protocol::schema::v1::SessionId> = None;
     // In-flight `no_wait` prompts awaited by a later `session/wait` step.
     let mut pending: Vec<SentRequest<PromptResponse>> = Vec::new();
@@ -190,11 +220,15 @@ async fn run_script(
 
     for step in &script.steps {
         match step {
-            Step::Initialize => {
-                let _response = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
+            Step::Initialize {
+                client_capabilities_meta,
+            } => {
+                let mut request = InitializeRequest::new(ProtocolVersion::V1);
+                if let Some(meta) = client_capabilities_meta {
+                    let meta_map = meta.as_object().cloned().unwrap_or_default();
+                    request = request.client_capabilities(ClientCapabilities::new().meta(meta_map));
+                }
+                let _response = connection.send_request(request).block_task().await?;
             }
             Step::NewSession { cwd } => {
                 let cwd = cwd
@@ -297,10 +331,79 @@ async fn run_script(
                     let _response = sent.block_task().await?;
                 }
             }
+            Step::Sleep { ms } => {
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+            }
+            Step::Request {
+                method,
+                params,
+                after_recv_contains,
+                capture_session_id,
+                expect_error,
+            } => {
+                if let Some(needle) = after_recv_contains {
+                    if !wait_for_line(&mut line_rx, &mut recv_lines, needle, UPDATE_WAIT_TIMEOUT)
+                        .await
+                    {
+                        return Err(agent_client_protocol::Error::internal_error().data(format!(
+                            "timed out waiting for an agent line with `{needle}`"
+                        )));
+                    }
+                }
+                let placeholders = Placeholders::new(session_id.as_ref().map(ToString::to_string));
+                let params = placeholders.expand(params);
+                let outcome = connection
+                    .send_request(UntypedMessage::new(method, params)?)
+                    .block_task()
+                    .await;
+                match outcome {
+                    Ok(result) => {
+                        if *capture_session_id {
+                            if let Some(id) = result.get("sessionId").and_then(|v| v.as_str()) {
+                                session_id = Some(id.to_string().into());
+                            }
+                        }
+                        if matches!(
+                            method.as_str(),
+                            "session/new" | "session/load" | "session/resume" | "session/fork"
+                        ) {
+                            tokio::time::sleep(POST_CREATE_SETTLE).await;
+                        }
+                    }
+                    Err(error) => {
+                        if !*expect_error {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Wait (bounded) until an agent line containing `needle` has been seen. Lines
+/// are drained from `rx` into `seen`, so earlier lines also satisfy the wait.
+async fn wait_for_line(
+    rx: &mut mpsc::UnboundedReceiver<String>,
+    seen: &mut Vec<String>,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        while let Ok(line) = rx.try_recv() {
+            seen.push(line);
+        }
+        if seen.iter().any(|l| l.contains(needle)) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(UPDATE_POLL_INTERVAL).await;
+    }
 }
 
 /// Wait until the update counter reaches `target` (bounded by `timeout`, never
@@ -322,6 +425,35 @@ async fn wait_for_updates(count: &AtomicUsize, target: usize, timeout: Duration)
 mod tests {
     use super::*;
     use crate::script::Script;
+
+    #[test]
+    fn allow_always_selects_the_durable_option_by_kind() {
+        use agent_client_protocol::schema::v1::PermissionOption;
+        let request = RequestPermissionRequest::new(
+            "s1",
+            tool_call(),
+            vec![
+                PermissionOption::new("allow-once", "Yes", PermissionOptionKind::AllowOnce),
+                PermissionOption::new(
+                    "allow-with-updates",
+                    "Yes, always",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                PermissionOption::new("reject", "No", PermissionOptionKind::RejectOnce),
+            ],
+        );
+        let response = reply_permission(request.clone(), PermissionPolicy::AllowAlways);
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(ref s) if s.option_id.to_string() == "allow-with-updates"
+        ));
+        // `allow` still picks the one-shot option.
+        let response = reply_permission(request, PermissionPolicy::Allow);
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(ref s) if s.option_id.to_string() == "allow-once"
+        ));
+    }
 
     #[test]
     fn allow_selects_first_option() {
@@ -408,6 +540,25 @@ mod tests {
     async fn wait_for_updates_gives_up_after_timeout() {
         let count = Arc::new(AtomicUsize::new(0));
         assert!(!wait_for_updates(&count, usize::MAX, Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_sees_earlier_and_later_lines() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut seen = Vec::new();
+        tx.send("hello async_task_spawned".to_string()).unwrap();
+        assert!(
+            wait_for_line(
+                &mut rx,
+                &mut seen,
+                "async_task_spawned",
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        assert!(!wait_for_line(&mut rx, &mut seen, "nope", Duration::from_millis(50)).await);
+        tx.send("nope".to_string()).unwrap();
+        assert!(wait_for_line(&mut rx, &mut seen, "nope", Duration::from_secs(1)).await);
     }
 
     #[test]

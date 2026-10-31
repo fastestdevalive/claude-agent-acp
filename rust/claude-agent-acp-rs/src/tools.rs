@@ -3,7 +3,7 @@
 //! → `content` shaping for completing `ToolCallUpdate`s.
 //!
 //! This is the Rust port of `toolInfoFromToolUse` and `toolUpdateFromToolResult`
-//! (`src/tools.ts`). Wire truth is the Node adapter at `v0.70.0`: the shapes here
+//! (`src/tools.ts`). Wire truth is the Node adapter at the pinned version (`porting/UPSTREAM_VERSION`, currently 0.94.0): the shapes here
 //! must produce byte-identical ACP tool frames to the captured fixtures.
 //!
 //! Two upstream parameters are intentionally not threaded yet (recorded in the
@@ -18,6 +18,7 @@ use agent_client_protocol::schema::v1::{
     Content, ContentBlock, Diff, TextContent, ToolCallContent, ToolCallLocation, ToolKind,
 };
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// The ACP tool-shape fields derived from a tool name + input (port of
 /// `toolInfoFromToolUse`, `src/tools.ts:131-502`).
@@ -76,25 +77,14 @@ fn location(path: &str, line: Option<u32>) -> ToolCallLocation {
 /// Build the ACP `_meta.claudeCode` object for a tool use (port of
 /// `claudeCodeMetaFromToolUse`, `src/acp-agent.ts:7983-8010`).
 ///
-/// `skillPath` is not resolved (that probes the filesystem — out of scope for
-/// this pure mapper); `skill` is still emitted when present.
-pub fn claude_code_meta(name: &str, input: &Value) -> Value {
+/// 2.10 (B2/X-9): for EVERY client the non-AIR `_meta` carries ONLY `{toolName}`
+/// — the `subagent` flag, the Bash description `title` and the `skill` moved to
+/// AIR-only `_meta.jetbrains.air.{subagent,commandTitle,skill}` (not re-added in
+/// this plan, OQ-14 / PARITY pending). Unconditional: Phase 2 does not depend on
+/// `AirClient` threading (3.2).
+pub fn claude_code_meta(name: &str, _input: &Value) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("toolName".to_string(), Value::String(name.to_string()));
-
-    if name == "Bash" {
-        if let Some(desc) = input.get("description").and_then(Value::as_str) {
-            map.insert("title".to_string(), Value::String(desc.to_string()));
-        }
-    }
-    if name == "Agent" || name == "Task" {
-        map.insert("subagent".to_string(), Value::Bool(true));
-    }
-    if name == "Skill" {
-        if let Some(skill) = input.get("skill").and_then(Value::as_str) {
-            map.insert("skill".to_string(), Value::String(skill.to_string()));
-        }
-    }
     Value::Object(map)
 }
 
@@ -103,6 +93,339 @@ pub fn tool_meta(name: &str, input: &Value) -> serde_json::Map<String, Value> {
     let mut meta = serde_json::Map::new();
     meta.insert("claudeCode".to_string(), claude_code_meta(name, input));
     meta
+}
+
+/// The AIR extension version stamped into `_meta.jetbrains.air.version`
+/// (`AIR_EXTENSION_VERSION`, `dist/air-extension.js`).
+const AIR_EXTENSION_VERSION: u64 = 1;
+
+/// A shell tool's `description` (`reporters/bash.js:8` `shellDescription`),
+/// falling back to `command_description`. `None` for an absent / non-string
+/// value; an empty string is returned as-is (callers test truthiness).
+fn shell_description(input: &Value) -> Option<&str> {
+    let obj = input.as_object()?;
+    if let Some(description) = obj.get("description").and_then(Value::as_str) {
+        return Some(description);
+    }
+    obj.get("command_description").and_then(Value::as_str)
+}
+
+/// Split `mcp__<server>__<tool>` the way Claude Code does
+/// (`renderer.js` `mcpToolName`): the server is the segment up to the next
+/// `__`, the tool is the whole rest. `None` for any other shape.
+pub fn mcp_tool_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("mcp__")?;
+    let separator = rest.find("__")?;
+    if separator == 0 {
+        return None;
+    }
+    let tool = &rest[separator + 2..];
+    if tool.is_empty() {
+        return None;
+    }
+    Some((&rest[..separator], tool))
+}
+
+/// The `_meta` of a tool-use report for an AIR client (port of
+/// `AcpToolCallRenderer.toolUseMeta`, `dist/tool-calls/renderer.js:566-590`):
+/// `{claudeCode:{toolName}}` plus, under `jetbrains.air` (always stamped with
+/// `version`), `commandTitle` (Bash / PowerShell description), `subagent`
+/// (`Agent` / `Task`), `skill {name, path?}` and `mcp {server, tool}`.
+/// `cwd` locates a skill's `SKILL.md` (`None` or empty: no path).
+pub fn air_tool_meta(
+    name: &str,
+    input: &Value,
+    cwd: Option<&Path>,
+) -> serde_json::Map<String, Value> {
+    let mut meta = tool_meta(name, input);
+    let mut air = serde_json::Map::new();
+    if matches!(name, "Bash" | "PowerShell") {
+        if let Some(description) = shell_description(input).filter(|d| !d.is_empty()) {
+            air.insert("commandTitle".into(), Value::String(description.into()));
+        }
+    }
+    if matches!(name, "Agent" | "Task") {
+        air.insert("subagent".into(), Value::Bool(true));
+    }
+    if name == "Skill" {
+        if let Some(skill) = input
+            .get("skill")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            let mut entry = serde_json::Map::new();
+            entry.insert("name".into(), Value::String(skill.into()));
+            if let Some(path) = resolve_skill_path(skill, cwd) {
+                entry.insert(
+                    "path".into(),
+                    Value::String(path.to_string_lossy().into_owned()),
+                );
+            }
+            air.insert("skill".into(), Value::Object(entry));
+        }
+    }
+    if let Some((server, tool)) = mcp_tool_name(name) {
+        air.insert(
+            "mcp".into(),
+            serde_json::json!({ "server": server, "tool": tool }),
+        );
+    }
+    if !air.is_empty() {
+        let mut stamped = serde_json::Map::new();
+        stamped.insert("version".into(), Value::from(AIR_EXTENSION_VERSION));
+        stamped.extend(air);
+        meta.insert(
+            "jetbrains".into(),
+            serde_json::json!({ "air": Value::Object(stamped) }),
+        );
+    }
+    meta
+}
+
+/// Whether AIR shows this tool use as the list of viewed files
+/// (`renderer.js` `namesViewedFile`): a read or a search with a path in its
+/// locations or in the `path` of its input (Grep also takes `file_path`).
+pub fn names_viewed_file(name: &str, input: &Value) -> bool {
+    let shape = tool_shape(name, input);
+    if !matches!(shape.kind, ToolKind::Read | ToolKind::Search) {
+        return false;
+    }
+    if shape
+        .locations
+        .iter()
+        .any(|l| !l.path.as_os_str().is_empty())
+    {
+        return true;
+    }
+    let path = if name == "Grep" {
+        input
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| input.get("file_path").and_then(Value::as_str))
+    } else {
+        input.get("path").and_then(Value::as_str)
+    };
+    path.is_some_and(|p| !p.is_empty())
+}
+
+/// Roots a skill's directory may sit under, relative to a scope directory.
+const SKILL_CONTAINER_DIRS: [&str; 2] = [".claude/skills", ".agents/skills"];
+/// Bytes of a `SKILL.md` that are read for its frontmatter.
+const MAX_FRONTMATTER_BYTES: usize = 8192;
+
+/// Whether `segment` would take a join outside the directory it is joined to.
+fn escapes_container(segment: &str) -> bool {
+    Path::new(segment).is_absolute() || segment.split(['/', '\\']).any(|part| part == "..")
+}
+
+/// The head of `file`, up to [`MAX_FRONTMATTER_BYTES`], cut back to its last
+/// complete line when the buffer filled.
+fn frontmatter_head(file: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    std::fs::File::open(file)
+        .ok()?
+        .take(MAX_FRONTMATTER_BYTES as u64)
+        .read_to_end(&mut buffer)
+        .ok()?;
+    let head = String::from_utf8_lossy(&buffer).into_owned();
+    if buffer.len() < MAX_FRONTMATTER_BYTES {
+        return Some(head);
+    }
+    Some(match head.rfind('\n') {
+        Some(cut) => head[..cut].to_string(),
+        None => String::new(),
+    })
+}
+
+/// The value `raw` carries, quotes resolved and a trailing comment dropped
+/// (`frontmatterScalar`).
+fn frontmatter_scalar(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let quote = chars.first().copied();
+    if quote != Some('"') && quote != Some('\'') {
+        // A `#` starts a comment at the start of the value or after a blank.
+        let mut cut = chars.len();
+        for (i, c) in chars.iter().enumerate() {
+            if *c == '#' && (i == 0 || matches!(chars[i - 1], ' ' | '\t')) {
+                cut = if i == 0 { 0 } else { i - 1 };
+                break;
+            }
+        }
+        return chars[..cut].iter().collect::<String>().trim().to_string();
+    }
+    let quote = quote.unwrap_or('"');
+    let mut value = String::new();
+    let mut index = 1;
+    while index < chars.len() {
+        let c = chars[index];
+        if c == quote {
+            if quote == '\'' && chars.get(index + 1) == Some(&'\'') {
+                value.push('\'');
+                index += 2;
+                continue;
+            }
+            return value;
+        }
+        if quote == '"' && c == '\\' && index + 1 < chars.len() {
+            index += 1;
+            value.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        value.push(c);
+        index += 1;
+    }
+    value
+}
+
+/// The `name:` the frontmatter of `skill_md` declares (`declaredSkillName`).
+fn declared_skill_name(skill_md: &Path) -> Option<String> {
+    let head = frontmatter_head(skill_md)?;
+    let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "..." {
+            break;
+        }
+        // `^name[ \t]*:(?:[ \t]+(.*))?$` — a key at column 0; the value needs a
+        // blank after the colon (`name:value` is a plain scalar, not a mapping).
+        let Some(rest) = line.strip_prefix("name") else {
+            continue;
+        };
+        let Some(after) = rest.trim_start_matches([' ', '\t']).strip_prefix(':') else {
+            continue;
+        };
+        let value = if after.is_empty() {
+            ""
+        } else if after.starts_with([' ', '\t']) {
+            after.trim()
+        } else {
+            continue;
+        };
+        let scalar = frontmatter_scalar(value);
+        return (!scalar.is_empty()).then_some(scalar);
+    }
+    None
+}
+
+/// The `SKILL.md` paths of `container`, keyed by declared name (sorted listing,
+/// first declaration wins).
+fn skills_by_declared_name(container: &Path) -> std::collections::HashMap<String, PathBuf> {
+    let mut by_name = std::collections::HashMap::new();
+    let mut entries: Vec<String> = std::fs::read_dir(container)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    for entry in entries {
+        let file = container.join(&entry).join("SKILL.md");
+        if std::fs::metadata(&file).is_err() {
+            continue;
+        }
+        if let Some(name) = declared_skill_name(&file) {
+            by_name.entry(name).or_insert(file);
+        }
+    }
+    by_name
+}
+
+/// Absolute path of a skill's `SKILL.md`, or `None` (port of
+/// `resolveSkillPath`, `reporters/interaction.js:358`). The home directory is
+/// read from `HOME`.
+pub fn resolve_skill_path(skill_name: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_skill_path_in(skill_name, cwd, home.as_deref())
+}
+
+/// [`resolve_skill_path`] with an explicit home directory (tests).
+pub fn resolve_skill_path_in(
+    skill_name: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let cwd = cwd.filter(|c| !c.as_os_str().is_empty())?;
+    let (scope, name) = match skill_name.split_once(':') {
+        Some((scope, name)) => (Some(scope), name),
+        None => (None, skill_name),
+    };
+    // The name comes from the agent: a separator or `..` must never reach the fs.
+    if name.is_empty()
+        || name.contains(['/', '\\'])
+        || name == ".."
+        || scope.is_some_and(escapes_container)
+    {
+        return None;
+    }
+    let bases: Vec<&Path> = std::iter::once(cwd).chain(home).collect();
+    let mut containers: Vec<PathBuf> = Vec::new();
+    let add_containers = |containers: &mut Vec<PathBuf>, base: &Path| {
+        for dir in SKILL_CONTAINER_DIRS {
+            containers.push(base.join(dir));
+        }
+    };
+    // A `<prefix>:<name>` skill is either directory-scoped or a plugin's.
+    let add_scoped = |containers: &mut Vec<PathBuf>, base: &Path| {
+        let Some(scope) = scope else { return };
+        for dir in SKILL_CONTAINER_DIRS {
+            containers.push(base.join(scope).join(dir));
+        }
+        containers.push(base.join(".claude/plugins").join(scope).join("skills"));
+        let marketplaces = base.join(".claude/plugins/marketplaces");
+        let Ok(listing) = std::fs::read_dir(&marketplaces) else {
+            return;
+        };
+        let mut installed: Vec<String> = listing
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        installed.sort();
+        for marketplace in installed {
+            containers.push(
+                marketplaces
+                    .join(marketplace)
+                    .join("plugins")
+                    .join(scope)
+                    .join("skills"),
+            );
+        }
+    };
+    for base in &bases {
+        add_scoped(&mut containers, base);
+    }
+    for base in &bases {
+        add_containers(&mut containers, base);
+    }
+    for container in &containers {
+        let candidate = container.join(name).join("SKILL.md");
+        if !std::fs::metadata(&candidate).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let declared = declared_skill_name(&candidate);
+        if declared.is_none() || declared.as_deref() == Some(name) {
+            return Some(candidate);
+        }
+    }
+    // A prompt command of `.claude/commands` is no skill: only the directory
+    // probe above may answer for it.
+    if scope.is_none()
+        && bases.iter().any(|base| {
+            base.join(".claude/commands")
+                .join(format!("{name}.md"))
+                .exists()
+        })
+    {
+        return None;
+    }
+    containers
+        .iter()
+        .find_map(|container| skills_by_declared_name(container).remove(name))
 }
 
 /// The absolute display path, unchanged (upstream `toDisplayPath` without a
@@ -477,13 +800,22 @@ pub fn tool_result_content(
             }
         }
         "Bash" => {
-            // No terminal support: format as a console code block.
-            let text = result_text(result_content).unwrap_or_default();
-            let trimmed = text.trim_end();
-            if trimmed.is_empty() {
-                None
+            // No terminal support. Node's Bash reporter only renders the
+            // console code block for a NON-error command output; an error (e.g.
+            // a deny message) falls back to the generic error fence
+            // (`toAcpContentUpdate(content, true)`) — a plain ``` fence,
+            // because a non-terminal client has no Bash `errorResult`
+            // (reporters/bash.js:29-30, content.js:89).
+            if is_error {
+                generic_content(result_content, true)
             } else {
-                Some(vec![text_content(format!("```console\n{}\n```", trimmed))])
+                let text = result_text(result_content).unwrap_or_default();
+                let trimmed = text.trim_end();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(vec![text_content(format!("```console\n{}\n```", trimmed))])
+                }
             }
         }
         "Agent" | "Task" => generic_content(result_content, is_error),
@@ -764,20 +1096,42 @@ mod tests {
         let _ = tool_shape("Other", &json!("not-an-object"));
     }
 
-    /// 9.1 — the `_meta.claudeCode` object carries toolName, Bash description
-    /// title, subagent flag, and Skill name.
+    /// 9.1 — the `_meta.claudeCode` object carries toolName (2.10: only
+    /// toolName — `subagent`/Bash `title`/`skill` moved to AIR-only meta).
     #[test]
     fn claude_code_meta_shapes() {
         let bash = claude_code_meta("Bash", &json!({"description": "run ls"}));
         assert_eq!(bash["toolName"], "Bash");
-        assert_eq!(bash["title"], "run ls");
-        assert!(bash.get("subagent").is_none());
+        assert!(bash.get("title").is_none(), "Bash title dropped (2.10)");
 
         let task = claude_code_meta("Task", &json!({}));
-        assert_eq!(task["subagent"], true);
+        assert!(
+            task.get("subagent").is_none(),
+            "subagent flag dropped (2.10)"
+        );
 
         let skill = claude_code_meta("Skill", &json!({"skill": "coding"}));
-        assert_eq!(skill["skill"], "coding");
+        assert!(skill.get("skill").is_none(), "skill dropped (2.10)");
+    }
+
+    /// 2.10 (B2/X-9) — `_meta.claudeCode` is `{toolName}` only, unconditionally,
+    /// for every client (Task subagent, Bash title, Skill name all dropped).
+    #[test]
+    fn inv_46_tool_meta_is_tool_name_only() {
+        let cases = [
+            ("Bash", json!({"description": "run ls"})),
+            ("Task", json!({"description": "Do a subtask"})),
+            ("Skill", json!({"skill": "coding"})),
+            ("Read", json!({"file_path": "/tmp/a.txt"})),
+        ];
+        for (name, input) in cases {
+            let meta = tool_meta(name, &input);
+            assert_eq!(
+                Value::Object(meta),
+                serde_json::json!({"claudeCode": {"toolName": name}}),
+                "2.10: _meta must be {{claudeCode:{{toolName}}}} for {name}"
+            );
+        }
     }
 
     /// 9.2 — tool-result content: Bash renders a console code block; a string
@@ -793,9 +1147,233 @@ mod tests {
         // Empty Bash output surfaces nothing.
         assert!(tool_result_content("Bash", &json!("  "), false).is_none());
 
+        // A Bash ERROR renders the plain ``` fence (Node:
+        // `toAcpContentUpdate(content, true)`), not the console block — the
+        // non-terminal client has no Bash `errorResult` (2.9 evidence).
+        let bash_err =
+            tool_result_content("Bash", &json!("User refused permission to run tool"), true)
+                .unwrap();
+        let ToolCallContent::Content(c) = &bash_err[0] else {
+            panic!("expected content");
+        };
+        let ContentBlock::Text(t) = &c.content else {
+            panic!("expected text block");
+        };
+        assert_eq!(
+            t.text.as_str(),
+            "```\nUser refused permission to run tool\n```",
+            "a Bash deny/error uses a plain ``` fence, not ```console"
+        );
+
         // Edit/Write/Skill results surface no content.
         assert!(tool_result_content("Edit", &json!("x"), false).is_none());
         assert!(tool_result_content("Write", &json!("x"), false).is_none());
         assert!(tool_result_content("Skill", &json!("x"), false).is_none());
+    }
+
+    /// rust-air-gaps 1.4 (G11) — AIR `_meta`: `commandTitle` from the shell
+    /// description, `subagent` for Agent/Task, `skill`, `mcp`, all stamped with
+    /// the AIR `version`; nothing AIR-specific for other tools.
+    #[test]
+    fn inv_51_air_tool_meta_keys() {
+        let bash = air_tool_meta(
+            "Bash",
+            &json!({"command": "ls", "description": "List"}),
+            None,
+        );
+        assert_eq!(
+            Value::Object(bash),
+            json!({"claudeCode": {"toolName": "Bash"},
+                   "jetbrains": {"air": {"version": 1, "commandTitle": "List"}}})
+        );
+        // `command_description` is the fallback; an empty description adds nothing.
+        let fallback = air_tool_meta("PowerShell", &json!({"command_description": "Do"}), None);
+        assert_eq!(fallback["jetbrains"]["air"]["commandTitle"], "Do");
+        let empty = air_tool_meta("Bash", &json!({"description": ""}), None);
+        assert!(empty.get("jetbrains").is_none());
+        let agent = air_tool_meta("Agent", &json!({}), None);
+        assert_eq!(
+            agent["jetbrains"]["air"],
+            json!({"version": 1, "subagent": true})
+        );
+        let task = air_tool_meta("Task", &json!({}), None);
+        assert_eq!(task["jetbrains"]["air"]["subagent"], true);
+        let skill = air_tool_meta("Skill", &json!({"skill": "demo"}), None);
+        assert_eq!(skill["jetbrains"]["air"]["skill"], json!({"name": "demo"}));
+        let mcp = air_tool_meta("mcp__srv__lookup__deep", &json!({}), None);
+        assert_eq!(
+            mcp["jetbrains"]["air"]["mcp"],
+            json!({"server": "srv", "tool": "lookup__deep"})
+        );
+        // Other tools: claudeCode only.
+        let read = air_tool_meta("Read", &json!({"file_path": "/a"}), None);
+        assert_eq!(
+            Value::Object(read),
+            json!({"claudeCode": {"toolName": "Read"}})
+        );
+    }
+
+    /// rust-air-gaps 1.4 — `mcp__<server>__<tool>` splitting.
+    #[test]
+    fn inv_51_mcp_tool_name_splits() {
+        assert_eq!(mcp_tool_name("mcp__a__b"), Some(("a", "b")));
+        assert_eq!(mcp_tool_name("mcp__a__b__c"), Some(("a", "b__c")));
+        assert_eq!(mcp_tool_name("mcp____b"), None);
+        assert_eq!(mcp_tool_name("mcp__a__"), None);
+        assert_eq!(mcp_tool_name("mcp__a"), None);
+        assert_eq!(mcp_tool_name("Bash"), None);
+    }
+
+    fn write_skill(dir: &Path, rel: &str, body: &str) -> PathBuf {
+        let file = dir.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, body).unwrap();
+        file
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("skill-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// rust-air-gaps 1.4 — `resolveSkillPath` on a temp tree: project and home
+    /// containers, frontmatter name mismatch, scoped / plugin layouts, commands
+    /// shadowing, and rejection of path escapes.
+    #[test]
+    fn inv_51_resolve_skill_path_on_a_temp_tree() {
+        let root = scratch("tree");
+        let cwd = root.join("project");
+        let home = root.join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let cwd_ref = Some(cwd.as_path());
+        let home_ref = Some(home.as_path());
+
+        // Unknown skill, missing cwd.
+        assert_eq!(resolve_skill_path_in("demo", cwd_ref, home_ref), None);
+        let project_skill = write_skill(
+            &cwd,
+            ".claude/skills/demo/SKILL.md",
+            "---\nname: demo\n---\nbody",
+        );
+        assert_eq!(
+            resolve_skill_path_in("demo", cwd_ref, home_ref),
+            Some(project_skill.clone())
+        );
+        assert_eq!(resolve_skill_path_in("demo", None, home_ref), None);
+
+        // The project wins over the home container.
+        write_skill(
+            &home,
+            ".claude/skills/demo/SKILL.md",
+            "---\nname: demo\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in("demo", cwd_ref, home_ref),
+            Some(project_skill)
+        );
+
+        // Home only, no frontmatter name declared: accepted.
+        let home_only = write_skill(&home, ".agents/skills/plain/SKILL.md", "no frontmatter");
+        assert_eq!(
+            resolve_skill_path_in("plain", cwd_ref, home_ref),
+            Some(home_only)
+        );
+
+        // A directory declaring ANOTHER name is skipped; the declaring file wins.
+        write_skill(
+            &cwd,
+            ".claude/skills/wrong/SKILL.md",
+            "---\nname: other\n---\n",
+        );
+        let declared = write_skill(
+            &cwd,
+            ".claude/skills/dir-x/SKILL.md",
+            "---\nname: \"wrong\" # c\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in("wrong", cwd_ref, home_ref),
+            Some(declared)
+        );
+
+        // `name:value` (no blank) declares nothing; `name:` nested is no name.
+        write_skill(
+            &cwd,
+            ".claude/skills/nospace/SKILL.md",
+            "---\nname:foo\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in("nospace", cwd_ref, home_ref),
+            Some(cwd.join(".claude/skills/nospace/SKILL.md"))
+        );
+
+        // Scoped: directory-scoped and plugin layouts.
+        let scoped = write_skill(
+            &cwd,
+            "team/.claude/skills/build/SKILL.md",
+            "---\nname: build\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in("team:build", cwd_ref, home_ref),
+            Some(scoped)
+        );
+        let plugin = write_skill(
+            &cwd,
+            ".claude/plugins/market/skills/lint/SKILL.md",
+            "---\nname: lint\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in("market:lint", cwd_ref, home_ref),
+            Some(plugin)
+        );
+        let installed = write_skill(
+            &home,
+            ".claude/plugins/marketplaces/mp/plugins/acme/skills/fmt/SKILL.md",
+            "---\nname: fmt\n---\n",
+        );
+        assert_eq!(
+            resolve_skill_path_in("acme:fmt", cwd_ref, home_ref),
+            Some(installed)
+        );
+
+        // A `.claude/commands` prompt command shadows the declared-name scan.
+        write_skill(
+            &cwd,
+            ".claude/skills/some-dir/SKILL.md",
+            "---\nname: cmd\n---\n",
+        );
+        write_skill(&cwd, ".claude/commands/cmd.md", "a command");
+        assert_eq!(resolve_skill_path_in("cmd", cwd_ref, home_ref), None);
+
+        // Escapes never reach the filesystem.
+        for bad in ["../x", "a/b", "a\\b", "..", "", "../evil:x", "/abs:x", "s:"] {
+            assert_eq!(resolve_skill_path_in(bad, cwd_ref, home_ref), None, "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// rust-air-gaps 1.4 — AIR shows a read or a search with a path as viewed
+    /// files; other tools are not.
+    #[test]
+    fn inv_51_names_viewed_file() {
+        assert!(names_viewed_file(
+            "Read",
+            &json!({"file_path": "/tmp/a.txt"})
+        ));
+        assert!(names_viewed_file(
+            "Grep",
+            &json!({"pattern": "x", "path": "/tmp"})
+        ));
+        assert!(names_viewed_file(
+            "Grep",
+            &json!({"pattern": "x", "file_path": "/tmp/a"})
+        ));
+        assert!(!names_viewed_file("Grep", &json!({"pattern": "x"})));
+        assert!(!names_viewed_file(
+            "Bash",
+            &json!({"command": "ls", "path": "/tmp"})
+        ));
     }
 }

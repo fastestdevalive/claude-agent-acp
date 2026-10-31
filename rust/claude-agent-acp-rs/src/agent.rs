@@ -21,16 +21,24 @@ use agent_client_protocol::{Agent, ConnectTo, ConnectionTo, Error, Result, Untyp
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::air::AirClient;
+use crate::auth_status::{spawn_auth_actor, AuthCmd, AuthHandle, AuthPush};
 use crate::control::InitializeOptions;
 use crate::map;
 use crate::process::{SpawnOptions, Timings};
 use crate::session::{Session, SessionError, SessionOptions, SessionOutbound};
+use crate::session_methods;
+use crate::system_prompt;
 
-/// The `_meta`/agentCapabilities that match the Node adapter at v0.70.0.
-///
-/// These are constant wire values captured in `porting/fixtures/*.frames.jsonl`;
-/// the differential ignores the volatile `modes`/`configOptions`/`authMethods`.
-const AGENT_INFO: &str = "{\"name\":\"@agentclientprotocol/claude-agent-acp\",\"title\":\"Claude Agent\",\"version\":\"0.70.0\"}";
+/// The `agentInfo` returned by `initialize`, matching the Node adapter (the
+/// volatile `version` is composed from `porting/UPSTREAM_VERSION`).
+fn agent_info() -> Value {
+    json!({
+        "name": "@agentclientprotocol/claude-agent-acp",
+        "title": "Claude Agent",
+        "version": crate::VERSION,
+    })
+}
 
 /// Options for [`serve`] (Decision D9 / B1).
 #[derive(Debug, Clone, Default)]
@@ -70,34 +78,76 @@ impl ServeOptions {
     }
 }
 
-/// The `initialize` response, byte-matching the Node adapter at v0.70.0
-/// (modulo ignored volatile fields).
-fn initialize_response() -> Value {
+/// The AIR capability list advertised verbatim from Node (research X-2 /
+/// `dist/acp-agent.js:1458-1470`). The list is independent of what the client
+/// declared. Each capability Rust does not implement is a `pending` PARITY row
+/// (OQ-1) — they are advertised for wire parity but stay inert.
+const AIR_CAPABILITIES: &[&str] = &[
+    "sessionFailure",
+    "agentFileChangeReport",
+    "nativeSubagentSessions",
+    "asyncTasks",
+    "customInstructions",
+    "recommendedValue",
+    "diffPatch",
+    "planFile",
+];
+
+/// The `initialize` response, byte-matching the Node adapter at the pinned
+/// upstream version (modulo ignored volatile fields); `agentInfo.version` is
+/// composed from `porting/UPSTREAM_VERSION` (Decision 3).
+///
+/// `air` is `Some` only for a client that declared `_meta.jetbrains.air`
+/// (Decision 11). Non-AIR clients get no `_meta.jetbrains`, no goal and no
+/// `sessionCapabilities.subagents` (E-3/E-4); the `authStatus` marker (E-2,
+/// R75-3) and the `systemPrompt` advertise (E-3, honouring is Phase 3) are
+/// always present.
+fn initialize_response(air: Option<&AirClient>) -> Value {
+    let is_air = air.is_some();
+    let mut session_caps = serde_json::Map::new();
+    session_caps.insert("additionalDirectories".into(), json!({}));
+    session_caps.insert("close".into(), json!({}));
+    session_caps.insert("delete".into(), json!({}));
+    session_caps.insert("fork".into(), json!({}));
+    session_caps.insert("list".into(), json!({}));
+    session_caps.insert("resume".into(), json!({}));
+    session_caps.insert("systemPrompt".into(), json!({ "mode": { "override": {} } }));
+    if is_air {
+        session_caps.insert("subagents".into(), json!({}));
+    }
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("steering".into(), json!({ "supported": true }));
+    if is_air {
+        meta.insert(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "version": 1,
+                    "capabilities": AIR_CAPABILITIES,
+                    "goal": { "version": 1, "controlMethod": "_session/goal", "actions": ["set", "clear"] },
+                }
+            }),
+        );
+    }
+
     json!({
         "protocolVersion": 1,
         "agentCapabilities": {
-            "_meta": { "claudeCode": { "promptQueueing": true } },
+            "_meta": {
+                "claudeCode": { "promptQueueing": true },
+                "authStatus": {},
+            },
             "promptCapabilities": { "image": true, "embeddedContext": true },
             "mcpCapabilities": { "http": true, "sse": true },
             "auth": { "logout": {} },
             "providers": {},
             "loadSession": true,
-            "sessionCapabilities": {
-                "additionalDirectories": {},
-                "close": {},
-                "delete": {},
-                "fork": {},
-                "list": {},
-                "resume": {}
-            }
+            "sessionCapabilities": Value::Object(session_caps),
         },
-        "agentInfo": serde_json::from_str::<Value>(AGENT_INFO).unwrap_or(Value::Null),
+        "agentInfo": agent_info(),
         "authMethods": [],
-        "_meta": {
-            "jetbrains": { "air": { "version": 1, "capabilities": ["sessionFailure", "agentFileChangeReport"] } },
-            "steering": { "supported": true },
-            "goal": { "version": 1, "controlMethod": "_session/goal", "actions": ["set", "clear"] }
-        }
+        "_meta": Value::Object(meta),
     })
 }
 
@@ -312,6 +362,37 @@ pub fn steer_outcome(turn_in_flight: bool, idle_behavior: Option<&str>) -> Resul
     }
 }
 
+/// Port of `parseAsyncTaskStopRequest` (`acp-agent.js:241`): the trimmed
+/// `(sessionId, asyncTaskId)`, else `-32602` with the Node's message and NO
+/// `data`.
+fn parse_async_task_stop_params(params: &Value) -> Result<(String, String), Error> {
+    let invalid = |message: &str| Error::new(-32602, format!("Invalid params: {message}"));
+    let Some(object) = params.as_object() else {
+        return Err(invalid("async task stop params must be an object"));
+    };
+    let field = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let session_id = field("sessionId");
+    let task_id = field("asyncTaskId");
+    if session_id.is_empty() {
+        return Err(invalid(
+            "async task stop params require a non-empty sessionId",
+        ));
+    }
+    if task_id.is_empty() {
+        return Err(invalid(
+            "async task stop params require a non-empty asyncTaskId",
+        ));
+    }
+    Ok((session_id, task_id))
+}
+
 /// Map a [`SessionError`] to the JSON-RPC error's `(message, data)` (review-04
 /// wiring: the actor maps `AuthRequired` → authRequired, else `internalError`
 /// with `errorKind` data). The message is the full `"Internal error: <detail>"`
@@ -344,6 +425,8 @@ fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
                 // does not depend on `lastAssistantError` (phase-13 audit of
                 // `idle-without-result`).
                 NoResult => Some(json!({"errorKind": "no_result"})),
+                // E-12: `errorKindData("incomplete_tool_call")`, unconditional.
+                IncompleteToolCall => Some(json!({"errorKind": "incomplete_tool_call"})),
                 _ => None,
             };
             let message = if *kind == AuthRequired {
@@ -381,6 +464,8 @@ pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOption
     let mut registry = Registry {
         sessions: std::collections::HashMap::new(),
         session_tx,
+        air: None,
+        auth: None,
     };
     Agent
         .builder()
@@ -436,6 +521,60 @@ struct Registry {
     sessions: std::collections::HashMap<String, Session>,
     /// Publishes each new session's handle to the notification handler.
     session_tx: mpsc::UnboundedSender<(String, Session)>,
+    /// The parsed AIR client declaration from `initialize` (Decision 11),
+    /// `Some` only when the client declared `_meta.jetbrains.air`.
+    air: Option<AirClient>,
+    /// The auth-status actor, spawned by the first `initialize` (G2).
+    auth: Option<AuthHandle>,
+}
+
+/// Spawn the [`crate::auth_status`] actor: it probes `claude auth status` and
+/// forwards each changed status as an `_auth/status_update` ext notification.
+fn spawn_auth(
+    opts: &ServeOptions,
+    connection: &ConnectionTo<agent_client_protocol::Client>,
+) -> AuthHandle {
+    let (push_tx, mut push_rx) = mpsc::unbounded_channel::<AuthPush>();
+    let connection = connection.clone();
+    tokio::spawn(async move {
+        while let Some(item) = push_rx.recv().await {
+            match item {
+                AuthPush::Status(status) => {
+                    if let Ok(msg) = UntypedMessage::new(
+                        crate::auth_status::AUTH_STATUS_UPDATE_METHOD,
+                        json!({ "authStatus": status }),
+                    ) {
+                        let _ = connection.send_notification(msg);
+                    }
+                }
+                // Every earlier status is already queued on the connection.
+                AuthPush::Barrier(done) => {
+                    let _ = done.send(());
+                }
+            }
+        }
+    });
+    let claude_path = opts.claude_path.clone();
+    let extra_env = opts.extra_env.clone();
+    let probe: crate::auth_status::ProbeFn = Box::new(move |cwd| {
+        let claude_path = claude_path.clone();
+        let extra_env = extra_env.clone();
+        Box::pin(async move {
+            crate::auth_status::probe_cli(claude_path.as_deref(), &cwd, &extra_env).await
+        })
+    });
+    spawn_auth_actor(push_tx, probe, std::env::current_dir().unwrap_or_default())
+}
+
+/// Hand a created session's account and cwd to the auth actor (publish the
+/// session identity; re-probe when the cwd differs from the last probe's).
+fn publish_session_account(registry: &Registry, cwd: PathBuf, session: &Session) {
+    if let Some(auth) = &registry.auth {
+        auth.send(AuthCmd::SessionCreated {
+            cwd,
+            account: session.account().cloned(),
+        });
+    }
 }
 
 /// Validate a `session/new` / `session/load` `cwd` exactly as the adapter's
@@ -473,6 +612,21 @@ fn validate_cwd(cwd: Option<&str>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validate the optional `systemPrompt` (after `validate_cwd`, before any spawn)
+/// and fold it plus AIR `customInstructions` into the `initialize` options
+/// (rust-air-gaps G3/G5, Decision 10).
+fn initialize_options_for(params: &Value) -> Result<InitializeOptions, Error> {
+    let client_prompt = system_prompt::client_system_prompt(params.get("systemPrompt"))?;
+    let custom = system_prompt::air_custom_instructions(params.get("_meta"));
+    let (system_prompt, append_system_prompt) =
+        system_prompt::sdk_initialize_fields(client_prompt.as_ref(), custom.as_deref());
+    Ok(InitializeOptions {
+        system_prompt,
+        append_system_prompt,
+        ..InitializeOptions::default()
+    })
+}
+
 /// Register a new session: keep its handle in the registry, publish it to the
 /// notification handler (lock-free), and spawn a task that forwards its updates
 /// to the client as they arrive. The actor emits a `FinalText` chunk before
@@ -495,6 +649,13 @@ fn register_session(
             match item {
                 SessionOutbound::Update(notif) => {
                     let _ = connection.send_notification(notif);
+                }
+                // Item 3.3: an untyped AIR `session/update` (async-task
+                // spawns/progress/state-updates), value = `{"sessionId",⋯,"update",{⋯}}`.
+                SessionOutbound::RawUpdate(value) => {
+                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                        let _ = connection.send_notification(msg);
+                    }
                 }
                 // Phase 9 flush barrier: every update sent before this marker
                 // has been forwarded; resolve the oneshot so the prompt task
@@ -526,6 +687,58 @@ fn register_session(
     });
 }
 
+/// Start (or restart) the session `session_id` from its stored transcript
+/// (`--resume`) and answer a `session/load`, `session/resume` or `session/fork`
+/// request; the new session is registered and its proactive command list sent.
+async fn start_resumed(
+    registry: &mut Registry,
+    session_id: String,
+    params: &Value,
+    opts: &ServeOptions,
+    responder: agent_client_protocol::Responder<Value>,
+    connection: &ConnectionTo<agent_client_protocol::Client>,
+) -> Result<(), Error> {
+    let cwd_str = params.get("cwd").and_then(Value::as_str);
+    if let Err(e) = validate_cwd(cwd_str) {
+        return responder.respond_with_error(e);
+    }
+    let initialize = match initialize_options_for(params) {
+        Ok(initialize) => initialize,
+        Err(e) => return responder.respond_with_error(e),
+    };
+    let cwd = cwd_str.map(PathBuf::from);
+    let (model, permission_mode) = options_from_meta(params);
+    let mut spawn = session_spawn_options(opts, cwd, session_id.clone(), model, permission_mode);
+    spawn.resume = Some(session_id.clone());
+    spawn.session_id = None;
+    let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
+    let sess_opts =
+        SessionOptions::new(spawn, opts.timings.clone(), initialize).with_air(registry.air.clone());
+    match Session::start(sess_opts, session_id.clone()).await {
+        Ok((session, update_rx)) => {
+            publish_session_account(registry, auth_cwd, &session);
+            // Phase 15 (Item 1): upstream sends a proactive
+            // `available_commands_update` with the REAL command list right
+            // after session/new / session/load
+            // (`sendAvailableCommandsUpdate` → `supportedCommands()`),
+            // because a plain session may never emit a `commands_changed`
+            // system frame. Build it from the initialize handshake's
+            // `commands` (a fresh session has no terminal slash commands).
+            let commands = session.commands().to_vec();
+            register_session(registry, &session_id, session, update_rx, connection);
+            responder.respond(session_response(&session_id))?;
+            let update = map::map_commands_changed(&json!(commands), &json!([]));
+            let notif = SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AvailableCommandsUpdate(update),
+            );
+            let _ = connection.send_notification(notif);
+            Ok(())
+        }
+        Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
+    }
+}
+
 /// Dispatch one ACP request (8.1). `registry` is owned by the handler closure;
 /// it is mutated sequentially by the connection loop.
 async fn handle_request(
@@ -544,22 +757,43 @@ async fn handle_request(
                 .get("protocolVersion")
                 .and_then(Value::as_u64)
                 .unwrap_or(1);
-            responder.respond(initialize_response())
+            // Parse the AIR client declaration once (Decision 11); the optional
+            // `clientCapabilities._meta.jetbrains.air` gates the AIR advertise
+            // (E-4 / X-1). Malformed -> None (a plain client).
+            registry.air = params
+                .get("clientCapabilities")
+                .and_then(AirClient::from_client_capabilities);
+            responder.respond(initialize_response(registry.air.as_ref()))?;
+            // G2 (Decision 11): learn the auth identity in the background AFTER
+            // the response (Node `initialize` never waits on the CLI probe);
+            // `_auth/status_update` is pushed only when the read lands.
+            let auth = registry
+                .auth
+                .get_or_insert_with(|| spawn_auth(opts, &connection))
+                .clone();
+            auth.probe(std::env::current_dir().unwrap_or_default(), false);
+            Ok(())
         }
         "session/new" => {
             let cwd_str = params.get("cwd").and_then(Value::as_str);
             if let Err(e) = validate_cwd(cwd_str) {
                 return responder.respond_with_error(e);
             }
+            let initialize = match initialize_options_for(&params) {
+                Ok(initialize) => initialize,
+                Err(e) => return responder.respond_with_error(e),
+            };
             let session_id = uuid_v4();
             let cwd = cwd_str.map(PathBuf::from);
             let (model, permission_mode) = options_from_meta(&params);
             let spawn =
                 session_spawn_options(opts, cwd, session_id.clone(), model, permission_mode);
-            let sess_opts =
-                SessionOptions::new(spawn, opts.timings.clone(), InitializeOptions::default());
+            let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
+            let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
+                .with_air(registry.air.clone());
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
+                    publish_session_account(registry, auth_cwd, &session);
                     // Phase 15 (Item 1): upstream sends a proactive
                     // `available_commands_update` with the REAL command list right
                     // after session/new / session/load
@@ -581,46 +815,138 @@ async fn handle_request(
                 Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
             }
         }
-        "session/load" => {
+        // `session/resume` is `session/load` without the history replay, which
+        // the Rust port never does — the same start path (G6).
+        "session/load" | "session/resume" => {
             let session_id = params
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let cwd_str = params.get("cwd").and_then(Value::as_str);
-            if let Err(e) = validate_cwd(cwd_str) {
+            start_resumed(registry, session_id, &params, opts, responder, &connection).await
+        }
+        "session/fork" => {
+            // Node order: validate the systemPrompt, copy the transcript, then
+            // start the new session like a resumed one (`unstable_forkSession`).
+            if let Err(e) = initialize_options_for(&params) {
                 return responder.respond_with_error(e);
             }
-            let cwd = cwd_str.map(PathBuf::from);
-            let (model, permission_mode) = options_from_meta(&params);
-            let mut spawn =
-                session_spawn_options(opts, cwd, session_id.clone(), model, permission_mode);
-            spawn.resume = Some(session_id.clone());
-            spawn.session_id = None;
-            let sess_opts =
-                SessionOptions::new(spawn, opts.timings.clone(), InitializeOptions::default());
-            match Session::start(sess_opts, session_id.clone()).await {
-                Ok((session, update_rx)) => {
-                    // Phase 15 (Item 1): upstream sends a proactive
-                    // `available_commands_update` with the REAL command list right
-                    // after session/new / session/load
-                    // (`sendAvailableCommandsUpdate` → `supportedCommands()`),
-                    // because a plain session may never emit a `commands_changed`
-                    // system frame. Build it from the initialize handshake's
-                    // `commands` (a fresh session has no terminal slash commands).
-                    let commands = session.commands().to_vec();
-                    register_session(registry, &session_id, session, update_rx, &connection);
-                    responder.respond(session_response(&session_id))?;
-                    let update = map::map_commands_changed(&json!(commands), &json!([]));
-                    let notif = SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::AvailableCommandsUpdate(update),
-                    );
-                    let _ = connection.send_notification(notif);
+            let fork_session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(message_id) = session_methods::fork_point_message_id(&params) {
+                return responder.respond_with_error(
+                    Error::new(
+                        -32602,
+                        format!(
+                            "Invalid params: Fork point message {message_id} was not found in session {fork_session_id}"
+                        ),
+                    )
+                    .data(json!({ "messageId": message_id })),
+                );
+            }
+            let cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let new_id = match session_methods::fork_copy(fork_session_id, cwd).await {
+                Ok(id) => id,
+                Err(e) => return responder.respond_with_error(e),
+            };
+            start_resumed(registry, new_id, &params, opts, responder, &connection).await
+        }
+        "session/close" => {
+            // Idempotent: an unknown (or already closed) session answers `{}`.
+            // The registry entry is removed first, so a later request sees it gone.
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match registry.sessions.remove(&session_id) {
+                Some(session) => {
+                    tokio::spawn(async move {
+                        session.close().await;
+                        let _ = responder.respond(json!({}));
+                    });
                     Ok(())
                 }
-                Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
+                None => responder.respond(json!({})),
             }
+        }
+        "session/list" => {
+            tokio::spawn(async move {
+                match session_methods::list(&params).await {
+                    Ok(result) => {
+                        let _ = responder.respond(result);
+                    }
+                    Err(e) => {
+                        let _ = responder.respond_with_error(e);
+                    }
+                }
+            });
+            Ok(())
+        }
+        // An AIR client archives with `session/delete` in Node; hard-deleting
+        // would destroy data Node keeps, so AIR keeps -32601 (Decision 22).
+        "session/delete" if registry.air.is_none() => {
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            // Tear a loaded session down first so its transcript is not recreated.
+            let loaded = registry.sessions.remove(&session_id);
+            tokio::spawn(async move {
+                if let Some(session) = loaded {
+                    session.close().await;
+                }
+                match session_methods::delete(session_id).await {
+                    Ok(()) => {
+                        let _ = responder.respond(json!({}));
+                    }
+                    Err(e) => {
+                        let _ = responder.respond_with_error(e);
+                    }
+                }
+            });
+            Ok(())
+        }
+        "logout" => {
+            // G2 / 2.4: `claude auth logout`, then a fresh read of the store
+            // (pushed as `_auth/status_update` BEFORE the response, like Node).
+            let auth = registry
+                .auth
+                .get_or_insert_with(|| spawn_auth(opts, &connection))
+                .clone();
+            let claude_path = opts.claude_path.clone();
+            let extra_env = opts.extra_env.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::auth_status::run_logout(claude_path.as_deref(), &extra_env).await
+                {
+                    let data = if e.stderr.is_empty() {
+                        json!({})
+                    } else {
+                        json!({ "stderr": e.stderr })
+                    };
+                    let _ = responder.respond_with_error(
+                        Error::new(-32603, format!("Internal error: {}", e.message)).data(data),
+                    );
+                    return;
+                }
+                let (reply, done) = tokio::sync::oneshot::channel();
+                auth.send(AuthCmd::Logout {
+                    cwd: std::env::current_dir().unwrap_or_default(),
+                    reply,
+                });
+                let _ = done.await;
+                let _ = responder.respond(json!({}));
+            });
+            Ok(())
         }
         "session/prompt" => {
             let session_id = params
@@ -630,9 +956,12 @@ async fn handle_request(
                 .to_string();
             let session = match registry.sessions.get(&session_id) {
                 Some(s) => s.clone(),
+                // Node: `throw new Error("Session not found")` -> -32603 with
+                // `data:{details}` (a closed or unknown session).
                 None => {
-                    return responder
-                        .respond_with_error(Error::invalid_params().data("no such session"));
+                    return responder.respond_with_error(
+                        Error::internal_error().data(json!({ "details": "Session not found" })),
+                    );
                 }
             };
             let first_text = params
@@ -684,6 +1013,13 @@ async fn handle_request(
                                         "totalTokens": usage.total_tokens,
                                     }),
                                 );
+                            }
+                        }
+                        // 2.12 (E-6): `result._meta.quota` on the same settles
+                        // that reported usage.
+                        if let Some(quota) = reply.quota {
+                            if let Some(map) = result.as_object_mut() {
+                                map.insert("_meta".to_string(), quota);
                             }
                         }
                         // Phase 9: await the flush barrier so every session
@@ -756,6 +1092,28 @@ async fn handle_request(
             });
             Ok(())
         }
+        "_session/async_task/stop" => {
+            // G1: stop one background task without cancelling the turn.
+            let (session_id, task_id) = match parse_async_task_stop_params(&params) {
+                Ok(parsed) => parsed,
+                Err(e) => return responder.respond_with_error(e),
+            };
+            let Some(session) = registry.sessions.get(&session_id).cloned() else {
+                return responder.respond(json!({ "stopped": false }));
+            };
+            // The CLI round-trip is awaited off the connection loop (INV-27).
+            tokio::spawn(async move {
+                match session.stop_async_task(task_id).await {
+                    Ok(stopped) => {
+                        let _ = responder.respond(json!({ "stopped": stopped }));
+                    }
+                    Err(e) => {
+                        let _ = responder.respond_with_error(rpc_error(session_error_to_rpc(&e)));
+                    }
+                }
+            });
+            Ok(())
+        }
         _ => {
             // Unhandled method (8.1): -32601.
             responder.respond_with_error(
@@ -790,6 +1148,54 @@ mod tests {
         assert_eq!(bytes.len(), 32);
         assert_eq!(u.as_bytes()[14], b'4');
         assert_eq!(u.as_bytes()[19] as char, '8', "variant bits (8/9/a/b)");
+    }
+
+    /// rust-air-gaps 1.5 — `_session/async_task/stop` param validation: the
+    /// Node's `-32602` messages, no `data`, values trimmed.
+    #[test]
+    fn inv_49_stop_params_errors() {
+        let ok =
+            parse_async_task_stop_params(&json!({"sessionId": " s1 ", "asyncTaskId": "\tbg1\n"}));
+        assert_eq!(ok.unwrap(), ("s1".to_string(), "bg1".to_string()));
+        for (params, message) in [
+            (
+                json!([]),
+                "Invalid params: async task stop params must be an object",
+            ),
+            (
+                json!(null),
+                "Invalid params: async task stop params must be an object",
+            ),
+            (
+                json!("x"),
+                "Invalid params: async task stop params must be an object",
+            ),
+            (
+                json!({"asyncTaskId": "bg1"}),
+                "Invalid params: async task stop params require a non-empty sessionId",
+            ),
+            (
+                json!({"sessionId": "  ", "asyncTaskId": "bg1"}),
+                "Invalid params: async task stop params require a non-empty sessionId",
+            ),
+            (
+                json!({"sessionId": 7, "asyncTaskId": "bg1"}),
+                "Invalid params: async task stop params require a non-empty sessionId",
+            ),
+            (
+                json!({"sessionId": "s1"}),
+                "Invalid params: async task stop params require a non-empty asyncTaskId",
+            ),
+            (
+                json!({"sessionId": "s1", "asyncTaskId": ""}),
+                "Invalid params: async task stop params require a non-empty asyncTaskId",
+            ),
+        ] {
+            let err = parse_async_task_stop_params(&params).unwrap_err();
+            assert_eq!(i32::from(err.code), -32602, "{params}");
+            assert_eq!(err.message, message, "{params}");
+            assert!(err.data.is_none(), "no data: {params}");
+        }
     }
 
     #[test]
@@ -852,19 +1258,16 @@ mod tests {
         let argv = crate::process::build_argv(&spawn);
         assert_eq!(session_id_from_argv(&argv), Some("uu-1234"));
         assert!(
-            argv.windows(2)
-                .any(|w| w == ["--model", "claude-sonnet-4-5"]),
-            "model -> --model: {argv:?}"
+            argv.iter().any(|a| a == "--model=claude-sonnet-4-5"),
+            "model -> --model=claude-sonnet-4-5: {argv:?}"
         );
         assert!(
-            argv.windows(2)
-                .any(|w| w == ["--permission-mode", "acceptEdits"]),
-            "permission mode -> --permission-mode: {argv:?}"
+            argv.iter().any(|a| a == "--permission-mode=acceptEdits"),
+            "permission mode -> --permission-mode=acceptEdits: {argv:?}"
         );
         assert!(
-            argv.windows(2)
-                .any(|w| w == ["--permission-prompt-tool", "stdio"]),
-            "the adapter always passes --permission-prompt-tool stdio (B2): {argv:?}"
+            argv.iter().any(|a| a == "--permission-prompt-tool=stdio"),
+            "the adapter always passes --permission-prompt-tool=stdio (E-13): {argv:?}"
         );
     }
 

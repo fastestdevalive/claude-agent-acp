@@ -17,6 +17,12 @@ trap cleanup EXIT
 mkdir -p "$TMP/rust"
 (cd "$RUST" && tar --exclude='./target' -cf - .) | (cd "$TMP/rust" && tar -xf -)
 
+# The temp tree's `build.rs` reads `../../porting/UPSTREAM_VERSION` relative to
+# the manifest dir, so the pin file must be present in the temp copy too
+# (the real `porting/` sibling is not copied).
+mkdir -p "$TMP/porting"
+cp "$ROOT/porting/UPSTREAM_VERSION" "$TMP/porting/UPSTREAM_VERSION"
+
 TMP_MANIFEST="$TMP/rust/Cargo.toml"
 FAIL=0
 

@@ -12,7 +12,8 @@
 //!    `usage_update` frame the Rust side never emits),
 //! 2. removing nodes at plain-field ignore paths (e.g. `result.configOptions`),
 //! 3. materialising ACP defaults the pinned crate omits on `tool_call` frames
-//!    (absent `status` → `"pending"`, absent `content` → `[]`) on both sides,
+//!    (absent `status` → `"pending"`, absent `content` → `[]`, absent `kind` →
+//!    `"other"`) on both sides,
 //! 4. normalising ids/uuids/timestamps to first-appearance placeholders.
 //!
 //! Because this shared module is `mod`-included by several independent test
@@ -421,6 +422,11 @@ fn normalize_tool_call_defaults(value: Value) -> Value {
                     .or_insert_with(|| Value::String("pending".to_string()));
                 map.entry("content")
                     .or_insert_with(|| Value::Array(Vec::new()));
+                // Same crate limitation for `kind`: `ToolKind::Other` is the
+                // default and is omitted from the wire, while the Node always
+                // emits `"kind":"other"` (an MCP / Skill tool call).
+                map.entry("kind")
+                    .or_insert_with(|| Value::String("other".to_string()));
             }
             Value::Object(map)
         }
@@ -503,7 +509,10 @@ fn normalize(value: Value, norm: &mut Norm) -> Value {
             if is_uuid(&s) || is_timestamp(&s) {
                 Value::String(norm.placeholder(&s))
             } else {
-                Value::String(s)
+                // Mirrors capture.sh `replaceUuids`: uuids EMBEDDED in a longer
+                // string (`"<promptUuid>:error"`) get first-appearance
+                // placeholders too.
+                Value::String(replace_embedded_uuids(&s, norm))
             }
         }
         Value::Object(map) => Value::Object(
@@ -516,6 +525,158 @@ fn normalize(value: Value, norm: &mut Norm) -> Value {
         }
         other => other,
     }
+}
+
+/// Replace every uuid substring of `text` with its first-appearance placeholder.
+fn replace_embedded_uuids(text: &str, norm: &mut Norm) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        match text.get(i..i + 36) {
+            Some(window) if is_uuid(window) => {
+                out.push_str(&norm.placeholder(window));
+                i += 36;
+            }
+            _ => {
+                let ch = text[i..].chars().next().expect("index is a char boundary");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// inv_49_normalize_embedded_uuid helper: exposed so the unit test can drive it.
+pub fn normalize_for_test(value: Value) -> Value {
+    normalize(value, &mut Norm::default())
+}
+
+/// Normalise a captured `initialize` control_request exactly as
+/// `capture.sh normalize_object` (plain mode) does, so a Rust-side request can
+/// be compared against a committed `<name>.init.json`: timestamps and short
+/// random ids (`^[a-z0-9]{8,20}$`) become first-appearance `$N`, embedded uuids
+/// too, and the worktree / fake-claude paths become `$ROOT` / `$FAKE_CLAUDE`.
+pub fn normalize_init(value: Value, root: &Path, fake: &Path) -> Value {
+    fn short_id(s: &str) -> bool {
+        (8..=20).contains(&s.len())
+            && s.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    }
+    fn walk(value: Value, norm: &mut Norm, root: &str, fake: &str) -> Value {
+        match value {
+            Value::String(s) => {
+                if is_timestamp(&s) || short_id(&s) {
+                    return Value::String(norm.placeholder(&s));
+                }
+                let s = replace_embedded_uuids(&s, norm);
+                let s = if s.contains(fake) {
+                    s.replace(fake, "$FAKE_CLAUDE")
+                } else if s.contains(root) {
+                    s.replace(root, "$ROOT")
+                } else {
+                    s
+                };
+                Value::String(s)
+            }
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|v| walk(v, norm, root, fake))
+                    .collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| (k, walk(v, norm, root, fake)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    walk(
+        value,
+        &mut Norm::default(),
+        &root.to_string_lossy(),
+        &fake.to_string_lossy(),
+    )
+}
+
+/// Normalise the two sides' `agentInfo.version` so a composed Rust version can
+/// be compared against the fixture's plain npm pin (Decision 3).
+///
+/// The Node FIXTURE carries the npm version verbatim (e.g. `0.70.0`); the Rust
+/// side now composes `<CARGO_PKG_VERSION>+upstream.<pin>` at build time. To make
+/// the differential honest (the `agentInfo` frame is NOT an ignore path):
+///
+/// 1. assert the fixture side's `result.agentInfo.version` == `pin`,
+/// 2. rewrite that fixture value to `format!("{CARGO_PKG_VERSION}+upstream.{pin}")`,
+/// 3. leave the Rust side's value UNCHANGED so it is compared exactly,
+/// 4. assert exactly one `agentInfo` frame exists per side (cannot pass vacuously).
+///
+/// Returns `(rust, fixture)` ready for `diff_frames`.
+pub fn normalize_agent_info_version(
+    rust: Vec<Frame>,
+    mut fixture: Vec<Frame>,
+    pin: &str,
+) -> (Vec<Frame>, Vec<Frame>) {
+    fn agent_info_version(frame: &Frame) -> Option<&str> {
+        frame
+            .json
+            .get("result")
+            .and_then(|r| r.get("agentInfo"))
+            .and_then(|a| a.get("version"))
+            .and_then(Value::as_str)
+    }
+
+    let rust_count = rust
+        .iter()
+        .filter(|f| agent_info_version(f).is_some())
+        .count();
+    let fixture_count = fixture
+        .iter()
+        .filter(|f| agent_info_version(f).is_some())
+        .count();
+    assert_eq!(
+        rust_count, 1,
+        "expected exactly one agentInfo frame on the Rust side, found {rust_count}"
+    );
+    assert_eq!(
+        fixture_count, 1,
+        "expected exactly one agentInfo frame on the fixture side, found {fixture_count}"
+    );
+
+    let composed = format!("{}+upstream.{pin}", env!("CARGO_PKG_VERSION"));
+    let mut rewrote = false;
+    for frame in fixture.iter_mut() {
+        if let Some(version) = agent_info_version(frame) {
+            assert_eq!(
+                version, pin,
+                "fixture agentInfo.version is {version:?}, expected pin {pin:?}"
+            );
+            if let Some(a) = frame
+                .json
+                .get_mut("result")
+                .and_then(|r| r.get_mut("agentInfo"))
+            {
+                a.as_object_mut()
+                    .expect("agentInfo is an object")
+                    .insert("version".into(), Value::String(composed.clone()));
+            }
+            rewrote = true;
+        }
+    }
+    assert!(rewrote, "agentInfo frame existed but was not rewritten");
+    (rust, fixture)
+}
+
+/// The pinned upstream npm version, read from `porting/UPSTREAM_VERSION`
+/// (trimmed). Mirrors `build.rs`/`capture.sh`; used by tests that assert the
+/// composed version string.
+pub fn pinned_upstream_version() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let pinned = std::fs::read_to_string(root.join("porting/UPSTREAM_VERSION"))
+        .expect("porting/UPSTREAM_VERSION exists");
+    pinned.trim().to_string()
 }
 
 /// True when `s` looks like a canonical 8-4-4-4-12 hex UUID.
@@ -634,6 +795,55 @@ pub fn run_recorder(
     transcript_path: &Path,
     out_path: &Path,
 ) -> Vec<Frame> {
+    run_recorder_inner(agent_cmd, script_path, transcript_path, out_path, None)
+}
+
+/// As [`run_recorder`], also returning the NORMALISED first `initialize`
+/// control_request fake-claude received (compare with `<name>.init.json`).
+pub fn run_recorder_with_init(
+    agent_cmd: &str,
+    script_path: &Path,
+    transcript_path: &Path,
+    out_path: &Path,
+) -> (Vec<Frame>, Value) {
+    let init_out = out_path.with_extension("init.raw");
+    let _ = std::fs::remove_file(&init_out);
+    let frames = run_recorder_inner(
+        agent_cmd,
+        script_path,
+        transcript_path,
+        out_path,
+        Some(&init_out),
+    );
+    let raw = read_json(&init_out);
+    let _ = std::fs::remove_file(&init_out);
+    // `normalize_init` mirrors capture.sh's `^[a-z0-9]{8,20}$` rule, which also
+    // rewrites the 10-character subtype "initialize" to a placeholder on both
+    // sides. Compare the real values here, before they disappear.
+    assert_eq!(
+        raw["type"], "control_request",
+        "first frame is a control_request"
+    );
+    assert_eq!(
+        raw["request"]["subtype"], "initialize",
+        "the captured request is the initialize handshake"
+    );
+    (
+        frames,
+        normalize_init(raw, &repo_root(), &fake_claude_binary()),
+    )
+}
+
+/// Per-run unique suffix for the hermetic HOME dirs.
+static NEXT_HOME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn run_recorder_inner(
+    agent_cmd: &str,
+    script_path: &Path,
+    transcript_path: &Path,
+    out_path: &Path,
+    init_out: Option<&Path>,
+) -> Vec<Frame> {
     let recorder = acp_recorder_binary();
     let fake = fake_claude_binary();
     assert!(
@@ -652,20 +862,37 @@ pub fn run_recorder(
         transcript_path.display()
     );
 
-    let status = std::process::Command::new(&recorder)
+    // Hermetic HOME / CLAUDE_CONFIG_DIR per run (mirrors capture.sh): the agent
+    // and the CLI never see the host user's settings, skills or transcripts, and
+    // `seed_files` land in a store nobody else shares.
+    let home = std::env::temp_dir().join(format!(
+        "acp-home-{}-{}",
+        std::process::id(),
+        NEXT_HOME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".claude")).expect("create hermetic HOME");
+
+    let mut command = std::process::Command::new(&recorder);
+    command
         .arg(agent_cmd)
         .arg(script_path)
         .arg(out_path)
         .current_dir(repo_root())
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
         .env("FAKE_CLAUDE_SCRIPT", transcript_path)
         .env("CLAUDE_CODE_EXECUTABLE", &fake)
         // Shorten the force-cancel backstop so a wedged-cancel settle
         // (`cancel-mid-turn`, 11.T4) completes fast instead of waiting the 30 s
         // default. The grace only fires when a cancel leaves the active turn
         // un-settled past the deadline, which only that corpus exercises.
-        .env("CLAUDE_ACP_FORCE_CANCEL_GRACE_MS", "1000")
-        .status()
-        .expect("spawn acp-recorder");
+        .env("CLAUDE_ACP_FORCE_CANCEL_GRACE_MS", "1000");
+    if let Some(init_out) = init_out {
+        command.env("FAKE_CLAUDE_INIT_OUT", init_out);
+    }
+    let status = command.status().expect("spawn acp-recorder");
+    let _ = std::fs::remove_dir_all(&home);
     assert!(
         status.success(),
         "acp-recorder exited non-zero for {agent_cmd}"

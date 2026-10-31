@@ -7,8 +7,9 @@
 mod common;
 
 use common::{
-    diff_frames, normalize_root_paths, parse_fixture_frames, repo_root, run_recorder,
-    rust_agent_binary, Frame, JsonPath,
+    diff_frames, normalize_agent_info_version, normalize_for_test, normalize_root_paths,
+    parse_fixture_frames, pinned_upstream_version, repo_root, run_recorder, rust_agent_binary,
+    Frame, JsonPath,
 };
 use serde_json::json;
 
@@ -356,6 +357,8 @@ fn run_and_diff_with(name: &str, ignore: &[JsonPath]) {
     // path; normalise it to `$ROOT` like capture.sh does before diffing.
     let frames = normalize_root_paths(frames, &root);
     let expected = parse_fixture_frames(&fixture);
+    let (frames, expected) =
+        normalize_agent_info_version(frames, expected, &pinned_upstream_version());
     if let Err(diff) = diff_frames(&frames, &expected, ignore) {
         panic!("{name} differential failed:\n{diff}");
     }
@@ -395,6 +398,8 @@ fn inv_24_commands_proactive() {
     let frames = run_recorder(&agent_cmd.to_string_lossy(), &script, &transcript, &out);
     let frames = normalize_root_paths(frames, &root);
     let expected = parse_fixture_frames(&fixture);
+    let (frames, expected) =
+        normalize_agent_info_version(frames, expected, &pinned_upstream_version());
     if let Err(diff) = diff_frames(&frames, &expected, &differential_ignore()) {
         panic!("commands-proactive differential failed:\n{diff}");
     }
@@ -442,11 +447,93 @@ fn inv_24_tool_then_text() {
     run_and_diff("tool-then-text");
 }
 
+/// rust-upstream-sync Phase 3 (item 3.6) — an AIR client (declaring
+/// `clientCapabilities._meta.jetbrains.air` asyncTasks) gets the async-task
+/// `session/update` spawn/progress/state life-cycle for a workflow task held
+/// until its terminal notification.
+#[test]
+fn inv_24_async_task_air() {
+    run_and_diff("async-task-air");
+}
+
+/// rust-upstream-sync Phase 3 (item 3.6) — a NON-AIR client gets none of the
+/// async-task updates despite emitting the same CLI task frames.
+#[test]
+fn inv_24_async_task_non_air() {
+    run_and_diff("async-task-non-air");
+}
+
+/// rust-upstream-sync Phase 3 (item 3.7, E-12) — a dispatched tool call with no
+/// `tool_result` fails the `end_turn` prompt `-32603` `incomplete_tool_call`
+/// after a `failed` `tool_call_update`.
+#[test]
+fn inv_24_unfinished_tool() {
+    run_and_diff("unfinished-tool");
+}
+
+/// rust-upstream-sync Phase 3 (item 3.8, R87-1) — an autonomous-origin result
+/// naming the queued prompt's uuid answers it (folded prompt) instead of being
+/// skipped as another cycle's.
+#[test]
+fn inv_24_folded_prompt() {
+    run_and_diff("folded-prompt");
+}
+
+/// rust-upstream-sync Phase 3 (item 3.9) — a Bash `can_use_tool` with an
+/// `addRules` suggestion offers the durable `allow-with-updates` option, and
+/// choosing it returns the suggestions verbatim as `updatedPermissions`
+/// (the transcript step `expect`s that `control_response`).
+#[test]
+fn inv_24_permission_suggestions() {
+    run_and_diff("permission-suggestions");
+}
+
 /// 8.T7 — lagging trailing idle after the next echo is absorbed, not a false
 /// #825 fail.
 #[test]
 fn inv_24_lagging_idle() {
     run_and_diff("lagging-idle");
+}
+
+/// rust-air-gaps 2.4 — `logout` runs `claude auth logout`, re-reads the store
+/// (the fake's marker makes it answer logged-out) and pushes the `none` status
+/// before the `{}` response.
+#[test]
+fn inv_24_logout_auth() {
+    run_and_diff("logout-auth");
+}
+
+/// rust-air-gaps 2.3 — `session/resume`, `session/list` (+ cursor error,
+/// delete, idempotent delete) and `session/fork` (a transcript copy that then
+/// lists as `<title> (fork)`) match Node's SDK-backed behaviour.
+#[test]
+fn inv_24_session_methods() {
+    run_and_diff("session-resume");
+    run_and_diff("session-list");
+    run_and_diff("session-fork");
+}
+
+/// rust-air-gaps 2.3 — `session/close` is idempotent and a prompt on a closed
+/// session is `-32603 {details:"Session not found"}`.
+#[test]
+fn inv_24_session_close() {
+    run_and_diff("session-close");
+}
+
+/// rust-air-gaps 2.2 — the `_auth/status_update` push after `initialize`
+/// (CLI `auth status --json` probe) lands between the initialize response and
+/// `session/new`, exactly once.
+#[test]
+fn inv_24_auth_status() {
+    run_and_diff("auth-status");
+}
+
+/// rust-air-gaps 2.1 — `_meta.quota.model_usage` carries per-model increment
+/// rows (insertion order, zero-total dropped, a rewound reading is its own
+/// increment).
+#[test]
+fn inv_24_model_usage() {
+    run_and_diff("model-usage");
 }
 
 /// rust-steering-lanes Phase 3 — a `_session/steering` injected mid-turn settles
@@ -543,4 +630,67 @@ fn request_permission_id_is_normalised_to_fixed_token() {
         diff_frames(&[node_response], &[rust_response], &[]).is_ok(),
         "the request_permission response id must be normalised to the fixed token"
     );
+}
+
+/// rust-air-gaps 1.1 (Decision 5) — uuids EMBEDDED in a longer string get
+/// first-appearance placeholders (mirrors capture.sh `replaceUuids`), the same
+/// uuid maps to the same placeholder, and a whole-string uuid is unchanged.
+#[test]
+fn inv_49_normalize_embedded_uuid() {
+    let a = "11111111-1111-1111-1111-111111111111";
+    let b = "22222222-2222-2222-2222-222222222222";
+    let out = normalize_for_test(json!({
+        "id": format!("{a}:error"),
+        "again": format!("x/{a}/y"),
+        "other": format!("{b}:error"),
+        "whole": a,
+        "plain": "no uuid here, naïve ünïcode",
+    }));
+    assert_eq!(
+        out,
+        json!({
+            "id": "$0:error",
+            "again": "x/$0/y",
+            "other": "$1:error",
+            "whole": "$0",
+            "plain": "no uuid here, naïve ünïcode",
+        })
+    );
+}
+
+/// rust-air-gaps Phase 1 (1.3, G3/G5) — the client `systemPrompt` option
+/// (append / override / load / combined with AIR `customInstructions`) is
+/// accepted with the Node's frames, and an unsupported mode or a non-text block
+/// answers the Node's `-32602` (message and `data`) with no session created.
+#[test]
+fn inv_24_system_prompt() {
+    for name in [
+        "system-prompt-append",
+        "system-prompt-override",
+        "system-prompt-load",
+        "system-prompt-bad-mode",
+        "system-prompt-bad-block",
+        "custom-instructions",
+        "system-prompt-combined",
+    ] {
+        run_and_diff(name);
+    }
+}
+
+/// rust-air-gaps Phase 1 (1.4, G11) — for an AIR client the tool reports carry
+/// `_meta.jetbrains.air.{commandTitle,subagent,skill,mcp}`, the AIR-only
+/// `is_mcp_tool_call` flag, and unchanged `_meta` keys are filtered from later
+/// updates of the same call.
+#[test]
+fn inv_24_air_tool_meta() {
+    run_and_diff("air-tool-meta");
+}
+
+/// rust-air-gaps Phase 1 (1.5, G1) — `_session/async_task/stop` on an announced
+/// AIR task: the `stopped` state update, the "Task stopped by user" notice, the
+/// `{stopped:true}` response (never before its updates), then the turn's own
+/// `end_turn`.
+#[test]
+fn inv_24_async_task_stop() {
+    run_and_diff("async-task-stop");
 }

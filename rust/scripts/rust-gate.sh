@@ -9,6 +9,21 @@ MANIFEST="$RUST/Cargo.toml"
 
 cd "$ROOT"
 
+# Portable per-command timeout (item 1.12). macOS ships no `timeout`/`gtimeout`,
+# so fall back to perl's alarm for the rest. Used to bound `cargo test` so a
+# hang is a failure, never a silent stall (guard G3).
+run_timeout() {
+  secs=$1
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  fi
+}
+
 echo "==> fmt"
 cargo fmt --manifest-path "$MANIFEST" --all --check
 
@@ -19,8 +34,11 @@ cargo clippy --manifest-path "$MANIFEST" --workspace --all-targets --all-feature
 echo "==> build (bins)"
 cargo build --manifest-path "$MANIFEST" --workspace --bins
 
+echo "==> prewarm upstream cache"
+run_timeout 300 bash "$ROOT/porting/capture.sh" --install-only
+
 echo "==> test"
-timeout 180 cargo test --manifest-path "$MANIFEST" --workspace
+run_timeout 180 cargo test --manifest-path "$MANIFEST" --workspace
 
 echo "==> cross-target check: x86_64-pc-windows-gnu"
 cargo check --manifest-path "$MANIFEST" --workspace --target x86_64-pc-windows-gnu
@@ -43,5 +61,8 @@ if [ "$(cargo tree --manifest-path "$MANIFEST" -d | grep -c '^agent-client-proto
     echo "G10 FAIL: duplicate agent-client-protocol versions"
     exit 1
 fi
+
+echo "==> upstream ahead (non-failing)"
+run_timeout 20 bash "$RUST/scripts/upstream-ahead.sh" || true
 
 echo "==> gate OK"

@@ -1,0 +1,9 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "expect_error": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "systemPrompt": {"mode": "weird", "content": [{"type": "text", "text": "x"}]}}}
+  ]
+}
