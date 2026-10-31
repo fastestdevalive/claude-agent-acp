@@ -169,4 +169,29 @@ pub struct T2aState {
     pub noticed_tool_uses: HashSet<String>,
     /// Effects for the run loop, drained after every dispatched frame.
     pub effects: Vec<Effect>,
+    /// Whether an arriving `prompt_suggestion` still answers the turn the user
+    /// is waiting on (`promptSuggestionExpected`, `acp-agent.ts:1005-1011`):
+    /// set at a turn's `result`, cleared when the next prompt arrives.
+    pub prompt_suggestion_expected: bool,
+    /// The last follow-up prompt published to the client
+    /// (`lastPublishedPromptSuggestion`): `None` covers both Node's
+    /// `undefined` (nothing pushed yet) and its `null` (cleared), which the
+    /// dedupe check treats alike.
+    pub last_published_prompt_suggestion: Option<String>,
+    /// The `/usage` turns of this session, keyed by prompt uuid
+    /// (`Turn.localCommand` / `localCommandMarkdown`, F24 / S-01).
+    pub usage_turns: crate::usage::UsageTurns,
+    /// The actor's command channel, so a frame handler can ask the run loop to
+    /// start a turn-activation effect (the `/usage` control request). Set once
+    /// when the actor starts.
+    pub(crate) command_tx: Option<tokio::sync::mpsc::UnboundedSender<super::Command>>,
+    /// `compaction.hasDeliveredOutput`: a compaction output was delivered in
+    /// this session, so a synthetic assistant frame of an earlier compact
+    /// attempt is not mapped and the #453 result fallback stays off
+    /// (`acp-agent.ts:6887`, `7843`). Cleared at every turn boundary.
+    pub compaction_output_delivered: bool,
+    /// The per-session compaction lifecycle (`ContextCompactionLifecycle`,
+    /// `acp-agent.ts:4544-4551`). Configured with the session id and the
+    /// client's presentation once the actor starts.
+    pub compaction: crate::context_compaction::ContextCompactionLifecycle,
 }

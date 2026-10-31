@@ -51,6 +51,9 @@ pub struct AsyncTaskRuntime {
     /// Oldest first, at most [`MAX_HIDDEN_TOOL_CALLS`] (the 1000-capped
     /// `resolvedToolNames` upstream reads).
     hidden_tool_calls: Vec<String>,
+    /// The native subagent runtime that the subagent tasks feed (the tasks this
+    /// runtime ignores, `async_tasks/subagents.rs`). Disabled by default.
+    subagents: crate::native_subagents::NativeSubagentRuntime,
 }
 
 /// `MAX_TOOL_RESULT_PATHS` (`async-tasks.ts:48`): how many tool results the
@@ -128,6 +131,10 @@ struct Task {
     stopping: bool,
     /// The "Task stopped by user" notice was already produced for this task.
     stop_announced: bool,
+    /// The route of the task's updates to the child session that owns its tool
+    /// call (`AsyncTask.route`, `async-tasks.ts:632`): resolved once (`??=`),
+    /// then kept for every later update.
+    route: Option<crate::native_subagents::runtime::ToolCallRoute>,
 }
 
 impl Default for Task {
@@ -152,6 +159,7 @@ impl Default for Task {
             published: HashMap::new(),
             stopping: false,
             stop_announced: false,
+            route: None,
         }
     }
 }
@@ -176,6 +184,7 @@ impl AsyncTaskRuntime {
             output_paths: Vec::new(),
             journal: Vec::new(),
             hidden_tool_calls: Vec::new(),
+            subagents: crate::native_subagents::NativeSubagentRuntime::default(),
         }
     }
 
@@ -638,6 +647,49 @@ impl AsyncTaskRuntime {
             .is_some_and(|t| t.announced && !t.ignored && !t.stopping && !is_terminal(&t.state))
     }
 
+    /// The tool call that started the task `id` (`task.toolCallId`), for the
+    /// native subagent route of the task's updates (`AsyncTaskRuntime.send`,
+    /// `async-tasks.ts:752`).
+    #[must_use]
+    pub fn tool_call_id_of(&self, id: &str) -> Option<String> {
+        self.tasks
+            .get(id)
+            .and_then(|task| task.tool_call_id.clone())
+    }
+
+    /// `AsyncTaskRuntime.send` (`async-tasks.ts:749-753`): the update goes to
+    /// the child session that owns the task's tool call, else the root. The
+    /// route is resolved once (`task.route ??= routeOf(...)`) and kept on the
+    /// task, so a later update still lands in the same child after the eager
+    /// entry was forgotten or `child_by_tool_call` evicted it.
+    pub fn route_task_update(
+        &mut self,
+        task_id: &str,
+        update: Value,
+        root_session_id: &str,
+        eager_session_id: Option<&str>,
+    ) -> Value {
+        let notification = json!({"sessionId": root_session_id, "update": update});
+        let kept = self.tasks.get(task_id).and_then(|task| task.route.clone());
+        let route = kept.or_else(|| {
+            self.tool_call_id_of(task_id).and_then(|tool_call_id| {
+                self.subagents
+                    .route_of_tool_call(&tool_call_id, eager_session_id)
+            })
+        });
+        let Some(route) = route else {
+            return notification;
+        };
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            if task.route.is_none() {
+                task.route = Some(route.clone());
+            }
+        }
+        self.subagents
+            .apply_route(route, &notification)
+            .unwrap_or(notification)
+    }
+
     /// Claim the stop of `id` synchronously (Node `claimStop`). `true` means the
     /// caller now owns the stop and must end with [`Self::task_stopped`] or
     /// [`Self::release_stop`].
@@ -687,6 +739,7 @@ impl AsyncTaskRuntime {
     pub fn clear(&mut self) {
         self.tasks.clear();
         self.order.clear();
+        self.subagents.clear();
         self.output_paths.clear();
         self.hidden_tool_calls.clear();
     }
@@ -730,6 +783,46 @@ impl AsyncTaskRuntime {
             let mut failed = None;
             for update in updates {
                 if let Err(error) = publish(update) {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = failed {
+                if let Some(previous) = previous {
+                    self.tasks.insert(id.clone(), previous);
+                }
+                errors.push(error);
+            }
+        }
+        errors
+    }
+
+    /// [`Self::finish_all_with`] with every terminal update routed to the child
+    /// session that owns the task's tool call (`AsyncTaskRuntime.send`), so the
+    /// stream-end finish lands where the task's earlier updates went.
+    pub fn finish_all_with_routed(
+        &mut self,
+        state: &str,
+        root_session_id: &str,
+        eager_session_of: &mut dyn FnMut(&str) -> Option<String>,
+        publish: &mut dyn FnMut(Value) -> Result<(), String>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        let ids =
+            self.ids_where(|t| (t.announced || t.held) && !t.ignored && !is_terminal(&t.state));
+        for id in ids {
+            let previous = self.tasks.get(&id).cloned();
+            let updates = self.finish(&id, state, None, TerminalSource::Shutdown);
+            let mut failed = None;
+            for update in updates {
+                let eager = self
+                    .tool_call_id_of(&id)
+                    .and_then(|tool_call_id| eager_session_of(&tool_call_id));
+                let routed = self.route_task_update(&id, update, root_session_id, eager.as_deref());
+                if let Err(error) = publish(routed) {
                     failed = Some(error);
                     break;
                 }
@@ -1596,6 +1689,12 @@ fn task_output_paths(text: &str) -> Vec<String> {
     }
     paths
 }
+
+mod subagents;
+pub use subagents::SubagentSends;
+
+#[cfg(test)]
+mod tests_t4b;
 
 #[cfg(test)]
 mod tests_t3a;

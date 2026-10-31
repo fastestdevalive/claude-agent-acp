@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize", "raw_capabilities": true, "client_capabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"compaction": {}}, "auth": {"terminal": false}, "_meta": {"jetbrains": {"air": {"version": 1, "capabilities": []}}}}},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "compact please"}
+  ]
+}

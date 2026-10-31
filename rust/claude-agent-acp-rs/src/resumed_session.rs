@@ -52,16 +52,78 @@ pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
     )
 }
 
+/// A full local transcript snapshot of a resumed session (`readResumedSession`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResumedSessionSnapshot {
+    pub messages: Vec<Value>,
+    pub model: Option<String>,
+}
+
+/// `resumedModelFromTranscript` (`resumed-session.ts:27-42`): the concrete model
+/// of the last real top-level assistant response, else `None`.
+pub fn resumed_model_from_transcript(messages: &[Value]) -> Option<String> {
+    for entry in messages.iter().rev() {
+        if entry.get("type").and_then(Value::as_str) != Some("assistant")
+            || entry
+                .get("parent_tool_use_id")
+                .is_some_and(|v| !v.is_null())
+            || entry.get("parent_agent_id").is_some_and(|v| !v.is_null())
+        {
+            continue;
+        }
+        let Some(message) = entry.get("message").filter(|m| m.is_object()) else {
+            continue;
+        };
+        if let Some(model) = concrete_model(message.get("model").and_then(Value::as_str)) {
+            return Some(model);
+        }
+    }
+    None
+}
+
+/// `readResumedSession` (`resumed-session.ts:47-66`): the SDK
+/// `getSessionMessages` snapshot plus the model it records. A read failure is
+/// an empty snapshot (Node logs and returns `{}`).
+pub fn read_resumed_session_with_env(
+    session_id: &str,
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> ResumedSessionSnapshot {
+    let messages = crate::transcript::session_messages(env, session_id);
+    let model = resumed_model_from_transcript(&messages);
+    ResumedSessionSnapshot { messages, model }
+}
+
+/// [`read_resumed_session_with_env`] against the process environment.
+pub fn read_resumed_session(session_id: &str) -> ResumedSessionSnapshot {
+    read_resumed_session_with_env(
+        session_id,
+        &crate::env_snapshot::EnvSnapshot::from_process(),
+    )
+}
+
 /// Read the resume model and the permission mode of a session with an env snapshot.
+///
+/// A session without a local transcript file falls back to a full-transcript
+/// read for the model (`readResumedTail`, `resumed-session.ts:97-110`); a
+/// caller that already has the model (`with_model == false`) gets no fallback.
 pub fn read_resumed_tail_with_env(
     session_id: &str,
     with_model: bool,
     env: &crate::env_snapshot::EnvSnapshot,
 ) -> ResumedTail {
-    let Some(path) = find_transcript_with_env(session_id, env) else {
-        return ResumedTail::default();
-    };
-    read_tail_from_file(&path, with_model).unwrap_or_default()
+    if let Some(path) = find_transcript_with_env(session_id, env) {
+        if let Ok(tail) = read_tail_from_file(&path, with_model) {
+            return tail;
+        }
+    }
+    if with_model {
+        ResumedTail {
+            model: read_resumed_session_with_env(session_id, env).model,
+            permission_mode: None,
+        }
+    } else {
+        ResumedTail::default()
+    }
 }
 
 /// Read the resume model and the permission mode of a session from the end of its local transcript.
@@ -267,6 +329,62 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(tail.model.as_deref(), Some("claude-opus-4-20250514"));
         assert_eq!(tail.permission_mode.as_deref(), Some("acceptEdits"));
+    }
+
+    /// O-13 — `readResumedSession` returns the SDK message snapshot and the
+    /// model of the last real top-level assistant response; a synthetic or a
+    /// nested assistant record does not describe the resumed model.
+    #[test]
+    fn o13_read_resumed_session_model() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("o13-{}-{n}", std::process::id()));
+        let slug = dir.join("projects").join("-p");
+        std::fs::create_dir_all(&slug).unwrap();
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let body = [
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"x"}]}}"#,
+        ]
+        .join("\n");
+        std::fs::write(slug.join(format!("{id}.jsonl")), format!("{body}\n")).unwrap();
+        let env = crate::env_snapshot::EnvSnapshot::from_pairs([(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().into_owned(),
+        )]);
+        let snapshot = read_resumed_session_with_env(id, &env);
+        assert_eq!(snapshot.messages.len(), 3);
+        assert_eq!(snapshot.model.as_deref(), Some("claude-sonnet-4-5"));
+        // The tail read uses the same file and reports the same model.
+        let tail = read_resumed_tail_with_env(id, true, &env);
+        assert_eq!(tail.model.as_deref(), Some("claude-sonnet-4-5"));
+        // A missing transcript falls back to a full read: no messages, no model.
+        let missing =
+            read_resumed_tail_with_env("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", true, &env);
+        assert_eq!(missing, ResumedTail::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resumed_model_skips_nested_and_synthetic_records() {
+        let messages = vec![
+            serde_json::json!({"type":"assistant","parent_tool_use_id":null,
+                "message":{"model":"claude-haiku-4-5"}}),
+            serde_json::json!({"type":"assistant","parent_tool_use_id":"toolu_1",
+                "message":{"model":"claude-subagent"}}),
+            serde_json::json!({"type":"assistant","parent_agent_id":"agent-1",
+                "message":{"model":"claude-subagent"}}),
+            serde_json::json!({"type":"assistant","parent_tool_use_id":null,
+                "message":{"model":"<synthetic>"}}),
+        ];
+        assert_eq!(
+            resumed_model_from_transcript(&messages).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(resumed_model_from_transcript(&[]), None);
     }
 
     #[test]

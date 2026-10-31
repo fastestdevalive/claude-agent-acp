@@ -355,6 +355,7 @@ fn t3a_enter_plan_mode_hook_remembers_the_previous_mode() {
     let (reply, _reply_rx) = oneshot::channel();
     let mut map_state = MapState::default();
     handle_hook_callback(
+        &mut rig.tasks,
         HookCall {
             request_id: "r1",
             callback_id: crate::hooks::POST_TOOL_USE_HOOK_ID,

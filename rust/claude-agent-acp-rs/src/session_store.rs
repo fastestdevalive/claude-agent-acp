@@ -10,12 +10,12 @@
 //! `CLAUDE_CONFIG_DIR` / `$HOME/.claude`.
 //!
 //! Not ported (PARITY): git-worktree sibling projects in a `cwd` listing, the
-//! sidecar title store, the `isSidechain`-first-line archive checks of
-//! `pF`, command-tag prompt filtering of `vi`, `compactMetadata` /
-//! attachment uuid remapping and `upToMessageId` of `forkSession`.
+//! sidecar title store, the `isSidechain`-first-line archive checks of `pF`,
+//! command-tag prompt filtering of `vi`, and `hu`'s 0600 fork-file mode (no
+//! platform mode code outside `process.rs`; the file is created exclusively).
 
-use std::collections::HashSet;
-use std::io::{Read, Seek, SeekFrom};
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -589,16 +589,549 @@ const FORK_DROPPED_KEYS: [&str; 7] = [
     "droppedPromptUuids",
 ];
 
-/// Copy the latest transcript of `source_id` (found under `dir`'s project) into
-/// a new session, as SDK `forkSession` without `upToMessageId`: a fresh uuid per
-/// entry (`progress` entries dropped, ancestors remapped past them),
-/// `sessionId` rewritten, `forkedFrom` recorded and a closing `custom-title`
+/// One entry of the SDK `ed` parent-resolution map (`sdk.mjs` `ed`): the entry
+/// plus the parent it resolves to after the compaction rewrites.
+struct ChainNode {
+    value: Value,
+    parent: Option<String>,
+}
+
+/// The result of `ed`: the parent map, the active chain (root first) and the
+/// leaf candidate that reached it (`found.terminal`), used by `sve`.
+struct ResolvedChain {
+    chain: Vec<String>,
+    terminal: Option<String>,
+}
+
+/// JavaScript truthiness of an optional JSON value (`!y.isSidechain`, etc.).
+fn js_truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
+        Some(Value::Array(_) | Value::Object(_)) => true,
+    }
+}
+
+fn uuid_of(value: &Value) -> &str {
+    value.get("uuid").and_then(Value::as_str).unwrap_or("")
+}
+
+/// The `ed` candidate predicate: an entry that can end a fork chain.
+fn is_forkable(node: &ChainNode) -> bool {
+    let value = &node.value;
+    !js_truthy(value.get("isSidechain"))
+        && !js_truthy(value.get("teamName"))
+        && value.get("type").and_then(Value::as_str) != Some("progress")
+        && !(value.get("type").and_then(Value::as_str) == Some("attachment")
+            && value
+                .get("attachment")
+                .and_then(|attachment| attachment.get("type"))
+                .and_then(Value::as_str)
+                == Some("fork_briefing"))
+}
+
+/// `ed` (`sdk.mjs`): resolve the parent map through the compaction boundaries,
+/// pick the leaf of the branch that ends at the newest user/assistant message
+/// and return that branch's chain, root first. `found.terminal` is the leaf
+/// candidate that reached the chain root (the boundary `sve` may drop).
+///
+/// The SDK's `wwe` regrouping (siblings that share an assistant message id,
+/// plus their queued attachments) is not applied here: it only widens the
+/// chain's liveness set for those grouped entries, which this cut never needs.
+fn resolve_chain(entries: &[Value]) -> ResolvedChain {
+    let mut order: Vec<String> = Vec::new();
+    let mut nodes: HashMap<String, ChainNode> = HashMap::new();
+    for entry in entries {
+        let Some(uuid) = entry.get("uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        if !nodes.contains_key(uuid) {
+            order.push(uuid.to_string());
+        }
+        nodes.insert(
+            uuid.to_string(),
+            ChainNode {
+                value: entry.clone(),
+                parent: entry
+                    .get("parentUuid")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            },
+        );
+    }
+    // `ed` step 2: a compact boundary re-parents the messages it preserved.
+    for uuid in order.clone() {
+        let Some(node) = nodes.get(&uuid) else {
+            continue;
+        };
+        if node.value.get("type").and_then(Value::as_str) != Some("system")
+            || node.value.get("subtype").and_then(Value::as_str) != Some("compact_boundary")
+        {
+            continue;
+        }
+        let compact = node.value.get("compactMetadata");
+        if let Some(preserved) = compact
+            .and_then(|metadata| metadata.get("preservedMessages"))
+            .filter(|value| js_truthy(Some(value)))
+        {
+            let uuids: Vec<String> = preserved
+                .get("uuids")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|uuid| uuid.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if uuids.is_empty() || uuids.iter().any(|uuid| !nodes.contains_key(uuid)) {
+                continue;
+            }
+            let anchor = preserved
+                .get("anchorUuid")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let mut cursor = anchor.clone();
+            for uuid in &uuids {
+                if let Some(node) = nodes.get_mut(uuid) {
+                    node.parent = cursor.clone();
+                }
+                cursor = Some(uuid.clone());
+            }
+            let first = uuids[0].clone();
+            let last = uuids[uuids.len() - 1].clone();
+            for key in order.clone() {
+                let Some(node) = nodes.get_mut(&key) else {
+                    continue;
+                };
+                if node.parent == anchor && key != first {
+                    node.parent = Some(last.clone());
+                }
+            }
+        } else if let Some(segment) = compact
+            .and_then(|metadata| metadata.get("preservedSegment"))
+            .filter(|value| js_truthy(Some(value)))
+        {
+            let head = segment
+                .get("headUuid")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let anchor = segment
+                .get("anchorUuid")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let tail = segment
+                .get("tailUuid")
+                .and_then(Value::as_str)
+                .map(String::from);
+            if let Some(head) = &head {
+                if let Some(node) = nodes.get_mut(head) {
+                    node.parent = anchor.clone();
+                }
+            }
+            for key in order.clone() {
+                let Some(node) = nodes.get_mut(&key) else {
+                    continue;
+                };
+                if node.parent == anchor && head.as_ref() != Some(&key) {
+                    node.parent = tail.clone();
+                }
+            }
+        }
+    }
+    // `ed` steps 3-8: the leaves, the forkable tips and the newest one.
+    let mut file_index: HashMap<String, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(uuid) = entry.get("uuid").and_then(Value::as_str) {
+            file_index.insert(uuid.to_string(), index);
+        }
+    }
+    let mut referenced: HashSet<String> = HashSet::new();
+    for node in nodes.values() {
+        if let Some(parent) = &node.parent {
+            referenced.insert(parent.clone());
+        }
+    }
+    let leaves: Vec<String> = order
+        .iter()
+        .filter(|uuid| !referenced.contains(*uuid))
+        .cloned()
+        .collect();
+    let mut parent_of_forkable: HashSet<String> = HashSet::new();
+    for node in nodes.values() {
+        if let Some(parent) = &node.parent {
+            if is_forkable(node) {
+                parent_of_forkable.insert(parent.clone());
+            }
+        }
+    }
+    let index_of = |uuid: &str| file_index.get(uuid).map_or(-1i64, |index| *index as i64);
+    let mut candidates: Vec<String> = order
+        .iter()
+        .filter(|uuid| {
+            nodes.get(*uuid).is_some_and(is_forkable) && !parent_of_forkable.contains(*uuid)
+        })
+        .cloned()
+        .collect();
+    candidates.sort_by_key(|uuid| std::cmp::Reverse(index_of(uuid)));
+    let mut dead: HashSet<String> = HashSet::new();
+    let mut root: Option<String> = None;
+    let mut terminal: Option<String> = None;
+    for candidate in candidates {
+        let mut trail: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut cursor = Some(candidate.clone());
+        while let Some(uuid) = cursor {
+            if dead.contains(&uuid) || seen.contains(&uuid) {
+                break;
+            }
+            let Some(node) = nodes.get(&uuid) else {
+                break;
+            };
+            let kind = node.value.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "user" || kind == "assistant" {
+                root = Some(uuid);
+                terminal = Some(candidate.clone());
+                break;
+            }
+            seen.insert(uuid.clone());
+            trail.push(uuid.clone());
+            cursor = node.parent.clone();
+        }
+        if root.is_some() {
+            break;
+        }
+        for uuid in trail {
+            dead.insert(uuid);
+        }
+    }
+    // `ed` step 9: no candidate reached a message; walk every leaf instead.
+    if root.is_none() {
+        let mut reached: Vec<String> = Vec::new();
+        for leaf in &leaves {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut cursor = Some(leaf.clone());
+            while let Some(uuid) = cursor {
+                if !seen.insert(uuid.clone()) {
+                    break;
+                }
+                let Some(node) = nodes.get(&uuid) else {
+                    break;
+                };
+                let kind = node.value.get("type").and_then(Value::as_str).unwrap_or("");
+                if kind == "user" || kind == "assistant" {
+                    reached.push(uuid);
+                    break;
+                }
+                cursor = node.parent.clone();
+            }
+        }
+        if reached.is_empty() {
+            return ResolvedChain {
+                chain: Vec::new(),
+                terminal: None,
+            };
+        }
+        let visible: Vec<String> = reached
+            .iter()
+            .filter(|uuid| {
+                let value = &nodes[*uuid].value;
+                !js_truthy(value.get("isSidechain"))
+                    && !js_truthy(value.get("teamName"))
+                    && !js_truthy(value.get("isMeta"))
+            })
+            .cloned()
+            .collect();
+        let pool = if visible.is_empty() { reached } else { visible };
+        let mut best = pool[0].clone();
+        let mut best_index = index_of(&best);
+        for uuid in pool.iter().skip(1) {
+            let index = index_of(uuid);
+            if index > best_index {
+                best = uuid.clone();
+                best_index = index;
+            }
+        }
+        root = Some(best);
+    }
+    // `ed` step 11: the chain from the root down to the chosen message.
+    let mut chain: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cursor = root;
+    while let Some(uuid) = cursor {
+        if !seen.insert(uuid.clone()) {
+            break;
+        }
+        let Some(node) = nodes.get(&uuid) else {
+            break;
+        };
+        chain.push(uuid);
+        cursor = node.parent.clone();
+    }
+    chain.reverse();
+    ResolvedChain { chain, terminal }
+}
+
+/// `ove`: the uuids a compact boundary says it preserved.
+fn compact_metadata_refs(entry: &Value) -> Vec<String> {
+    let Some(metadata) = entry
+        .get("compactMetadata")
+        .filter(|value| value.is_object())
+    else {
+        return Vec::new();
+    };
+    let mut refs = Vec::new();
+    if let Some(uuids) = metadata
+        .get("preservedMessages")
+        .filter(|value| value.is_object())
+        .and_then(|preserved| preserved.get("uuids"))
+        .and_then(Value::as_array)
+    {
+        refs.extend(
+            uuids
+                .iter()
+                .filter_map(|uuid| uuid.as_str().map(String::from)),
+        );
+    }
+    if let Some(segment) = metadata
+        .get("preservedSegment")
+        .filter(|value| value.is_object())
+    {
+        for key in ["headUuid", "tailUuid"] {
+            if let Some(uuid) = segment.get(key).and_then(Value::as_str) {
+                refs.push(uuid.to_string());
+            }
+        }
+    }
+    refs
+}
+
+/// `fR`: a compact boundary that is not live and sits at/after the chain start.
+fn is_stale_boundary(
+    uuid: &str,
+    live: &HashSet<String>,
+    first_index: &HashMap<String, usize>,
+    start: usize,
+) -> bool {
+    !live.contains(uuid) && first_index.get(uuid).copied().unwrap_or(start) >= start
+}
+
+/// `wF`: mark a stale boundary and the branch hanging off it as left out —
+/// its ancestors up to the live chain, then their descendants.
+fn mark_stale_branch(
+    uuid: &str,
+    entries: &[Value],
+    by_uuid: &HashMap<String, usize>,
+    first_index: &HashMap<String, usize>,
+    live: &HashSet<String>,
+    start: usize,
+    left_out: &mut HashSet<String>,
+) {
+    let mut cursor = by_uuid.get(uuid).copied();
+    while let Some(index) = cursor {
+        let current = uuid_of(&entries[index]).to_string();
+        if !is_stale_boundary(&current, live, first_index, start) || left_out.contains(&current) {
+            break;
+        }
+        left_out.insert(current);
+        cursor = entries[index]
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .and_then(|parent| by_uuid.get(parent))
+            .copied();
+    }
+    for entry in entries {
+        let Some(current) = entry.get("uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(parent) = entry.get("parentUuid").and_then(Value::as_str) else {
+            continue;
+        };
+        if left_out.contains(parent) {
+            left_out.insert(current.to_string());
+        }
+    }
+}
+
+/// `sve` (`sdk.mjs`): from a fork slice, drop the compact boundaries that are
+/// not on its live chain, with the stale branches they anchor. Re-resolves the
+/// chain until it stops changing, so a boundary that only becomes stale after
+/// another was dropped is dropped too.
+fn live_chain_slice(entries: &[Value], fresh_uuid: &mut dyn FnMut() -> String) -> Vec<Value> {
+    let Some(last) = entries.last() else {
+        return entries.to_vec();
+    };
+    // `sve` first applies `PF` to every entry: sidechain/team fields reset.
+    let mut prepared: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            let mut copy = entry.clone();
+            if let Some(map) = copy.as_object_mut() {
+                map.insert("isSidechain".into(), json!(false));
+                for key in FORK_DROPPED_KEYS {
+                    map.remove(key);
+                }
+            }
+            copy
+        })
+        .collect();
+    prepared.push(json!({
+        "type": "system",
+        "uuid": fresh_uuid(),
+        "parentUuid": last.get("uuid").cloned().unwrap_or(Value::Null),
+        "sessionId": last.get("sessionId").cloned().unwrap_or(Value::Null),
+        "timestamp": last.get("timestamp").cloned().unwrap_or(Value::Null),
+    }));
+    let resolved = resolve_chain(&prepared);
+    let Some(start_uuid) = resolved.chain.first().cloned() else {
+        return entries.to_vec();
+    };
+    let mut first_index: HashMap<String, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(uuid) = entry.get("uuid").and_then(Value::as_str) {
+            first_index.entry(uuid.to_string()).or_insert(index);
+        }
+    }
+    let Some(start) = first_index.get(&start_uuid).copied() else {
+        return entries.to_vec();
+    };
+    let chain: HashSet<String> = resolved.chain.iter().cloned().collect();
+    let mut by_uuid: HashMap<String, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(uuid) = entry.get("uuid").and_then(Value::as_str) {
+            by_uuid.insert(uuid.to_string(), index);
+        }
+    }
+    // `l`: the slice's last entry plus every chain entry, and their ancestors.
+    let mut live: HashSet<String> = HashSet::new();
+    let mut seeds: Vec<String> = Vec::new();
+    if let Some(uuid) = last.get("uuid").and_then(Value::as_str) {
+        seeds.push(uuid.to_string());
+    }
+    seeds.extend(resolved.chain.iter().cloned());
+    for seed in seeds {
+        let mut cursor = by_uuid.get(&seed).copied();
+        while let Some(index) = cursor {
+            let uuid = uuid_of(&entries[index]).to_string();
+            if live.contains(&uuid) {
+                break;
+            }
+            live.insert(uuid);
+            cursor = entries[index]
+                .get("parentUuid")
+                .and_then(Value::as_str)
+                .and_then(|parent| by_uuid.get(parent))
+                .copied();
+        }
+    }
+    let mut left_out: HashSet<String> = HashSet::new();
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) != Some("system")
+            || entry.get("subtype").and_then(Value::as_str) != Some("compact_boundary")
+        {
+            continue;
+        }
+        let uuid = uuid_of(entry);
+        if !is_stale_boundary(uuid, &live, &first_index, start)
+            || compact_metadata_refs(entry)
+                .iter()
+                .any(|uuid| live.contains(uuid))
+        {
+            continue;
+        }
+        mark_stale_branch(
+            uuid,
+            entries,
+            &by_uuid,
+            &first_index,
+            &live,
+            start,
+            &mut left_out,
+        );
+    }
+    // The SDK re-runs `ed` without the left-out entries and drops the boundary
+    // that became stale, until the chain stops changing.
+    loop {
+        let remaining: Vec<Value> = prepared
+            .iter()
+            .filter(|entry| !left_out.contains(uuid_of(entry)))
+            .cloned()
+            .collect();
+        let found = resolve_chain(&remaining);
+        if found.chain.len() == chain.len() && found.chain.iter().all(|uuid| chain.contains(uuid)) {
+            break;
+        }
+        let Some(terminal) = found.terminal else {
+            break;
+        };
+        // The SDK would loop here if `wF` marked nothing; stop instead.
+        if left_out.contains(&terminal) || !is_stale_boundary(&terminal, &live, &first_index, start)
+        {
+            break;
+        }
+        mark_stale_branch(
+            &terminal,
+            entries,
+            &by_uuid,
+            &first_index,
+            &live,
+            start,
+            &mut left_out,
+        );
+    }
+    if left_out.is_empty() {
+        return entries.to_vec();
+    }
+    entries
+        .iter()
+        .filter(|entry| !left_out.contains(uuid_of(entry)))
+        .cloned()
+        .collect()
+}
+
+/// `c0` — the non-empty string field `field` of a `queued_command` attachment.
+fn queued_command_field<'a>(entry: &'a Value, field: &str) -> Option<&'a str> {
+    if entry.get("type").and_then(Value::as_str) != Some("attachment") {
+        return None;
+    }
+    let attachment = entry.get("attachment")?;
+    if attachment.get("type").and_then(Value::as_str) != Some("queued_command") {
+        return None;
+    }
+    attachment
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+/// `qA` — the file index of `target` by uuid, else of the first
+/// `queued_command` attachment whose `source_uuid` is `target`.
+fn fork_cut_index(entries: &[Value], target: &str) -> Option<usize> {
+    entries
+        .iter()
+        .position(|entry| entry.get("uuid").and_then(Value::as_str) == Some(target))
+        .or_else(|| {
+            entries
+                .iter()
+                .position(|entry| queued_command_field(entry, "source_uuid") == Some(target))
+        })
+}
+
+/// Copy the latest transcript of `source_id` (found under `dir`'s project)
+/// into a new session, as SDK `forkSession` (`sdk.mjs` `IF`/`eve`). With
+/// `up_to` the copy stops at that transcript uuid; without it every message is
+/// copied. Each entry gets a fresh uuid (`progress` entries dropped, ancestors
+/// remapped past them), `sessionId` rewritten, compactMetadata/attachment uuids
+/// remapped, `forkedFrom` recorded and a closing `custom-title`
 /// `"<title> (fork)"`. Returns the new session id.
 pub fn fork(
     root: &Path,
     source_id: &str,
     dir: &str,
     new_uuid: &mut dyn FnMut() -> String,
+    up_to: Option<&str>,
 ) -> Result<String, StoreError> {
     if !is_session_id(source_id) {
         return Err(StoreError::Invalid(format!(
@@ -622,6 +1155,9 @@ pub fn fork(
     let text = String::from_utf8_lossy(&raw).into_owned();
     let mut transcript: Vec<Value> = Vec::new();
     let mut replacements: Vec<Value> = Vec::new();
+    let mut history_suppressed = false;
+    let mut atis_latch: Option<String> = None;
+    let mut relocated_cwd: Option<String> = None;
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -635,9 +1171,41 @@ pub fn fork(
             if let Some(items) = entry.get("replacements").and_then(Value::as_array) {
                 replacements.extend(items.iter().cloned());
             }
+        } else if kind == "history-suppression" {
+            history_suppressed = true;
+        } else if kind == "atis-latch"
+            && entry.get("sessionId").and_then(Value::as_str) == Some(source_id)
+        {
+            if let Some(atis) = entry.get("atis").and_then(Value::as_str) {
+                if atis.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+                    atis_latch = Some(atis.to_string());
+                }
+            }
+        } else if kind == "relocated"
+            && entry.get("sessionId").and_then(Value::as_str) == Some(source_id)
+        {
+            if let Some(cwd) = entry
+                .get("relocatedCwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+            {
+                relocated_cwd = Some(cwd.to_string());
+            }
         }
     }
     transcript.retain(|e| e.get("isSidechain").and_then(Value::as_bool) != Some(true));
+    // `upToMessageId`: stop at the target message. The SDK finds the uuid
+    // directly, else a `queued_command` attachment's `source_uuid` (`qA`), then
+    // drops the compact boundaries that are not on the live chain of the slice
+    // (`sve`).
+    if let Some(target) = up_to {
+        let Some(index) = fork_cut_index(&transcript, target) else {
+            return Err(StoreError::NotFound(format!(
+                "Message {target} not found in session {source_id}"
+            )));
+        };
+        transcript = live_chain_slice(&transcript[..=index], new_uuid);
+    }
     let uuid_of = |e: &Value| {
         e.get("uuid")
             .and_then(Value::as_str)
@@ -655,12 +1223,34 @@ pub fn fork(
     for entry in &transcript {
         new_ids.entry(uuid_of(entry)).or_insert_with(&mut *new_uuid);
     }
+    // `l`: `ive` remaps compactMetadata anchors through the kept (non-progress)
+    // entries only, so an anchor that points at a progress entry stays as it is.
+    let kept_ids: HashMap<String, String> = kept
+        .iter()
+        .filter_map(|entry| {
+            let uuid = uuid_of(entry);
+            new_ids.get(&uuid).map(|new| (uuid.clone(), new.clone()))
+        })
+        .collect();
     let by_uuid: std::collections::HashMap<String, &Value> =
         transcript.iter().map(|e| (uuid_of(e), e)).collect();
     let fork_id = new_uuid();
     let now = iso8601(now_ms());
     let mut out: Vec<String> = Vec::new();
+    if history_suppressed {
+        out.push(
+            json!({"type": "history-suppression", "sessionId": fork_id,
+                "cause": "fork_inherit", "ts": now})
+            .to_string(),
+        );
+    }
     let last = kept.len() - 1;
+    let remap_id = |ids: &HashMap<String, String>, value: &Value| -> Value {
+        value.as_str().map_or_else(
+            || value.clone(),
+            |id| ids.get(id).map_or_else(|| value.clone(), |new| json!(new)),
+        )
+    };
     for (i, entry) in kept.iter().enumerate() {
         let mut parent = entry
             .get("parentUuid")
@@ -694,6 +1284,100 @@ pub fn fork(
         {
             map.insert("neutralizedByFork".into(), json!(true));
         }
+        // `ive`: compactMetadata preserved-message anchors follow the new ids.
+        if map.get("type").and_then(Value::as_str) == Some("system") {
+            if let Some(compact) = map
+                .get("compactMetadata")
+                .filter(|value| value.is_object())
+                .cloned()
+            {
+                let mut compact = compact;
+                if let Some(compact_map) = compact.as_object_mut() {
+                    let has_anchors = compact_map.contains_key("preservedMessages")
+                        || compact_map.contains_key("preservedSegment")
+                        || compact_map.contains_key("runningTurnSends");
+                    compact_map.remove("runningTurnSends");
+                    if has_anchors {
+                        if let Some(preserved) = compact_map
+                            .get_mut("preservedMessages")
+                            .and_then(Value::as_object_mut)
+                        {
+                            if let Some(value) = preserved.get("anchorUuid").cloned() {
+                                preserved.insert("anchorUuid".into(), remap_id(&kept_ids, &value));
+                            }
+                            for key in ["uuids", "allUuids"] {
+                                if let Some(Value::Array(items)) = preserved.get(key).cloned() {
+                                    preserved.insert(
+                                        key.into(),
+                                        Value::Array(
+                                            items
+                                                .iter()
+                                                .map(|item| remap_id(&kept_ids, item))
+                                                .collect(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(segment) = compact_map
+                            .get_mut("preservedSegment")
+                            .and_then(Value::as_object_mut)
+                        {
+                            for key in ["headUuid", "anchorUuid", "tailUuid"] {
+                                if let Some(value) = segment.get(key).cloned() {
+                                    segment.insert(key.into(), remap_id(&kept_ids, &value));
+                                }
+                            }
+                        }
+                        map.insert("compactMetadata".into(), compact);
+                    }
+                }
+            }
+        }
+        // `ave`: deferred tool announcements follow the new ids.
+        if map.get("type").and_then(Value::as_str) == Some("attachment") {
+            if let Some(attachment) = map
+                .get("attachment")
+                .filter(|value| value.is_object())
+                .cloned()
+            {
+                if let Some(attachment_map) = attachment.as_object() {
+                    if attachment_map.get("type").and_then(Value::as_str)
+                        == Some("deferred_tools_record")
+                    {
+                        if let Some(Value::Array(items)) =
+                            attachment_map.get("nameOnlyAnnouncements")
+                        {
+                            let mapped: Vec<Value> = items
+                                .iter()
+                                .filter_map(|item| {
+                                    item.as_str()
+                                        .and_then(|id| new_ids.get(id))
+                                        .map(|new| json!(new))
+                                })
+                                .collect();
+                            let mut updated = attachment.clone();
+                            if let Some(obj) = updated.as_object_mut() {
+                                obj.insert("nameOnlyAnnouncements".into(), Value::Array(mapped));
+                            }
+                            map.insert("attachment".into(), updated);
+                        }
+                    }
+                }
+            }
+            // `u0`: a `queued_command` attachment's `source_uuid` follows the
+            // new ids (`qu`/`c0`: other attachments keep their source_uuid).
+            let source_uuid = queued_command_field(entry, "source_uuid").map(String::from);
+            if let Some(source_uuid) = source_uuid {
+                if let Some(new) = new_ids.get(&source_uuid) {
+                    if let Some(attachment) =
+                        map.get_mut("attachment").and_then(Value::as_object_mut)
+                    {
+                        attachment.insert("source_uuid".into(), json!(new));
+                    }
+                }
+            }
+        }
         for key in FORK_DROPPED_KEYS {
             map.remove(key);
         }
@@ -726,19 +1410,27 @@ pub fn fork(
             .to_string(),
         );
     }
-    let head: String = text.chars().take(WINDOW as usize).collect();
-    let tail: String = {
-        let all: Vec<char> = text.chars().collect();
-        all[all.len().saturating_sub(WINDOW as usize)..]
-            .iter()
-            .collect()
-    };
-    let title = last_string_field(&tail, "customTitle")
-        .filter(|s| !s.is_empty())
-        .or_else(|| last_string_field(&head, "customTitle").filter(|s| !s.is_empty()))
-        .or_else(|| last_string_field(&tail, "aiTitle").filter(|s| !s.is_empty()))
-        .or_else(|| last_string_field(&head, "aiTitle").filter(|s| !s.is_empty()))
-        .or_else(|| first_prompt(&head).filter(|s| !s.is_empty()))
+    if let Some(atis) = atis_latch {
+        out.push(json!({"type": "atis-latch", "sessionId": fork_id, "atis": atis}).to_string());
+    }
+    if let Some(cwd) = relocated_cwd {
+        out.push(
+            json!({"type": "relocated", "sessionId": fork_id, "relocatedCwd": cwd}).to_string(),
+        );
+    }
+    // `nve`'s title: the tail window's customTitle first, then the head
+    // window's (the sidecar title store is not ported), then the tail and head
+    // aiTitle, then the first prompt of the head window.
+    let head = String::from_utf8_lossy(&raw[..raw.len().min(WINDOW as usize)]).into_owned();
+    let tail =
+        String::from_utf8_lossy(&raw[raw.len().saturating_sub(WINDOW as usize)..]).into_owned();
+    let custom =
+        last_string_field(&tail, "customTitle").or_else(|| last_string_field(&head, "customTitle"));
+    let title = custom
+        .filter(|title| !title.is_empty())
+        .or_else(|| last_string_field(&tail, "aiTitle").filter(|title| !title.is_empty()))
+        .or_else(|| last_string_field(&head, "aiTitle").filter(|title| !title.is_empty()))
+        .or_else(|| first_prompt(&head).filter(|prompt| !prompt.is_empty()))
         .unwrap_or_else(|| "Forked session".to_string());
     out.push(
         json!({"type": "custom-title", "sessionId": fork_id,
@@ -747,7 +1439,14 @@ pub fn fork(
     );
     let mut body = out.join("\n");
     body.push('\n');
-    std::fs::write(project_dir.join(format!("{fork_id}.jsonl")), body)?;
+    // `hu` writes the fork transcript with `mode: 384` (0600); platform-specific
+    // mode code is confined to `process.rs`, so only the exclusive-create half
+    // is portable here. `create_new` also refuses to overwrite an existing id.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(project_dir.join(format!("{fork_id}.jsonl")))?;
+    file.write_all(body.as_bytes())?;
     Ok(fork_id)
 }
 
@@ -1007,7 +1706,7 @@ mod tests {
             n += 1;
             format!("00000000-0000-4000-8000-{n:012}")
         };
-        let fork_id = fork(&root, A, &real, &mut gen).expect("fork");
+        let fork_id = fork(&root, A, &real, &mut gen, None).expect("fork");
         let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
             .expect("fork file");
         let lines: Vec<Value> = raw
@@ -1038,17 +1737,389 @@ mod tests {
         assert!(page.sessions.iter().any(|r| r.session_id == A));
     }
 
+    /// M-33/M-90 — a fork with `upToMessageId` copies only up to that message;
+    /// an unknown message is `NotFound` (the caller answers invalidParams).
+    #[test]
+    fn m33_fork_up_to_message_stops_at_the_point() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        let body = format!(
+            "{}\n{}\n{}\n{}\n",
+            user_line("u1", None, &real, "one"),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":A,
+                "message":{"role":"assistant","content":[{"type":"text","text":"first"}]}}),
+            user_line("u2", Some("a1"), &real, "two"),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","sessionId":A,
+                "message":{"role":"assistant","content":[{"type":"text","text":"second"}]}}),
+        );
+        write_session(&root, &slug, A, &body, 50);
+        let mut n = 0u32;
+        let mut gen = || {
+            n += 1;
+            format!("00000000-0000-4000-8000-{n:012}")
+        };
+        let fork_id = fork(&root, A, &real, &mut gen, Some("a1")).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        // u1, a1, custom-title: u2/a2 are past the fork point.
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0]["message"]["content"], "one");
+        assert_eq!(lines[1]["message"]["content"][0]["text"], "first");
+        assert_eq!(lines[2]["type"], "custom-title");
+        assert!(fork(&root, A, &real, &mut gen, Some("missing")).is_err());
+    }
+
+    /// M-32/M-90 — the fork copy remaps compactMetadata anchors and queued
+    /// attachment source uuids, and writes history-suppression/atis-latch/
+    /// relocated records (`IF`/`ive`/`ave`/`u0`).
+    #[test]
+    fn m32_fork_copies_fork_metadata_records() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            user_line("u1", None, &real, "one"),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":A,
+                "message":{"role":"assistant","content":[{"type":"text","text":"first"}]}}),
+            json!({"type":"attachment","uuid":"q1","parentUuid":"a1","sessionId":A,
+                "attachment":{"type":"queued_command","prompt":"q","source_uuid":"u1"}}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"b1",
+                "parentUuid":"q1","sessionId":A,
+                "compactMetadata":{"preservedMessages":{"anchorUuid":"u1","uuids":["a1"],
+                    "allUuids":["u1","a1"]},"runningTurnSends":{"x":1},"keep":"y"}}),
+            json!({"type":"history-suppression","cause":"x"}),
+            json!({"type":"atis-latch","sessionId":A,"atis":"abc"}),
+            json!({"type":"relocated","sessionId":A,"relocatedCwd":"/new"}),
+        );
+        write_session(&root, &slug, A, &body, 50);
+        let mut n = 0u32;
+        let mut gen = || {
+            n += 1;
+            format!("00000000-0000-4000-8000-{n:012}")
+        };
+        let fork_id = fork(&root, A, &real, &mut gen, None).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let by_type = |kind: &str| lines.iter().find(|l| l["type"] == json!(kind));
+        let suppression = by_type("history-suppression").expect("history-suppression");
+        assert_eq!(suppression["cause"], "fork_inherit");
+        assert_eq!(suppression["sessionId"], json!(fork_id));
+        let atis = by_type("atis-latch").expect("atis-latch");
+        assert_eq!(atis["atis"], "abc");
+        assert_eq!(atis["sessionId"], json!(fork_id));
+        let relocated = by_type("relocated").expect("relocated");
+        assert_eq!(relocated["relocatedCwd"], "/new");
+        let user = lines
+            .iter()
+            .find(|l| l["forkedFrom"]["messageUuid"] == json!("u1"))
+            .expect("user");
+        let assistant = lines
+            .iter()
+            .find(|l| l["message"]["role"] == "assistant")
+            .expect("assistant");
+        let boundary = by_type("system").expect("boundary");
+        assert_eq!(
+            boundary["compactMetadata"]["preservedMessages"]["anchorUuid"],
+            user["uuid"]
+        );
+        assert_eq!(
+            boundary["compactMetadata"]["preservedMessages"]["uuids"],
+            json!([assistant["uuid"]])
+        );
+        assert_eq!(
+            boundary["compactMetadata"]["preservedMessages"]["allUuids"],
+            json!([user["uuid"], assistant["uuid"]])
+        );
+        assert!(boundary["compactMetadata"]
+            .get("runningTurnSends")
+            .is_none());
+        assert_eq!(boundary["compactMetadata"]["keep"], "y");
+        let attachment = by_type("attachment").expect("attachment");
+        assert_eq!(attachment["attachment"]["source_uuid"], user["uuid"]);
+    }
+
+    /// M-33/M-90 — `sve`: the fork cut follows the live chain, so a compact
+    /// boundary (and the rewind branch it anchors) that is not on the chain is
+    /// dropped from the slice.
+    #[test]
+    fn m33_fork_cut_drops_a_stale_compact_boundary_and_its_branch() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        let entry = |kind: &str, uuid: &str, parent: &str, text: &str| {
+            json!({"type": kind, "uuid": uuid, "parentUuid": parent, "sessionId": A,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "message": {"role": kind, "content": [{"type": "text", "text": text}]}})
+        };
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            user_line("u1", None, &real, "one"),
+            entry("assistant", "a1", "u1", "first"),
+            user_line("u2", Some("a1"), &real, "two"),
+            entry("assistant", "a2", "u2", "second"),
+            // A rewind branch off a1, carrying a superseded compaction boundary.
+            user_line("u3", Some("a1"), &real, "rewound"),
+            entry("assistant", "a3", "u3", "rewritten"),
+            json!({"type": "system", "subtype": "compact_boundary", "uuid": "cb1",
+                "parentUuid": "a3", "sessionId": A,
+                "timestamp": "2026-01-01T00:00:04.000Z",
+                "compactMetadata": {"preservedMessages": {"anchorUuid": "gone",
+                    "uuids": ["gone-1"]}}}),
+            user_line("u4", Some("a2"), &real, "three"),
+            entry("assistant", "a4", "u4", "third"),
+        );
+        write_session(&root, &slug, A, &body, 50);
+        let mut n = 0u32;
+        let mut gen = || {
+            n += 1;
+            format!("00000000-0000-4000-8000-{n:012}")
+        };
+        let fork_id = fork(&root, A, &real, &mut gen, Some("a4")).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        // u1, a1, u2, a2, u4, a4, custom-title: the rewind branch (u3/a3) and
+        // the superseded boundary are not on the live chain.
+        assert_eq!(lines.len(), 7, "{lines:?}");
+        let forked: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l["forkedFrom"]["messageUuid"].as_str())
+            .collect();
+        assert_eq!(forked, ["u1", "a1", "u2", "a2", "u4", "a4"], "{lines:?}");
+        assert!(!lines.iter().any(|l| l["type"] == json!("system")));
+    }
+
+    /// M-33 — `qA` falls back to a `queued_command` attachment's `source_uuid`
+    /// only: another attachment type's `source_uuid` does not move the cut.
+    #[test]
+    fn m33_fork_cut_queued_command_source_uuid_only() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            user_line("u1", None, &real, "one"),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":A,
+                "message":{"role":"assistant","content":[{"type":"text","text":"first"}]}}),
+            // Not a queued command: its source_uuid is not a cut candidate.
+            json!({"type":"attachment","uuid":"x1","parentUuid":"a1","sessionId":A,
+                "attachment":{"type":"deferred_tools_record","source_uuid":"target"}}),
+            json!({"type":"attachment","uuid":"q1","parentUuid":"x1","sessionId":A,
+                "attachment":{"type":"queued_command","prompt":"q","source_uuid":"target"}}),
+            user_line("u2", Some("q1"), &real, "two"),
+        );
+        write_session(&root, &slug, A, &body, 50);
+        let mut n = 0u32;
+        let mut gen = || {
+            n += 1;
+            format!("00000000-0000-4000-8000-{n:012}")
+        };
+        let fork_id = fork(&root, A, &real, &mut gen, Some("target")).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        // u1, a1, x1, q1, custom-title: u2 is past the queued command.
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[3]["attachment"]["type"], json!("queued_command"));
+        assert_eq!(lines[4]["type"], json!("custom-title"));
+    }
+
+    /// M-33/M-32 — `nve`: the fork title reads the tail window's customTitle,
+    /// then the head window's, then the aiTitles, then the first prompt. A
+    /// customTitle only in the middle of the file is not a title.
+    #[test]
+    fn m32_fork_title_reads_only_the_head_and_tail_windows() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        let filler = |from: usize, to: usize| -> String {
+            (from..to)
+                .map(|i| {
+                    json!({"type": "progress", "uuid": format!("f{i}"), "parentUuid": "u1",
+                        "sessionId": A, "timestamp": "2026-01-01T00:00:00.000Z",
+                        "data": "x".repeat(200)})
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The middle title sits past the 64 KiB head window and before the
+        // 64 KiB tail window.
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            user_line("u1", None, &real, "hello"),
+            filler(0, 400),
+            json!({"type": "custom-title", "sessionId": A, "customTitle": "MID-TITLE"}),
+            filler(400, 800),
+            json!({"type": "progress", "uuid": "last", "parentUuid": "u1",
+                "sessionId": A, "timestamp": "2026-01-01T00:00:00.000Z", "data": "end"}),
+        );
+        assert!(
+            body.len() > (3 * WINDOW) as usize,
+            "the title is in the middle"
+        );
+        write_session(&root, &slug, A, &body, 50);
+        let mut n = 0u32;
+        let mut gen = || {
+            n += 1;
+            format!("00000000-0000-4000-8000-{n:012}")
+        };
+        let fork_id = fork(&root, A, &real, &mut gen, None).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1]["customTitle"], json!("hello (fork)"));
+
+        // A tail customTitle wins over a head one.
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            json!({"type": "custom-title", "sessionId": A, "customTitle": "HEAD-TITLE"}),
+            user_line("u1", None, &real, "hello"),
+            filler(0, 400),
+            json!({"type": "custom-title", "sessionId": A, "customTitle": "MID-TITLE"}),
+            json!({"type": "custom-title", "sessionId": A, "customTitle": "TAIL-TITLE"}),
+        );
+        write_session(&root, &slug, A, &body, 60);
+        let fork_id = fork(&root, A, &real, &mut gen, None).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        assert_eq!(
+            lines[1]["customTitle"],
+            json!("TAIL-TITLE (fork)"),
+            "{lines:?}"
+        );
+    }
+
+    /// M-32/LOW-6 — `ive` remaps compactMetadata anchors through the kept
+    /// (non-progress) map, so an anchor that points at a progress entry is
+    /// left alone.
+    #[test]
+    fn m32_fork_compact_anchor_at_a_progress_entry_is_not_remapped() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        let body = format!(
+            "{}\n{}\n{}\n{}\n",
+            user_line("u1", None, &real, "one"),
+            json!({"type":"progress","uuid":"p1","parentUuid":"u1","sessionId":A,
+                "timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"b1",
+                "parentUuid":"p1","sessionId":A,
+                "compactMetadata":{"preservedMessages":{"anchorUuid":"p1","uuids":["p1"]}}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"p1","sessionId":A,
+                "message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}),
+        );
+        write_session(&root, &slug, A, &body, 50);
+        let mut n = 0u32;
+        let mut gen = || {
+            n += 1;
+            format!("00000000-0000-4000-8000-{n:012}")
+        };
+        let fork_id = fork(&root, A, &real, &mut gen, None).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let boundary = lines
+            .iter()
+            .find(|l| l["type"] == json!("system"))
+            .expect("boundary");
+        assert_eq!(
+            boundary["compactMetadata"]["preservedMessages"]["anchorUuid"],
+            json!("p1")
+        );
+        assert_eq!(
+            boundary["compactMetadata"]["preservedMessages"]["uuids"],
+            json!(["p1"])
+        );
+    }
+
+    /// LOW-4 — the fork file is created exclusively: an id that already has a
+    /// file is refused, never overwritten (`hu`'s `mode: 384` write, carried
+    /// without platform mode code).
+    #[test]
+    fn m32_fork_refuses_to_overwrite_an_existing_id() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        write_session(&root, &slug, A, &user_line("u1", None, &real, "one"), 50);
+        write_session(&root, &slug, "dup", "existing\n", 60);
+        let mut gen = || "dup".to_string();
+        assert!(matches!(
+            fork(&root, A, &real, &mut gen, None),
+            Err(StoreError::Io(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join(&slug).join("dup.jsonl")).expect("kept"),
+            "existing\n"
+        );
+    }
+
     #[test]
     fn inv_52_fork_errors() {
         let tmp = TempDir::new();
         let root = tmp.0.join("projects");
         let mut gen = || "x".to_string();
         assert!(matches!(
-            fork(&root, "bad", "/p", &mut gen),
+            fork(&root, "bad", "/p", &mut gen, None),
             Err(StoreError::Invalid(_))
         ));
         assert!(matches!(
-            fork(&root, A, "/p", &mut gen),
+            fork(&root, A, "/p", &mut gen, None),
             Err(StoreError::NotFound(_))
         ));
     }

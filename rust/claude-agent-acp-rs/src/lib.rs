@@ -7,16 +7,22 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod acp_subagents;
 pub mod agent;
 pub mod air;
 pub mod async_tasks;
 pub mod auth_status;
 pub mod client_caps;
 pub mod codec;
+pub mod context_compaction;
+pub mod context_compaction_meta;
 pub mod control;
 pub mod diff;
 pub mod dispatch;
+pub mod elicitation;
 pub mod env_snapshot;
+pub mod event_loop_yield;
+pub mod fork_session;
 pub mod gateway_models;
 pub mod goal;
 pub mod hide_claude_auth;
@@ -24,7 +30,9 @@ pub mod hooks;
 pub mod logger;
 pub mod map;
 pub mod mcp_command;
+pub mod message_ids;
 pub mod meta_filter;
+pub mod native_subagents;
 pub mod notices;
 pub mod permission;
 pub mod permission_mode;
@@ -48,12 +56,14 @@ pub mod settings;
 pub mod settings_manager;
 pub mod system_prompt;
 pub mod tool_meta;
+pub mod tool_reporters_compaction;
 pub mod tools;
 pub mod transcript;
 pub mod turn;
 pub mod unfinished;
 pub mod usage;
 pub mod usage_markdown;
+pub mod v2;
 
 // Public library surface mirroring upstream `src/lib.ts` (FX-4 / O-83, Q-19).
 pub use agent::serve as run_acp;

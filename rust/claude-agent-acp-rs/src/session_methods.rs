@@ -86,15 +86,22 @@ pub fn fork_point_message_id(params: &Value) -> Option<String> {
 }
 
 /// Copy the latest transcript of `source_id` into a new session under `cwd`'s
-/// project; returns the new session id.
+/// project, optionally up to one transcript uuid; returns the new session id.
 pub async fn fork_copy(
     source_id: String,
     cwd: String,
+    up_to: Option<String>,
     env: &crate::env_snapshot::EnvSnapshot,
 ) -> Result<String, Error> {
     let root = session_store::projects_root_with_env(env);
     tokio::task::spawn_blocking(move || {
-        session_store::fork(&root, &source_id, &cwd, &mut crate::agent::uuid_v4)
+        session_store::fork(
+            &root,
+            &source_id,
+            &cwd,
+            &mut crate::agent::uuid_v4,
+            up_to.as_deref(),
+        )
     })
     .await
     .map_err(join_error)?

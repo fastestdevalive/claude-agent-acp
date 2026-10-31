@@ -54,6 +54,7 @@ pub(super) fn rig() -> Rig {
         auth_contexts: std::collections::HashMap::new(),
         guard_states: std::collections::HashMap::new(),
         hide_claude_auth: true,
+        protocol: crate::v2::ProtocolMode::V1,
         provider_gate: Arc::new(tokio::sync::Semaphore::new(GATE_PERMITS as usize)),
         provider_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sessions_view: Arc::new(watch::channel(std::collections::HashMap::new()).0),

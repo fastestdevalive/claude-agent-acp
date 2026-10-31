@@ -110,6 +110,14 @@ impl ToolBooks {
         }
     }
 
+    /// Whether any foreground tool call is still open (`foregroundWork.has(sessionId)`,
+    /// `acp-agent.ts:3824-3832`): a cycle Claude Code started on its own keeps
+    /// one even when `turnQueue` is empty.
+    #[must_use]
+    pub fn has_foreground(&self) -> bool {
+        self.foreground.values().any(|ids| !ids.is_empty())
+    }
+
     fn take_turn(&mut self, prompt_uuid: &str) -> Vec<String> {
         self.foreground.remove(prompt_uuid).unwrap_or_default()
     }

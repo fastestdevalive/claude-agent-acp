@@ -46,6 +46,12 @@ pub enum Step {
         /// both are present the explicit `_meta` is merged over the object's.
         #[serde(default)]
         client_capabilities: Option<Value>,
+        /// Send `client_capabilities` VERBATIM instead of through the typed
+        /// `ClientCapabilities` (T5FA): the pinned schema gates
+        /// `session.compaction` behind a cargo feature this crate does not
+        /// enable, so the typed round-trip would strip it from the capture.
+        #[serde(default)]
+        raw_capabilities: bool,
     },
     /// `session/new`
     #[serde(rename = "session/new")]
@@ -187,7 +193,8 @@ mod tests {
             script.steps[0],
             Step::Initialize {
                 client_capabilities_meta: None,
-                client_capabilities: None
+                client_capabilities: None,
+                raw_capabilities: false
             }
         );
         assert_eq!(
@@ -316,7 +323,8 @@ mod tests {
                 client_capabilities_meta: Some(serde_json::json!({
                     "jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}
                 })),
-                client_capabilities: None
+                client_capabilities: None,
+                raw_capabilities: false
             }
         );
     }
@@ -366,6 +374,7 @@ mod tests {
         let Step::Initialize {
             client_capabilities_meta,
             client_capabilities,
+            ..
         } = &script.steps[0]
         else {
             panic!("expected an initialize step");

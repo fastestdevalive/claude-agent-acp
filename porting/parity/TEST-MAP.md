@@ -7,7 +7,7 @@
 
 file | case title | status | note
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > uses permissions.defaultMode for new sessions | covered:spawn-settings-mode | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > initial effort reflects SDK state: %j | missing:F11 | O-56: creation-time effort seeding, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > initial effort reflects SDK state: %j | covered:config-recommended-air | .each over SDK effort states: covered by the creation-time effort seeding tests in tests/t5a2_fast_mode.rs and src/session/tests_t5a2.rs
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > keeps a settings-requested ultracode on when applying effort | ported:tests/t1b_config.rs::effort_flag_settings_carries_ultracode_only_when_requested | pure effortFlagSettings; session.rs:1972 passes ext.config.ultracode
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > seeds effort from higher-priority programmatic model settings | missing:F11 | O-50/O-56: session.rs must call merge_effort_settings (ported) for the seed, Turn 5
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > supports acceptEdits mode defaults | covered:spawn-settings-mode | 
@@ -25,7 +25,7 @@ src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > falls back to '
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > ignores model from settings when it is not a string | ported:src/session_model.rs::f5b_settings_model_non_string_logged_and_ignored | upstream message text asserted
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > advertises `auto` when the resolved model lacks supportsAutoMode | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > includes `auto` when the resolved model has supportsAutoMode: true | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > falls back permissions.defaultMode='auto' to Accept edits on an unsupported model | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > falls back permissions.defaultMode='auto' to Accept edits on an unsupported model | covered:config-set-mode-auto-config | 
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > does not clamp permissions.defaultMode='auto' on a model that supports auto | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > restricts configOptions to the user's allowlist using their exact IDs | covered:config-model-allowlist | Node-captured picker
 src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > unions availableModels across user and project settings | ported:src/settings.rs::f5b_available_models_union_across_tiers | source-order union+dedupe
@@ -46,8 +46,8 @@ src/tests/acp-agent.test.ts | task plan lifecycle > clears the task plan on a co
 src/tests/acp-agent.test.ts | ACP subprocess integration > should connect to the ACP subprocess | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | ACP subprocess integration > should include available commands | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | ACP subprocess integration > /compact works | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | ACP subprocess integration > /compact reports the ACP compaction lifecycle to a capable client | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | ACP subprocess integration > routes AskUserQuestion through ACP form elicitation and round-trips the answer | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | ACP subprocess integration > /compact reports the ACP compaction lifecycle to a capable client | ported:tests/t5fa_compaction_update_session.rs::t5fa_compaction_update_session_matches_the_node_golden | 
+src/tests/acp-agent.test.ts | ACP subprocess integration > routes AskUserQuestion through ACP form elicitation and round-trips the answer | ported:tests/t4a3_ask_user_question.rs::t4a3_ask_user_question_form_is_sent_and_answer_applied | 
 src/tests/acp-agent.test.ts | Central auth settings integration > uses the local project override instead of an unused user Central helper | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | Central auth settings integration > honors the programmatic helper override %j | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | Central auth settings integration > does not let a late SDK result restore the previous helper name | missing:T-UNCLASSIFIED | 
@@ -106,43 +106,43 @@ src/tests/acp-agent.test.ts | stripLocalCommandMetadata > handles null/undefined
 src/tests/acp-agent.test.ts | usage Markdown > keeps the expected experimental SDK response shape compile- and runtime-checked | ported:src/usage_markdown.rs::keeps_the_expected_experimental_sdk_response_shape | 
 src/tests/acp-agent.test.ts | usage Markdown > renders limits, session totals, and MCP contributions from structured data | ported:src/usage_markdown.rs::renders_limits_session_totals_and_mcp_contributions | 
 src/tests/acp-agent.test.ts | usage Markdown > escapes and limits MCP contribution rows | ported:src/usage_markdown.rs::escapes_and_limits_mcp_contribution_rows | 
-src/tests/acp-agent.test.ts | usage Markdown > recognizes only exact local usage commands | ported:src/usage_markdown.rs::recognizes_only_exact_local_usage_commands | 
+src/tests/acp-agent.test.ts | usage Markdown > recognizes only exact local usage commands | ported:src/session/tests_t4fa.rs::t4fa_usage_detection_requires_a_single_text_block | 
 src/tests/acp-agent.test.ts | usage Markdown > omits the limits section when every utilization is unavailable | ported:src/usage_markdown.rs::omits_the_limits_section_when_every_utilization_is_unavailable | 
-src/tests/acp-agent.test.ts | usage Markdown > replaces the exact SDK /usage turn output with structured Markdown | missing:F24 | needs the /usage command in the session (S-01/N-10, Turn 4 lane A)
-src/tests/acp-agent.test.ts | usage Markdown > forwards a later diagnostic from the same local-command output lane | missing:F24 | needs local_command_output handling (N-10, Turn 4 lane A)
-src/tests/acp-agent.test.ts | usage Markdown > does not append usage Markdown to a model-generated /usage result | missing:F24 | needs the /usage command in the session (S-01/N-10, Turn 4 lane A)
-src/tests/acp-agent.test.ts | usage Markdown > runs the original command and preserves its raw output when %s | missing:F24 | needs the /usage command in the session (S-01/N-10, Turn 4 lane A)
-src/tests/acp-agent.test.ts | usage Markdown > cancels a turn while structured usage is pending without publishing fallback output | missing:F24 | needs cancel/pending wiring (S-01, Turn 4 lane A)
+src/tests/acp-agent.test.ts | usage Markdown > replaces the exact SDK /usage turn output with structured Markdown | ported:src/session/tests_t4fa.rs::t4fa_usage_success_swaps_in_the_markdown | 
+src/tests/acp-agent.test.ts | usage Markdown > forwards a later diagnostic from the same local-command output lane | ported:tests/t4a_usage.rs::t4a_usage_is_replaced_by_the_structured_markdown | 
+src/tests/acp-agent.test.ts | usage Markdown > does not append usage Markdown to a model-generated /usage result | ported:tests/t4a_usage.rs::t4a_usage_does_not_replace_a_model_answer | 
+src/tests/acp-agent.test.ts | usage Markdown > runs the original command and preserves its raw output when %s | ported:tests/t4a_usage.rs::t4a_usage_incompatible_response_keeps_the_cli_output | .each variants: invalid response, rejected request (error) and runtime-method-missing (timeout/error fallbacks) are t4a_usage_incompatible_response_keeps_the_cli_output, t4a_usage_error_keeps_the_cli_output, t4a_usage_timeout_keeps_the_cli_output
+src/tests/acp-agent.test.ts | usage Markdown > cancels a turn while structured usage is pending without publishing fallback output | ported:src/session/tests_t4a.rs::t4a_cancelled_usage_turn_publishes_nothing | 
 src/tests/acp-agent.test.ts | isLocalCommandMetadata > is true when stripping leaves nothing | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | isLocalCommandMetadata > is false when real content survives stripping | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | synthetic login message (issue #863) > isSyntheticLoginMessage matches the CLI auth-error message | ported:src/session/tests_t2a.rs::t2a_synthetic_login_message_matching | matches the CLI auth-error message
 src/tests/acp-agent.test.ts | synthetic login message (issue #863) > isSyntheticLoginMessage does not match real assistant messages | ported:src/session/tests_t2a.rs::t2a_synthetic_login_message_matching | real assistant messages do not match
 src/tests/acp-agent.test.ts | synthetic login message (issue #863) > loadSession replay hands the client the prompt without the reminder appended to it | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | synthetic login message (issue #863) > loadSession replay skips the synthetic login message but keeps the rest | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | task notification replay > hides the notification and restores the task state like the live frame | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | task notification replay > hides the notification and restores the task state like the live frame | ported:src/transcript.rs::b45_replay_restores_a_background_task_card | 
 src/tests/acp-agent.test.ts | task notification replay > detects a notification without an origin by its text and maps killed to stopped | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > restores a background task launched by a %s block | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > routes a task to the session of its launching tool even when the root receives the stop | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > keeps the user text next to an embedded notification | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > sends nothing for a task that no tool call in the history started | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > takes the output path from the tool result when the notification has none | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | task notification replay > sends nothing for a task that a Monitor tool call started | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | task notification replay > sends nothing for a task that a Monitor tool call started | ported:src/transcript.rs::b45_native_subagent_notification_restores_no_async_task | 
 src/tests/acp-agent.test.ts | task notification replay > sends one terminal state for a repeated notification | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > restores the notified state of a background Agent after its launch result | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > keeps a task-notification delivery with a subkind as a prompt | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | meta messages from other agents, sessions and channels > isReplayHiddenMetaMessage matches only meta messages with an inter-agent origin | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | meta messages from other agents, sessions and channels > loadSession replay skips them but keeps the user's own prompt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage-limit failure replay > restores the latest synthetic usage limit as a typed failure | ported:src/transcript.rs::t3a_replay_restores_usage_limit_failures_at_their_position | covered too by scenario session-failure-replay-usage-limit
+src/tests/acp-agent.test.ts | usage-limit failure replay > restores the latest synthetic usage limit as a typed failure | ported:src/transcript.rs::t3a_replay_restores_usage_limit_failures_at_their_position | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > keeps a recovered historical failure as a typed transcript record | ported:src/transcript.rs::t3a_replay_limit_followed_by_a_real_answer_is_not_active | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > preserves the standard transcript for clients without the extension | ported:src/transcript.rs::t3a_replay_restores_usage_limit_failures_at_their_position | plain-client half of the test
 src/tests/acp-agent.test.ts | usage-limit failure replay > clears the replayed failure after a successful follow-up | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > does not clear restored quota after a successful local command | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | usage-limit failure replay > replays every quota failure with its persisted turn id and keeps only the latest active | covered:session-failure-replay-usage-limit | 
+src/tests/acp-agent.test.ts | usage-limit failure replay > replays every quota failure with its persisted turn id and keeps only the latest active | ported:src/transcript.rs::t3a_replay_limit_followed_by_a_real_answer_is_not_active | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > does not record a restored failure when publishing it fails | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | usage-limit failure replay > recognizes a sanitized raw transcript through the real SDK parser | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/list > returns one page and a cursor while more sessions exist | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/list > rejects a cursor that it did not issue | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent transcript replay > replays a subagent from its own transcript file | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | subagent transcript replay > replays a subagent from its own transcript file | ported:src/transcript.rs::b53_load_replay_end_marker_shape | 
 src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > replays a fork child without the launching message and boilerplate it inherited | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > replays each child under its live session id, with its incoming messages, before the response | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > ends a child that the user stopped as cancelled, and one without a known end as idle | missing:T-UNCLASSIFIED | 
@@ -208,9 +208,9 @@ src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > omi
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > restores the attribution via the streamed refinement when the eager emission raced task_started | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > routes native child tool calls and permission requests to the child session | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > reports a child as requires_action while its permission request is open (the subagents RFD) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > a child's permission request that Claude Code withdraws (the subagents RFD) > reports no running when a cancel withdraws it, and leaves the child's end to the SDK | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > a child's permission request that Claude Code withdraws (the subagents RFD) > reports no running when a cancel withdraws it, and leaves the child's end to the SDK | ported:src/session/tests_t4fd.rs::t4fd_withdrawn_request_ends_the_token_as_withdrawn | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > a child's permission request that Claude Code withdraws (the subagents RFD) > reports no running when a session/close withdraws it | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > a child's permission request that Claude Code withdraws (the subagents RFD) > reports running when Claude Code withdraws it on its own, since the child goes on | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > a child's permission request that Claude Code withdraws (the subagents RFD) > reports running when Claude Code withdraws it on its own, since the child goes on | ported:src/session/tests_t4fd.rs::t4fd_a_cli_withdraw_without_a_cancel_reports_running | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > sends the PostToolUse hook update of a child's Edit to the child session | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > keeps a raced permission on the root until the child is announced | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > keeps a raced permission's tool call on the root after a cancel, while its background child runs on | missing:T-UNCLASSIFIED | 
@@ -267,12 +267,12 @@ src/tests/acp-agent.test.ts | native subagent eager tool ownership > keeps permi
 src/tests/acp-agent.test.ts | native subagent eager tool ownership > pins a raced child tool lifecycle to the root where permission created it | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | runPromptWithCancellation > cancels the in-flight prompt when the request signal aborts ($/cancel_request) | ported:tests/wire_transport.rs::wire_cancel_request_cancels_the_prompt | prompt settles `cancelled` via the session cancel path |
 src/tests/acp-agent.test.ts | runPromptWithCancellation > does not cancel after the prompt settles normally | ported:tests/wire_transport.rs::wire_late_cancel_request_is_ignored | the cancellation watch is dropped with the reply | 
-src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when success result has stop_reason max_tokens | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
+src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when success result has stop_reason max_tokens | ported:src/session/tests_t4fa.rs::t4fa_usage_max_tokens_is_untouched | 
 src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when success result has stop_reason max_tokens and is_error true | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
 src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when error_during_execution has stop_reason max_tokens | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
 src/tests/acp-agent.test.ts | stop reason propagation > should return end_turn for success with null stop_reason | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
 src/tests/acp-agent.test.ts | stop reason propagation > should consume background task results and return the prompt's own result | ported:src/turn/turn_tests.rs::autonomous_result_does_not_touch_live_turn | 
-src/tests/acp-agent.test.ts | stop reason propagation > only reconciles Fast mode from user-driven results, not task-notification followups | missing:T-PORT | Fast mode reconcile on user results only (lane B fast-mode config)
+src/tests/acp-agent.test.ts | stop reason propagation > only reconciles Fast mode from user-driven results, not task-notification followups | ported:src/session/tests_t5a2.rs::t5a2_result_reconciles_fast_mode_and_ignores_cooldown_and_autonomous_results | 
 src/tests/acp-agent.test.ts | stop reason propagation > does not fold a task-notification result's tokens into an already-active turn's usage | ported:src/turn/turn_tests.rs::inv_48_machine_autonomous_advances_reading_not_tally | 
 src/tests/acp-agent.test.ts | stop reason propagation > ignores command_lifecycle frames without logging an unexpected-case error | ported:src/turn/turn_tests_t1a.rs::f13_lifecycle_diagnostics | 
 src/tests/acp-agent.test.ts | stop reason propagation > treats the command_lifecycle 'refused' state (2.1.238+) as terminal, not unknown | ported:src/turn/turn_tests_t1a.rs::f13_lifecycle_diagnostics | 
@@ -284,7 +284,7 @@ src/tests/acp-agent.test.ts | stop reason propagation > maps the SDK goal shape 
 src/tests/acp-agent.test.ts | stop reason propagation > settles a no-echo command result (e.g. /compact) by promoting the head turn | ported:src/turn/turn_tests.rs::echo_less_result_promotes_head | 
 src/tests/acp-agent.test.ts | stop reason propagation > resolves at the terminal result without waiting for a lagging idle (issue #773) | covered:lagging-idle | 
 src/tests/acp-agent.test.ts | stop reason propagation > forwards background output that arrives after the turn resolves (issue #679) | missing:F14 | post-settle background output with real task frames
-src/tests/acp-agent.test.ts | stop reason propagation > should throw internal error for success with is_error true and no max_tokens | ported:src/turn/turn_tests.rs::result_subtype_grid | 
+src/tests/acp-agent.test.ts | stop reason propagation > should throw internal error for success with is_error true and no max_tokens | ported:src/session/tests_t4fa.rs::t4fa_usage_login_error_keeps_its_result | 
 src/tests/acp-agent.test.ts | stop reason propagation > publishes the Claude failure title for compatible AIR version %i | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > updates an api retry warning into the terminal failure | missing:F25 | session failure completion / auth recovery / worker shutdown
 src/tests/acp-agent.test.ts | stop reason propagation > says how long a no-response retry waited and will wait | missing:F25 | session failure completion / auth recovery / worker shutdown
@@ -314,7 +314,7 @@ src/tests/acp-agent.test.ts | stop reason propagation > uses a fresh session-sco
 src/tests/acp-agent.test.ts | stop reason propagation > publishes and returns a sanitized transport failure when the query iterator throws | ported:src/session/tests_t1ga.rs::t1ga_air_child_death_ends_the_active_turn_with_transport_lost | AIR active turn ends end_turn with transport_lost meta; also t1ga_air_child_death_without_an_active_turn_publishes_the_failure_on_the_session and the Node-captured process-death-active-air / process-death-reload-air
 src/tests/acp-agent.test.ts | stop reason propagation > forwards SDKAssistantMessage.error as structured data on internal errors | covered:session-failure-provider-error | 
 src/tests/acp-agent.test.ts | stop reason propagation > omits errorKind data when no SDKAssistantMessage.error was observed | covered:error-result | 
-src/tests/acp-agent.test.ts | model refusal fallback handling > notifies the user and reconciles model state on model_refusal_fallback | covered:frame-model-fallback | notice and model state sync
+src/tests/acp-agent.test.ts | model refusal fallback handling > notifies the user and reconciles model state on model_refusal_fallback | ported:src/session/tests_t5a2.rs::t5fa3_an_inline_switch_completes_when_the_control_response_rides_the_stream | 
 src/tests/acp-agent.test.ts | model refusal fallback handling > includes the refusal explanation in the fallback notice when present | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_notice_and_transcript | explanation in the notice
 src/tests/acp-agent.test.ts | model refusal fallback handling > publishes the model fallback as a warning advisory for AIR clients | covered:frame-api-retry-air | warning advisory for AIR
 src/tests/acp-agent.test.ts | model refusal fallback handling > publishes the model fallback as a notice for clients on the notice contract | ported:src/session/tests_t2a.rs::t2a_model_refusal_fallback_notice_and_transcript | notice on the notice contract
@@ -330,20 +330,20 @@ src/tests/acp-agent.test.ts | model refusal fallback handling > keeps the banner
 src/tests/acp-agent.test.ts | model refusal fallback handling > ignores a non-human-authored refusal banner (refused_user_message_uuid null) | ported:src/session/tests_t2a.rs::t2a_refusal_explanation_streams_at_the_result | non-human-authored banner ignored
 src/tests/acp-agent.test.ts | terminal slash command filtering > latches init's terminal_slash_commands and re-advertises without them | covered:terminal-commands | corpus terminal-commands (T1-G9a) |
 src/tests/acp-agent.test.ts | terminal slash command filtering > does not re-advertise when a later init repeats the same latch | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | skill commands in available_commands_update > marks a skill with a SKILL.md on disk for an AIR client | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | skill commands in available_commands_update > resolves the SKILL.md paths again after a commands_changed | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | skill commands in available_commands_update > gives a client that is not AIR no _meta | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | skill commands in available_commands_update > marks a skill with a SKILL.md on disk for an AIR client | ported:src/session/tests_t4a.rs::t4a_air_skill_commands_carry_kind_and_path | 
+src/tests/acp-agent.test.ts | skill commands in available_commands_update > resolves the SKILL.md paths again after a commands_changed | ported:src/session/tests_t4a.rs::t4a_air_skill_commands_carry_kind_and_path | 
+src/tests/acp-agent.test.ts | skill commands in available_commands_update > gives a client that is not AIR no _meta | ported:src/session/tests_t4a.rs::t4a_air_skill_commands_carry_kind_and_path | 
 src/tests/acp-agent.test.ts | logout > advertises the logout capability during initialize | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | logout > advertises the agent subagent capability of AIR's draft to AIR alone | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | logout > negotiates subagents through AIR metadata when the SDK strips the draft field | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | logout > advertises canonical AIR sessionFailure support during initialize | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | logout > advertises AIR sessionFailure support even before client negotiation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/fork > starts the forked session, so the client can prompt it at once | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | session/fork > starts the forked session, so the client can prompt it at once | ported:tests/t5b_fork.rs::m32_fork_without_point_copies_latest_transcript | 
 src/tests/acp-agent.test.ts | session/fork > reuses the forked session for a later resume or load with the same settings | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/fork > fails when the forked session cannot start | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/fork > forks the latest turn in the requested workspace | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/fork > forks at an AIR message id through the current SDK | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/fork > forks at an inactive persisted branch by $resolution | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | session/fork > forks the latest turn in the requested workspace | ported:src/session_store.rs::m32_fork_copies_fork_metadata_records | 
+src/tests/acp-agent.test.ts | session/fork > forks at an AIR message id through the current SDK | ported:tests/t5fb_fork_cut.rs::m33_fork_point_cut_follows_the_live_chain | 
+src/tests/acp-agent.test.ts | session/fork > forks at an inactive persisted branch by $resolution | ported:src/fork_session.rs::m33_resolves_live_active_and_full_history | 
 src/tests/acp-agent.test.ts | session/close > should close an existing session and remove it | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/close > should abort the session's abort controller | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/close > is idempotent for a session that is not loaded here | missing:T-UNCLASSIFIED | 
@@ -421,19 +421,19 @@ src/tests/acp-agent.test.ts | assembled assistant text fallback > does not forwa
 src/tests/acp-agent.test.ts | assembled assistant text fallback > emits one compaction tool lifecycle and ignores duplicate terminal status | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > does not repeat a failed compaction error delivered as an assistant message | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > does not replay stale local-command output after a successful compaction | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > emits the ACP compaction lifecycle for a client that advertises session.compaction | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > emits the ACP compaction lifecycle for a client that advertises session.compaction | ported:tests/t5fa_compaction_update_session.rs::t5fa_compaction_update_session_matches_the_node_golden | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > reports a failed compaction through compaction_update and swallows the duplicated stdout | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > closes a compaction the turn abandoned as cancelled, before the prompt settles | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > closes compaction before a cancelled wedged prompt settles (%s) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > discards force-cancelled compaction frames until the next %s | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > closes an active compaction before the SDK iterator %s | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > resets an active compaction before starting a fresh compaction lifecycle | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > closes a compaction the turn abandoned as cancelled, before the prompt settles | ported:src/session/tests_t5a.rs::t5a_result_closes_an_open_compaction_update_as_cancelled | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > closes compaction before a cancelled wedged prompt settles (%s) | ported:src/session/tests_t5a.rs::t5a_cancel_interrupts_the_compaction_and_drops_late_frames | .each variants covered by the compaction interrupt/restart tests in tests/t5fa_restart.rs and src/session/tests_t5fa.rs
+src/tests/acp-agent.test.ts | assembled assistant text fallback > discards force-cancelled compaction frames until the next %s | ported:src/session/tests_t5fa.rs::t5fa_command_lifecycle_started_resumes_after_cancel | .each variants covered by the compaction interrupt/restart tests in tests/t5fa_restart.rs and src/session/tests_t5fa.rs
+src/tests/acp-agent.test.ts | assembled assistant text fallback > closes an active compaction before the SDK iterator %s | ported:src/session/tests_t5fa.rs::t5fa_stream_end_closes_an_open_entity_as_cancelled | .each variants covered by the compaction interrupt/restart tests in tests/t5fa_restart.rs and src/session/tests_t5fa.rs
+src/tests/acp-agent.test.ts | assembled assistant text fallback > resets an active compaction before starting a fresh compaction lifecycle | ported:src/session/tests_t5fa.rs::t5fa_conversation_reset_closes_the_entity_and_drops_the_pending_summary | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > does not open a compaction entity from API compaction stream blocks alone | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > replays a persisted compaction summary as a completed compaction_update for capable clients | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > preserves the model response after multiple compactions in one turn | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > emits a completed compaction tool call for a terminal-only result | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > uses compaction deltas as a single heartbeat without exposing the summary | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | assembled assistant text fallback > does not let a previous turn's lagging idle reset the active compaction | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | assembled assistant text fallback > does not let a previous turn's lagging idle reset the active compaction | ported:src/session/tests_t5fa.rs::t5fa_idle_settling_a_held_turn_does_not_reset_the_compaction | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > marks informational notices with metadata | covered:frame-informational | informational metadata
 src/tests/acp-agent.test.ts | assembled assistant text fallback > marks info-level notices even when their text has no severity prefix | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > delivers an informational frame as a notice and still owns the result text | ported:src/session/tests_t2a.rs::t2a_informational_notice_dedupes_and_owns_the_result_text | notice owns the result text
@@ -670,10 +670,10 @@ src/tests/acp-scenarios-compare.test.ts | compareWithBaseline > available_comman
 src/tests/acp-scenarios-compare.test.ts | compareWithBaseline > available_commands_update > reports a dropped command | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios-compare.test.ts | compareWithBaseline > available_commands_update > reports a changed mcp command that origin/main listed | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios-v2.test.ts | ACP v2 scenarios > pass, or stop as the table says | missing:T-UNCLASSIFIED | 
-src/tests/acp-scenarios-v2.test.ts | ACP v2 scenarios > schema check > rejects a message that breaks the v2 schema | missing:T-UNCLASSIFIED | 
+src/tests/acp-scenarios-v2.test.ts | ACP v2 scenarios > schema check > rejects a message that breaks the v2 schema | different:the v2 schema validation runs in capture.sh --v2 (Node, Ajv against the SDK schema) when goldens are captured; Rust has no schema validator | 
 src/tests/acp-scenarios-v2.test.ts | ACP v2 scenarios > schema check > %s | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios-v2.test.ts | ACP v2 scenarios > tool calls are reported with a title first > %s | missing:T-UNCLASSIFIED | 
-src/tests/acp-scenarios-v2.test.ts | ACP v2 scenarios > v2 golden files > %s | missing:T-UNCLASSIFIED | 
+src/tests/acp-scenarios-v2.test.ts | ACP v2 scenarios > v2 golden files > %s | ported:tests/t5c_v2_harness.rs::test_d03_replay_captured_v2_initialize_golden | .each over the v2 scenario goldens: only the captured initialize golden exists in this turn (tests/t5c_v2_harness.rs); the other scenarios arrive with the v2 surface in Turns 6-7
 src/tests/acp-scenarios.test.ts | the origin/main baseline > writes the recordings of the plain and Zed profiles | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios.test.ts | ACP scenarios > normalize > keeps a UUID that the run did not generate | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios.test.ts | ACP scenarios > normalize > names the generated ids in the order of their first appearance | missing:T-UNCLASSIFIED | 
@@ -713,8 +713,8 @@ src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > drops every update of a 
 src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > gets the Write patch, but no file text in the PostToolUse toolResponse | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > sends no creation patch over a file and no Edit patch before the preview | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > sends the Bash output as terminal deltas | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP protocol routing > serves the unchanged v1 handshake to a v1 client | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP protocol routing > serves the v2 handshake to a v2 client | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP protocol routing > serves the unchanged v1 handshake to a v1 client | covered:initialize-capabilities-plain | 
+src/tests/acp-v2.test.ts | ACP protocol routing > serves the v2 handshake to a v2 client | ported:tests/t5fc_v2_e2e.rs::t5fc_v2_initialize_matches_golden_then_later_requests_are_method_not_found | 
 src/tests/acp-v2.test.ts | ACP v2 sessions > creates a session with v2 MCP servers, config options, and commands | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 sessions > lists the commands in every setup response: resume, resume with replay, and fork | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 sessions > rejects an MCP transport that v1 cannot express | missing:T-UNCLASSIFIED | 
@@ -806,9 +806,9 @@ src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > two request
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports no running before idle cancelled for a request of a cycle that Claude Code started, which a cancel withdraws | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 terminal of a command in the background > keeps the terminal running after the Bash call, and ends it when the command's task ends | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 terminal of a command in the background > ends the terminal at the Bash result when the command's task ended before it | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > renames the group id of grouped select options | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > passes systemPrompt to every v1 session lifecycle request | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > rejects a config option value type that v1 cannot express | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > renames the group id of grouped select options | ported:src/v2/tests.rs::test_o86_v2_config_options | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > passes systemPrompt to every v1 session lifecycle request | ported:src/v2/tests.rs::test_v2_session_lifecycle_helpers | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > rejects a config option value type that v1 cannot express | ported:src/v2/tests.rs::test_o86_v1_set_session_config_option_request | 
 src/tests/acp-v2.test.ts | ACP v2 session translation > fails on session updates that it does not translate yet | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 session translation > passes the subagent updates through, which v1 and v2 share | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 session translation > reports a subagent's work state on the child's stream as well | missing:T-UNCLASSIFIED | 
@@ -846,7 +846,7 @@ src/tests/additional-roots.test.ts | additionalRoots > merges official ACP addit
 src/tests/additional-roots.test.ts | additionalRoots > falls back to _meta.additionalRoots when the official field is omitted | ported:tests/t1b_roots.rs::falls_back_to_meta_additional_roots_when_the_official_field_is_omitted | 
 src/tests/agent-discovery.test.ts | agent discovery (SDK) > BUILTIN_AGENT_NAMES exactly covers the SDK's default agent roster | ported:tests/t1b_config.rs::builtin_agent_names_match_the_upstream_roster | the live-SDK roster comparison (RUN_INTEGRATION_TESTS) is not run offline; the constant is asserted
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > recovers a background Bash task from its structured tool result | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends every update of a task to the session that owned its tool call at the spawn | missing:T-UNCLASSIFIED | 
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends every update of a task to the session that owned its tool call at the spawn | ported:src/native_subagents/tests.rs::air_keeps_work_of_a_child_tool_call_in_its_generation_and_async_tasks_reach_it_late | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > publishes a stopped terminal after a task-specific stop | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > acknowledges a stop as a live notice for a client on the notice contract | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > still announces a stop whose SDK notification landed first | missing:T-UNCLASSIFIED | 
@@ -880,7 +880,7 @@ src/tests/async-tasks.test.ts | AsyncTaskRuntime > heals a lone lost terminal ed
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > recovers a live task whose task_started edge was lost | covered:async-task-level-recovery | level-only recovery
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps level-only recovery panel-only when task_started arrives late | ported:src/async_tasks.rs::t2a_level_recovery_is_panel_only_and_the_late_edge_corrects_it | panel-only stays
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends the changed fields again when a retry follows a failed send | ported:src/async_tasks.rs::t2a_rollback_after_a_failed_send_repeats_the_changed_fields | journal rollback
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > finishes remaining tasks and can retry a task whose terminal publication failed | ported:src/async_tasks.rs::v18_finish_all_continues_and_retries_a_failed_terminal_publication | 
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > finishes remaining tasks and can retry a task whose terminal publication failed | ported:tests/t4fa_settle.rs::t4fa_crash_reports_running_tasks_as_failed | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps the updates of a held task behind its spawn | ported:src/async_tasks.rs::t2a_progress_usage_validation_and_held_beats | held beats follow the spawn
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends the spawn without a tool id when a held task ends first | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > takes the tool id of the terminal notification of a held task | missing:T-UNCLASSIFIED | 
@@ -1010,38 +1010,38 @@ src/tests/clear-context-coordinator.test.ts | ExitPlanCoordinator > settles a re
 src/tests/clear-context-coordinator.test.ts | ExitPlanCoordinator > %s | missing:T-UNCLASSIFIED | 
 src/tests/clear-context-coordinator.test.ts | observeExitPlanToolResults > restores a rejected ExitPlanMode marker from authoritative stream metadata | ported:src/session/exit_plan.rs::t3a_rejected_exit_plan_result_recreates_the_interruption | 
 src/tests/clear-context-coordinator.test.ts | observeExitPlanToolResults > correlates an accepted plan result with its pending context reset | ported:src/session/exit_plan.rs::t3a_tool_result_marks_the_interruption_seen_and_names_the_accepted_plan | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle for a client that is not AIR > sends the upstream tool call fields and no AIR key | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle for a client that is not AIR > sends compaction updates without _meta, and a summary that differs from the chunks | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | clientSupportsCompactionUpdates > requires the v1 session.compaction object | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > keeps only the <summary> body of the hook's raw model output | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > is not fooled by tag names quoted inside the analysis or the summary | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > takes the widest inline span and stays linear without a closing tag | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > strips the persisted continuation framing | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > strips the older tagged transcript framing | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > fails closed on a continuation prompt whose framing it does not recognize | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > strips a leading analysis block even when the summary tags are missing | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > does not let a <summary> mention inside an inline analysis anchor the span | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | compactionSummaryText > passes plain text through and drops empty summaries | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | isCompactSummaryMessage > matches only user messages flagged by Claude Code | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > opens in_progress, carries the hook summary on the terminal update, then enriches from the boundary | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > holds a summary recorded before the opening status and attaches it once | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > keeps a pending summary across a previous turn's reset | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > holds a summary that arrives after a terminal entity for the next compaction | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > ignores a malformed or empty hook payload and reports whether a summary was kept | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > materializes a terminal-only compaction as a single completed update | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > seeds _meta on a boundary-first terminal even without metadata | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > reports failures with the error and consumes the duplicated stdout once | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > streams API compaction text as summary chunks only into an announced entity | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > closes an in-progress entity as cancelled on reset and starts fresh afterwards | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > ignores interrupted work's late frames and hooks until a new turn begins | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > discards pending summaries on interruption and accepts terminal-only output in a new turn | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > leaves completed entities terminal when their surrounding work is interrupted | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > never throws from %s | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > starts a new entity for a compaction that follows a terminal one | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle summary chunks > does not repeat a streamed summary in the terminal update | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle summary for AIR > sends the summary when it differs from the streamed chunks | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (tool_call) > keeps the legacy synthetic tool call and never exposes the summary | missing:T-UNCLASSIFIED | 
-src/tests/context-compaction.test.ts | ContextCompactionLifecycle (tool_call) > materializes a missed opening as a terminal tool_call with the failure content | missing:T-UNCLASSIFIED | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle for a client that is not AIR > sends the upstream tool call fields and no AIR key | ported:src/context_compaction.rs::non_air_tool_call_sends_upstream_fields_and_no_air_key | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle for a client that is not AIR > sends compaction updates without _meta, and a summary that differs from the chunks | ported:src/context_compaction.rs::compaction_updates_without_meta_and_a_summary_that_differs_from_the_chunks | 
+src/tests/context-compaction.test.ts | clientSupportsCompactionUpdates > requires the v1 session.compaction object | ported:src/context_compaction.rs::client_supports_compaction_updates_requires_the_v1_object | 
+src/tests/context-compaction.test.ts | compactionSummaryText > keeps only the <summary> body of the hook's raw model output | ported:src/context_compaction.rs::summary_text_keeps_only_the_tagged_body | 
+src/tests/context-compaction.test.ts | compactionSummaryText > is not fooled by tag names quoted inside the analysis or the summary | ported:src/context_compaction.rs::summary_text_is_not_fooled_by_quoted_tag_names | 
+src/tests/context-compaction.test.ts | compactionSummaryText > takes the widest inline span and stays linear without a closing tag | ported:src/context_compaction.rs::summary_text_takes_the_widest_inline_span_and_stays_linear | 
+src/tests/context-compaction.test.ts | compactionSummaryText > strips the persisted continuation framing | ported:src/context_compaction.rs::summary_text_strips_the_persisted_continuation_framing | 
+src/tests/context-compaction.test.ts | compactionSummaryText > strips the older tagged transcript framing | ported:src/context_compaction.rs::summary_text_strips_the_older_tagged_transcript_framing | 
+src/tests/context-compaction.test.ts | compactionSummaryText > fails closed on a continuation prompt whose framing it does not recognize | ported:src/context_compaction.rs::summary_text_fails_closed_on_unrecognized_continuation_framing | 
+src/tests/context-compaction.test.ts | compactionSummaryText > strips a leading analysis block even when the summary tags are missing | ported:src/context_compaction.rs::summary_text_strips_a_leading_analysis_block_without_summary_tags | 
+src/tests/context-compaction.test.ts | compactionSummaryText > does not let a <summary> mention inside an inline analysis anchor the span | ported:src/context_compaction.rs::summary_text_does_not_anchor_on_a_summary_mention_inside_inline_analysis | 
+src/tests/context-compaction.test.ts | compactionSummaryText > passes plain text through and drops empty summaries | ported:src/context_compaction.rs::summary_text_passes_plain_text_and_drops_empty_summaries | 
+src/tests/context-compaction.test.ts | isCompactSummaryMessage > matches only user messages flagged by Claude Code | ported:src/context_compaction.rs::compact_summary_message_matches_only_flagged_user_messages | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > opens in_progress, carries the hook summary on the terminal update, then enriches from the boundary | ported:src/context_compaction.rs::opens_in_progress_carries_the_summary_then_enriches_from_the_boundary | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > holds a summary recorded before the opening status and attaches it once | ported:src/context_compaction.rs::holds_a_summary_recorded_before_the_opening_status | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > keeps a pending summary across a previous turn's reset | ported:src/context_compaction.rs::keeps_a_pending_summary_across_a_previous_turns_reset | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > holds a summary that arrives after a terminal entity for the next compaction | ported:src/context_compaction.rs::holds_a_summary_that_arrives_after_a_terminal_entity_for_the_next_compaction | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > ignores a malformed or empty hook payload and reports whether a summary was kept | ported:src/context_compaction.rs::ignores_a_malformed_or_empty_hook_payload | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > materializes a terminal-only compaction as a single completed update | ported:src/context_compaction.rs::materializes_a_terminal_only_compaction_as_one_completed_update | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > seeds _meta on a boundary-first terminal even without metadata | ported:src/context_compaction.rs::seeds_meta_on_a_boundary_first_terminal_without_metadata | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > reports failures with the error and consumes the duplicated stdout once | ported:src/context_compaction.rs::failures_carry_the_error_and_consume_the_duplicated_stdout_once | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > streams API compaction text as summary chunks only into an announced entity | ported:src/context_compaction.rs::streams_api_text_as_summary_chunks_only_into_an_announced_entity | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > closes an in-progress entity as cancelled on reset and starts fresh afterwards | ported:tests/t5fa_restart.rs::t5fa3_the_restart_closes_an_open_compaction_entity | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > ignores interrupted work's late frames and hooks until a new turn begins | ported:src/session/tests_t5fa.rs::t5fa3_an_incomplete_tool_call_result_interrupts_the_compaction | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > discards pending summaries on interruption and accepts terminal-only output in a new turn | ported:src/session/tests_t5fa.rs::t5fa_error_result_interrupts_the_compaction | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > leaves completed entities terminal when their surrounding work is interrupted | ported:src/context_compaction.rs::leaves_completed_entities_terminal_when_their_work_is_interrupted | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > never throws from %s | ported:src/context_compaction.rs::reset_and_interrupt_are_idempotent_and_never_panic | .each over the send-failure paths: covered by the lifecycle send-failure tests in src/context_compaction.rs
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (compaction_update) > starts a new entity for a compaction that follows a terminal one | ported:src/context_compaction.rs::starts_a_new_entity_for_a_compaction_that_follows_a_terminal_one | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle summary chunks > does not repeat a streamed summary in the terminal update | ported:src/context_compaction.rs::does_not_repeat_a_streamed_summary_in_the_terminal_update | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle summary for AIR > sends the summary when it differs from the streamed chunks | ported:src/context_compaction.rs::sends_the_summary_when_it_differs_from_the_streamed_chunks | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (tool_call) > keeps the legacy synthetic tool call and never exposes the summary | ported:src/context_compaction.rs::legacy_tool_call_never_exposes_the_summary | 
+src/tests/context-compaction.test.ts | ContextCompactionLifecycle (tool_call) > materializes a missed opening as a terminal tool_call with the failure content | ported:src/context_compaction.rs::materializes_a_missed_opening_as_a_terminal_tool_call_with_failure_content | 
 src/tests/create-session-options.test.ts | createSession options merging > [dynamic#1] | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > [dynamic#2] | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > allowDangerouslySkipPermissions > requests bypass capability by default and mirrors it in the mode catalog | missing:T-UNCLASSIFIED | 
@@ -1060,7 +1060,7 @@ src/tests/create-session-options.test.ts | createSession options merging > defau
 src/tests/create-session-options.test.ts | createSession options merging > passes through user-provided tools string array | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > explicit tools array takes precedence over disableBuiltInTools | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > passes through empty tools array to disable all built-in tools | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > recreates a resumed Query with changed skills and the same session ID | missing:T-UNCLASSIFIED | 
+src/tests/create-session-options.test.ts | createSession options merging > recreates a resumed Query with changed skills and the same session ID | ported:tests/t4a3_init_options.rs::t4a3_init_options_carry_skills_and_verbatim_prompts | 
 src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > keeps the legacy default when neither the client nor caller opts in | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
 src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > preserves caller-provided legacy transcript forwarding | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
 src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > accepts the legacy transcript extension | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
@@ -1104,11 +1104,11 @@ src/tests/create-session-options.test.ts | createSession options merging > cwd v
 src/tests/create-session-options.test.ts | createSession options merging > cwd validation > rejects a non-existent cwd with invalidParams | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > cwd validation > rejects a cwd that points at a file with invalidParams | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > cwd validation > accepts an existing absolute directory | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > elicitation > keeps AskUserQuestion disabled and omits callbacks without elicitation capability | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > elicitation > enables AskUserQuestion and wires the elicitation callback when form is supported | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > elicitation > wires callbacks for url-only elicitation but keeps AskUserQuestion disabled | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > elicitation > starts MCP OAuth as an ACP URL elicitation and completes it after reconnect | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > elicitation > still merges user-provided disallowedTools when AskUserQuestion is enabled | missing:T-UNCLASSIFIED | 
+src/tests/create-session-options.test.ts | createSession options merging > elicitation > keeps AskUserQuestion disabled and omits callbacks without elicitation capability | ported:tests/t4a3_ask_user_question.rs::t4a3_ask_user_question_disallowed_without_form_capability | 
+src/tests/create-session-options.test.ts | createSession options merging > elicitation > enables AskUserQuestion and wires the elicitation callback when form is supported | ported:tests/t4a3_ask_user_question.rs::t4a3_ask_user_question_allowed_with_form_capability | 
+src/tests/create-session-options.test.ts | createSession options merging > elicitation > wires callbacks for url-only elicitation but keeps AskUserQuestion disabled | ported:tests/t4a3_ask_user_question.rs::t4a3_ask_user_question_disallowed_tools_merge | 
+src/tests/create-session-options.test.ts | createSession options merging > elicitation > starts MCP OAuth as an ACP URL elicitation and completes it after reconnect | ported:tests/t4a3_mcp_oauth.rs::t4a3_mcp_reconnect_starts_oauth | 
+src/tests/create-session-options.test.ts | createSession options merging > elicitation > still merges user-provided disallowedTools when AskUserQuestion is enabled | ported:tests/t4a3_ask_user_question.rs::t4a3_ask_user_question_disallowed_tools_merge | 
 src/tests/create-session-options.test.ts | createSession options merging > session/close right after session/new > answers at once and closes the query | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > session/close right after session/new > does not wait for an interrupt queued behind the background getContextUsage | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > context window seeding > does not wait for getContextUsage during session creation | covered:config-session-new | session/new returns without a getContextUsage transcript step | 
@@ -1120,13 +1120,13 @@ src/tests/create-session-options.test.ts | createSession options merging > conte
 src/tests/create-session-options.test.ts | createSession options merging > context window seeding > restores the transcript model for direct session/new resume metadata | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > context window seeding > scopes providerCacheKey by per-session env routing | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > context window seeding > scopes providerCacheKey by provider headers: same endpoint, different headers → different buckets | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > declares the dialog kind and callback when the client supports form elicitation | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > omits the dialog wiring without form elicitation support (url-only included) | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > renders the prompt as a form elicitation and maps the retry choice | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > completes with cancelled when the user keeps the refusal | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > cancels unrecognized dialog kinds without presenting anything | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > cancels on a malformed payload without presenting anything | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > cancels when the elicitation request fails | missing:T-UNCLASSIFIED | 
+src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > declares the dialog kind and callback when the client supports form elicitation | ported:tests/t4a3_elicitation_control.rs::t4a3_supported_dialog_kinds_declared_for_form_client | 
+src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > omits the dialog wiring without form elicitation support (url-only included) | ported:tests/t4a3_elicitation_control.rs::t4a3_no_capability_keeps_sdk_defaults | 
+src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > renders the prompt as a form elicitation and maps the retry choice | ported:tests/t4a3_elicitation_control.rs::t4a3_user_dialog_retry_fallback | 
+src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > completes with cancelled when the user keeps the refusal | ported:tests/t4a3_elicitation_control.rs::t4a3_user_dialog_keep_refusal | 
+src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > cancels unrecognized dialog kinds without presenting anything | ported:tests/t4a3_elicitation_control.rs::t4a3_user_dialog_malformed_payload_cancels | 
+src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > cancels on a malformed payload without presenting anything | ported:tests/t4a3_elicitation_control.rs::t4a3_user_dialog_malformed_payload_cancels | 
+src/tests/create-session-options.test.ts | createSession options merging > refusal fallback dialog > cancels when the elicitation request fails | ported:tests/t4a3_elicitation_control.rs::t4a3_mcp_elicitation_client_error_declines | 
 src/tests/create-session-options.test.ts | createSession options merging > model switches and PreModelSwitch hooks > tolerates a PreModelSwitch hook vetoing the fresh-session model pin | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > model switches and PreModelSwitch hooks > still fails session/new loudly on a non-hook setModel failure | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > model switches and PreModelSwitch hooks > routes the PostCompact hook's summary into the session's compaction lifecycle | missing:T-UNCLASSIFIED | 
@@ -1191,46 +1191,46 @@ src/tests/diff-patch.test.ts | PostToolUse hook patches > builds no patch for a 
 src/tests/diff-patch.test.ts | PostToolUse hook patches > declines a patch that it cannot build exactly | ported:tests/t1c_diff_tests.rs::test_no_preview_when_not_exact | inexact patch returns None fallback
 src/tests/diff-patch.test.ts | PostToolUse hook patches > maps structured hunks to the standard diff | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
 src/tests/diff-patch.test.ts | PostToolUse hook patches > leaves a created file to the tool-call content in the standard mapping | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
-src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > maps a form-mode request, defaulting the schema type to object | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > maps a url-mode request and preserves the elicitation id | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > generates an elicitation id when a url request omits one | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > returns null for a url request with no url | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > maps accept with content | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > defaults accept content to an empty object | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > maps decline and cancel | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > maps a custom/future action to cancel | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | extractAskUserQuestions > reads questions off the tool input | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | extractAskUserQuestions > returns null when there are no questions | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | extractAskUserQuestions > filters out malformed questions (missing options, empty options, bad question) | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | extractAskUserQuestions > returns null when every question is filtered out | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > keys a single-select question by a stable id and carries the prompt in message only | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > carries descriptions structurally and forwards previews under _meta | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > includes a per-question optional free-text custom-answer field | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > builds an array property for multi-select questions and includes per-field question text | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > writes selected labels (keyed by indexed fields) into updatedInput on accept | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > uses a multi-select question's custom answer alone when nothing is selected | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > uses a single-select question's custom answer alone when nothing is selected | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > keeps a single-select pick and carries its custom text as the tool's notes annotation | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > appends a multi-select question's custom answer to its selections | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > quotes a multi-select custom answer that contains the separator, as the CLI does | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > keeps the selection when the custom answer is blank | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > uses the custom answer alone when the multi-select array is empty | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > ignores empty selections and blank custom answers | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > treats decline as answered with no answers | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > returns cancel on cancel | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > returns cancel for a custom/future action it does not understand | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | applyAskElicitationResponse > omits answers for questions the user left unanswered | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | extractRefusalFallbackPrompt > extracts required and optional fields | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | extractRefusalFallbackPrompt > returns null when a required model field is missing or mistyped | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | extractRefusalFallbackPrompt > normalizes a non-string category to null and drops empty guidance | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | refusalFallbackToCreateRequest > builds a single-choice form whose enum consts are the dialog's wire results | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | refusalFallbackToCreateRequest > omits the category marker and appends guidance when provided | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | refusalFallbackResultFromResponse > maps an accepted retry choice to retry_fallback | missing:T-UNCLASSIFIED | 
-src/tests/elicitation.test.ts | refusalFallbackResultFromResponse > keeps the refusal for every other outcome | missing:T-UNCLASSIFIED | 
-src/tests/event-loop-yield.test.ts | EventLoopYielder > lets a loop run on within its budget | missing:T-UNCLASSIFIED | 
-src/tests/event-loop-yield.test.ts | EventLoopYielder > yields to the event loop past its budget | missing:T-UNCLASSIFIED | 
-src/tests/event-loop-yield.test.ts | EventLoopYielder > starts a new budget once the event loop has turned | missing:T-UNCLASSIFIED | 
-src/tests/event-loop-yield.test.ts | EventLoopYielder > does not yield for a loop that waits on I/O between items | missing:T-UNCLASSIFIED | 
+src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > maps a form-mode request, defaulting the schema type to object | ported:src/elicitation.rs::mcp_elicitation_maps_form_mode_request | 
+src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > maps a url-mode request and preserves the elicitation id | ported:src/elicitation.rs::mcp_elicitation_maps_url_mode_request_and_preserves_id | 
+src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > generates an elicitation id when a url request omits one | ported:src/elicitation.rs::mcp_elicitation_generates_id_when_url_omits_one | 
+src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > returns null for a url request with no url | ported:src/elicitation.rs::mcp_elicitation_returns_none_for_url_with_no_url | 
+src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > maps accept with content | ported:src/elicitation.rs::create_elicitation_response_maps_accept_with_content | 
+src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > defaults accept content to an empty object | ported:src/elicitation.rs::create_elicitation_response_defaults_accept_content_to_empty_object | 
+src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > maps decline and cancel | ported:src/elicitation.rs::create_elicitation_response_maps_decline_and_cancel | 
+src/tests/elicitation.test.ts | createElicitationResponseToElicitResult > maps a custom/future action to cancel | ported:src/elicitation.rs::create_elicitation_response_maps_custom_action_to_cancel | 
+src/tests/elicitation.test.ts | extractAskUserQuestions > reads questions off the tool input | ported:src/elicitation.rs::extract_ask_user_questions_reads_from_tool_input | 
+src/tests/elicitation.test.ts | extractAskUserQuestions > returns null when there are no questions | ported:src/elicitation.rs::extract_ask_user_questions_returns_none_when_empty_or_invalid | 
+src/tests/elicitation.test.ts | extractAskUserQuestions > filters out malformed questions (missing options, empty options, bad question) | ported:src/elicitation.rs::extract_ask_user_questions_returns_none_when_empty_or_invalid | 
+src/tests/elicitation.test.ts | extractAskUserQuestions > returns null when every question is filtered out | ported:src/elicitation.rs::extract_ask_user_questions_returns_none_when_empty_or_invalid | 
+src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > keys a single-select question by a stable id and carries the prompt in message only | ported:src/elicitation.rs::ask_user_questions_to_create_request_single_select | 
+src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > carries descriptions structurally and forwards previews under _meta | ported:src/elicitation.rs::ask_user_questions_to_create_request_preview_under_meta | 
+src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > includes a per-question optional free-text custom-answer field | ported:src/elicitation.rs::ask_user_questions_to_create_request_air_custom_field | 
+src/tests/elicitation.test.ts | askUserQuestionsToCreateRequest > builds an array property for multi-select questions and includes per-field question text | ported:src/elicitation.rs::ask_user_questions_to_create_request_multi_select | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > writes selected labels (keyed by indexed fields) into updatedInput on accept | ported:src/elicitation.rs::apply_ask_elicitation_response_accept_answers | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > uses a multi-select question's custom answer alone when nothing is selected | ported:src/elicitation.rs::apply_ask_elicitation_response_blank_and_unanswered | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > uses a single-select question's custom answer alone when nothing is selected | ported:src/elicitation.rs::apply_ask_elicitation_response_custom_answer_alone_and_combined | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > keeps a single-select pick and carries its custom text as the tool's notes annotation | ported:src/elicitation.rs::apply_ask_elicitation_response_custom_answer_alone_and_combined | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > appends a multi-select question's custom answer to its selections | ported:src/elicitation.rs::apply_ask_elicitation_response_custom_answer_alone_and_combined | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > quotes a multi-select custom answer that contains the separator, as the CLI does | ported:src/elicitation.rs::apply_ask_elicitation_response_custom_answer_alone_and_combined | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > keeps the selection when the custom answer is blank | ported:src/elicitation.rs::apply_ask_elicitation_response_blank_and_unanswered | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > uses the custom answer alone when the multi-select array is empty | ported:src/elicitation.rs::apply_ask_elicitation_response_blank_and_unanswered | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > ignores empty selections and blank custom answers | ported:src/elicitation.rs::apply_ask_elicitation_response_blank_and_unanswered | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > treats decline as answered with no answers | ported:src/elicitation.rs::apply_ask_elicitation_response_decline_and_cancel | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > returns cancel on cancel | ported:src/elicitation.rs::apply_ask_elicitation_response_decline_and_cancel | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > returns cancel for a custom/future action it does not understand | ported:src/elicitation.rs::apply_ask_elicitation_response_decline_and_cancel | 
+src/tests/elicitation.test.ts | applyAskElicitationResponse > omits answers for questions the user left unanswered | ported:src/elicitation.rs::apply_ask_elicitation_response_blank_and_unanswered | 
+src/tests/elicitation.test.ts | extractRefusalFallbackPrompt > extracts required and optional fields | ported:src/elicitation.rs::extract_refusal_fallback_prompt_extracts_fields | 
+src/tests/elicitation.test.ts | extractRefusalFallbackPrompt > returns null when a required model field is missing or mistyped | ported:src/elicitation.rs::extract_refusal_fallback_prompt_returns_none_when_model_missing | 
+src/tests/elicitation.test.ts | extractRefusalFallbackPrompt > normalizes a non-string category to null and drops empty guidance | ported:src/elicitation.rs::extract_refusal_fallback_prompt_normalizes_category_and_guidance | 
+src/tests/elicitation.test.ts | refusalFallbackToCreateRequest > builds a single-choice form whose enum consts are the dialog's wire results | ported:src/elicitation.rs::refusal_fallback_to_create_request_builds_single_choice_form | 
+src/tests/elicitation.test.ts | refusalFallbackToCreateRequest > omits the category marker and appends guidance when provided | ported:src/elicitation.rs::refusal_fallback_to_create_request_filters_empty_category | 
+src/tests/elicitation.test.ts | refusalFallbackResultFromResponse > maps an accepted retry choice to retry_fallback | ported:src/elicitation.rs::refusal_fallback_result_from_response_maps_results | 
+src/tests/elicitation.test.ts | refusalFallbackResultFromResponse > keeps the refusal for every other outcome | ported:src/elicitation.rs::refusal_fallback_result_from_response_maps_results | 
+src/tests/event-loop-yield.test.ts | EventLoopYielder > lets a loop run on within its budget | ported:src/event_loop_yield.rs::lets_a_loop_run_within_its_budget | 
+src/tests/event-loop-yield.test.ts | EventLoopYielder > yields to the event loop past its budget | ported:src/event_loop_yield.rs::yields_to_the_event_loop_past_its_budget | 
+src/tests/event-loop-yield.test.ts | EventLoopYielder > starts a new budget once the event loop has turned | ported:src/event_loop_yield.rs::starts_a_new_budget_once_the_event_loop_has_turned | 
+src/tests/event-loop-yield.test.ts | EventLoopYielder > does not yield for a loop that waits on I/O between items | ported:src/event_loop_yield.rs::does_not_yield_for_a_loop_that_waits_on_io | 
 src/tests/event-loop-yield.test.ts | consumer under a buffered backlog > lets timers run while it drains, and keeps every update in order | missing:T-UNCLASSIFIED | 
 src/tests/event-loop-yield.test.ts | consumer under a buffered backlog > runs a cancel that arrives mid-backlog before the backlog ends | missing:T-UNCLASSIFIED | 
 src/tests/event-loop-yield.test.ts | consumer teardown under a buffered backlog > settles the turn when the session closes mid-backlog | missing:T-UNCLASSIFIED | 
@@ -1253,19 +1253,19 @@ src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > omits the Fa
 src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > omits the Fast mode option when no fast mode state is provided | ported:tests/t1b_config.rs::build_options_omit_fast_mode_when_unsupported_or_without_state | 
 src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > surfaces a boolean toggle when supported and the client opted in | ported:tests/t1b_config.rs::build_options_surface_fast_mode_as_boolean_or_select | 
 src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > surfaces a select fallback when supported but the client did not opt in | ported:tests/t1b_config.rs::build_options_surface_fast_mode_as_boolean_or_select | 
-src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode on/off through a boolean value | missing:F11 | M-37/A-02: set_config_option fast branch + applyFlagSettings({fastMode}) is session.rs (Turn 5); resolve_fast_mode_enabled is ported
-src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode through the on/off select fallback | missing:F11 | M-37/A-02: set_config_option fast branch + applyFlagSettings({fastMode}) is session.rs (Turn 5); resolve_fast_mode_enabled is ported
-src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > does not change session state when the SDK rejects the flag | missing:F11 | M-37/A-02: set_config_option fast branch + applyFlagSettings({fastMode}) is session.rs (Turn 5); resolve_fast_mode_enabled is ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > emits a config_option_update when the SDK reports a new state | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > leaves the toggle on and quiet during a rate-limit cooldown | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > never lets a stray cooldown spuriously enable a toggle the user has off | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > clears the toggle when the SDK reports off | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > is a no-op when the reported state is undefined or unchanged | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains a blocking reason once when the SDK refuses a toggle the user turned on | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains the flip as a live notice to a client on the notice contract | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > updates the description when only the reason changes | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > drops a retained reason once fast mode comes back on | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > preserves the retained setting (no clobber) when the model has no Fast mode option | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode on/off through a boolean value | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_toggles_through_boolean_and_select_values | 
+src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode through the on/off select fallback | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_toggles_through_boolean_and_select_values | 
+src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > does not change session state when the SDK rejects the flag | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_rejects_an_invalid_value_and_keeps_state_on_sdk_failure | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > emits a config_option_update when the SDK reports a new state | ported:src/session/tests_t5a2.rs::t5a2_init_reconciles_the_fast_mode_state | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > leaves the toggle on and quiet during a rate-limit cooldown | ported:src/session/tests_t5a2.rs::t5a2_result_reconciles_fast_mode_and_ignores_cooldown_and_autonomous_results | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > never lets a stray cooldown spuriously enable a toggle the user has off | ported:src/session/tests_t5a2.rs::t5a2_result_reconciles_fast_mode_and_ignores_cooldown_and_autonomous_results | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > clears the toggle when the SDK reports off | ported:src/session/tests_t5a2.rs::t5a2_result_reconciles_fast_mode_and_ignores_cooldown_and_autonomous_results | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > is a no-op when the reported state is undefined or unchanged | ported:src/session_config.rs::t5a2_reconcile_fast_mode_matches_upstream_guards | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains a blocking reason once when the SDK refuses a toggle the user turned on | ported:src/session/tests_t5a2.rs::t5a2_result_reconciles_fast_mode_and_ignores_cooldown_and_autonomous_results | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains the flip as a live notice to a client on the notice contract | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_flip_is_a_live_notice_for_notice_clients | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > updates the description when only the reason changes | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_reason_only_and_no_option_preserve_intent | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > drops a retained reason once fast mode comes back on | ported:src/session_config.rs::t5a2_reconcile_fast_mode_matches_upstream_guards | 
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > preserves the retained setting (no clobber) when the model has no Fast mode option | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_reason_only_and_no_option_preserve_intent | 
 src/tests/field-tracker.test.ts | ToolCallFieldTracker > removes unchanged fields and drops an update with nothing new | missing:T-UNCLASSIFIED | 
 src/tests/field-tracker.test.ts | ToolCallFieldTracker > keeps an update whose _meta carries more than claudeCode | missing:T-UNCLASSIFIED | 
 src/tests/field-tracker.test.ts | ToolCallFieldTracker > merges _meta.jetbrains.air keys like claudeCode keys | missing:T-UNCLASSIFIED | 
@@ -1383,7 +1383,7 @@ src/tests/incomplete-tools.test.ts | tool calls of a background subagent that a 
 src/tests/live-capability-events-audit.test.ts | live Claude SDK to ACP capability audit > observes a scheduled wake-up while the ACP session is idle | missing:T-UNCLASSIFIED | 
 src/tests/live-capability-events-audit.test.ts | live Claude SDK to ACP capability audit > records whether a real refusal produces retraction or fallback messages | missing:T-UNCLASSIFIED | 
 src/tests/live-capability-events-audit.test.ts | live Claude SDK to ACP capability audit > captures tool_use_summary / post_turn_summary / task_summary shape after a multi-tool turn | missing:T-UNCLASSIFIED | 
-src/tests/live-capability-session-audit.test.ts | live Claude SDK to ACP capability audit > forwards a background subagent permission request in default mode | missing:T-UNCLASSIFIED | 
+src/tests/live-capability-session-audit.test.ts | live Claude SDK to ACP capability audit > forwards a background subagent permission request in default mode | ported:src/session/tests_t5a2.rs::t5a2_a_background_subagent_permission_request_goes_to_the_child_session | 
 src/tests/live-capability-session-audit.test.ts | live Claude SDK to ACP capability audit > keeps ACP routing stable across a real /clear and follow-up | missing:T-UNCLASSIFIED | 
 src/tests/live-capability-session-audit.test.ts | live Claude SDK to ACP capability audit > captures the real background Bash launch and terminal task lifecycle | missing:T-UNCLASSIFIED | 
 src/tests/live-capability-session-audit.test.ts | live Claude SDK to ACP capability audit > settles every announced tool call when a real Bash turn is cancelled | missing:T-UNCLASSIFIED | 
@@ -1432,14 +1432,14 @@ src/tests/mcp-command.test.ts | /mcp > replaces the result text when no other sh
 src/tests/mcp-command.test.ts | /mcp > leaves the text of other /mcp prompts unchanged | covered:mcp-prompt-rewrite | plus inv_56_prompt_mcp_command_single_text_block
 src/tests/mcp-command.test.ts | /mcp > publishes nothing when a cancel comes during the status read with %j | different:cancel clears the /mcp state so nothing is published; not corpus-captured | 
 src/tests/mcp-command.test.ts | /mcp > stops the actions and publishes nothing when a cancel comes during a reconnect | different:same cancel path; not corpus-captured | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow after an explicit reconnect of an ACP server | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow only for the ACP servers of a reconnect of all | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a plain /mcp | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a server that is not from the ACP request | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the turn was cancelled | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not hold the turn while the MCP OAuth flow runs | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow without URL elicitation | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the result fell back to the CLI text | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow after an explicit reconnect of an ACP server | ported:tests/t4a3_mcp_oauth.rs::t4a3_mcp_reconnect_starts_oauth | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow only for the ACP servers of a reconnect of all | ported:src/mcp_command.rs::filter_reconnected_for_oauth_keeps_configured_acp_servers | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a plain /mcp | ported:tests/t4a3_mcp_oauth.rs::t4a3_mcp_reconnect_starts_oauth | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a server that is not from the ACP request | ported:src/mcp_command.rs::filter_reconnected_for_oauth_keeps_configured_acp_servers | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the turn was cancelled | ported:tests/t4a3_mcp_oauth.rs::t4a3_mcp_reconnect_starts_oauth | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not hold the turn while the MCP OAuth flow runs | ported:tests/t4a3_mcp_oauth.rs::t4a3_session_start_runs_mcp_oauth | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow without URL elicitation | ported:tests/t4a3_elicitation_control.rs::t4a3_no_capability_keeps_sdk_defaults | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the result fell back to the CLI text | ported:tests/t4a3_mcp_oauth.rs::t4a3_mcp_reconnect_starts_oauth | 
 src/tests/mcp-command.test.ts | /mcp in available_commands_update > advertises one mcp entry when Claude Code also has one | covered:commands-proactive | the adapter's entry replaces a CLI `mcp` entry (map.rs)
 src/tests/mcp-command.test.ts | /mcp replay > hides a persisted /mcp invocation | ported:src/transcript.rs::inv_67_local_command_metadata_stripped | REPLAY_HIDDEN_COMMANDS includes /mcp; marker-only stripping covers both upstream cases
 src/tests/model-presentation.test.ts | versioned model display names > adds standard-family versions and preserves model identity and recommendation | ported:tests/t1b_model.rs::versioned_names_and_recommendation_through_the_model_option | + src/session_model.rs::model_presentation_goldens
@@ -1480,33 +1480,33 @@ src/tests/model-resolution.test.ts | settingsEffortForModel > matches equivalent
 src/tests/model-resolution.test.ts | settingsEffortForModel > falls back to the top-level effortLevel when no per-model entry matches | ported:tests/t1b_config.rs::settings_effort_falls_back_to_the_top_level_effort | 
 src/tests/model-resolution.test.ts | settingsEffortForModel > returns undefined when neither layer sets an effort | ported:tests/t1b_config.rs::settings_effort_falls_back_to_the_top_level_effort | 
 src/tests/model-resolution.test.ts | effortFlagSettings > carries ultracode only when settings request it | ported:tests/t1b_config.rs::effort_flag_settings_carries_ultracode_only_when_requested | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > publishes a raced spawn exactly once | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > publishes a raced spawn exactly once | ported:src/session/tests_t4a2.rs::t4a2_air_announce_publishes_subagent_spawned | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > publishes a raced terminal exactly once after the spawn | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > falls back to one ordinary failed tool call when no child ever starts | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > creates a schema-valid non-native failed tool call without a cached initial call | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > clears failed-control identity and parent affinity before an id is reused | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > falls back to one ordinary failed tool call when no child ever starts | ported:src/native_subagents/tests.rs::air_falls_back_to_one_ordinary_failed_tool_call_when_no_child_starts | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > creates a schema-valid non-native failed tool call without a cached initial call | ported:src/native_subagents/tests.rs::air_failed_fallback_without_an_initial_call_is_a_tool_call | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > clears failed-control identity and parent affinity before an id is reused | ported:src/native_subagents/tests.rs::display_labels | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > discards unknown pending child updates during finishAll | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > creates a distinct ACP lifecycle when the SDK restarts the same task id | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > announces resumed subagent generation immediately when SendMessage restarts the task (#1158) | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > announces a resumed nested subagent under a live ancestor when its parent has finished | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > the subagent prompt in subagent_spawned > carries the exact task_started prompt | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > the subagent prompt in subagent_spawned > falls back to the prompt of the Agent tool input | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > the subagent prompt in subagent_spawned > carries the exact task_started prompt | ported:src/native_subagents/tests.rs::spawn_prompt_is_the_exact_task_started_prompt | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > the subagent prompt in subagent_spawned > falls back to the prompt of the Agent tool input | ported:src/native_subagents/tests.rs::spawn_prompt_falls_back_to_the_agent_input | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > the subagent prompt in subagent_spawned > omits the prompt when the adapter has none | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > opens a new generation when a failed child runs again | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > routes the first update after a SendMessage resume to the new generation | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > sends the SendMessage text as the prompt of the new generation | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > sends the SendMessage text as the prompt of the new generation | ported:src/session/tests_t4a2.rs::t4a2_a_send_message_result_resumes_the_child | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > omits the prompt of a new generation without a SendMessage text | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > finds the SendMessage text that resumed the agent | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > finds the SendMessage text that resumed the agent | ported:src/session/tests_t4a2.rs::t4a2_a_resumed_task_carries_the_send_message_text | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > names the SendMessage call that resumed the agent even without a text | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > keeps the work of a child tool call in the generation that started it | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > ignores a late update of a completed child without a resume signal | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > keeps the work of a child tool call in the generation that started it | ported:src/session/tests_t4a2.rs::t4a2_a_late_async_task_update_reaches_the_finished_child | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > ignores a late update of a completed child without a resume signal | ported:src/native_subagents/tests.rs::air_keeps_work_of_a_child_tool_call_in_its_generation_and_async_tasks_reach_it_late | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > keeps the Agent tool call as a tool call of the session that made it | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > announces the child with the parent's labels, then sends it the prompt | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > announces the child with the parent's labels, then sends it the prompt | ported:src/session/tests_t4a2.rs::t4a2_rfd_announce_publishes_the_child_and_its_prompt | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > titles a child without a name by its role | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > keeps the session of an idle child, which a resume runs again | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > moves the work of a resume to the child, under the id of the call that resumed it | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > ignores a SendMessage result that arrives after the run it started ended | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > ends a run under an id the child used before, which the SDK falls back to | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > ends a run under an id the child used before, which the SDK falls back to | ported:src/session/tests_t4fa.rs::t4fa_stale_task_notification_does_not_settle_the_live_task | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > reports a running patch as running, without its guessed prompt or call | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > resumes a child with an open request as requires_action | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > names the session that sent a resume's prompt, and no sender when it is unknown | missing:T-UNCLASSIFIED | 
@@ -1521,20 +1521,20 @@ src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > kee
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a nested child whose own parent is not announced yet > announces it after that parent, when the parent's task started before its launch frame | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a nested child whose own parent is not announced yet > never announces it under the root, when its parent is not known yet | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > keeps the role in the title when a late frame names the child | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > reports nothing when the parent is cancelled, until the SDK ends the child | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > reports nothing when the parent is cancelled, until the SDK ends the child | ported:src/session/tests_t4a2.rs::t4a2_parent_cancel_reports_air_children_and_counts_rfd | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > ends the children that still run with the stream as idle, with no reason it did not see | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > keeps a SendMessage result without a text from resuming a run that ended | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > reports a child that can no longer be observed as unknown | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > reports a child as requires_action while its requests are open | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > does not report running again for a child that ended while it waited | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a cancel of one child by the client > stops the child's task, and leaves its end to the SDK | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a cancel of one child by the client > stops nothing for a session that is no child, or for AIR, which grants no cancel | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not report running for a request that a cancel withdraws, and leaves the child's end to the SDK | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not report running for a request that the client's cancel of the child withdraws | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not report running for a request of a foreground subagent that the cancel of its parent stops | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > reports running for a request that Claude Code withdraws without a cancel, since the child goes on | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > keeps the open request of a child that outlives a cancel, and reports running once the user answers it | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not count a cancel that came before the request opened | missing:T-UNCLASSIFIED | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > reports a child as requires_action while its requests are open | ported:src/session/tests_t5a.rs::t5a_open_requests_keep_the_child_requires_action | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > does not report running again for a child that ended while it waited | ported:src/session/tests_t5a.rs::t5a_child_ended_while_it_waited_does_not_run_again | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a cancel of one child by the client > stops the child's task, and leaves its end to the SDK | ported:tests/t4fd_cancel_child.rs::t4fd_cancel_of_a_child_session_stops_its_task | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a cancel of one child by the client > stops nothing for a session that is no child, or for AIR, which grants no cancel | ported:src/native_subagents/tests.rs::rfd_parent_cancel_reports_nothing_and_child_cancel_stops_the_task | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not report running for a request that a cancel withdraws, and leaves the child's end to the SDK | ported:src/session/tests_t5a.rs::t5a_parent_cancel_withdrawal_reports_no_running | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not report running for a request that the client's cancel of the child withdraws | ported:src/session/tests_t5a.rs::t5a_child_request_withdrawn_by_a_cancel_then_ended_by_the_sdk | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not report running for a request of a foreground subagent that the cancel of its parent stops | ported:src/session/tests_t5a.rs::t5a_parent_cancel_of_a_foreground_subagent_does_not_report_running | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > reports running for a request that Claude Code withdraws without a cancel, since the child goes on | ported:src/native_subagents/tests.rs::rfd_request_withdrawn_by_a_cancel_does_not_report_running | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > keeps the open request of a child that outlives a cancel, and reports running once the user answers it | ported:src/session/tests_t5a.rs::t5a_parent_cancel_keeps_the_open_request_and_runs_once_answered | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > does not count a cancel that came before the request opened | ported:src/session/tests_t5a.rs::t5a_cancel_before_the_request_opened_is_not_counted | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the RFD form > a request that Claude Code withdraws > lets the last of two requests decide: $first, then $last | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > restores the agent on a resume signal, delivers its buffered output, and numbers later generations from it | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > restores the agent from a message under an unknown parent_tool_use_id alone, and routes it | missing:T-UNCLASSIFIED | 
@@ -1627,11 +1627,11 @@ src/tests/permission-presentation.test.ts | Claude permission presentation for a
 src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > shows the exact preview patch, which the tool call does not show | missing:F10 | permission presentation owned by Turn 6
 src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > drops a prediction that says nothing | ported:src/prompt_suggestions.rs::drops_a_prediction_that_says_nothing | 
 src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > names no vendor and clears with an empty list | ported:src/prompt_suggestions.rs::names_no_vendor_and_clears_with_an_empty_list | 
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > publishes the predicted prompt after the turn's result | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > clears the previous prediction when the next prompt arrives | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > does not publish a prediction that is only whitespace | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > drops a prediction the next prompt outran | missing:F24 | needs session/consumer wiring (Turn 4 lane A)
-src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > sends nothing to a client that is not AIR | missing:F24 | needs AIR capability gating in the session (Turn 4 lane A)
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > publishes the predicted prompt after the turn's result | ported:src/session/tests_t4a.rs::t4a_suggestion_window_opens_at_result_and_publishes_once | 
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > clears the previous prediction when the next prompt arrives | ported:tests/t4fa_settle.rs::t4fa_steer_starting_a_turn_runs_the_prompt_preamble | 
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > does not publish a prediction that is only whitespace | ported:src/session/tests_t4a.rs::t4a_suggestion_window_opens_at_result_and_publishes_once | 
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > drops a prediction the next prompt outran | ported:src/session/tests_t4a.rs::t4a_suggestion_is_dropped_when_the_gate_is_off | 
+src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > sends nothing to a client that is not AIR | ported:src/session/tests_t4a.rs::t4a_suggestion_is_not_published_to_a_plain_client | 
 src/tests/providers.test.ts | providers > advertises the providers capability in initialize | covered:providers-validation | initialize response carries providers:{}
 src/tests/providers.test.ts | providers > lists one mutually exclusive provider slot with native routing | covered:providers-validation | 
 src/tests/providers.test.ts | providers > reflects apiType/baseUrl after set, and never echoes headers | ported:src/agent/providers/tests.rs::t3b_list_never_echoes_headers | 
@@ -1675,20 +1675,20 @@ src/tests/recommended-config-values.test.ts | buildConfigOptions recommended val
 src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > does not substitute a similar model for the unavailable default %s | ported:tests/t1b_config.rs::recommended_does_not_substitute_a_similar_model_for_the_unavailable_default | each: both resolvedModel spellings are looped in the one Rust test
 src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > matches equivalent SDK context suffix spellings exactly | ported:tests/t1b_config.rs::recommended_matches_equivalent_context_suffix_spellings_exactly | 
 src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > uses an available effort when medium is not supported | ported:tests/t1b_config.rs::recommended_uses_an_available_effort_when_medium_is_not_supported | 
-src/tests/remote-control.test.ts | /remote-control > starts Remote Control and reports the URL | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > passes the argument as the session name | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > reconnects and renames on every run instead of toggling | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > disconnects with `off` | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > reports the failure of %s to the user | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > refuses %s while a turn is still running | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > refuses the command while Claude Code runs a cycle of its own | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > answers while only settled turns remain in the queue | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > leaves %s to Claude Code | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > handles the command when Claude Code lists it as terminal-only | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > while the request is in flight > holds a following prompt back until the reply is sent | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > while the request is in flight > refuses a second command | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > while the request is in flight > lets prompts through again once the command is done | missing:T-UNCLASSIFIED | 
-src/tests/remote-control.test.ts | /remote-control > advertises the command only when the query supports it | missing:T-UNCLASSIFIED | 
+src/tests/remote-control.test.ts | /remote-control > starts Remote Control and reports the URL | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_connect | 
+src/tests/remote-control.test.ts | /remote-control > passes the argument as the session name | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_named_connect | 
+src/tests/remote-control.test.ts | /remote-control > reconnects and renames on every run instead of toggling | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_named_connect | 
+src/tests/remote-control.test.ts | /remote-control > disconnects with `off` | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_off | 
+src/tests/remote-control.test.ts | /remote-control > reports the failure of %s to the user | ported:src/control.rs::test_format_remote_control_result | .each variants covered by the t4a3_remote_control_* tests in tests/t4a3_remote_control.rs
+src/tests/remote-control.test.ts | /remote-control > refuses %s while a turn is still running | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_refused_while_working | .each variants covered by the t4a3_remote_control_* tests in tests/t4a3_remote_control.rs
+src/tests/remote-control.test.ts | /remote-control > refuses the command while Claude Code runs a cycle of its own | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_refused_during_an_autonomous_cycle | 
+src/tests/remote-control.test.ts | /remote-control > answers while only settled turns remain in the queue | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_connect | 
+src/tests/remote-control.test.ts | /remote-control > leaves %s to Claude Code | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_not_intercepted_when_cli_offers_it | .each variants covered by the t4a3_remote_control_* tests in tests/t4a3_remote_control.rs
+src/tests/remote-control.test.ts | /remote-control > handles the command when Claude Code lists it as terminal-only | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_connect | 
+src/tests/remote-control.test.ts | /remote-control > while the request is in flight > holds a following prompt back until the reply is sent | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_holds_a_following_prompt | 
+src/tests/remote-control.test.ts | /remote-control > while the request is in flight > refuses a second command | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_refuses_a_second_command | 
+src/tests/remote-control.test.ts | /remote-control > while the request is in flight > lets prompts through again once the command is done | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_holds_a_following_prompt | 
+src/tests/remote-control.test.ts | /remote-control > advertises the command only when the query supports it | ported:src/map.rs::inv_36_commands_append_mcp_and_remote_control | 
 src/tests/resolve-permission-mode.test.ts | resolvePermissionMode > returns 'default' when no mode is provided | ported:src/permission_mode.rs::inv_57_permission_mode_aliases | |
 src/tests/resolve-permission-mode.test.ts | resolvePermissionMode > resolves exact canonical modes | ported:src/permission_mode.rs::inv_57_permission_mode_aliases | |
 src/tests/resolve-permission-mode.test.ts | resolvePermissionMode > resolves case-insensitive aliases | ported:src/permission_mode.rs::inv_57_permission_mode_aliases | |
@@ -1698,28 +1698,28 @@ src/tests/resolve-permission-mode.test.ts | resolvePermissionMode > trims whites
 src/tests/resolve-permission-mode.test.ts | resolvePermissionMode > falls back to 'default' and logs on non-string values | ported:src/permission_mode.rs::inv_57_invalid_permission_mode_is_logged | |
 src/tests/resolve-permission-mode.test.ts | resolvePermissionMode > falls back to 'default' and logs on empty string | ported:src/permission_mode.rs::inv_57_invalid_permission_mode_is_logged | |
 src/tests/resolve-permission-mode.test.ts | resolvePermissionMode > falls back to 'default' and logs on unknown mode | ported:src/permission_mode.rs::inv_57_invalid_permission_mode_is_logged | |
-src/tests/resumed-session.test.ts | resumedModelFromTranscript > returns the last real assistant model | missing:T-UNCLASSIFIED | 
-src/tests/resumed-session.test.ts | resumedModelFromTranscript > skips synthetic assistant records after the real response | missing:T-UNCLASSIFIED | 
-src/tests/resumed-session.test.ts | resumedModelFromTranscript > skips nested assistant records that can use a different model | missing:T-UNCLASSIFIED | 
-src/tests/resumed-session.test.ts | resumedModelFromTranscript > returns undefined when the transcript has no real assistant model | missing:T-UNCLASSIFIED | 
-src/tests/resumed-session.test.ts | readResumedTail > reads the last real main-thread model across many backward reads | missing:T-UNCLASSIFIED | 
+src/tests/resumed-session.test.ts | resumedModelFromTranscript > returns the last real assistant model | ported:src/resumed_session.rs::o13_read_resumed_session_model | 
+src/tests/resumed-session.test.ts | resumedModelFromTranscript > skips synthetic assistant records after the real response | ported:src/resumed_session.rs::resumed_model_skips_nested_and_synthetic_records | 
+src/tests/resumed-session.test.ts | resumedModelFromTranscript > skips nested assistant records that can use a different model | ported:src/resumed_session.rs::resumed_model_skips_nested_and_synthetic_records | 
+src/tests/resumed-session.test.ts | resumedModelFromTranscript > returns undefined when the transcript has no real assistant model | ported:src/resumed_session.rs::resumed_model_skips_nested_and_synthetic_records | 
+src/tests/resumed-session.test.ts | readResumedTail > reads the last real main-thread model across many backward reads | ported:src/resumed_session.rs::scan_tail_from_file_model_and_permission | 
 src/tests/resumed-session.test.ts | readResumedTail > reads a record that is longer than one backward read | missing:T-UNCLASSIFIED | 
 src/tests/resumed-session.test.ts | readResumedTail > reads the first line of the file | missing:T-UNCLASSIFIED | 
 src/tests/resumed-session.test.ts | readResumedTail > returns undefined when no real model is recorded | missing:T-UNCLASSIFIED | 
-src/tests/resumed-session.test.ts | readResumedTail > reads the permission mode of the last main-thread user record | missing:T-UNCLASSIFIED | 
+src/tests/resumed-session.test.ts | readResumedTail > reads the permission mode of the last main-thread user record | ported:src/resumed_session.rs::scan_tail_from_file_model_and_permission | 
 src/tests/resumed-session.test.ts | readResumedTail > reads a permission mode that is before the last model | missing:T-UNCLASSIFIED | 
 src/tests/resumed-session.test.ts | readResumedTail > ignores the permission-mode records of the CLI metadata block | missing:T-UNCLASSIFIED | 
-src/tests/resumed-session.test.ts | readResumedTail > gives no plan mode when a plan exit follows it | missing:T-UNCLASSIFIED | 
+src/tests/resumed-session.test.ts | readResumedTail > gives no plan mode when a plan exit follows it | ported:src/resumed_session.rs::scan_tail_plan_mode_exit_clears_plan_mode | 
 src/tests/resumed-session.test.ts | readResumedTail > stops the mode search at the last human prompt without a mode | missing:T-UNCLASSIFIED | 
 src/tests/resumed-session.test.ts | readResumedTail > reads the mode of the prompt before a compaction | missing:T-UNCLASSIFIED | 
 src/tests/resumed-session.test.ts | readResumedTail > returns no permission mode when the transcript records none | missing:T-UNCLASSIFIED | 
 src/tests/session-config-options.test.ts | session config options > newSession returns configOptions > includes configOptions in the response | covered:config-session-new | 
 src/tests/session-config-options.test.ts | session config options > newSession returns configOptions > includes mode and model config options | covered:config-session-new | 
 src/tests/session-config-options.test.ts | session config options > loadSession returns configOptions > includes configOptions from createSession | covered:resume-load | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when session not found | missing:F11 | behaviour exists (agent.rs 'Session not found') but has no Rust test; add with the M-43 husk tests, Turn 5
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when session not found | ported:tests/t5a2_fast_mode.rs::t5a2_a_husk_session_rejects_config_and_mode_changes | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when config option not found | covered:config-invalid | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when value is not valid for the option | covered:config-invalid | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > rejects mode and config changes once the query stream has closed (husk session) | missing:F11 | M-43: husk session, Turn 5
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > rejects mode and config changes once the query stream has closed (husk session) | ported:tests/t5a2_fast_mode.rs::t5a2_a_husk_session_rejects_config_and_mode_changes | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > changes mode, sends current_mode_update but not config_option_update | covered:config-set-mode | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > changes model and does not send a config_option_update notification | covered:config-set-model | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > resolves model alias 'opus' to full model ID | ported:tests/t1b_model.rs::set_config_model_value_resolves_aliases_display_names_and_exact_ids | 
@@ -1739,22 +1739,22 @@ src/tests/session-config-options.test.ts | session config options > no config_op
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > calls applyFlagSettings with effortLevel | covered:config-set-effort | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > calls applyFlagSettings with null effortLevel for 'default' | ported:tests/t1b_config.rs::effort_flag_settings_carries_ultracode_only_when_requested | toSdkEffortLevel -> null
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > updates effort currentValue in returned configOptions | covered:config-set-effort | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > keeps effort state unchanged when the SDK rejects a direct selection | missing:F11 | A-09: reject path of the effort apply, Turn 5
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > throws for invalid effort value | missing:F11 | validation exists in session.rs but has no Rust test, Turn 5
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > keeps effort state unchanged when the SDK rejects a direct selection | ported:src/session/tests_t5a2.rs::t5a2_direct_effort_selection_keeps_state_on_sdk_rejection | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > throws for invalid effort value | ported:src/session/tests_t5a2.rs::t5a2_direct_effort_selection_keeps_state_on_sdk_rejection | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > does not send config_option_update notification | covered:config-set-effort | 
 src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > other options are unchanged when effort is updated | covered:config-set-effort | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > applies concrete defaults and re-seeds automatic effort from each model's settings | missing:F11 | A-08/O-55: effort sync after model switch, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > applies concrete defaults and re-seeds automatic effort from each model's settings | covered:config-recommended-air | 
 src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > re-seeds switches from retained programmatic settings before file settings | missing:F11 | O-50: session-side effortSettingsOverride, Turn 5 (merge_effort_settings ported)
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears an unsupported user pin before choosing the new model's concrete effort | missing:F11 | A-08, Turn 5
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a legacy pin without promoting persisted effort to a flag override | missing:F11 | A-08, Turn 5
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > retains the original pin value when a legacy clamp fails | missing:F11 | A-09, Turn 5
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > restores the last applied effort when recommended-value synchronization fails | missing:F11 | A-09/O-55, Turn 5
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > returns the new model state when effort synchronization fails | missing:F11 | A-09, Turn 5
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > publishes the new model state when external-switch effort synchronization fails | missing:F11 | R-01/A-09, Turn 5
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > drops effort option when switching to a model without effort support | ported:tests/t1b_config.rs::effort_option_is_dropped_for_a_model_without_effort_support | pure rebuild
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a pinned effort via applyFlagSettings when switching to a model without effort | missing:F11 | A-08, Turn 5
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > adds effort option when switching to a model that supports effort | ported:tests/t1b_config.rs::effort_option_appears_for_a_model_that_supports_effort | pure rebuild
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clamps effort to valid value when new model has different supported levels | ported:tests/t1b_config.rs::effort_value_is_clamped_to_the_new_models_levels | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears an unsupported user pin before choosing the new model's concrete effort | ported:src/session/tests_t5a2.rs::t5a2_legacy_pin_clamped_away_clears_the_flag_layer | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a legacy pin without promoting persisted effort to a flag override | ported:src/session/tests_t5a2.rs::t5a2_legacy_pin_clamped_away_clears_the_flag_layer | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > retains the original pin value when a legacy clamp fails | ported:src/session/tests_t5a2.rs::t5a2_legacy_clamp_failure_retains_the_original_pin | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > restores the last applied effort when recommended-value synchronization fails | ported:src/session/tests_t5a2.rs::t5a2_effort_sync_failure_restores_the_last_applied_value | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > returns the new model state when effort synchronization fails | ported:src/session/tests_t5a2.rs::t5a2_effort_sync_failure_restores_the_last_applied_value | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > publishes the new model state when external-switch effort synchronization fails | ported:src/session/tests_t5a2.rs::t5a2_external_switch_publishes_new_state_when_effort_sync_fails | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > drops effort option when switching to a model without effort support | ported:src/session/tests_t5a2.rs::t5a2_switch_to_a_model_without_effort_clears_the_pinned_flag | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a pinned effort via applyFlagSettings when switching to a model without effort | ported:src/session/tests_t5a2.rs::t5a2_switch_to_a_model_without_effort_clears_the_pinned_flag | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > adds effort option when switching to a model that supports effort | ported:src/session/tests_t5a2.rs::t5a2_air_client_syncs_the_displayed_effort_after_a_model_switch | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clamps effort to valid value when new model has different supported levels | ported:src/session/tests_t5a2.rs::t5a2_legacy_pin_clamped_away_clears_the_flag_layer | 
 src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > preserves effort value when new model supports the same level | ported:tests/t1b_config.rs::effort_value_is_preserved_when_the_new_model_supports_it | 
 src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > seeds effort from the new model's persisted modelSettings entry on an unpinned switch | missing:F11 | A-08: session seed (settings_effort_for_model ported in tests/t1b_config.rs), Turn 5
 src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > falls back to the top-level settings effort when the new model has no per-model entry | missing:F11 | A-08: session seed, Turn 5
@@ -1768,10 +1768,10 @@ src/tests/session-config-options.test.ts | session config options > context wind
 src/tests/session-config-options.test.ts | session config options > context window on model change > falls back to the default window when inference misses, then refines it in the background | missing:F11 | R-01, Turn 5
 src/tests/session-config-options.test.ts | session config options > context window on model change > drops a background answer that arrives after another switch | ported:src/session_model.rs::f5b_context_window_answer_still_current | 
 src/tests/session-config-options.test.ts | session config options > context window on model change > keeps the learned window when re-asserting the current model | ported:src/session.rs::inv_63_model_reselection_keeps_learned_window | 
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the stable mode catalog when switching to Haiku | missing:F11 | P-06/R-01, Turn 5
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the same mode catalog when switching from Haiku back to Opus | missing:F11 | P-06/R-01, Turn 5
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > preserves the current mode when it remains valid after a model switch | missing:F11 | P-06/R-01, Turn 5
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > falls back to Accept edits and emits current_mode_update on a Haiku switch | missing:F11 | P-06/R-01, Turn 5
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the stable mode catalog when switching to Haiku | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the same mode catalog when switching from Haiku back to Opus | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > preserves the current mode when it remains valid after a model switch | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > falls back to Accept edits and emits current_mode_update on a Haiku switch | ported:src/session/tests_t5a2.rs::t5a2_external_switch_reconciles_mode_effort_fast_and_notifies | 
 src/tests/session-hooks.test.ts | session hooks with the Claude Code binary > [dynamic-describe#1] > runs the user, project and IDE hooks of one event, only in their session | missing:T-UNCLASSIFIED | 
 src/tests/session-hooks.test.ts | session hooks with the Claude Code binary > [dynamic-describe#1] > replaces and removes IDE hooks on session/load | missing:T-UNCLASSIFIED | 
 src/tests/session-index-units.test.ts | project directory encoding > matches the SDK encoding and never decodes | ported:src/session_index/project_dirs.rs::encoding_matches_the_sdk_and_never_decodes | 
@@ -1994,25 +1994,25 @@ src/tests/session-index.test.ts | the pages of one list > reads every copy of a 
 src/tests/session-index.test.ts | the pages of one list > enumerates again once a transcript is added or removed | missing:T-UNCLASSIFIED | 
 src/tests/session-index.test.ts | titles by the SDK's rule > finds a custom title whose record starts before the tail window | missing:T-UNCLASSIFIED | 
 src/tests/session-load.test.ts | session load/resume lifecycle > SDK: session created but never prompted has no messages and is not resumable | missing:T-UNCLASSIFIED | 
-src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession throws resourceNotFound for a non-existent session | missing:T-UNCLASSIFIED | 
-src/tests/session-load.test.ts | session load/resume lifecycle > ACP: resumeSession throws resourceNotFound for a non-existent session | missing:T-UNCLASSIFIED | 
-src/tests/session-load.test.ts | session load/resume lifecycle > ACP: newSession without prompt, then loadSession on fresh agent throws resourceNotFound | missing:T-UNCLASSIFIED | 
-src/tests/session-load.test.ts | session load/resume lifecycle > ACP: newSession without prompt, then resumeSession on fresh agent throws resourceNotFound | missing:T-UNCLASSIFIED | 
-src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession does not replay local-command metadata user messages | missing:T-UNCLASSIFIED | 
+src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession throws resourceNotFound for a non-existent session | ported:tests/t5fb_resume_closed.rs::m31_load_unknown_session_with_closed_channel_is_resource_not_found | 
+src/tests/session-load.test.ts | session load/resume lifecycle > ACP: resumeSession throws resourceNotFound for a non-existent session | ported:tests/t5fb_resume_closed.rs::m31_resume_unknown_session_with_closed_channel_is_resource_not_found | 
+src/tests/session-load.test.ts | session load/resume lifecycle > ACP: newSession without prompt, then loadSession on fresh agent throws resourceNotFound | ported:tests/t5b_resume_load.rs::m31_load_unknown_session_is_resource_not_found | 
+src/tests/session-load.test.ts | session load/resume lifecycle > ACP: newSession without prompt, then resumeSession on fresh agent throws resourceNotFound | ported:tests/t5b_resume_load.rs::m31_resume_unknown_session_is_resource_not_found | 
+src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession does not replay local-command metadata user messages | ported:src/transcript.rs::b48_marker_only_command_without_args_is_kept | 
 src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession strips marker tags from a concatenated single-string prompt | missing:T-UNCLASSIFIED | 
 src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession reports the model the resumed session is actually running | missing:T-UNCLASSIFIED | 
 src/tests/session-mode.test.ts | session mode > applies a valid mode to the SDK query | covered:config-set-mode | set_permission_mode control request
 src/tests/session-mode.test.ts | session mode > rejects invalid and unavailable modes before touching the query | covered:config-invalid | unknown mode / bypass-unavailable error
 src/tests/session-mode.test.ts | session mode > detects model-specific Auto availability | missing:F11 | R-01/P-06: session.rs model_lacks_auto has no direct test of the upstream cases (Turn 5)
-src/tests/session-mode.test.ts | session mode > falls Auto back to Accept edits and warns only once per session | ported:src/session.rs::fallback_warning_is_published_once_per_session | P-06 (deferred first-prompt warning) is Turn 5
-src/tests/session-mode.test.ts | session mode > warns about the Auto fallback as a live notice when the client can present one | missing:F11 | P-06: notice-capable warning path, Turn 5
+src/tests/session-mode.test.ts | session mode > falls Auto back to Accept edits and warns only once per session | ported:src/session/tests_t5a2.rs::t5a2_initial_auto_clamp_warns_at_the_first_prompt_once | 
+src/tests/session-mode.test.ts | session mode > warns about the Auto fallback as a live notice when the client can present one | ported:src/session/tests_t5a2.rs::t5a2_auto_fallback_warning_is_a_live_notice_for_notice_clients | 
 src/tests/session-mode.test.ts | session mode > handles setSessionMode and publishes the updated config option | covered:config-set-mode | current_mode_update + config_option_update
-src/tests/session-mode.test.ts | session mode > rejects missing and closed sessions | missing:F11 | M-43: husk session / SESSION_ENDED_MESSAGE, Turn 5
+src/tests/session-mode.test.ts | session mode > rejects missing and closed sessions | ported:tests/t5a2_fast_mode.rs::t5a2_a_husk_session_rejects_config_and_mode_changes | 
 src/tests/session-mode.test.ts | session mode > omits bypassPermissions from the catalog when bypass capability is disabled | ported:src/session_config.rs::inv_62_mode_catalog | 
-src/tests/session-mode.test.ts | session mode > initializes the stable mode catalog and falls unsupported Auto back | missing:F11 | P-06: creation-time auto clamp, Turn 5
+src/tests/session-mode.test.ts | session mode > initializes the stable mode catalog and falls unsupported Auto back | covered:config-set-mode-auto-config | 
 src/tests/session-mode.test.ts | session mode > keeps mode state and its config option synchronized | covered:config-set-mode | 
 src/tests/session-mode.test.ts | session mode > remembers the mode the session left when it entered plan mode | ported:src/session/exit_plan.rs::t3a_pre_plan_mode_tracks_entry_and_exit | also t3a_enter_plan_mode_hook_remembers_the_previous_mode
-src/tests/session-mode.test.ts | session mode > reconciles Auto after a model switch | missing:F11 | R-01: PostModelSwitch mode reconcile, Turn 5
+src/tests/session-mode.test.ts | session mode > reconciles Auto after a model switch | ported:src/session/tests_t5a2.rs::t5a2_external_switch_reconciles_mode_effort_fast_and_notifies | 
 src/tests/session-mode.test.ts | resolveInitialPermissionMode > uses defaultMode when nothing else is given | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
 src/tests/session-mode.test.ts | resolveInitialPermissionMode > continues in the mode of the resumed transcript instead of defaultMode | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
 src/tests/session-mode.test.ts | resolveInitialPermissionMode > lets an explicit mode win over the resumed transcript | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
@@ -2295,25 +2295,25 @@ src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a symlinked skill whose link name differs from its declared name | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a symlinked skill of .agents/skills by its declared name | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > prefers the directory that carries the name when its file declares no name | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > prefers the file that declares the name over a directory of that name declaring another | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > prefers the file that declares the name over a directory of that name declaring another | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > omits the path when the directory of that name belongs to another skill | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a directory-scoped skill by its declared name | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a plugin skill by its declared name | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > ignores a name that the frontmatter does not declare | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a directory-scoped skill by its declared name | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a plugin skill by its declared name | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > ignores a name that the frontmatter does not declare | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > picks up a declared name that changed after the first resolution | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > picks up a rewrite that restored the modification time of the file | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a user-level skill by its declared name | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a marketplace plugin skill by its declared name | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > gives one name to the same skill on every machine | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > leaves a prompt command of .claude/commands unresolved | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > keeps a name that escapes its container off the filesystem | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a user-level skill by its declared name | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > resolves a marketplace plugin skill by its declared name | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > gives one name to the same skill on every machine | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > leaves a prompt command of .claude/commands unresolved | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > keeps a name that escapes its container off the filesystem | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > lists a container once for the whole resolution pass | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > reads a quoted name | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > reads a name with a trailing comment | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > reads a quoted name | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > reads a name with a trailing comment | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > keeps a hash that starts no comment | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > reads a name written with CRLF line endings | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > reads a name of a block that ends with ... | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a value that no space separates from the key | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a value that no space separates from the key | ported:src/tools.rs::inv_51_resolve_skill_path_on_a_temp_tree | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a name nested under another key | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a name below the frontmatter | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a file with no frontmatter | missing:T-UNCLASSIFIED | 
@@ -2370,7 +2370,7 @@ scripts/next-preview-version.test.mjs | fetchPublishedVersions > treats 404 as a
 scripts/next-preview-version.test.mjs | fetchPublishedVersions > retries a server error and resolves | missing:T-UNCLASSIFIED | 
 scripts/next-preview-version.test.mjs | fetchPublishedVersions > retries a network failure and resolves | missing:T-UNCLASSIFIED | 
 scripts/next-preview-version.test.mjs | fetchPublishedVersions > gives up rather than guessing when every attempt fails | missing:T-UNCLASSIFIED | 
-src/tests/acp-scenarios/scenarios.ts | scenario > ask-user-question | missing:T-UNCLASSIFIED | 
+src/tests/acp-scenarios/scenarios.ts | scenario > ask-user-question | ported:tests/t4a3_ask_user_question.rs::t4a3_ask_user_question_form_is_sent_and_answer_applied | 
 src/tests/acp-scenarios/scenarios.ts | scenario > async-task-ends-before-tool-id | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios/scenarios.ts | scenario > async-task-held-until-tool-id | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios/scenarios.ts | scenario > async-task-released-at-turn-end | missing:T-UNCLASSIFIED | 

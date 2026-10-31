@@ -1172,6 +1172,7 @@ impl Rig {
         self.map_state.begin_stopped_work();
         settle_events(
             events,
+            &mut self.tasks,
             &mut self.map_state,
             &self.live_background,
             &mut self.pending,
@@ -1183,6 +1184,7 @@ impl Rig {
             None,
             &mut self.ext.titles,
             &mut self.ext.t2a.failures,
+            &mut self.ext.t2a.usage_turns,
         );
     }
 
@@ -1639,6 +1641,7 @@ fn t2a_force_cancel_closes_every_open_tool_call() {
     let events = rig.machine.force_cancel();
     settle_events(
         events,
+        &mut rig.tasks,
         &mut rig.map_state,
         &rig.live_background,
         &mut rig.pending,
@@ -1650,6 +1653,7 @@ fn t2a_force_cancel_closes_every_open_tool_call() {
         None,
         &mut rig.ext.titles,
         &mut rig.ext.t2a.failures,
+        &mut rig.ext.t2a.usage_turns,
     );
     let updates = rig.updates();
     assert_eq!(updates.len(), 1, "{updates:?}");

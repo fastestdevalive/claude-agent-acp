@@ -115,7 +115,24 @@ enum Outbound {
     /// Stop answering inbound requests (`sdk.mjs` `cleanupPerformed`): frames
     /// that still arrive are skipped, never answered. Outbound frames keep
     /// flowing until the handle is dropped.
+    ///
+    /// This does NOT settle outstanding outbound requests: their replies stay
+    /// in `pending` until the child answers or the task exits (the task holds
+    /// `inbound`'s sender, so it does not exit at child-stdout EOF). Use
+    /// [`Outbound::FailPending`] for that.
     Close,
+    /// Fail every outstanding outbound request with [`ControlError::Closed`]
+    /// without touching the writer, the inbound handlers or the `closed` flag
+    /// (`pending.clear()`, as [`Outbound::Rebind`] does). The session actor
+    /// sends it at child-stdout EOF so a switch whose reply can no longer
+    /// arrive settles instead of hanging the held-frame lane.
+    ///
+    /// It **latches** until [`Outbound::Rebind`]: every request enqueued
+    /// afterwards still reaches the wire (the frames are unchanged) but settles
+    /// `Closed` at once instead of entering `pending`. A request enqueued after
+    /// the EOF, from a switch task that had not polled yet, could otherwise
+    /// wait for a reply that can never come and wedge the actor.
+    FailPending,
     /// Continue on another child's stdin (a clear-context restart): the old
     /// writer is dropped, which closes the old child's stdin, every request the
     /// old child never answered fails, its in-flight inbound handlers are
@@ -185,6 +202,11 @@ pub struct InitializeOptions {
     pub agent_progress_summaries: Option<bool>,
     /// `planModeInstructions` (O-154): emitted only when `Some`.
     pub plan_mode_instructions: Option<String>,
+    /// `verbatimPrompts` (O-162): emitted only when `Some`.
+    pub verbatim_prompts: Option<bool>,
+    /// `supportedDialogKinds` (R-08): the blocking dialogs the adapter renders.
+    /// Emitted only for a form-capable client (`acp-agent.ts:11259-11269`).
+    pub supported_dialog_kinds: Option<Vec<String>>,
     /// `enableFileCheckpointing` (O-136). It is NOT part of the initialize
     /// request — the SDK turns it into the
     /// `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` env var — so it rides here
@@ -253,6 +275,23 @@ impl InitializeOptions {
             request.insert(
                 "perTaskStopAffordance".to_string(),
                 Value::Bool(*per_task_stop),
+            );
+        }
+        if let Some(verbatim_prompts) = &self.verbatim_prompts {
+            request.insert(
+                "verbatimPrompts".to_string(),
+                Value::Bool(*verbatim_prompts),
+            );
+        }
+        if let Some(dialog_kinds) = &self.supported_dialog_kinds {
+            request.insert(
+                "supportedDialogKinds".to_string(),
+                Value::Array(
+                    dialog_kinds
+                        .iter()
+                        .map(|kind| Value::String(kind.clone()))
+                        .collect(),
+                ),
             );
         }
         Value::Object(request)
@@ -380,9 +419,24 @@ impl Control {
     /// Stop answering inbound `control_request`s (`sdk.mjs`
     /// `cleanupPerformed`). Queued inbound frames are drained without a
     /// response; outbound frames (the teardown `interrupt`) still flow.
+    /// Outstanding outbound requests are NOT settled by this — see
+    /// [`Control::fail_pending`].
     pub fn close(&self) -> Result<(), ControlError> {
         self.tx
             .send(Outbound::Close)
+            .map_err(|_| ControlError::Closed)
+    }
+
+    /// Fail every outstanding outbound request with [`ControlError::Closed`]
+    /// without rebinding or closing anything: the child can no longer answer
+    /// (stdout EOF), so its waiters must settle rather than hang. The writer
+    /// and the inbound handler map are left untouched.
+    ///
+    /// The failure latches until [`Control::rebind`]: requests enqueued after
+    /// this call still go to the wire but settle `Closed` immediately.
+    pub fn fail_pending(&self) -> Result<(), ControlError> {
+        self.tx
+            .send(Outbound::FailPending)
             .map_err(|_| ControlError::Closed)
     }
 
@@ -414,6 +468,40 @@ impl Control {
     /// whose reply payload carries `mcpServers` (`sdk.mjs` `mcpServerStatus`).
     pub async fn mcp_status(&self) -> Result<Value, ControlError> {
         self.send_request(json!({ "subtype": "mcp_status" })).await
+    }
+
+    /// `query.mcpAuthenticate(serverName, redirectUri)` (A-25, `acp-agent.ts:2605`):
+    /// `{subtype: "mcp_authenticate", serverName, ...(redirectUri ? {redirectUri} : {})}`.
+    pub async fn mcp_authenticate(
+        &self,
+        server_name: &str,
+        redirect_uri: Option<&str>,
+    ) -> Result<Value, ControlError> {
+        let mut payload = json!({
+            "subtype": "mcp_authenticate",
+            "serverName": server_name,
+        });
+        if let Some(uri) = redirect_uri {
+            payload["redirectUri"] = json!(uri);
+        }
+        self.send_request(payload).await
+    }
+
+    /// `query.enableRemoteControl(enabled, name)` (A-27, `acp-agent.ts:568-575`, `3967`, `3975`):
+    /// `{subtype: "remote_control", enabled, ...(name ? {name} : {})}`.
+    pub async fn enable_remote_control(
+        &self,
+        enabled: bool,
+        name: Option<&str>,
+    ) -> Result<Value, ControlError> {
+        let mut payload = json!({
+            "subtype": "remote_control",
+            "enabled": enabled,
+        });
+        if let Some(n) = name {
+            payload["name"] = json!(n);
+        }
+        self.send_request(payload).await
     }
 
     /// `query.reconnectMcpServer(serverName)` (rust-air-gaps A-24):
@@ -451,6 +539,93 @@ impl Control {
                 .map_err(|_| ControlError::Closed)?;
         }
         Ok(())
+    }
+}
+
+/// Remote Control command action (S-03, `acp-agent.ts:580`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteControlAction {
+    Connect { name: Option<String> },
+    Disconnect,
+}
+
+/// A parsed `/remote-control` slash command (S-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteControlCommand {
+    pub action: RemoteControlAction,
+}
+
+/// Parses `/remote-control [name]` and `/remote-control off` from a prompt string (S-03, `acp-agent.ts:582-593`).
+#[must_use]
+pub fn parse_remote_control_command(prompt: &str) -> Option<RemoteControlCommand> {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with("/remote-control") {
+        return None;
+    }
+    let rest = &trimmed["/remote-control".len()..];
+    if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let arg = rest.trim();
+    if arg.eq_ignore_ascii_case("off") {
+        Some(RemoteControlCommand {
+            action: RemoteControlAction::Disconnect,
+        })
+    } else if arg.is_empty() {
+        Some(RemoteControlCommand {
+            action: RemoteControlAction::Connect { name: None },
+        })
+    } else {
+        Some(RemoteControlCommand {
+            action: RemoteControlAction::Connect {
+                name: Some(arg.to_string()),
+            },
+        })
+    }
+}
+
+/// Parses `/remote-control` from an ACP PromptRequest payload with a single text block.
+#[must_use]
+pub fn prompt_remote_control_command(params: &Value) -> Option<RemoteControlCommand> {
+    let blocks = params.get("prompt").and_then(Value::as_array)?;
+    if blocks.len() != 1 {
+        return None;
+    }
+    let block = blocks.first()?;
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    parse_remote_control_command(block.get("text").and_then(Value::as_str)?)
+}
+
+/// Formats the assistant message text for a `/remote-control` command outcome (S-03, `acp-agent.ts:3964-3983`).
+#[must_use]
+pub fn format_remote_control_result(
+    action: &RemoteControlAction,
+    result: Result<&Value, &str>,
+) -> String {
+    match action {
+        RemoteControlAction::Disconnect => match result {
+            Ok(_) => "Remote Control is off. Run /remote-control to reconnect.".to_string(),
+            Err(err) => format!("Could not stop Remote Control: {err}"),
+        },
+        RemoteControlAction::Connect { .. } => match result {
+            Ok(val) => {
+                let session_url = val
+                    .pointer("/response/response/session_url")
+                    .or_else(|| val.get("session_url"))
+                    .and_then(Value::as_str);
+                if let Some(url) = session_url {
+                    format!(
+                        "Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n{url}\n\nRun /remote-control off to disconnect."
+                    )
+                } else {
+                    "Remote Control is active, but Claude Code did not return a session URL."
+                        .to_string()
+                }
+            }
+            Err(err) => format!("Could not start Remote Control: {err}"),
+        },
     }
 }
 
@@ -545,7 +720,7 @@ fn build_success_response(request_id: &str, payload: Value) -> Value {
 
 /// Build an `error` `control_response` carrying the `error` string the SDK
 /// always writes (`sdk.mjs` `handleControlRequest`'s catch: `error: ot(r)`).
-fn build_error_response(request_id: &str, error: &str) -> Value {
+pub(crate) fn build_error_response(request_id: &str, error: &str) -> Value {
     json!({
         "type": "control_response",
         "response": {
@@ -609,6 +784,9 @@ async fn control_task(
     // `sdk.mjs` `cleanupPerformed`: once the session is closing, inbound
     // requests that still arrive are skipped rather than answered.
     let mut closed = false;
+    // Set by `FailPending`, cleared by `Rebind`: latched failure for requests
+    // enqueued after the child's stdout EOF (see `Outbound::FailPending`).
+    let mut failing = false;
 
     loop {
         tokio::select! {
@@ -632,8 +810,15 @@ async fn control_task(
                             "request": payload,
                         });
                         // Serialise the request_id into the map BEFORE writing so
-                        // a response racing the write still resolves.
-                        pending.insert(id.clone(), reply);
+                        // a response racing the write still resolves. When the
+                        // child's stdout already reached EOF (`failing`), the
+                        // reply can never arrive: still write the frame (the
+                        // wire is unchanged) but settle it `Closed` at once.
+                        if failing {
+                            let _ = reply.send(Err(ControlError::Closed));
+                        } else {
+                            pending.insert(id.clone(), reply);
+                        }
                         if write_frame(&mut stdin, &frame).await.is_err() {
                             break;
                         }
@@ -664,7 +849,15 @@ async fn control_task(
                     Outbound::Close => {
                         closed = true;
                     }
+                    Outbound::FailPending => {
+                        // Same settlement as `Rebind`, without moving the writer:
+                        // every waiter gets `ControlError::Closed`. Latched until
+                        // `Rebind`, so later requests settle `Closed` too.
+                        pending.clear();
+                        failing = true;
+                    }
                     Outbound::Rebind(next) => {
+                        failing = false;
                         stdin = next;
                         pending.clear();
                         for (_, task) in inflight.drain() {
@@ -1621,5 +1814,238 @@ mod tests {
             .unwrap();
         let written: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(written["type"], "user");
+    }
+
+    /// T5FA4 — `fail_pending` settles an outstanding request with
+    /// [`ControlError::Closed`] while leaving the writer usable (unlike
+    /// `close`, which only stops answering inbound requests).
+    #[tokio::test]
+    async fn t5fa4_fail_pending_settles_an_outstanding_request() {
+        let (control, mut lines, _inbound) = harness(ControlOptions::default());
+        let waiting = {
+            let control = control.clone();
+            tokio::spawn(async move { control.send_request(json!({"subtype": "probe"})).await })
+        };
+        let line = next_line(&mut lines).await;
+        assert_eq!(line["request"]["subtype"], "probe");
+
+        control.fail_pending().unwrap();
+        let outcome = timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the unanswered request settles")
+            .expect("join");
+        assert!(
+            matches!(outcome, Err(ControlError::Closed)),
+            "the failed request reports closed: {outcome:?}"
+        );
+
+        // The writer was not rebound or closed: a later frame still goes out.
+        control
+            .send_user(json!({"type": "user", "message": {"content": "hi"}}))
+            .await
+            .unwrap();
+        let after = next_line(&mut lines).await;
+        assert_eq!(after["type"], "user");
+    }
+
+    /// T5FA5 — `fail_pending` latches until `rebind`: a request enqueued after
+    /// it still reaches the wire but settles `Closed` at once (it would wait
+    /// forever otherwise), and after `rebind` requests are pending again.
+    #[tokio::test]
+    async fn t5fa5_fail_pending_latches_until_rebind() {
+        let (control, mut lines, inbound) = harness(ControlOptions::default());
+
+        control.fail_pending().unwrap();
+        // A request enqueued after the EOF: the frame is still written, the
+        // caller settles without waiting for a reply that cannot come.
+        let after_eof = {
+            let control = control.clone();
+            tokio::spawn(async move { control.send_request(json!({"subtype": "late"})).await })
+        };
+        let written = next_line(&mut lines).await;
+        assert_eq!(
+            written["request"]["subtype"], "late",
+            "the wire is unchanged"
+        );
+        let outcome = timeout(Duration::from_secs(5), after_eof)
+            .await
+            .expect("the late request settles without a reply")
+            .expect("join");
+        assert!(
+            matches!(outcome, Err(ControlError::Closed)),
+            "the late request reports closed: {outcome:?}"
+        );
+
+        // `rebind` clears the latch: a request is correlated again and resolves
+        // from the new child's answer.
+        let (next_stdin, next_reader) = tokio::io::duplex(64 * 1024);
+        control.rebind(next_stdin).unwrap();
+        let waiting = {
+            let control = control.clone();
+            tokio::spawn(async move { control.send_request(json!({"subtype": "probe"})).await })
+        };
+        let mut reader = tokio::io::BufReader::new(next_reader);
+        let mut line = String::new();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("a line on the new stdin")
+            .unwrap();
+        let written: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(written["request"]["subtype"], "probe");
+        let req_id = written["request_id"].as_str().unwrap().to_string();
+        inbound
+            .send(json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": req_id,
+                    "response": {"ok": true}
+                }
+            }))
+            .unwrap();
+        let resolved = timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the rebound request is pending and resolves")
+            .expect("join")
+            .expect("success");
+        assert_eq!(
+            resolved.pointer("/response/response/ok"),
+            Some(&json!(true))
+        );
+    }
+
+    /// O-143, O-162 — `skills` and `verbatimPrompts` are serialized into initialize payload when provided.
+    #[test]
+    fn initialize_request_carries_skills_and_verbatim_prompts() {
+        let opts = InitializeOptions {
+            skills: Some(json!(["custom-skill"])),
+            verbatim_prompts: Some(true),
+            ..Default::default()
+        };
+        let request = opts.build_request();
+        assert_eq!(request["skills"], json!(["custom-skill"]));
+        assert_eq!(request["verbatimPrompts"], json!(true));
+
+        let absent = InitializeOptions::default().build_request();
+        assert!(absent.get("skills").is_none());
+        assert!(absent.get("verbatimPrompts").is_none());
+    }
+
+    /// A-27 — enable_remote_control sends `remote_control` control request.
+    #[tokio::test]
+    async fn test_enable_remote_control_request() {
+        let (control, mut lines, inbound) = harness(ControlOptions::default());
+        let control_clone = control.clone();
+        let task = tokio::spawn(async move {
+            control_clone
+                .enable_remote_control(true, Some("my-session"))
+                .await
+        });
+
+        let line = next_line(&mut lines).await;
+        assert_eq!(line["request"]["subtype"], "remote_control");
+        assert_eq!(line["request"]["enabled"], json!(true));
+        assert_eq!(line["request"]["name"], json!("my-session"));
+        let req_id = line["request_id"].as_str().unwrap();
+
+        inbound
+            .send(json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": req_id,
+                    "response": {
+                        "session_url": "https://claude.ai/code/my-session"
+                    }
+                }
+            }))
+            .unwrap();
+
+        let res = task.await.unwrap().expect("control success");
+        assert_eq!(
+            res.pointer("/response/response/session_url"),
+            Some(&json!("https://claude.ai/code/my-session"))
+        );
+    }
+
+    /// S-03 — remote control command parsing and result formatting.
+    #[test]
+    fn test_remote_control_command_parsing() {
+        assert_eq!(
+            parse_remote_control_command("/remote-control"),
+            Some(RemoteControlCommand {
+                action: RemoteControlAction::Connect { name: None }
+            })
+        );
+        assert_eq!(
+            parse_remote_control_command("  /remote-control   "),
+            Some(RemoteControlCommand {
+                action: RemoteControlAction::Connect { name: None }
+            })
+        );
+        assert_eq!(
+            parse_remote_control_command("/remote-control my-session"),
+            Some(RemoteControlCommand {
+                action: RemoteControlAction::Connect {
+                    name: Some("my-session".to_string())
+                }
+            })
+        );
+        assert_eq!(
+            parse_remote_control_command("/remote-control off"),
+            Some(RemoteControlCommand {
+                action: RemoteControlAction::Disconnect
+            })
+        );
+        assert_eq!(
+            parse_remote_control_command("/remote-control OFF"),
+            Some(RemoteControlCommand {
+                action: RemoteControlAction::Disconnect
+            })
+        );
+        assert_eq!(parse_remote_control_command("/remote-control-extra"), None);
+        assert_eq!(parse_remote_control_command("hello /remote-control"), None);
+
+        let req = json!({"prompt": [{"type": "text", "text": "/remote-control foo"}]});
+        assert_eq!(
+            prompt_remote_control_command(&req),
+            Some(RemoteControlCommand {
+                action: RemoteControlAction::Connect {
+                    name: Some("foo".to_string())
+                }
+            })
+        );
+        let req_empty = json!({"prompt": []});
+        assert_eq!(prompt_remote_control_command(&req_empty), None);
+    }
+
+    #[test]
+    fn test_format_remote_control_result() {
+        let dc = RemoteControlAction::Disconnect;
+        assert_eq!(
+            format_remote_control_result(&dc, Ok(&json!({}))),
+            "Remote Control is off. Run /remote-control to reconnect."
+        );
+        assert_eq!(
+            format_remote_control_result(&dc, Err("network timeout")),
+            "Could not stop Remote Control: network timeout"
+        );
+
+        let conn = RemoteControlAction::Connect { name: None };
+        assert_eq!(
+            format_remote_control_result(
+                &conn,
+                Ok(&json!({"session_url": "https://claude.ai/code/123"}))
+            ),
+            "Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\nhttps://claude.ai/code/123\n\nRun /remote-control off to disconnect."
+        );
+        assert_eq!(
+            format_remote_control_result(&conn, Ok(&json!({}))),
+            "Remote Control is active, but Claude Code did not return a session URL."
+        );
+        assert_eq!(
+            format_remote_control_result(&conn, Err("auth failed")),
+            "Could not start Remote Control: auth failed"
+        );
     }
 }

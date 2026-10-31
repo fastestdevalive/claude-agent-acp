@@ -29,6 +29,7 @@ fn registry() -> Registry {
         auth_contexts: std::collections::HashMap::new(),
         guard_states: std::collections::HashMap::new(),
         hide_claude_auth: false,
+        protocol: crate::v2::ProtocolMode::V1,
         provider_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         provider_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sessions_view: Arc::new(watch::channel(std::collections::HashMap::new()).0),

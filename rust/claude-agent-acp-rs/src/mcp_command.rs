@@ -677,6 +677,24 @@ impl McpPrepared {
     }
 }
 
+/// Filter the servers reconnected by `/mcp reconnect` to those configured in the session's
+/// ACP MCP servers, returning the set eligible for OAuth follow-up (S-02, F23c).
+#[must_use]
+pub fn filter_reconnected_for_oauth(
+    reconnected: &[String],
+    configured_acp_servers: &[String],
+) -> Vec<String> {
+    let configured: HashSet<&str> = configured_acp_servers.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for server in reconnected {
+        if configured.contains(server.as_str()) && seen.insert(server.clone()) {
+            result.push(server.clone());
+        }
+    }
+    result
+}
+
 /// The servers that the action changes. A named server is always a target, so
 /// the control API reports its own error.
 fn action_targets(command: &McpCommand, statuses: &[Value]) -> Vec<String> {
@@ -1430,6 +1448,28 @@ mod tests {
         assert_eq!(action_targets(&enable_all, &servers()), vec!["old"]);
     }
 
+    /// S-02/A-01 (`acp-agent.ts:3750-3756`) — only the reconnected servers that
+    /// the session's ACP request configured are eligible for the OAuth follow-up,
+    /// deduplicated and in reconnect order.
+    #[test]
+    fn filter_reconnected_for_oauth_keeps_configured_acp_servers() {
+        let strings = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|item| (*item).to_string()).collect()
+        };
+        assert_eq!(
+            filter_reconnected_for_oauth(
+                &strings(&["linear", "user", "linear"]),
+                &strings(&["linear"])
+            ),
+            vec!["linear"]
+        );
+        assert_eq!(
+            filter_reconnected_for_oauth(&strings(&["acp", "user"]), &strings(&["acp", "other"])),
+            vec!["acp"]
+        );
+        assert!(filter_reconnected_for_oauth(&strings(&["user"]), &strings(&["acp"])).is_empty());
+    }
+
     /// rust-air-gaps G12 (S-02) — the action assembly for the upstream cases.
     #[test]
     fn inv_56_render_action_cases() {
@@ -1585,5 +1625,19 @@ mod tests {
         );
         assert_eq!(assistant_text(Some(&json!({"content":""}))), None);
         assert_eq!(assistant_text(None), None);
+    }
+
+    /// S-02 (F23c) — filter reconnected servers for OAuth follow-up against configured ACP servers.
+    #[test]
+    fn test_filter_reconnected_for_oauth_dedups_and_intersects() {
+        let reconnected = vec![
+            "srv1".to_string(),
+            "srv2".to_string(),
+            "srv1".to_string(),
+            "srv3".to_string(),
+        ];
+        let configured = vec!["srv1".to_string(), "srv3".to_string(), "srv4".to_string()];
+        let filtered = filter_reconnected_for_oauth(&reconnected, &configured);
+        assert_eq!(filtered, vec!["srv1".to_string(), "srv3".to_string()]);
     }
 }

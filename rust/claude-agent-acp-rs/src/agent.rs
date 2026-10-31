@@ -202,7 +202,7 @@ fn process_entrypoint() -> (String, Vec<String>) {
 /// auth methods. `env` is the hermetic snapshot that gates the remote login
 /// branch, and `executable`/`argv` are the process entrypoint used by
 /// `_meta["terminal-auth"]`.
-fn initialize_response(
+pub fn initialize_response(
     air: Option<&AirClient>,
     caps: &ClientCapabilities,
     env: &crate::env_snapshot::EnvSnapshot,
@@ -657,6 +657,9 @@ pub fn session_spawn_options(
         executable_args: claude.executable_args,
         plugins: claude.plugins,
         plugin_delivery: claude.plugin_delivery,
+        fork_session: claude.fork_session,
+        resume_session_at: claude.resume_session_at,
+        resume_drops_turn: claude.resume_drops_turn,
         persist_session: claude.persist_session,
         project_config_root: claude.project_config_root,
         extra_args: claude.extra_args,
@@ -992,6 +995,7 @@ fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
             );
         }
         SessionError::Closed => (crate::turn::SESSION_ENDED_MESSAGE.to_string(), None),
+        SessionError::InvalidRequest(message) => (message.clone(), None),
         SessionError::Start(m) => (m.clone(), None),
     };
     (format!("Internal error: {message}"), data)
@@ -1012,6 +1016,9 @@ fn rpc_error(rpc: (String, Option<Value>)) -> Error {
 /// Convert a `SessionError` to the JSON-RPC wire error (`RequestError.authRequired`
 /// code -32000 for `AuthRequired`, else -32603).
 fn session_rpc_error(err: &SessionError) -> Error {
+    if let SessionError::InvalidRequest(message) = err {
+        return Error::new(-32600, message.clone());
+    }
     if let SessionError::PromptFailed {
         kind: crate::turn::FailureKind::AuthRequired,
         ..
@@ -1035,15 +1042,19 @@ fn set_request_error(message: String) -> Error {
 }
 
 /// A resumed session whose CLI cannot find the stored conversation answers
-/// `resourceNotFound` (-32002), not `Internal error` (`acp-agent.ts:8662-8672`:
+/// `resourceNotFound` (-32002), not `Internal error` (`acp-agent.ts:11421-11430`:
 /// `RequestError.resourceNotFound(sessionId)`). Node maps the SDK's
 /// "No conversation found with session ID" / "Query closed before response
 /// received" initialization errors; the Rust initialize handshake surfaces the
-/// CLI's own error text, so the substring check is equivalent for the first.
+/// CLI's own error text for the first and `ControlError::Closed`'s
+/// "control channel closed" for the second (the CLI exits before answering
+/// `initialize`), so the checks are the equivalent of the SDK's.
 fn resumed_start_error(err: &SessionError, resumed: bool, session_id: &str) -> Error {
     if resumed {
         if let SessionError::Start(message) = err {
-            if message.contains("No conversation found with session ID") {
+            if message.contains("No conversation found with session ID")
+                || message.ends_with("control channel closed")
+            {
                 return Error::new(-32002, format!("Resource not found: {session_id}"))
                     .data(json!({ "uri": session_id }));
             }
@@ -1114,6 +1125,7 @@ async fn serve_until(
         auth_contexts: std::collections::HashMap::new(),
         guard_states: std::collections::HashMap::new(),
         hide_claude_auth,
+        protocol: crate::v2::ProtocolMode::V1,
         provider_gate: Arc::new(tokio::sync::Semaphore::new(GATE_PERMITS as usize)),
         provider_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sessions_view: Arc::new(watch::channel(std::collections::HashMap::new()).0),
@@ -1388,6 +1400,21 @@ async fn run_registry_actor(
                 None => break,
                 Some(Incoming::Request { request, served }) => {
                     let (req, responder, connection) = *request;
+                    // B2: a negotiated v2 connection serves only `initialize`
+                    // until Turn 6 wires the v2 surface; every other request
+                    // gets upstream's method-not-found answer, so a v2 client
+                    // never waits on a v1 shape.
+                    if registry.protocol == crate::v2::ProtocolMode::V2
+                        && req.method() != "initialize"
+                    {
+                        let method = req.method().to_string();
+                        let _ = responder.respond_with_error(
+                            Error::new(-32601, format!("\"Method not found\": {method}"))
+                                .data(json!({ "method": method })),
+                        );
+                        let _ = served.send(());
+                        continue;
+                    }
                     let permit = if is_gated(req.method()) {
                         if !parked.is_empty() {
                             parked.push_back((req, responder, connection));
@@ -1444,6 +1471,16 @@ async fn handle_notification(
             .to_string();
         if let Some(session) = sessions.get(&session_id) {
             let _ = session.cancel().await;
+        } else {
+            // `cancel` (`acp-agent.ts:8383-8388`): an id that is no session of
+            // this connection may be the child session of a native subagent. The
+            // RFD form grants that session a `cancel` capability; stopping its
+            // task leaves the parent's work alone.
+            for session in sessions.values() {
+                if session.cancel_child(session_id.clone()).await {
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -1502,6 +1539,10 @@ struct Registry {
     guard_states: std::collections::HashMap<String, crate::hide_claude_auth::GuardState>,
     /// `--hide-claude-auth`.
     hide_claude_auth: bool,
+    /// The protocol version this connection negotiated in `initialize`
+    /// (`v2::ProtocolMode`): v1 unless experimental v2 was opted into and the
+    /// client asked for version 2 or later (B1/B2).
+    protocol: crate::v2::ProtocolMode,
     /// The gate of the provider update in flight (`providerUpdate`), a
     /// reader/writer lock over [`GATE_PERMITS`] permits. A provider update runs
     /// off this handler — it waits for the submitted turns and starts every
@@ -2198,6 +2239,17 @@ fn initialize_options_for(
     let file_change_reporter = air.is_some_and(|client| client.supports("agentFileChangeReport"));
     let enable_file_checkpointing =
         file_change_reporter || opts.enable_file_checkpointing == Some(true);
+    let cc_opts = params
+        .get("_meta")
+        .and_then(|m| m.get("claudeCode"))
+        .and_then(|c| c.get("options"));
+    let skills = cc_opts
+        .and_then(|o| o.get("skills"))
+        .filter(|v| !v.is_null())
+        .cloned();
+    let verbatim_prompts = cc_opts
+        .and_then(|o| o.get("verbatimPrompts"))
+        .and_then(Value::as_bool);
     Ok(InitializeOptions {
         system_prompt,
         append_system_prompt,
@@ -2207,12 +2259,16 @@ fn initialize_options_for(
         prompt_suggestions: Some(prompt_suggestions),
         tool_aliases: opts.tool_aliases,
         tool_config: opts.tool_config,
+        skills,
+        verbatim_prompts,
+        supported_dialog_kinds: caps
+            .elicitation_form
+            .then(|| vec![crate::elicitation::REFUSAL_FALLBACK_DIALOG_KIND.to_string()]),
         forward_subagent_text,
         per_task_stop_affordance,
         agent_progress_summaries: opts.agent_progress_summaries,
         plan_mode_instructions: opts.plan_mode_instructions,
         enable_file_checkpointing,
-        ..InitializeOptions::default()
     })
 }
 
@@ -2220,6 +2276,28 @@ fn initialize_options_for(
 /// notification handler (lock-free), and spawn a task that forwards its updates
 /// to the client as they arrive. The actor emits a `FinalText` chunk before
 /// resolving the prompt's oneshot, so the chunk lands ahead of the response.
+/// The names of the ACP-provided MCP servers of a setup request
+/// (`params.mcpServers`, F23c/A-01).
+fn mcp_server_names(params: &Value) -> Vec<String> {
+    params
+        .get("mcpServers")
+        .and_then(Value::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|server| server.get("name").and_then(Value::as_str))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `afterSetupResponse`'s MCP half (`acp-agent.ts:10434-10440`): start the
+/// background OAuth run for the session's ACP servers.
+fn start_setup_mcp_auth(session: &crate::session::Session, params: &Value) {
+    session.start_mcp_auth(mcp_server_names(params), true);
+}
+
 fn register_session(
     registry: &mut Registry,
     session_id: &str,
@@ -2439,6 +2517,32 @@ fn wire_session(
                         let _ = reply.send(result);
                     });
                 }
+                // F23a/F23b: `session/create_elicitation` (the ACP method is
+                // `elicitation/create`). Same shape as the permission round trip:
+                // spawned here, cancelled by dropping the reply (`$/cancel_request`).
+                SessionOutbound::CreateElicitation { params, reply } => {
+                    let connection = connection.clone();
+                    tokio::spawn(async move {
+                        let mut reply = reply;
+                        let result = match UntypedMessage::new("elicitation/create", params) {
+                            Ok(msg) => {
+                                let sent = connection.send_request(msg);
+                                tokio::select! {
+                                    res = sent.block_task() => res.map_err(|e| e.to_string()),
+                                    () = reply.closed() => Err("Tool use aborted".to_string()),
+                                }
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let _ = reply.send(result);
+                    });
+                }
+                // F23b/N-37: `elicitation/complete` is a notification.
+                SessionOutbound::CompleteElicitation { params } => {
+                    if let Ok(msg) = UntypedMessage::new("elicitation/complete", params) {
+                        let _ = connection.send_notification(msg);
+                    }
+                }
             }
         }
         // The actor ended (the stream died or the session closed): its row shows
@@ -2594,6 +2698,7 @@ async fn start_resumed(
         let raw_sdk_messages = claude.raw_sdk_messages.clone();
         let settings_arg = claude.settings_arg.clone();
         let launch_env = claude.env.clone();
+        let ask_disallowed = !env.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
         let mut spawn = session_spawn_options(
             opts,
             cwd.clone(),
@@ -2601,7 +2706,7 @@ async fn start_resumed(
             claude,
             permission_mode,
             allow_bypass,
-            true,
+            ask_disallowed,
         );
         if fresh {
             // A new conversation that keeps the old id: `resume` stays unset, so
@@ -2635,17 +2740,34 @@ async fn start_resumed(
         let replay_future = async {
             let messages = crate::transcript::session_messages_async(&opts.env, &session_id).await;
             let mut failure_book = crate::session::failures::SessionFailures::default();
+            // B-45: replay restores background task cards for a client that
+            // takes AIR async tasks; B-55: the loop yields to the event loop
+            // between messages on the upstream `messageLoopYielder` budget.
+            let async_tasks_enabled = env.air.as_ref().is_some_and(|a| a.supports("asyncTasks"));
+            let mut replay_async_tasks =
+                crate::async_tasks::AsyncTaskRuntime::new(async_tasks_enabled);
+            let mut replay_message_ids = crate::message_ids::MessageIdMap::default();
+            let mut yielder = crate::event_loop_yield::EventLoopYielder::with_clock(
+                crate::event_loop_yield::MESSAGE_LOOP_BUDGET_MS,
+            );
             let (notifications, task_state, last_published) =
-                crate::transcript::replay_with_failures(
+                crate::transcript::replay_session_async(
                     &messages,
                     &session_id,
                     air,
                     env.caps.plan,
-                    env.air
-                        .as_ref()
-                        .is_some_and(|a| a.supports("sessionFailure"))
-                        .then_some(&mut failure_book),
-                );
+                    crate::transcript::ReplaySinks {
+                        failures: env
+                            .air
+                            .as_ref()
+                            .is_some_and(|a| a.supports("sessionFailure"))
+                            .then_some(&mut failure_book),
+                        async_tasks: Some(&mut replay_async_tasks),
+                        message_ids: Some(&mut replay_message_ids),
+                    },
+                    &mut yielder,
+                )
+                .await;
             for mut value in notifications {
                 // A cancelled recreate stops replaying into a connection that is
                 // ending.
@@ -2660,13 +2782,23 @@ async fn start_resumed(
                     let _ = connection.send_notification(msg);
                 }
             }
-            (task_state, last_published, failure_book)
+            // B-53: a client with `loadReplayEnd` gets one more update after
+            // the whole replay (`acp-agent.ts:9529-9544`). A stopped replay
+            // does not get it.
+            if env.caps.load_replay_end && !recreate_cancelled(env) {
+                let marker = crate::transcript::load_replay_end_marker(&session_id);
+                if let Ok(msg) = UntypedMessage::new("session/update", marker) {
+                    let _ = connection.send_notification(msg);
+                }
+            }
+            (task_state, last_published, failure_book, replay_message_ids)
         };
         let no_replay: (
             Vec<(String, crate::hooks::TaskStateEntry)>,
             Option<String>,
             crate::session::failures::SessionFailures,
-        ) = (Vec::new(), None, Default::default());
+            crate::message_ids::MessageIdMap,
+        ) = (Vec::new(), None, Default::default(), Default::default());
         // The guard is created the moment the start returns, so a session that is
         // waiting for the replay to finish is already covered.
         let start_future = async {
@@ -2749,9 +2881,10 @@ async fn start_resumed(
             // the Task* state it rebuilt into the live actor so a status-only
             // TaskUpdate after the load still applies.
             if replay {
-                let (task_state, last_published, failure_book) = replayed;
+                let (task_state, last_published, failure_book, replay_message_ids) = replayed;
                 let _ = session.seed_task_state(task_state, last_published).await;
                 let _ = session.seed_failures(failure_book).await;
+                session.seed_message_ids(replay_message_ids);
                 timing.phase("replay", "");
             }
             let mgr = Arc::new(crate::settings_manager::SettingsManager::new(
@@ -2801,13 +2934,23 @@ async fn start_resumed(
                     is_air_client: env.air.is_some(),
                 },
                 &session_id,
-                session,
+                session.clone(),
                 update_rx,
                 connection,
             );
             timing.phase("register", "");
             responder.respond(session_response(&session_id, &modes, &config_options))?;
-            let update = map::map_commands_changed(&json!(commands), &[]);
+            start_setup_mcp_auth(&session, params);
+            // S-22: an AIR client gets `kind`/`skillPath` on its skill commands
+            // (`acp-agent.ts:12560-12652`).
+            let air_cwd = env.air.as_ref().map(|_| auth_cwd.as_path());
+            let home = opts.env.get_path("HOME");
+            let update = map::map_commands_changed_with_skills(
+                &json!(commands),
+                &[],
+                air_cwd,
+                home.as_deref(),
+            );
             // Decision 8: raw JSON with `input: null` for commands without a
             // hint (the typed update would omit the field).
             let value = json!({
@@ -2840,10 +2983,24 @@ async fn handle_request(
 
     match method.as_str() {
         "initialize" => {
-            let _version = params
-                .get("protocolVersion")
-                .and_then(Value::as_u64)
-                .unwrap_or(1);
+            // B1: with experimental v2 negotiated, translate the v2 request to
+            // the v1 request the agent reads BEFORE any parsing, so a v2
+            // client's `capabilities` are honoured. Without the opt-in the
+            // params pass through unchanged (O-139).
+            let negotiated = match crate::v2::negotiate_initialize(
+                &params,
+                crate::v2::is_experimental_v2_enabled(&opts.env),
+            ) {
+                Ok(negotiated) => negotiated,
+                // L4/L5: an invalid version gets the upstream router error
+                // instead of a dropped reply.
+                Err(error) => {
+                    responder.respond_with_error(error)?;
+                    return Ok(());
+                }
+            };
+            registry.protocol = negotiated.mode;
+            let params = &negotiated.params;
             // Parse the AIR client declaration once (Decision 11); the optional
             // `clientCapabilities._meta.jetbrains.air` gates the AIR advertise
             // (E-4 / X-1). Malformed -> None (a plain client).
@@ -2867,7 +3024,7 @@ async fn handle_request(
             }));
             registry.index.negotiate(registry.air.as_ref());
             let (executable, argv) = process_entrypoint();
-            responder.respond(initialize_response(
+            let v1_resp = initialize_response(
                 registry.air.as_ref(),
                 &registry.caps,
                 &opts.env,
@@ -2875,7 +3032,16 @@ async fn handle_request(
                 &argv,
                 &registry.index.capabilities(),
                 registry.hide_claude_auth,
-            ))?;
+            );
+            if negotiated.mode == crate::v2::ProtocolMode::V2 {
+                match crate::v2::v2_initialize_response(&v1_resp) {
+                    Ok(v2_resp) => responder.respond(v2_resp)?,
+                    // L5: answer the client instead of dropping the reply.
+                    Err(error) => responder.respond_with_error(error)?,
+                }
+            } else {
+                responder.respond(v1_resp)?;
+            }
             // G2 (Decision 11): learn the auth identity in the background AFTER
             // the response (Node `initialize` never waits on the CLI probe);
             // `_auth/status_update` is pushed only when the read lands.
@@ -2927,6 +3093,7 @@ async fn handle_request(
             let raw_sdk_messages = claude.raw_sdk_messages.clone();
             let settings_arg = claude.settings_arg.clone();
             let launch_env = claude.env.clone();
+            let ask_disallowed = !registry.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
             let mut spawn = session_spawn_options(
                 opts,
                 cwd,
@@ -2934,7 +3101,7 @@ async fn handle_request(
                 claude,
                 permission_mode,
                 allow_bypass,
-                true,
+                ask_disallowed,
             );
             let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
             // `useAuthStatusSettings`: a context that differs from the last probe's
@@ -3002,10 +3169,30 @@ async fn handle_request(
                     registry
                         .fingerprints
                         .insert(session_id.clone(), compute_session_fingerprint(&params));
-                    register_session(registry, &session_id, session, update_rx, &connection);
+                    register_session(
+                        registry,
+                        &session_id,
+                        session.clone(),
+                        update_rx,
+                        &connection,
+                    );
                     timing.phase("register", "");
                     responder.respond(session_response(&session_id, &modes, &config_options))?;
-                    let update = map::map_commands_changed(&json!(commands), &[]);
+                    start_setup_mcp_auth(&session, &params);
+                    // S-22: an AIR client gets `kind`/`skillPath` on its skill
+                    // commands (`acp-agent.ts:12560-12652`).
+                    let air_cwd = registry
+                        .air
+                        .as_ref()
+                        .and_then(|_| params.get("cwd").and_then(Value::as_str))
+                        .map(PathBuf::from);
+                    let home = opts.env.get_path("HOME");
+                    let update = map::map_commands_changed_with_skills(
+                        &json!(commands),
+                        &[],
+                        air_cwd.as_deref(),
+                        home.as_deref(),
+                    );
                     // Decision 8: raw JSON with `input: null` for commands
                     // without a hint (the typed update would omit the field).
                     let value = json!({
@@ -3209,7 +3396,20 @@ async fn handle_request(
                 // follows the response, like Node's `setTimeout(..., 0)`.
                 {
                     let commands = session.live_commands().await;
-                    let update = map::map_commands_changed(&json!(commands), &[]);
+                    // S-22: an AIR client gets `kind`/`skillPath` on its skill
+                    // commands (`acp-agent.ts:12560-12652`).
+                    let air_cwd = registry
+                        .air
+                        .as_ref()
+                        .and_then(|_| params.get("cwd").and_then(Value::as_str))
+                        .map(PathBuf::from);
+                    let home = opts.env.get_path("HOME");
+                    let update = map::map_commands_changed_with_skills(
+                        &json!(commands),
+                        &[],
+                        air_cwd.as_deref(),
+                        home.as_deref(),
+                    );
                     let value = json!({
                         "sessionId": session_id.clone(),
                         "update": map::available_commands_json(&update),
@@ -3249,27 +3449,69 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            if let Some(message_id) = session_methods::fork_point_message_id(&params) {
-                return responder.respond_with_error(
-                    Error::new(
-                        -32602,
-                        format!(
-                            "Invalid params: Fork point message {message_id} was not found in session {fork_session_id}"
-                        ),
-                    )
-                    .data(json!({ "messageId": message_id })),
-                );
-            }
             let cwd = params
                 .get("cwd")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // M-33/M-34/M-36: resolve the AIR fork point through the live
+            // messageId map, the active chain and the full transcript
+            // (`forkSession`, `fork-session.ts:194-237`). An unresolvable point
+            // is `invalidParams` before any copy or list change.
+            //
+            // A malformed point (a non-string `messageId`) is the SDK's
+            // TypeError from `fork.messageId?.trim()`, i.e. an internal error,
+            // never a silent full fork.
+            let fork_point = match crate::fork_session::fork_point(
+                params.get("_meta").unwrap_or(&Value::Null),
+            ) {
+                Ok(point) => point,
+                Err(error) => {
+                    return responder.respond_with_error(
+                        Error::internal_error().data(json!({ "details": error.to_string() })),
+                    );
+                }
+            };
+            let up_to = match fork_point {
+                None => None,
+                Some(point) => {
+                    // B-29: prefer the live map (the ids the client saw live).
+                    let live_session = registry.sessions.get(&fork_session_id).cloned();
+                    let live_map = match live_session {
+                        Some(session) => Some(session.message_ids().await),
+                        None => None,
+                    };
+                    let active = crate::transcript::session_messages(&opts.env, &fork_session_id);
+                    let full = crate::transcript::full_history(&opts.env, &fork_session_id);
+                    match crate::fork_session::resolve_fork_point(
+                        &point,
+                        live_map.as_ref(),
+                        &active,
+                        &full,
+                    ) {
+                        Some((uuid, _)) => Some(uuid),
+                        None => {
+                            return responder.respond_with_error(
+                                Error::new(
+                                    -32602,
+                                    format!(
+                                        "Invalid params: Fork point message {} was not found in session {fork_session_id}",
+                                        point.message_id
+                                    ),
+                                )
+                                .data(json!({ "messageId": point.message_id })),
+                            );
+                        }
+                    }
+                }
+            };
             // The session list holds back this fork until its response is out
             // (`SessionIndexConnection.forking`).
             registry.index.fork_started(&fork_session_id);
             let new_id =
-                match session_methods::fork_copy(fork_session_id.clone(), cwd, &opts.env).await {
+                match session_methods::fork_copy(fork_session_id.clone(), cwd, up_to, &opts.env)
+                    .await
+                {
                     Ok(id) => id,
                     Err(e) => {
                         registry.index.fork_answered(&fork_session_id);
@@ -3803,23 +4045,37 @@ async fn handle_request(
                 .unwrap_or("");
             let is_local_only = is_local_only_command(first_text);
             let mcp_command = crate::mcp_command::prompt_mcp_command(&params);
+            // F24/S-03 (`acp-agent.ts:3809-3857`): the adapter answers
+            // `/remote-control [name|off]` itself when Claude Code does not offer
+            // its own non-terminal command. The reply bypasses the turn queue, so
+            // it is refused while Claude is working.
+            let remote_command = match crate::control::prompt_remote_control_command(&params) {
+                Some(command) if session.remote_control_available().await => Some(command),
+                _ => None,
+            };
+            // The busy refusal is made by the actor (`Command::RemoteControlPrompt`),
+            // atomically with the turn queue and the foreground work.
             let uuid = uuid_v4();
-            let frame = prompt_to_claude(&params, &session_id, &uuid);
-            // G12 (Decision 21): record the `/mcp` command on the actor BEFORE
-            // the prompt, so the actor knows the turn's replacement is coming.
-            // Both sends are on the same unbounded channel, so the actor sees
-            // the command first.
-            if let Some(command) = mcp_command {
-                session.send_mcp(uuid.clone(), command);
-            }
             // Enqueue the prompt on the actor synchronously so a later
             // `session/cancel` notification (processed on the same single-task
             // connection) is always ordered *after* it — the queued-sweep
             // ordering the cancel relies on. Only the settlement is awaited on
             // a spawned task so the connection is never blocked while a turn is
             // in flight (Node's `prompt()` returns immediately).
-            let prompt_text = acp_prompt_text(&params);
-            let mut reply_rx = session.send_prompt(uuid, frame, is_local_only, prompt_text);
+            let mut reply_rx = if let Some(command) = remote_command {
+                session.remote_control(command)
+            } else {
+                let frame = prompt_to_claude(&params, &session_id, &uuid);
+                // G12 (Decision 21): record the `/mcp` command on the actor BEFORE
+                // the prompt, so the actor knows the turn's replacement is coming.
+                // Both sends are on the same unbounded channel, so the actor sees
+                // the command first.
+                if let Some(command) = mcp_command {
+                    session.send_mcp(uuid.clone(), command);
+                }
+                let prompt_text = acp_prompt_text(&params);
+                session.send_prompt(uuid, frame, is_local_only, prompt_text)
+            };
             // What the session index shows of a session this connection runs: the
             // turn is running until its reply settles (`noteSessionState`).
             let board = registry.index.board().clone();
@@ -4191,6 +4447,11 @@ mod tests_t3b;
 mod tests_t3fb;
 #[cfg(test)]
 mod tests_t3fd;
+#[cfg(test)]
+mod tests_t4b;
+
+#[cfg(test)]
+mod tests_t5b;
 
 #[cfg(test)]
 mod tests_t2gb;
@@ -4963,7 +5224,9 @@ mod tests {
             &json!({"_meta": {"claudeCode": {"options": {
                 "promptSuggestions": false,
                 "forwardSubagentText": true,
-                "perTaskStopAffordance": false
+                "perTaskStopAffordance": false,
+                "skills": ["custom_skill"],
+                "verbatimPrompts": true,
             }}}}),
             &plain,
             None,
@@ -4972,11 +5235,15 @@ mod tests {
         assert_eq!(init.prompt_suggestions, Some(false));
         assert!(init.forward_subagent_text);
         assert_eq!(init.per_task_stop_affordance, Some(false));
+        assert_eq!(init.skills, Some(json!(["custom_skill"])));
+        assert_eq!(init.verbatim_prompts, Some(true));
         assert!(!init.enable_file_checkpointing);
         let request = init.build_request();
         assert_eq!(request["promptSuggestions"], json!(false));
         assert_eq!(request["forwardSubagentText"], json!(true));
         assert_eq!(request["perTaskStopAffordance"], json!(false));
+        assert_eq!(request["skills"], json!(["custom_skill"]));
+        assert_eq!(request["verbatimPrompts"], json!(true));
 
         // A plain client: promptSuggestions defaults on, the other two are
         // absent/false.

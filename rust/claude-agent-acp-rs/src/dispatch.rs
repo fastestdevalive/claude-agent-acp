@@ -74,7 +74,9 @@ pub fn route(msg: &StreamMsg, _view: &TurnView) -> Route {
             Route::Control
         }
         "user" | "assistant" | "result" | "system" | "stream_event" | "rate_limit_event"
-        | "tool_progress" | "conversation_reset" | "auth_status" => Route::Session,
+        | "tool_progress" | "conversation_reset" | "auth_status" | "prompt_suggestion" => {
+            Route::Session
+        }
         _ => Route::Ignore,
     }
 }

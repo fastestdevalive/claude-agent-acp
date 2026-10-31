@@ -1,0 +1,61 @@
+{
+  "protocolVersion": 2,
+  "info": {
+    "name": "@agentclientprotocol/claude-agent-acp",
+    "title": "Claude Agent",
+    "version": "0.94.0"
+  },
+  "capabilities": {
+    "session": {
+      "prompt": {
+        "image": {},
+        "embeddedContext": {}
+      },
+      "mcp": {
+        "stdio": {},
+        "http": {}
+      },
+      "delete": {},
+      "fork": {},
+      "additionalDirectories": {},
+      "systemPrompt": {
+        "mode": {
+          "override": {}
+        }
+      }
+    },
+    "providers": {},
+    "_meta": {
+      "claudeCode": {
+        "promptQueueing": true
+      },
+      "authStatus": {}
+    }
+  },
+  "authMethods": [
+    {
+      "description": "Use Claude subscription ",
+      "name": "Claude Subscription",
+      "type": "terminal",
+      "args": [
+        "--cli",
+        "auth",
+        "login",
+        "--claudeai"
+      ],
+      "methodId": "claude-ai-login"
+    },
+    {
+      "description": "Use Anthropic Console (API usage billing)",
+      "name": "Anthropic Console",
+      "type": "terminal",
+      "args": [
+        "--cli",
+        "auth",
+        "login",
+        "--console"
+      ],
+      "methodId": "console-login"
+    }
+  ]
+}

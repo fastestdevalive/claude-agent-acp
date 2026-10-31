@@ -110,7 +110,7 @@ fn t3a_exit_plan_interruption_settles_the_turn_cancelled_and_owes_its_idle() {
         "is_error": true, "usage": {"input_tokens": 3, "output_tokens": 4}});
     let begin = machine.on_result_begin(&diagnostic);
     machine.note_exit_plan_interruption(ExitPlanVerdict::KeepPlanning);
-    let events = machine.on_result_finish(&diagnostic, false, begin);
+    let events = machine.on_result_finish(&diagnostic, false, false, begin);
     assert_eq!(
         settled_with(&events),
         vec![("p1".to_string(), StopReason::Cancelled, 4)]
@@ -138,7 +138,7 @@ fn t3a_exit_plan_interruption_in_a_held_follow_up_ends_the_held_turn_cancelled()
     let begin = machine.on_result_begin(&diagnostic);
     assert!(begin.autonomous);
     machine.note_exit_plan_interruption(ExitPlanVerdict::KeepPlanning);
-    let events = machine.on_result_finish(&diagnostic, false, begin);
+    let events = machine.on_result_finish(&diagnostic, false, false, begin);
     assert_eq!(
         settled_with(&events),
         vec![("p1".to_string(), StopReason::Cancelled, 5)],
@@ -161,10 +161,10 @@ fn t3a_unmarked_autonomous_diagnostic_leaves_the_held_turn_held() {
     placeholder["num_turns"] = serde_json::json!(0);
     machine.note_exit_plan_interruption(ExitPlanVerdict::KeepPlanning);
     let begin = machine.on_result_begin(&placeholder);
-    let _ = machine.on_result_finish(&placeholder, false, begin);
+    let _ = machine.on_result_finish(&placeholder, false, false, begin);
     let diagnostic = autonomous_diagnostic();
     let begin = machine.on_result_begin(&diagnostic);
-    let events = machine.on_result_finish(&diagnostic, false, begin);
+    let events = machine.on_result_finish(&diagnostic, false, false, begin);
     assert!(settled_with(&events).is_empty(), "{events:?}");
     assert!(machine.active_is_held());
 }
@@ -182,7 +182,7 @@ fn t3a_context_reset_hands_the_turn_on_with_the_result_usage() {
         "is_error": true, "usage": {"input_tokens": 3, "output_tokens": 4}});
     let begin = machine.on_result_begin(&diagnostic);
     machine.note_exit_plan_interruption(ExitPlanVerdict::ContextReset);
-    let events = machine.on_result_finish(&diagnostic, false, begin);
+    let events = machine.on_result_finish(&diagnostic, false, false, begin);
     assert!(events.is_empty(), "nothing settles or fails: {events:?}");
     assert!(!machine.has_active(), "the turn left the machine");
     let turn = machine.take_restart_turn().expect("the turn is handed on");
@@ -212,7 +212,7 @@ fn t3a_context_reset_in_a_held_follow_up_drops_the_hold() {
     let diagnostic = autonomous_diagnostic();
     let begin = machine.on_result_begin(&diagnostic);
     machine.note_exit_plan_interruption(ExitPlanVerdict::ContextReset);
-    let events = machine.on_result_finish(&diagnostic, false, begin);
+    let events = machine.on_result_finish(&diagnostic, false, false, begin);
     assert!(settled_with(&events).is_empty() && failed(&events).is_empty());
     let turn = machine
         .take_restart_turn()
@@ -284,7 +284,7 @@ fn t3fa_context_reset_of_a_held_follow_up_reports_no_cycle_end() {
         let diagnostic = autonomous_diagnostic();
         let begin = machine.on_result_begin(&diagnostic);
         machine.note_exit_plan_interruption(verdict);
-        machine.on_result_finish(&diagnostic, false, begin)
+        machine.on_result_finish(&diagnostic, false, false, begin)
     };
     let ended = |events: &[TurnEvent]| events.iter().any(|e| matches!(e, TurnEvent::CycleEnded));
     assert!(!ended(&run(ExitPlanVerdict::ContextReset)));

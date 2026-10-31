@@ -27,19 +27,19 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | acp-agent.ts@promptToClaude | turn.rs, tools.rs | split:turn.rs | prompt conversion + tool-call bookkeeping |
 | acp-agent.ts@toAcpNotifications | map.rs, tools.rs | split:map.rs | notification mapping + streamEvent |
 | acp-agent.ts@runPromptWithCancellation | turn.rs, agent.rs | split:turn.rs | runPrompt/v1AgentApp/runAcp/context-window |
-| acp-subagents.ts | - | missing:F35b | AIR/RFD subagent event builders |
+| acp-subagents.ts | acp_subagents.rs | 1:1 | AIR/RFD subagent event builders (T4B); announce/route hooks into session.rs finish with U-11/U-68 |
 | air-extension.ts | air.rs | merged:air.rs | AIR extension |
 | async-tasks.ts | async_tasks.rs | merged:async_tasks.rs | async task registry |
 | auth-status.ts | auth_status.rs | 1:1 | auth status actor, epoch, probe context |
 | clear-context-coordinator.ts | session/clear_context.rs | 1:1 | fresh-query clear-context hand-off (B-74/B-75 PARTIAL: Fast-mode reconcile after restart waits for F11) |
 | client-system-prompt.ts | system_prompt.rs | 1:1 | client system prompt merge |
-| context-compaction-meta.ts | - | missing:F20 | compaction meta lifecycle |
-| context-compaction.ts | - | missing:F20 | compaction engine |
+| context-compaction-meta.ts | context_compaction_meta.rs | 1:1 | AIR contextCompaction meta (T5A) |
+| context-compaction.ts | context_compaction.rs | 1:1 | compaction lifecycle, summary handling, boundary metadata (T5A) |
 | diff.ts | diff.rs | 1:1 | line diff (Myers, context 3, budget), diff memo, git patch formatting and ACP v2 diff content ported (T1C, F8) |
-| elicitation.ts | - | missing:F23a | ACP elicitation mapping |
+| elicitation.ts | elicitation.rs | 1:1 | ACP elicitation mapping, AskUserQuestion form, refusal_fallback dialog, MCP OAuth (T4C) |
 | exit-plan.ts | session/exit_plan.rs | 1:1 | ExitPlanMode hand-off, approved plan, keep-planning interrupt |
 | file-change-audit.ts | - | missing:AG-3 | file-change audit report |
-| fork-session.ts | session_methods.rs | merged:session_methods.rs | fork-session helpers |
+| fork-session.ts | fork_session.rs, message_ids.rs, session_methods.rs | split:fork_session.rs | fork point parse, fork operation, messageId map (T5B) |
 | gateway-models.ts | gateway_models.rs | 1:1 | gateway / Bedrock model listing over reqwest (D10) |
 | goal-extension.ts | - | missing:AG-1 | `_session/goal` |
 | hide-claude-auth.ts | hide_claude_auth.rs | 1:1 | account predicates, refusal errors, per-turn guard |
@@ -47,7 +47,7 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | lib.ts | lib.rs | different:Rust crate exports differ from the TS public surface (FX-4) | public exports |
 | managed-policy.ts | - | missing:F5a | managed env tier and MDM/registry tiers |
 | mcp-command.ts | - | missing:AG-4 | `/mcp` prompt |
-| native-subagents.ts | - | missing:F35a | native subagent child-session registry |
+| native-subagents.ts | native_subagents.rs, native_subagents/runtime.rs, async_tasks/subagents.rs | split:native_subagents.rs | native subagent child-session registry (T4B); route/cancel hooks pending U-11/U-68 |
 | paths.ts | session_store.rs | different:path helpers replaced by session storage | path helpers |
 | permissions/effects.ts | permission.rs | merged:permission.rs | permission effects |
 | permissions/modes.ts | permission_mode.rs | merged:permission_mode.rs | permission modes |
@@ -61,7 +61,7 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | permissions/response.ts | permission.rs | merged:permission.rs | permission response mapping |
 | prompt-suggestions.ts | prompt_suggestions.rs | 1:1 | prompt suggestion text and meta (pure; wiring is F24 Turn 4) |
 | resumed-session.ts | resumed_session.rs | merged:resumed_session.rs | resumed-session state |
-| serve.ts | bin/claude-agent-acp-rs.rs | merged:bin/claude-agent-acp-rs.rs | serve entrypoint |
+| serve.ts | bin/claude-agent-acp-rs.rs, v2/serve.rs | split:bin/claude-agent-acp-rs.rs | serve entrypoint; protocol router in v2/serve.rs (T5C) |
 | session-config-ids.ts | session_config.rs | merged:session_config.rs | config ids |
 | session-effort.ts | session_config.rs | merged:session_config.rs | effort config |
 | session-failure-extension.ts | session_failure.rs | 1:1 | session failure controller, replay, advisory notices |
@@ -96,7 +96,7 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | tool-calls/renderer.ts | map.rs | merged:map.rs | renderer |
 | tool-calls/reporters/agent.ts | tools.rs | merged:tools.rs | agent reporter |
 | tool-calls/reporters/bash.ts | tools.rs | merged:tools.rs | bash reporter |
-| tool-calls/reporters/compaction.ts | - | missing:F20 | legacy compaction tool call |
+| tool-calls/reporters/compaction.ts | tool_reporters_compaction.rs | 1:1 | compaction tool call reporter (T5A) |
 | tool-calls/reporters/file-edit.ts | tools.rs | merged:tools.rs | file-edit reporter |
 | tool-calls/reporters/index.ts | tools.rs | merged:tools.rs | reporter registry |
 | tool-calls/reporters/interaction.ts | tools.rs | merged:tools.rs | interaction reporter |
@@ -107,13 +107,13 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | tools.ts | tools.rs | merged:tools.rs | tool definitions |
 | turn-events.ts | turn.rs | merged:turn.rs | turn events |
 | usage-markdown.ts | usage_markdown.rs | 1:1 | `/usage` markdown formatter (pure; wiring is F24 Turn 4) |
-| utils.ts | - | missing:F31 | EventLoopYielder (B-17/B-55) |
+| utils.ts | event_loop_yield.rs | 1:1 | EventLoopYielder / messageLoopYielder (T5B; B-17 race tests in T7) |
 | v2/agent.ts | - | missing:F38b | ACP v2 surface |
-| v2/initialize.ts | - | missing:F38a | ACP v2 surface |
+| v2/initialize.ts | v2/initialize.rs | 1:1 | v2 initialize mapping and response (T5C) |
 | v2/permission.ts | - | missing:F40 | ACP v2 surface |
 | v2/prompt.ts | - | missing:F39 | ACP v2 surface |
 | v2/session-update.ts | - | missing:F39 | ACP v2 surface |
-| v2/session.ts | - | missing:F38a | ACP v2 surface |
+| v2/session.ts | v2/session.rs | 1:1 | v2 session translation: config shape, extension methods, tool call statuses (T5C) |
 | v2/terminal.ts | - | missing:F40 | ACP v2 surface |
 | v2/tool-call-meta.ts | - | missing:F40 | ACP v2 surface |
 | v2/tool-call.ts | - | missing:F40 | ACP v2 surface |

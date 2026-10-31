@@ -425,6 +425,7 @@ async fn start_update_session(
         let raw_sdk_messages = claude.raw_sdk_messages.clone();
         let settings_arg = claude.settings_arg.clone();
         let launch_env = claude.env.clone();
+        let ask_disallowed = !env.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
         let mut spawn = session_spawn_options(
             opts,
             cwd.clone(),
@@ -432,7 +433,7 @@ async fn start_update_session(
             claude,
             live_mode.clone(),
             allow_bypass,
-            true,
+            ask_disallowed,
         );
         if fresh {
             spawn.resume = None;
@@ -614,6 +615,7 @@ async fn start_live_session(
         let raw_sdk_messages = claude.raw_sdk_messages.clone();
         let settings_arg = claude.settings_arg.clone();
         let launch_env = claude.env.clone();
+        let ask_disallowed = !registry.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
         let mut spawn = session_spawn_options(
             opts,
             cwd.clone(),
@@ -621,7 +623,7 @@ async fn start_live_session(
             claude,
             live_mode.clone(),
             allow_bypass,
-            true,
+            ask_disallowed,
         );
         if fresh {
             spawn.resume = None;

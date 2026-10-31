@@ -227,6 +227,174 @@ impl UsageState {
     }
 }
 
+// ---------------------------------------------------------------- `/usage`
+//
+// The structured replacement for a local `/usage` turn (`acp-agent.ts:501-533`,
+// `3718-3733`): the CLI runs the command itself, and the replacement takes the
+// place of its text. The producer starts at turn activation and is memoised per
+// turn, like Node's `turn.localCommandMarkdown`.
+
+/// `STRUCTURED_USAGE_TIMEOUT_MS` (`acp-agent.ts:428`): the timeout that keeps
+/// an unstable control request from holding an otherwise-completed local
+/// command indefinitely.
+pub const STRUCTURED_USAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The structured replacement for the text of a local `/usage` turn, or `None`
+/// to keep the CLI's original text (timeout, transport error, incompatible
+/// response) (`structuredUsageMarkdown`).
+pub async fn structured_usage_markdown(
+    control: &crate::control::Control,
+    zone: &crate::usage_markdown::Zone,
+) -> Option<String> {
+    let receipt = tokio::time::timeout(
+        STRUCTURED_USAGE_TIMEOUT,
+        control.send_request(json!({ "subtype": "get_usage" })),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    // `request()` resolves with the response payload of a success verdict.
+    let payload = receipt.get("response")?.get("response")?;
+    let usage = crate::usage_markdown::parse_usage_response(payload)?;
+    Some(crate::usage_markdown::format_usage_response(&usage, zone))
+}
+
+/// One `/usage` turn's local-command state (`Turn.localCommandMarkdown` plus
+/// its `localCommandDelivered` / `localCommandOriginalOutput` bookkeeping).
+#[derive(Debug, Default)]
+pub struct UsageTurn {
+    /// The CLI text of the first output shape that carried the command's output
+    /// (the `originalOutput` of `takeLocalCommandMarkdown`).
+    pub original_output: Option<String>,
+    /// The produced replacement, once the control request finishes:
+    /// `None` = still pending, `Some(None)` = produce failed or timed out (keep
+    /// the CLI text), `Some(Some(markdown))` = the replacement.
+    pub prepared: Option<Option<String>>,
+    /// Whether the replacement (or the kept CLI text) has been published.
+    pub delivered: bool,
+    /// The control request has been started at activation
+    /// (`startsAtActivation: true`).
+    pub run_started: bool,
+    /// The turn was cancelled: the producer is aborted and its output is not
+    /// published (`localCommandAbort.abort()`).
+    pub aborted: bool,
+}
+
+impl UsageTurn {
+    /// Whether the turn's result must wait for the replacement
+    /// (`await pending` in `takeLocalCommandMarkdown`).
+    #[must_use]
+    pub fn waits_for_replacement(&self) -> bool {
+        self.run_started && !self.aborted && self.prepared.is_none() && !self.delivered
+    }
+}
+
+/// The `/usage` turns of one session, keyed by prompt uuid.
+#[derive(Debug, Default)]
+pub struct UsageTurns {
+    turns: std::collections::HashMap<String, UsageTurn>,
+}
+
+impl UsageTurns {
+    pub fn insert(&mut self, uuid: &str) {
+        self.turns.insert(uuid.to_string(), UsageTurn::default());
+    }
+
+    #[must_use]
+    pub fn get(&self, uuid: &str) -> Option<&UsageTurn> {
+        self.turns.get(uuid)
+    }
+
+    pub fn get_mut(&mut self, uuid: &str) -> Option<&mut UsageTurn> {
+        self.turns.get_mut(uuid)
+    }
+
+    pub fn remove(&mut self, uuid: &str) -> Option<UsageTurn> {
+        self.turns.remove(uuid)
+    }
+
+    /// `localCommandAbort.abort()`: every in-flight `/usage` turn is aborted, so
+    /// its pending replacement resolves to "keep the CLI text" and its output is
+    /// not published.
+    pub fn abort_all(&mut self) {
+        for turn in self.turns.values_mut() {
+            turn.aborted = true;
+            turn.prepared.get_or_insert(None);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.turns.clear();
+    }
+}
+
+/// The process's local zone, resolved once per process: `date` is a blocking
+/// subprocess, so a `/usage` producer must not pay for it on every call.
+static SYSTEM_ZONE: std::sync::OnceLock<crate::usage_markdown::Zone> = std::sync::OnceLock::new();
+
+/// The process's local zone for `/usage` reset times: what
+/// `Intl.DateTimeFormat(.., { timeZoneName: "short" })` renders under `TZ`.
+/// The port has no tz-database dependency, so it asks the system `date` for the
+/// offset and short name and falls back to UTC when that is unavailable. The
+/// answer is cached for the life of the process.
+#[must_use]
+pub fn system_zone() -> crate::usage_markdown::Zone {
+    SYSTEM_ZONE.get_or_init(resolve_system_zone).clone()
+}
+
+/// The zone a `/usage` producer may use, bounded: a cached answer is returned
+/// immediately, otherwise `date` runs off the runtime with a short timeout. A
+/// timeout or a failed blocking task answers `None`, so the producer reports
+/// "keep the CLI text" instead of holding the turn.
+pub async fn system_zone_bounded() -> Option<crate::usage_markdown::Zone> {
+    if let Some(zone) = SYSTEM_ZONE.get() {
+        return Some(zone.clone());
+    }
+    let resolved = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::task::spawn_blocking(system_zone),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(resolved)
+}
+
+fn resolve_system_zone() -> crate::usage_markdown::Zone {
+    let output = std::process::Command::new("date").arg("+%z %Z").output();
+    let Ok(output) = output else {
+        return crate::usage_markdown::Zone::utc();
+    };
+    if !output.status.success() {
+        return crate::usage_markdown::Zone::utc();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_zone(&text).unwrap_or_else(crate::usage_markdown::Zone::utc)
+}
+
+/// Parse `date "+%z %Z"` output (`-0700 PDT`).
+#[must_use]
+pub fn parse_zone(text: &str) -> Option<crate::usage_markdown::Zone> {
+    let mut parts = text.split_whitespace();
+    let offset = parts.next()?;
+    let name = parts.next()?;
+    let sign = match offset.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = offset.get(1..)?;
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i32 = digits[..2].parse().ok()?;
+    let minutes: i32 = digits[2..].parse().ok()?;
+    Some(crate::usage_markdown::Zone::fixed(
+        sign * (hours * 60 + minutes),
+        name,
+    ))
+}
+
 /// Attach `_meta["_claude/model"]` if `model` is provided.
 fn attach_usage_model(mut update: serde_json::Map<String, Value>, model: Option<&str>) -> Value {
     if let Some(m) = model {

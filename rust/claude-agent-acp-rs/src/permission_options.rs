@@ -381,6 +381,9 @@ fn build_unsorted_options(ctx: &OptionsContext) -> Vec<Value> {
         return build_computer_use_mcp_options(ctx);
     }
     match ctx.tool_name.as_str() {
+        "AskUserQuestion" => {
+            panic!("AskUserQuestion must be handled by ACP elicitation, not permission options")
+        }
         "Bash" => build_shell_options(ctx, "Bash"),
         "PowerShell" => build_shell_options(ctx, "PowerShell"),
         "Read" => build_file_options(ctx, input_path(ctx, "file_path"), "read"),
@@ -2194,5 +2197,15 @@ mod tests {
     fn trailing_backslash_is_not_a_trailing_slash() {
         assert_eq!(normalize_path_for_display("a\\b\\"), "a\\b\\");
         assert_eq!(normalize_path_for_display("a\\b\\/"), "a\\b\\/");
+    }
+
+    /// P-58: Permission builder refuses AskUserQuestion (throws, routed to elicitation).
+    #[test]
+    #[should_panic(
+        expected = "AskUserQuestion must be handled by ACP elicitation, not permission options"
+    )]
+    fn permission_builder_refuses_ask_user_question() {
+        let context = ctx("AskUserQuestion", serde_json::json!({}));
+        build_options(&context);
     }
 }

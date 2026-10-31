@@ -1331,7 +1331,7 @@ fn f16a_result_begin_activates_before_emissions() {
         "ensureActiveTurn promotes the echo-less head first"
     );
     assert!(machine.has_active(), "not settled until the finish half");
-    let events = machine.on_result_finish(&result_frame("success", false), false, begin);
+    let events = machine.on_result_finish(&result_frame("success", false), false, false, begin);
     assert_eq!(settled(&events), vec![("pc", StopReason::EndTurn)]);
 }
 

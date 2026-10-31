@@ -29,7 +29,7 @@
 //! 6760–6864, the partial-JSON lexer at 179–232.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock, ContentChunk,
@@ -38,7 +38,7 @@ use agent_client_protocol::schema::v1::{
     ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind, UnstructuredCommandInput,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::meta_filter::ChangedMetaFilter;
 use crate::tools;
@@ -122,6 +122,9 @@ pub struct MapState {
     /// `conversation_reset` (`acp-agent.ts:8199`); those consumers are NOT
     /// ported yet (F17), so nothing outside the tests reads this memory today.
     resolved_tool_names: Vec<(String, String)>,
+    /// B-29: the ACP messageId -> SDK uuid map (`Session.messageIdToUuid`,
+    /// `acp-agent.ts:7712-7719`). Fork reads it to resolve an AIR fork point.
+    message_ids: crate::message_ids::MessageIdMap,
     /// Whether the client gets the text/thinking of a subagent
     /// (`forwardsSubagentText`, `acp-agent.ts:10947-10953`): the historical
     /// `_meta["subagent-transcript"]` capability, native subagent sessions, or
@@ -137,6 +140,21 @@ pub struct MapState {
     /// The Agent/Task calls of the live background subagents (see
     /// [`MapState::set_background_subagents`]).
     background_subagents: HashSet<String>,
+    /// The ACP session that a permission request created a tool call in
+    /// (`session.eagerToolCallSessions`, `acp-agent.ts:1266`): the child
+    /// session of an announced subagent, else the root. `sendUpdate` passes it
+    /// to the native subagent routing as the forced session, and the final
+    /// status of the call drops it (`acp-agent.ts:4560,4630`). Insertion
+    /// ordered with the tool-memory cap.
+    eager_tool_call_sessions: Vec<(String, String)>,
+    /// The tool-use cache's ids in first-insertion order: a JavaScript object
+    /// keeps the position of an existing key on re-assignment, and
+    /// `sendMessageResume` scans it latest-first.
+    tool_use_order: Vec<String>,
+    /// The adapter logger, for the diagnostics the native subagent runtime
+    /// records (`NativeSubagentRuntime.logs`): they are drained at the session
+    /// boundary so a long session does not accumulate them.
+    logger: Option<std::sync::Arc<crate::logger::Logger>>,
 }
 
 /// A command tool: its output goes to the terminal channel (`BashReporter`,
@@ -403,6 +421,90 @@ impl MapState {
         recall(&self.tool_call_parents, id)
     }
 
+    /// Remember the session a permission request created the tool call `id` in
+    /// (`session.eagerToolCallSessions.set(toolCallId, notificationSessionId)`,
+    /// `acp-agent.ts:9906`).
+    pub(crate) fn record_eager_session(&mut self, id: &str, session: &str) {
+        remember(&mut self.eager_tool_call_sessions, id, session);
+    }
+
+    /// `session.eagerToolCallSessions.get(toolCallId)` (`acp-agent.ts:4560`).
+    pub(crate) fn eager_session(&self, id: &str) -> Option<String> {
+        recall(&self.eager_tool_call_sessions, id).map(ToString::to_string)
+    }
+
+    /// Drop the eager session of a call that reached a final status
+    /// (`session.eagerToolCallSessions.delete`, `acp-agent.ts:4630`).
+    pub(crate) fn forget_eager_session(&mut self, id: &str) {
+        self.eager_tool_call_sessions.retain(|(key, _)| key != id);
+    }
+
+    /// A copy of the eager-session map, for the runtime's forced-session lookup
+    /// while the session's own `sendUpdate` tail holds the state mutably.
+    pub(crate) fn eager_snapshot(&self) -> HashMap<String, String> {
+        self.eager_tool_call_sessions.iter().cloned().collect()
+    }
+
+    /// `session.eagerToolCallSessions?.clear()` (cancel, reset, teardown).
+    pub(crate) fn clear_eager_sessions(&mut self) {
+        self.eager_tool_call_sessions.clear();
+    }
+
+    /// Attach the adapter logger for the native subagent runtime's diagnostics.
+    pub(crate) fn set_logger(&mut self, logger: Option<std::sync::Arc<crate::logger::Logger>>) {
+        self.logger = logger;
+    }
+
+    /// The adapter logger, if any.
+    pub(crate) fn logger(&self) -> Option<&std::sync::Arc<crate::logger::Logger>> {
+        self.logger.as_ref()
+    }
+
+    /// Forget that a tool call surfaced to the client
+    /// (`session.emittedToolCalls.delete`, `acp-agent.ts:4588`): a native
+    /// Agent/Task control call the routing suppressed is not a tool call the
+    /// client holds, so a later permission request must be able to surface it.
+    pub(crate) fn unmark_emitted(&mut self, id: &str) {
+        self.emitted.remove(id);
+    }
+
+    /// The tool-use cache in first-insertion order, as
+    /// `sendMessageResume` scans it (`Object.entries(toolUseCache)`).
+    pub fn tool_uses_in_order(&self) -> Vec<(String, crate::native_subagents::ToolUseRecord)> {
+        self.tool_use_order
+            .iter()
+            .filter_map(|id| {
+                let tool_use = self.tool_use_cache.get(id)?;
+                Some((
+                    id.clone(),
+                    crate::native_subagents::ToolUseRecord {
+                        name: tool_use
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        input: tool_use.get("input").cloned().unwrap_or(Value::Null),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Cache a `tool_use` block by id, keeping its first-insertion position
+    /// (Node's `toolUseCache[chunk.id] = chunk`).
+    fn cache_tool_use(&mut self, id: String, block: Value) {
+        if !self.tool_use_cache.contains_key(&id) {
+            self.tool_use_order.push(id.clone());
+        }
+        self.tool_use_cache.insert(id, block);
+    }
+
+    /// Drop a cached `tool_use` (`delete toolUseCache[id]`).
+    fn uncache_tool_use(&mut self, id: &str) {
+        self.tool_use_cache.remove(id);
+        self.tool_use_order.retain(|existing| existing != id);
+    }
+
     /// Keep the tool name of a tool result before the tool-use cache drops it
     /// (`rememberResolvedToolNames`).
     fn remember_resolved_tool_name(&mut self, id: &str, name: &str) {
@@ -425,6 +527,21 @@ impl MapState {
     /// `acp-agent.ts:8199`) after a conversation reset.
     pub(crate) fn clear_resolved_tool_names(&mut self) {
         self.resolved_tool_names.clear();
+    }
+
+    /// B-29: record one consolidated message's ACP id -> SDK uuid mapping.
+    pub fn record_message_id(&mut self, message_id: &str, uuid: &str) {
+        self.message_ids.set(message_id, uuid);
+    }
+
+    /// B-29: the session's map, for `session/fork` (a clone; no lock is held).
+    pub fn message_ids(&self) -> crate::message_ids::MessageIdMap {
+        self.message_ids.clone()
+    }
+
+    /// B-54: merge the history replay's map into the session's.
+    pub fn seed_message_ids(&mut self, map: crate::message_ids::MessageIdMap) {
+        self.message_ids.extend(map);
     }
 
     /// Open the stopped-work window after a cancel (Decision 18): a late
@@ -507,7 +624,7 @@ impl MapState {
     /// field-tracker entries go.
     pub(crate) fn close_tool_call(&mut self, id: &str) {
         self.emitted.remove(id);
-        self.tool_use_cache.remove(id);
+        self.uncache_tool_use(id);
         self.tool_tracker.remove(id);
         self.progress_meta.remove(id);
         self.pending_hooks.remove(id);
@@ -537,7 +654,7 @@ impl MapState {
             self.pending_hooks.insert(id.clone());
         }
         self.emitted.insert(id.clone());
-        self.tool_use_cache.insert(id, block);
+        self.cache_tool_use(id, block);
     }
 
     /// Retrieve the cached tool_use block for an id, if present.
@@ -1178,7 +1295,7 @@ fn map_block(
             // Node caches EVERY tool_use by id before branching, TodoWrite
             // included (`toolUseCache[chunk.id] = chunk`, `acp-agent.ts:13083`,
             // T-19), so a later tool_result always finds its name/input.
-            state.tool_use_cache.insert(
+            state.cache_tool_use(
                 block["id"].as_str().unwrap_or("").to_string(),
                 block.clone(),
             );
@@ -1217,6 +1334,7 @@ fn map_block(
             // exactly once.
             let was_emitted = state.emitted.remove(&id);
             let cached = state.tool_use_cache.remove(&id);
+            state.tool_use_order.retain(|existing| existing != &id);
             let Some(tool_use) = cached else {
                 // T-20: a result whose tool_use never reached the cache. The
                 // permission flow may have surfaced the tool_call before the
@@ -1301,7 +1419,7 @@ fn tool_call_from_use(
         return tool_call_update_refine(id, &name, raw_input, state, ctx);
     }
     state.emitted.insert(id.clone());
-    state.tool_use_cache.insert(id.clone(), block.clone());
+    state.cache_tool_use(id.clone(), block.clone());
     // T-15: remember the Agent/Task call that started the subagent making this
     // call (`recordToolCallParent`).
     if let Some(parent) = ctx.parent.as_deref() {
@@ -1702,6 +1820,25 @@ pub fn map_commands_changed(
     commands: &Value,
     terminal_commands: &[String],
 ) -> AvailableCommandsUpdate {
+    map_commands_changed_with_skills(commands, terminal_commands, None, None)
+}
+
+/// The AIR `_meta` key of a skill command (`AIR_KIND_KEY`).
+pub const AIR_SKILL_KIND: &str = "kind";
+/// The AIR `_meta` key of a skill command's absolute `SKILL.md` path
+/// (`AIR_SKILL_PATH_KEY`).
+pub const AIR_SKILL_PATH: &str = "skillPath";
+
+/// [`map_commands_changed`] with the AIR skill meta (`getAvailableSlashCommands`,
+/// `acp-agent.ts:12560-12652`): an AIR client gets `_meta.jetbrains.air` with
+/// `kind: "skill"` and the absolute `SKILL.md` path of every skill command it
+/// can locate. Built-in commands and MCP prompts never carry it.
+pub fn map_commands_changed_with_skills(
+    commands: &Value,
+    terminal_commands: &[String],
+    air_skill_cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> AvailableCommandsUpdate {
     const UNSUPPORTED: &[&str] = &[
         "clear",
         "cost",
@@ -1726,6 +1863,7 @@ pub fn map_commands_changed(
             if terminal_names.contains(name) {
                 continue;
             }
+            let mcp_prompt = name.ends_with(" (MCP)");
             let final_name = match name.strip_suffix(" (MCP)") {
                 Some(rest) => format!("mcp:{rest}"),
                 None => name.to_string(),
@@ -1757,6 +1895,25 @@ pub fn map_commands_changed(
                     built = built.input(AvailableCommandInput::Unstructured(
                         UnstructuredCommandInput::new(hint),
                     ));
+                }
+            }
+            // AIR gets the kind and the `SKILL.md` path of each skill command
+            // (`acp-agent.ts:12623-12640`): not for a built-in command or an
+            // MCP prompt, and only when the file exists on disk.
+            if let Some(cwd) = air_skill_cwd {
+                if !mcp_prompt && command.get("builtin").and_then(Value::as_bool) != Some(true) {
+                    if let Some(path) = crate::tools::resolve_skill_path_in(name, Some(cwd), home) {
+                        let meta = crate::air::with_air_meta(
+                            Some(&crate::air::with_air_meta(
+                                None,
+                                AIR_SKILL_KIND,
+                                json!("skill"),
+                            )),
+                            AIR_SKILL_PATH,
+                            json!(path.to_string_lossy()),
+                        );
+                        built = built.meta(meta.as_object().cloned());
+                    }
                 }
             }
             avail.push(built);

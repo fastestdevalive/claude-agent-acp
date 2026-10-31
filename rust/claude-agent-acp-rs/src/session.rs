@@ -100,6 +100,11 @@ pub enum SessionError {
     /// `Internal error` with the message in `data.details`.
     #[error("{0}")]
     ModelSwitchFailed(String),
+    /// A refusal of a well-formed request (`RequestError.invalidRequest`), e.g.
+    /// `/remote-control` while Claude is working (S-03): `-32600` with the
+    /// message as its own text.
+    #[error("{0}")]
+    InvalidRequest(String),
     #[error("failed to start the session: {0}")]
     Start(String),
 }
@@ -178,6 +183,16 @@ pub enum SessionOutbound {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Send a `session/create_elicitation` (wire method `elicitation/create`,
+    /// F23a/F23b) request to the client and await its answer. The forwarding
+    /// task spawns the round trip, so neither the actor nor the connection loop
+    /// waits on it; dropping `reply` cancels the request (`$/cancel_request`).
+    CreateElicitation {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// `elicitation/complete` (F23b/N-37): a notification, no answer expected.
+    CompleteElicitation { params: Value },
     /// What the session index learns of this session (M-65): the forwarding task
     /// applies it to the connection's board.
     Board(BoardEvent),
@@ -317,6 +332,16 @@ pub(crate) enum Command {
         uuid: String,
         command: crate::mcp_command::McpCommand,
     },
+    /// Start a `/usage` turn's structured producer at activation (F24 / S-01,
+    /// `startsAtActivation: true`): the run loop spawns the `get_usage` control
+    /// request with its 5 s timeout.
+    StartUsage { uuid: String },
+    /// Re-entry from the spawned `/usage` producer: the replacement (or `None`
+    /// to keep the CLI text).
+    UsagePrepared {
+        uuid: String,
+        markdown: Option<String>,
+    },
     /// Re-entry from the spawned `/mcp` control run: the replacement is ready
     /// (or `None` to keep the CLI text).
     McpPrepared {
@@ -356,6 +381,65 @@ pub(crate) enum Command {
         frame: Value,
         reply: oneshot::Sender<Value>,
     },
+    /// An inbound MCP `elicitation` control request (F23b/R-10). The actor spawns
+    /// the client round trip; the answer re-enters as
+    /// [`Self::ElicitationControlAnswered`] and resolves `reply`.
+    ElicitationControl {
+        frame: Value,
+        reply: oneshot::Sender<Value>,
+    },
+    /// The spawned MCP-elicitation round trip finished.
+    ElicitationControlAnswered { request_id: String, response: Value },
+    /// An inbound `request_user_dialog` control request (F23b/R-08).
+    UserDialogControl {
+        frame: Value,
+        reply: oneshot::Sender<Value>,
+    },
+    /// The spawned refusal-fallback dialog round trip finished.
+    UserDialogAnswered { request_id: String, response: Value },
+    /// The spawned AskUserQuestion elicitation round trip finished (F23a/U-42).
+    AskUserQuestionAnswered { response: Value, request_id: String },
+    /// The CLI withdrew an inbound request (`control_cancel_request`, or the
+    /// control channel rebound to a fresh child on a clear-context restart): the
+    /// actor aborts the client round trip and ends the child's awaiting-user
+    /// token as withdrawn.
+    ElicitationWithdrawn { request_id: String },
+    /// A permission round trip ended without the client answering (the request
+    /// errored or was dropped): the child's awaiting-user token ends without an
+    /// abort, so the child reports `running` again.
+    AwaitEnded { request_id: String },
+    /// Start MCP OAuth for the ACP servers of this session (F23c/A-01).
+    /// `configured` is true for the session-start call, which also records the
+    /// session's ACP server names for the `/mcp reconnect` follow-up.
+    StartMcpAuth {
+        servers: Vec<String>,
+        configured: bool,
+    },
+    /// The spawned MCP OAuth run finished (clears the single-flight guard).
+    McpAuthFinished,
+    /// B-29: the ACP messageId -> SDK uuid map (`Session.messageIdToUuid`),
+    /// read by `session/fork` to resolve an AIR fork point.
+    MessageIds {
+        reply: oneshot::Sender<crate::message_ids::MessageIdMap>,
+    },
+    /// B-54: merge the history replay's messageId map into the session's.
+    SeedMessageIds {
+        map: crate::message_ids::MessageIdMap,
+    },
+    /// Whether the adapter may answer `/remote-control` itself (F24/S-03): true
+    /// unless Claude Code offers its own `remote-control` command.
+    RemoteControlAvailability { reply: oneshot::Sender<bool> },
+    /// A `/remote-control` prompt (F24/S-03): run `enableRemoteControl` off the
+    /// actor and answer the prompt with its text.
+    RemoteControlPrompt {
+        command: crate::control::RemoteControlCommand,
+        reply: oneshot::Sender<Result<PromptReply, PromptFailure>>,
+    },
+    /// The spawned `/remote-control` control call finished.
+    RemoteControlDone {
+        text: String,
+        reply: oneshot::Sender<Result<PromptReply, PromptFailure>>,
+    },
     /// The bounded wait for the consumer to reach `tool_use_id` ran out.
     ToolUseWaitElapsed { tool_use_id: String },
     /// Whether `session/cancel` also stops the background `local_workflow` tasks
@@ -387,6 +471,15 @@ pub(crate) enum Command {
     StopAsyncTask {
         task_id: String,
         reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// A `session/cancel` for a native subagent's child session
+    /// (`cancelChild`, `acp-agent.ts:8396-8409`): stop the child's task without
+    /// cancelling the parent. `Ok(true)` when the session is a child of this
+    /// session's runtime, `Ok(false)` otherwise (the caller falls through to the
+    /// normal cancel).
+    CancelChild {
+        session_id: String,
+        reply: oneshot::Sender<bool>,
     },
     /// The CLI confirmed `stop_task` (re-entry from the spawned request).
     TaskStopped {
@@ -511,16 +604,71 @@ pub(crate) enum Command {
     /// Re-entry after `set_model` control request. `notify_client` publishes
     /// `config_option_update` after the bookkeeping (PostModelSwitch sync, which has
     /// no caller to return the options to); the user path returns them in `reply`.
+    ///
+    /// `inline` marks the external switches the consumer loop waits for: the
+    /// refusal fallback (`acp-agent.ts:6702` awaits
+    /// `syncModelAfterExternalSwitch`), unlike the PostModelSwitch hook, which
+    /// runs it detached (`setImmediate`, `acp-agent.ts:11328-11337`) while the
+    /// loop keeps draining the stream.
     ModelApplied {
         model_val: String,
         result: Result<(), String>,
         reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
         notify_client: bool,
+        inline: bool,
     },
     /// Re-entry after `apply_flag_settings` control request.
     EffortApplied {
         effort_val: String,
         result: Result<(), String>,
+        reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+    },
+    /// Re-entry after the `apply_flag_settings {fastMode}` control request of a
+    /// `session/set_config_option fast` (`applyFastMode`, `acp-agent.ts:10771-10781`).
+    FastModeApplied {
+        enabled: bool,
+        result: Result<(), String>,
+        reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+    },
+    /// Re-entry after the `apply_flag_settings {agent}` control request of a live
+    /// Agent switch (`acp-agent.ts:10676-10688`).
+    AgentApplied {
+        value: String,
+        result: Result<(), String>,
+        reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+    },
+    /// Re-entry after the model switch's `set_permission_mode` (auto clamp) and
+    /// `apply_flag_settings` (effort sync) control requests. Carries the outcome
+    /// so the switch can restore or drop the effort option before replying
+    /// (`acp-agent.ts:10606-10668`).
+    ModelSwitchSynced {
+        /// The switched-to model value.
+        model_val: String,
+        /// The effort apply outcome; `None` when no sync was needed.
+        effort_result: Option<Result<(), String>>,
+        /// The user pin before the switch (`session.effortPinnedLevel`).
+        pinned_before: Option<String>,
+        /// The last applied effort before the switch (`appliedEffortBeforeSwitch`).
+        applied_before: Option<String>,
+        /// Whether the old pin survives on the new model.
+        effort_pinned_for_new: bool,
+        /// The concrete displayed effort the sync applied.
+        new_effort: Option<String>,
+        /// Whether the client opted into the AIR `recommendedValue` capability.
+        use_recommended_value: bool,
+        /// The auto-mode downgrade target, if the switch invalidated Auto.
+        downgraded_to: Option<String>,
+        /// Whether the fallback warning is still to be shown.
+        warn: bool,
+        /// Whether the client is told (`config_option_update`) instead of the
+        /// caller's reply carrying the options.
+        notify_client: bool,
+        /// Whether the switch is one the consumer loop waits for (the refusal
+        /// fallback), so the stream stays gated until its round trips settle.
+        inline: bool,
+        /// Whether the switch actually changed the model (background context
+        /// window refresh).
+        model_changed: bool,
         reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
     },
     /// Fetch the actor's LIVE modes + config options (MAJOR 5: `session/resume`
@@ -734,11 +882,15 @@ impl Session {
         // spawned, so the inbound `can_use_tool` handler can route frames to the
         // actor (phase 10).
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let support = crate::elicitation::ElicitationSupport {
+            form: opts.caps.elicitation_form,
+            url: opts.caps.elicitation_url,
+        };
         let control = Control::spawn(
             stdin,
             control_in_rx,
             ControlOptions {
-                on_request: Some(build_permission_request_handler(tx.clone())),
+                on_request: Some(build_permission_request_handler(tx.clone(), support)),
             },
         );
 
@@ -954,7 +1106,8 @@ impl Session {
         let is_auto_unavailable = current_model_info
             .as_ref()
             .is_some_and(|m| m.supports_auto_mode != Some(true));
-        let mut effective_mode = if initial_mode == "auto" && is_auto_unavailable {
+        let auto_clamped = initial_mode == "auto" && is_auto_unavailable;
+        let mut effective_mode = if auto_clamped {
             crate::session_config::AUTO_MODE_FALLBACK.to_string()
         } else {
             initial_mode.to_string()
@@ -985,34 +1138,62 @@ impl Session {
             )
         });
 
-        let config_options = crate::session_config::build_config_options(
-            &modes,
-            &selection.available_models,
-            &current_model_id,
-            &model_infos,
-            current_effort.as_deref(),
-            use_recommended_value,
+        // A-04 (acp-agent.ts:12324-12355): discover the main-thread agents the
+        // SDK reports and adopt the requested one only when the picker surfaces
+        // it.
+        let agents = crate::session_config::discover_custom_agents(info.agents.as_ref());
+        let current_agent =
+            crate::session_config::resolve_current_agent(opts.spawn.agent.as_deref(), &agents);
+        // N-03 seed (acp-agent.ts:11565-11584): the CLI may start a session with
+        // Fast mode already on, or force it off when `fastModePerSessionOptIn`
+        // is set. The toggle is only surfaced while the model supports it.
+        let fast_mode = crate::session_config::fast_mode_option_state_from_initialize(
+            &json!({
+                "fast_mode_state": info.fast_mode_state.clone(),
+                "fast_mode_disabled_reason": info.fast_mode_disabled_reason.clone(),
+            }),
+            crate::session_config::model_supports_fast_mode(&model_infos, &current_model_id),
+            opts.caps.boolean_config,
+        );
+
+        let config_options = crate::session_config::build_config_options_with(
+            &crate::session_config::ConfigOptionsInput {
+                modes: &modes,
+                available_models: &selection.available_models,
+                current_model_id: &current_model_id,
+                model_infos: &model_infos,
+                current_effort: current_effort.as_deref(),
+                agents: &agents,
+                current_agent: &current_agent,
+                fast_mode: Some(&fast_mode),
+                use_recommended_value,
+            },
         );
 
         // MAJOR 3 / P4 (acp-agent.js:8804-8807): Node seeds `apply_flag_settings
         // {effortLevel}` at session creation ONLY when the client opts in via the
         // AIR `useRecommendedValue` capability. A legacy (non-AIR) client gets no
         // effort flag at creation — the CLI resolves persisted effort itself.
+        // O-56: the seed carries `ultracode` through `effortFlagSettings`
+        // (`session-effort.ts:19-25`).
         if use_recommended_value {
             if let Some(effort_opt) = config_options
                 .iter()
                 .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
             {
-                if effort_opt.current_value != "default" {
-                    let _ = control
-                        .send_request(json!({
-                            "subtype": "apply_flag_settings",
-                            "settings": {
-                                "effortLevel": &effort_opt.current_value,
-                            }
-                        }))
-                        .await;
-                }
+                // `await q.applyFlagSettings(...)` with no catch
+                // (`acp-agent.ts:11594-11609`): a rejection fails `session/new`
+                // instead of leaving an effort on screen the SDK never applied.
+                control
+                    .send_request(json!({
+                        "subtype": "apply_flag_settings",
+                        "settings": crate::session_config::effort_flag_settings(
+                            Some(&effort_opt.current_value),
+                            settings.ultracode,
+                        ),
+                    }))
+                    .await
+                    .map_err(|e| SessionError::Start(e.to_string()))?;
             }
         }
 
@@ -1029,6 +1210,11 @@ impl Session {
             is_air,
             ultracode: settings.ultracode,
             pre_plan_mode: None,
+            agents,
+            current_agent,
+            fast_mode_enabled: fast_mode.enabled,
+            fast_mode_disabled_reason: fast_mode.disabled_reason.clone(),
+            pending_auto_fallback_warning: auto_clamped,
             provider_cache_key,
         };
 
@@ -1149,6 +1335,44 @@ impl Session {
         let _ = self.tx.send(Command::McpPrompt { uuid, command });
     }
 
+    /// Start the background MCP OAuth run (F23c/A-01). `configured` is true for
+    /// the session-start call, which also records the session's ACP servers for
+    /// the `/mcp reconnect` follow-up.
+    pub fn start_mcp_auth(&self, servers: Vec<String>, configured: bool) {
+        let _ = self.tx.send(Command::StartMcpAuth {
+            servers,
+            configured,
+        });
+    }
+
+    /// Whether the adapter may answer `/remote-control` itself (F24/S-03): the
+    /// CLI does not offer its own non-terminal `remote-control` command.
+    pub async fn remote_control_available(&self) -> bool {
+        let (reply, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::RemoteControlAvailability { reply })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+
+    /// Answer a `/remote-control` prompt (F24/S-03) without a model turn. The
+    /// reply resolves once the control call returned and its text is queued.
+    pub fn remote_control(
+        &self,
+        command: crate::control::RemoteControlCommand,
+    ) -> oneshot::Receiver<Result<PromptReply, PromptFailure>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(Command::RemoteControlPrompt {
+            command,
+            reply: reply_tx,
+        });
+        reply_rx
+    }
+
     /// Steer the session (12.1): inject a message into the running turn at
     /// `now` priority, or report the idle `promptRequired` / `startedNewTurn`
     /// outcome. Returns the `oneshot` resolving with the `{outcome: …}` value.
@@ -1178,6 +1402,20 @@ impl Session {
             return false;
         }
         reply_rx.await.unwrap_or(false)
+    }
+
+    /// B-29: the ACP messageId -> SDK uuid map the session recorded.
+    pub async fn message_ids(&self) -> crate::message_ids::MessageIdMap {
+        let (reply, reply_rx) = oneshot::channel();
+        if self.tx.send(Command::MessageIds { reply }).is_err() {
+            return crate::message_ids::MessageIdMap::default();
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+
+    /// B-54: merge the history replay's messageId map into the session's.
+    pub fn seed_message_ids(&self, map: crate::message_ids::MessageIdMap) {
+        let _ = self.tx.send(Command::SeedMessageIds { map });
     }
 
     /// Stop one background task without cancelling the turn (`_session/async_task/stop`).
@@ -1242,6 +1480,22 @@ impl Session {
         self.tx
             .send(Command::Cancel)
             .map_err(|_| SessionError::Closed)
+    }
+
+    /// A `session/cancel` named the child session `session_id`: stop the task of
+    /// that native subagent without cancelling this session
+    /// (`cancelChildSession`, `acp-agent.ts:8396-8409`). `false` means the id is
+    /// no announced child of this session's runtime.
+    pub async fn cancel_child(&self, session_id: String) -> bool {
+        let (reply, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::CancelChild { session_id, reply })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
     }
 
     /// A client chose the title of this session (`_session/rename`, archive,
@@ -1398,10 +1652,51 @@ impl Session {
     }
 }
 
+/// Sends [`Command::ElicitationWithdrawn`] when the inbound handler future is
+/// dropped before its reply resolved — a `control_cancel_request`, or the
+/// control channel rebound to a fresh child on a clear-context restart. The
+/// actor then aborts the client round trip (which sends `$/cancel_request`) and
+/// ends the child's awaiting-user token as withdrawn.
+struct WithdrawOnDrop {
+    command_tx: mpsc::UnboundedSender<Command>,
+    request_id: String,
+    armed: bool,
+}
+
+impl WithdrawOnDrop {
+    fn new(command_tx: mpsc::UnboundedSender<Command>, request_id: &str) -> Self {
+        Self {
+            command_tx,
+            request_id: request_id.to_string(),
+            armed: true,
+        }
+    }
+
+    /// The handler resolved normally: no withdraw is owed.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WithdrawOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.command_tx.send(Command::ElicitationWithdrawn {
+                request_id: self.request_id.clone(),
+            });
+        }
+    }
+}
+
 /// Build the inbound `control_request` handler injected into the control
 /// channel (phase 10). A `can_use_tool` request is routed to the session actor
 /// via [`Command::Permission`] (which owns the `MapState` needed to
 /// `ensure_tool_call_emitted`); the reply resolves with the `control_response`.
+///
+/// F23b: a capable client's MCP `elicitation` and `request_user_dialog` are
+/// routed to the actor, which spawns the client round trip. A client without
+/// the capability keeps the SDK's defaults: an `elicitation` is answered
+/// `{action:"decline"}` and a dialog stays silent.
 ///
 /// The handler models the SDK's `processControlRequest` dispatch for the
 /// subtypes the adapter does not own (F3a): the `Z4` machine-only subtypes and
@@ -1411,6 +1706,7 @@ impl Session {
 /// carrying the thrown message (`Unsupported control request subtype: X`).
 fn build_permission_request_handler(
     command_tx: mpsc::UnboundedSender<Command>,
+    support: crate::elicitation::ElicitationSupport,
 ) -> Arc<RequestHandler> {
     Arc::new(Box::new(move |frame: Value| {
         let command_tx = command_tx.clone();
@@ -1433,13 +1729,16 @@ fn build_permission_request_handler(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let guard = WithdrawOnDrop::new(command_tx.clone(), &request_id);
                 let _ = command_tx.send(Command::Permission {
                     frame,
                     reply: reply_tx,
                 });
-                Some(reply_rx.await.unwrap_or_else(|_| {
+                let answer = reply_rx.await.unwrap_or_else(|_| {
                     permission::deny_control_response(&request_id, &tool_use_id)
-                }))
+                });
+                guard.disarm();
+                Some(answer)
             } else if subtype == "hook_callback" {
                 let callback_id = frame
                     .pointer("/request/callback_id")
@@ -1467,15 +1766,57 @@ fn build_permission_request_handler(
                         .await
                         .unwrap_or_else(|_| crate::hooks::hook_control_response_error(&request_id)),
                 )
-            } else if crate::control::SUPPRESSED_SUBTYPES.contains(&subtype)
-                || subtype == "request_user_dialog"
-            {
-                // F3a (a): `Z4` is never answered; a dialog with no handler
-                // stays silent so a capable client (F23b) or the worker's park
-                // deadline settles it.
+            } else if subtype == "request_user_dialog" {
+                // F23b (R-08): only a form-capable client gets a dialog; every
+                // other client keeps the SDK's silent default.
+                if !support.form {
+                    return None;
+                }
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let guard = WithdrawOnDrop::new(command_tx.clone(), &request_id);
+                let _ = command_tx.send(Command::UserDialogControl {
+                    frame,
+                    reply: reply_tx,
+                });
+                let answer = reply_rx.await.unwrap_or_else(|_| {
+                    json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": { "behavior": "cancelled" },
+                        },
+                    })
+                });
+                guard.disarm();
+                Some(answer)
+            } else if crate::control::SUPPRESSED_SUBTYPES.contains(&subtype) {
+                // F3a (a): `Z4` is never answered.
                 None
             } else if subtype == "elicitation" {
-                // F3a (b): the SDK's auto-decline is a SUCCESS verdict.
+                // F23b (R-10): forward to the client when it advertised form or
+                // url elicitation; otherwise the SDK's auto-decline is a SUCCESS
+                // verdict (F3a (b)).
+                if support.form || support.url {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let guard = WithdrawOnDrop::new(command_tx.clone(), &request_id);
+                    let _ = command_tx.send(Command::ElicitationControl {
+                        frame,
+                        reply: reply_tx,
+                    });
+                    let answer = reply_rx.await.unwrap_or_else(|_| {
+                        json!({
+                            "type": "control_response",
+                            "response": {
+                                "subtype": "success",
+                                "request_id": request_id,
+                                "response": { "action": "decline" },
+                            },
+                        })
+                    });
+                    guard.disarm();
+                    return Some(answer);
+                }
                 Some(json!({
                     "type": "control_response",
                     "response": {
@@ -1645,6 +1986,7 @@ fn fresh_map_state(ext: &SessionExt, forward_subagent_text: bool) -> MapState {
     // text/thinking, stamped with its parent (`forwardsSubagentText`,
     // `acp-agent.ts:10947-10953`).
     map_state.set_forward_subagent_text(forward_subagent_text);
+    map_state.set_logger(ext.logger.clone());
     map_state
 }
 
@@ -1667,6 +2009,18 @@ fn reset_ext_for_fresh_context(ext: &mut SessionExt) {
     ext.task_state.clear();
     ext.last_published_task_plan = None;
     ext.mcp.clear();
+    ext.t2a.usage_turns.clear();
+    // F20/B-109: the fresh context gets a brand-new compaction lifecycle, like
+    // the fresh consumer upstream builds (`acp-agent.ts:4542`): no open entity,
+    // no pending hook summary, no interruption latch, and compaction frames are
+    // accepted again. The old context's terminal was published by the caller
+    // (`compaction.interrupt()`), not by this reset.
+    ext.t2a.compaction = crate::context_compaction::ContextCompactionLifecycle::new(
+        ext.t2a.compaction.session_id().to_string(),
+        ext.t2a.compaction.presentation(),
+        ext.caps.air_client,
+    );
+    ext.t2a.compaction_output_delivered = ext.t2a.compaction.has_delivered_output();
     ext.t2a.pending_worker_shutdown = false;
     ext.t2a.background_terminals.clear();
     ext.t2a.background = state::BackgroundFacts::default();
@@ -1730,19 +2084,34 @@ pub const SESSION_GONE: &str = "Session ended";
 /// logged (Node surfaces it as an `AggregateError`).
 fn finish_async_tasks(
     tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
     state: &str,
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     logger: Option<&crate::logger::Logger>,
 ) {
-    let errors = tasks.finish_all_with(state, &mut |update| {
-        update_tx
-            .send(SessionOutbound::RawUpdate(json!({
-                "sessionId": session_id,
-                "update": update,
-            })))
-            .map_err(|error| error.to_string())
-    });
+    // T4B hook 2 (`finishLifecycle`, `acp-agent.ts:4637-4660`): children that still
+    // run are closed first; a stop is a cancel, anything else a failure.
+    let native_state = if state == "stopped" {
+        crate::acp_subagents::SubagentState::Cancelled
+    } else {
+        crate::acp_subagents::SubagentState::Failed
+    };
+    let native_errors = finish_all_subagents(tasks, map_state, native_state, update_tx, session_id);
+    if let (false, Some(logger)) = (native_errors.is_empty(), logger) {
+        logger.error(&format!(
+            "Session {session_id}: failed to publish terminal subagent state: {}",
+            native_errors.join("; ")
+        ));
+    }
+    let errors = {
+        let mut eager_session_of = |id: &str| map_state.eager_session(id);
+        tasks.finish_all_with_routed(state, session_id, &mut eager_session_of, &mut |routed| {
+            update_tx
+                .send(SessionOutbound::RawUpdate(routed))
+                .map_err(|error| error.to_string())
+        })
+    };
     if let (false, Some(logger)) = (errors.is_empty(), logger) {
         logger.error(&format!(
             "Session {session_id}: failed to finish async tasks: {}",
@@ -1766,28 +2135,279 @@ async fn next_stream_line(
 /// in their original order: frames already queued for replay come after them in
 /// the stream, and appending would reorder a second `/mcp` result that holds
 /// again.
+///
+/// A local-command run's release is NOT gated on an inline external switch being
+/// in flight: replaying while the switch holds the stream is harmless because
+/// the inline gate holds every non-control frame again in the same order, so the
+/// switch's `config_option_update` still precedes them. (The old gate was an
+/// equivalent mutant — it changed nothing observable.)
 fn release_held_frames(replay: &mut std::collections::VecDeque<Value>, held: &mut Vec<Value>) {
     for frame in held.drain(..).rev() {
         replay.push_front(frame);
     }
 }
 
-/// Whether `line` is the result of a `/mcp` turn whose control run has started but
-/// not finished: it must wait for the run's replacement (AG-4, S-02).
-fn holds_for_mcp_run(
-    line: &Value,
-    machine: &TurnMachine,
-    mcp: &crate::mcp_command::McpTurns,
-) -> bool {
-    if line.get("type").and_then(Value::as_str) != Some("result")
-        || machine.result_is_autonomous(line)
-    {
+/// Await a spawned producer's `JoinHandle`, answering `None` on a panic. The
+/// producer's re-entry (`UsagePrepared` / `McpPrepared`) is what releases the
+/// frames held behind it, so a panic must still report "keep the CLI text"
+/// rather than leave the turn held forever.
+async fn join_produced<T>(handle: tokio::task::JoinHandle<T>) -> Option<T> {
+    handle.await.ok()
+}
+
+/// Whether `line` is an output shape of a turn whose local-command producer (a
+/// `/usage` or `/mcp` turn) is still running: Node awaits the pending
+/// replacement at that shape, so the frame — and every session frame behind it —
+/// waits for the producer's re-entry (`takeLocalCommandMarkdown`,
+/// `acp-agent.ts:5074-5088`).
+fn holds_for_local_command_run(line: &Value, machine: &TurnMachine, ext: &mut SessionExt) -> bool {
+    let Some(uuid) = machine.foreground_target().map(str::to_string) else {
+        return false;
+    };
+    // `ensureLocalCommandMarkdown` starts `produce` lazily at take time
+    // (`acp-agent.ts:5073`): a `/usage` output shape that arrives before the
+    // turn was activated starts its producer here, so the frame can wait for
+    // the re-entry instead of being dropped by the handler.
+    let needs_start = ext.t2a.usage_turns.get(&uuid).is_some_and(|turn| {
+        !turn.run_started && !turn.aborted && turn.prepared.is_none() && !turn.delivered
+    });
+    if needs_start {
+        if let Some(turn) = ext.t2a.usage_turns.get_mut(&uuid) {
+            turn.run_started = true;
+        }
+        if let Some(tx) = &ext.t2a.command_tx {
+            let _ = tx.send(Command::StartUsage { uuid: uuid.clone() });
+        }
+    }
+    let pending = ext
+        .t2a
+        .usage_turns
+        .get(&uuid)
+        .is_some_and(crate::usage::UsageTurn::waits_for_replacement)
+        || ext
+            .mcp
+            .get(&uuid)
+            .is_some_and(|turn| turn.run_started && turn.prepared.is_none() && !turn.delivered);
+    if !pending {
         return false;
     }
-    machine
-        .foreground_target()
-        .and_then(|uuid| mcp.get(uuid))
-        .is_some_and(|turn| turn.run_started && turn.prepared.is_none() && !turn.delivered)
+    match line.get("type").and_then(Value::as_str) {
+        Some("result") => !machine.result_is_autonomous(line),
+        Some("system") => {
+            line.get("subtype").and_then(Value::as_str) == Some("local_command_output")
+        }
+        Some("assistant") => {
+            line.get("parent_tool_use_id") == Some(&Value::Null)
+                && line.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+        }
+        _ => false,
+    }
+}
+
+/// Whether `uuid` names a turn with a local-command producer (a `/usage` or
+/// `/mcp` prompt).
+fn is_local_command_turn(ext: &SessionExt, uuid: &str) -> bool {
+    ext.t2a.usage_turns.get(uuid).is_some() || ext.mcp.get(uuid).is_some()
+}
+
+/// The prompt text when the ACP prompt was exactly one `type:"text"` chunk
+/// (`localCommandMarkdown`, `acp-agent.ts:3722-3726`). The converted frame holds
+/// one text block exactly then: an image, a resource, a second text chunk or a
+/// resource link all leave more blocks (or a non-text one), and Node then has no
+/// local command.
+fn single_text_prompt(frame: &Value) -> Option<&str> {
+    let content = frame.pointer("/message/content")?.as_array()?;
+    if content.len() != 1 {
+        return None;
+    }
+    let block = &content[0];
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    block.get("text").and_then(Value::as_str)
+}
+
+/// The start of `prompt()`'s preamble that every prompt runs, including a steer
+/// that starts a detached turn (upstream calls `this.prompt()` at
+/// `acp-agent.ts:4353`): the stale prediction is cleared (`3887-3898`) and a
+/// `/usage` prompt registers its structured producer (`3722-3734`).
+fn prompt_preamble(
+    uuid: &str,
+    frame: &Value,
+    ext: &mut SessionExt,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    if ext.t2a.last_published_prompt_suggestion.is_some() {
+        publish_prompt_suggestion(ext.air.is_some(), &mut ext.t2a, None, update_tx, session_id);
+    } else {
+        ext.t2a.prompt_suggestion_expected = false;
+    }
+    if single_text_prompt(frame).is_some_and(crate::usage_markdown::is_usage_command_text) {
+        ext.t2a.usage_turns.insert(uuid);
+    }
+}
+
+/// What claiming a local-command replacement decided for one output shape
+/// (`takeLocalCommandMarkdown`, `acp-agent.ts:5074-5088`).
+enum LocalCommandTake {
+    /// Not a local-command turn, or its producer failed: keep the CLI text.
+    Keep,
+    /// The replacement was already published for this exact output (a mirror
+    /// of the same text from another SDK shape): publish nothing.
+    Suppress,
+    /// Publish this replacement instead of the CLI text.
+    Replace(String),
+    /// The producer is still running: the frame must wait for it (the run loop
+    /// holds it, so a handler never sees this).
+    Pending,
+}
+
+/// Claim the structured replacement for the turn currently producing a
+/// local-command output (`takeLocalCommandMarkdown`): `Keep` means "not a
+/// local-command turn (or its request failed)", `Suppress` means another SDK
+/// message shape already delivered this exact output.
+fn take_local_command_markdown(
+    machine: &TurnMachine,
+    ext: &mut SessionExt,
+    original: &str,
+) -> LocalCommandTake {
+    let Some(uuid) = machine.foreground_target().map(str::to_string) else {
+        return LocalCommandTake::Keep;
+    };
+    // A prompt is exactly one local command, so at most one producer owns it.
+    if let Some(turn) = ext.t2a.usage_turns.get_mut(&uuid) {
+        return match turn.prepared.clone() {
+            None => LocalCommandTake::Pending,
+            // `produce` failed, timed out or was aborted: keep the CLI text.
+            Some(None) => LocalCommandTake::Keep,
+            Some(Some(markdown)) => {
+                if turn.delivered {
+                    if turn.original_output.as_deref() == Some(original) {
+                        LocalCommandTake::Suppress
+                    } else {
+                        LocalCommandTake::Keep
+                    }
+                } else {
+                    turn.delivered = true;
+                    turn.original_output = Some(original.to_string());
+                    LocalCommandTake::Replace(markdown)
+                }
+            }
+        };
+    }
+    if let Some(turn) = ext.mcp.get_mut(&uuid) {
+        let Some(prepared) = turn.prepared.as_ref() else {
+            return if turn.run_started && !turn.delivered {
+                LocalCommandTake::Pending
+            } else {
+                LocalCommandTake::Keep
+            };
+        };
+        let Some(markdown) = prepared.render(original) else {
+            return LocalCommandTake::Keep;
+        };
+        if turn.delivered {
+            if turn.original_output.as_deref() == Some(original) {
+                LocalCommandTake::Suppress
+            } else {
+                LocalCommandTake::Keep
+            }
+        } else {
+            turn.delivered = true;
+            turn.original_output = Some(original.to_string());
+            LocalCommandTake::Replace(markdown)
+        }
+    } else {
+        LocalCommandTake::Keep
+    }
+}
+
+/// Publish a local-command output shape as an `agent_message_chunk` (the
+/// replacement, or the CLI's own text) and record it as delivered assistant
+/// text (`sendUpdate`, `acp-agent.ts:4615-4622`).
+fn publish_local_command_chunk(
+    text: &str,
+    message_id: Option<String>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    emitted_assistant_text: &mut bool,
+    ext: &mut SessionExt,
+) {
+    // The lifecycle's failed compaction error also arrives as local-command
+    // stdout: consume that one duplicate before it renders
+    // (`consumeDuplicateErrorOutput`, `acp-agent.ts:4610-4618,6071`).
+    if ext.t2a.compaction.consume_duplicate_error_output(text) {
+        return;
+    }
+    let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+    if let Some(id) = message_id.filter(|id| !id.is_empty()) {
+        chunk = chunk.message_id(MessageId::new(id));
+    }
+    let _ = update_tx.send(SessionOutbound::Update(SessionNotification::new(
+        session_id.to_string(),
+        SessionUpdate::AgentMessageChunk(chunk),
+    )));
+    *emitted_assistant_text = true;
+    ext.titles.on_assistant_text(text);
+}
+
+/// Publish the ordered updates of the compaction lifecycle and mirror its
+/// `hasDeliveredOutput` onto the actor state the result fallback reads.
+///
+/// AIR gets the changed-`_meta` filter last, exactly like every other final
+/// notification (`ChangedMetaClient`, `acp-agent.ts:991-1010`): a legacy
+/// `tool_call_update` carries only the keys that changed, and one left with
+/// nothing is dropped. A `compaction_update` is not a tool call, so it passes
+/// through whole.
+fn publish_compaction_updates(
+    ext: &mut SessionExt,
+    map_state: &mut MapState,
+    updates: Vec<Value>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    for update in updates {
+        let Some(update) = map_state.filter_hook_meta(update) else {
+            continue;
+        };
+        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+            "sessionId": session_id,
+            "update": update,
+        })));
+    }
+    ext.t2a.compaction_output_delivered = ext.t2a.compaction.has_delivered_output();
+}
+
+/// Start a `/usage` turn's producer when it activates (`activateTurn` ->
+/// `ensureLocalCommandMarkdown`, `acp-agent.ts:4805-4807`).
+fn start_usage_producers(events: &[TurnEvent], ext: &mut SessionExt) {
+    // A turn activation proves the interrupted command's tail has drained in
+    // the SDK's FIFO stream (`activateTurn` -> `compaction.resume()`,
+    // `acp-agent.ts:4806`).
+    if events
+        .iter()
+        .any(|event| matches!(event, TurnEvent::Activated { .. }))
+    {
+        ext.t2a.compaction.resume();
+    }
+    for event in events {
+        let TurnEvent::Activated { prompt_uuid } = event else {
+            continue;
+        };
+        let Some(turn) = ext.t2a.usage_turns.get_mut(prompt_uuid) else {
+            continue;
+        };
+        if turn.run_started {
+            continue;
+        }
+        turn.run_started = true;
+        if let Some(tx) = &ext.t2a.command_tx {
+            let _ = tx.send(Command::StartUsage {
+                uuid: prompt_uuid.clone(),
+            });
+        }
+    }
 }
 
 /// How long a `can_use_tool` request waits for the consumer to reach its tool use
@@ -1804,6 +2424,49 @@ fn can_use_tool_id(frame: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// The answer to an AskUserQuestion `can_use_tool` that was cancelled or could
+/// not be presented: upstream throws `Tool use aborted` (`acp-agent.ts:10339-10353`),
+/// which the SDK reports as an `error` control response.
+fn ask_aborted_response(request_id: &str) -> Value {
+    crate::control::build_error_response(request_id, "Tool use aborted")
+}
+
+/// The allow answer to an AskUserQuestion `can_use_tool`: upstream returns
+/// `{behavior:"allow", updatedInput}` and the SDK appends only `toolUseID`
+/// (`acp-agent.ts:10355`) — no `decisionClassification`.
+fn ask_allow_response(request_id: &str, tool_use_id: &str, updated_input: &Value) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "allow",
+                "updatedInput": updated_input,
+                "toolUseID": tool_use_id,
+            },
+        },
+    })
+}
+
+/// The deny answer to an AskUserQuestion `can_use_tool`: upstream's
+/// `{behavior:"deny", message}` plus the SDK's `toolUseID`, with no
+/// `decisionClassification`.
+fn ask_deny_response(request_id: &str, tool_use_id: &str, message: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "deny",
+                "message": message,
+                "toolUseID": tool_use_id,
+            },
+        },
+    })
 }
 
 /// Deny a request for a tool use of the work a cancel stopped: its tool does not
@@ -1862,6 +2525,106 @@ fn release_parked_permissions(
     *parked = still_parked;
 }
 
+/// The longest one MCP OAuth control request (authenticate / status) may take.
+/// Upstream awaits the SDK's own request; bounding it keeps a wedged child from
+/// pinning the OAuth task forever (the poll itself keeps its 10 min bound).
+const MCP_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Send `elicitation/complete` and wait until the forwarder processed it: the
+/// URL dialog's dismissal must be on the wire before the request is dropped,
+/// which sends `$/cancel_request` (`acp-agent.ts:2645-2658`). The FIFO
+/// [`SessionOutbound::Flush`] barrier resolves only after the notification.
+async fn complete_elicitation_flushed(tx: &mpsc::UnboundedSender<SessionOutbound>, params: Value) {
+    let _ = tx.send(SessionOutbound::CompleteElicitation { params });
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if tx.send(SessionOutbound::Flush(ack_tx)).is_ok() {
+        let _ = ack_rx.await;
+    }
+}
+
+/// Bridge one server's startup OAuth flow (F23c/A-01, `authenticateMcpServer`,
+/// `acp-agent.ts:2600-2660`): `mcpAuthenticate`, a URL elicitation, the status
+/// poll up to 10 minutes, and `completeElicitation` on every outcome. Runs in a
+/// task spawned by the session actor; the session's abort signal tears it down.
+async fn authenticate_mcp_server(
+    control: &Control,
+    session_id: &str,
+    server_name: &str,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    cancel: watch::Receiver<bool>,
+) -> Result<bool, String> {
+    let auth_control = control.clone();
+    let auth_name = server_name.to_string();
+    let status_control = control.clone();
+    let status_name = server_name.to_string();
+    let elicit_tx = update_tx.clone();
+    let complete_tx = update_tx.clone();
+    crate::elicitation::authenticate_single_mcp_server(
+        session_id,
+        server_name,
+        move || async move {
+            match tokio::time::timeout(
+                MCP_CONTROL_TIMEOUT,
+                auth_control.mcp_authenticate(&auth_name, None),
+            )
+            .await
+            {
+                // `Control::send_request` returns the whole control_response
+                // frame; the SDK's `mcpAuthenticate` resolves with its inner
+                // payload (`response.response`).
+                Ok(Ok(frame)) => Ok(frame
+                    .pointer("/response/response")
+                    .cloned()
+                    .unwrap_or(Value::Null)),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("The request timed out.".to_string()),
+            }
+        },
+        move || {
+            let control = status_control.clone();
+            let name = status_name.clone();
+            async move {
+                let frame =
+                    match tokio::time::timeout(MCP_CONTROL_TIMEOUT, control.mcp_status()).await {
+                        Ok(Ok(frame)) => frame,
+                        Ok(Err(error)) => return Err(error.to_string()),
+                        Err(_) => return Err("The request timed out.".to_string()),
+                    };
+                let servers = frame
+                    .pointer("/response/response/mcpServers")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                // A server missing from the status fails the wait
+                // (`acp-agent.ts:2664-2670`).
+                Ok(servers
+                    .iter()
+                    .find(|server| server.get("name").and_then(Value::as_str) == Some(&name))
+                    .and_then(|server| server.get("status").and_then(Value::as_str))
+                    .map(String::from))
+            }
+        },
+        move |params| {
+            let tx = elicit_tx.clone();
+            async move {
+                let (ptx, prx) = oneshot::channel();
+                let _ = tx.send(SessionOutbound::CreateElicitation { params, reply: ptx });
+                prx.await
+                    .unwrap_or_else(|_| Err("Tool use aborted".to_string()))
+            }
+        },
+        move |params| {
+            let tx = complete_tx.clone();
+            async move {
+                complete_elicitation_flushed(&tx, params).await;
+                Ok(())
+            }
+        },
+        cancel,
+    )
+    .await
+}
+
 /// The next command: one a clear-context restart held back comes first, in the
 /// order it arrived, ahead of anything the client sent since.
 async fn next_command(
@@ -1872,6 +2635,20 @@ async fn next_command(
         Some(command) => Some(command),
         None => commands.recv().await,
     }
+}
+
+/// The refusal of `/remote-control` while Claude is working
+/// (`acp-agent.ts:3824-3832`): an unsettled turn, a model cycle Claude Code
+/// started on its own (`foregroundWork.has`, which is not in `turnQueue`), or a
+/// clear-context restart bringing the fresh context up.
+fn remote_control_busy_error(machine: &TurnMachine, restarting: bool) -> Option<SessionError> {
+    if machine.has_unsettled() || machine.runs_autonomous_cycle() || restarting {
+        return Some(SessionError::InvalidRequest(
+            "Remote Control can't be changed while Claude is working. Try again when the turn ends."
+                .to_string(),
+        ));
+    }
+    None
 }
 
 /// The session actor's core `select!` loop — the real command-dispatch path.
@@ -1900,6 +2677,20 @@ async fn run_loop(
     let mut ext = SessionExt::new(air, cwd, env)
         .with_caps(caps)
         .with_logger(logger);
+    ext.t2a.command_tx = Some(command_tx.clone());
+    // F20: the per-session compaction lifecycle. The presentation is the ACP
+    // compaction contract for a client that advertises `session.compaction`,
+    // and the legacy "Compact conversation" tool call for every other client
+    // (`acp-agent.ts:4544-4551`).
+    ext.t2a.compaction = crate::context_compaction::ContextCompactionLifecycle::new(
+        session_id.clone(),
+        if ext.caps.compaction {
+            crate::context_compaction::CompactionPresentation::CompactionUpdate
+        } else {
+            crate::context_compaction::CompactionPresentation::ToolCall
+        },
+        ext.caps.air_client,
+    );
     let mut machine = TurnMachine::new();
     if resumed {
         machine.mark_resumed();
@@ -1908,7 +2699,9 @@ async fn run_loop(
     machine.set_forwards_subagent_text(forward_subagent_text);
     // AIR async-task runtime (item 3.4/3.5): enabled only for a client that
     // advertised the AIR `asyncTasks` capability.
-    let mut tasks = AsyncTaskRuntime::new(ext.air_supports("asyncTasks"));
+    let mut tasks = AsyncTaskRuntime::new(ext.air_supports("asyncTasks"))
+        // T4B hook 1: the native subagent runtime lives beside the task runtime.
+        .with_subagent_form(ext.caps.subagent_form, &session_id);
     // uuid -> prompt reply oneshot (8.7).
     let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, PromptFailure>>> =
         HashMap::new();
@@ -1937,6 +2730,39 @@ async fn run_loop(
     // `Cancelled` (R28 deny written back to the control writer, INV-21 / 27;
     // CUJ 2).
     let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // F23b: inbound MCP `elicitation` / `request_user_dialog` round trips waiting
+    // on the client. `request_id -> (reply, the CANCEL outcome to send when a
+    // cancel or the session close withdraws the request, the task waiting on the
+    // client)`. Aborting the task drops the client request's reply, which sends
+    // `$/cancel_request` (as for permissions).
+    let mut pending_elicitations: HashMap<
+        String,
+        (oneshot::Sender<Value>, Value, tokio::task::JoinHandle<()>),
+    > = HashMap::new();
+    // F23a: AskUserQuestion round trips (`request_id -> (reply, aborted answer)`).
+    let mut pending_ask: HashMap<String, (oneshot::Sender<Value>, Value)> = HashMap::new();
+    // The session's abort signal, handed to the elicitation helpers so a spawned
+    // client wait settles as CANCEL when the session CLOSES. It is a close-only
+    // latch: `session/cancel` aborts the pending round trips itself (below), and
+    // must NOT tear an MCP OAuth flow down (upstream ends OAuth on close only,
+    // `acp-agent.ts:2614-2617`). Never reset once set.
+    let (elicit_cancel_tx, elicit_cancel_rx) = watch::channel(false);
+    // A `/remote-control` control call in flight (S-03). A prompt that arrives
+    // meanwhile waits for it (`acp-agent.ts:3904`): its reply bypasses the turn
+    // queue, so letting the turn start would interleave the two.
+    let mut remote_control_pending = false;
+    let mut held_remote_control: std::collections::VecDeque<Command> =
+        std::collections::VecDeque::new();
+    // F23c: the ACP-provided MCP servers of this session (used to pick the OAuth
+    // follow-up of a `/mcp reconnect`), and the single-flight guard of the
+    // background OAuth run (upstream `mcpAuthentications`).
+    let mut acp_mcp_servers: Vec<String> = Vec::new();
+    let mut mcp_auth_running = false;
+    // The open permission requests of native subagent children (`awaitingUser`):
+    // `request_id -> token`, ended when the client answers or the request is
+    // withdrawn (cancel/close).
+    let mut pending_await_tokens: HashMap<String, crate::native_subagents::AwaitToken> =
+        HashMap::new();
     // `can_use_tool` requests waiting for the consumer to reach their tool use in
     // the stopped-work window (F16b, B-62).
     let mut parked_permissions: Vec<ParkedPermission> = Vec::new();
@@ -1944,10 +2770,28 @@ async fn run_loop(
     // frames held behind a `/mcp` result that waits for its control run (AG-4).
     let mut replay: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
     let mut held_behind_mcp: Vec<Value> = Vec::new();
+    // External model switches (`syncModelAfterExternalSwitch`) the consumer loop
+    // waits for: only the refusal fallback runs inline upstream, while the
+    // hook's sync is detached (`setImmediate`, `acp-agent.ts:11328-11337`) and
+    // keeps reading the stream. Counted, never a bool, so an overlapping
+    // user-driven switch (which never touches this) cannot clear it; each
+    // decrements on its own `ModelSwitchSynced`, so a close, a failed control
+    // round trip or a dead child cannot leave one stuck. While it is positive
+    // every non-control frame is held (the switch's own `control_response`
+    // lines still flow) and released when the last one finishes.
+    let mut inline_external_switches_in_flight: usize = 0;
     // The stream closed while frames were still held behind an unfinished `/mcp`
     // run: they are processed without waiting (the run's replacement will never
     // come), so their results settle their turns.
     let mut stream_ended = false;
+    // Child-stdout EOF was seen while an inline external switch was still in
+    // flight (T5FA4). The switch's replies arrive on this stream and can no
+    // longer come, so `fail_pending` settles its round trips and the stream
+    // branch is gated off until its `ModelSwitchSynced` publishes the
+    // `config_option_update` and releases the held frames. Cleared only when a
+    // fresh child is adopted (`ExitPlanRestart`, `RestartDone`), because the
+    // closed stream stays closed.
+    let mut eof_seen = false;
     // The force-cancel backstop (11.2, INV-17, #680): the absolute deadline at
     // which a wedged stream's active turn is force-settled `cancelled`. Armed at
     // most once per cancel sequence (`!forceCancelTimer`), cleared as soon as no
@@ -1988,6 +2832,7 @@ async fn run_loop(
             );
             settle_events(
                 events,
+                &mut tasks,
                 &mut map_state,
                 &live_background,
                 &mut pending,
@@ -1999,6 +2844,7 @@ async fn run_loop(
                 None,
                 &mut ext.titles,
                 &mut ext.t2a.failures,
+                &mut ext.t2a.usage_turns,
             );
         }};
         ($plan:expr, failed $message:expr) => {{
@@ -2033,6 +2879,7 @@ async fn run_loop(
                             let events = machine.force_cancel();
                             settle_events(
                                 events,
+                                &mut tasks,
                                 &mut map_state,
                                 &live_background,
                                 &mut pending,
@@ -2044,6 +2891,7 @@ async fn run_loop(
                                 None,
                                 &mut ext.titles,
         &mut ext.t2a.failures,
+        &mut ext.t2a.usage_turns,
                             );
                             // The cancelled turn's result may never come (that is why the
                             // backstop fired): close its delivery stretch here so partial
@@ -2067,6 +2915,12 @@ async fn run_loop(
                             )
                         {
                             deferred_commands.push(cmd);
+                            continue;
+                        }
+                        // F24/S-03: a prompt that follows a `/remote-control`
+                        // command waits for its reply (`acp-agent.ts:3904`).
+                        if remote_control_pending && matches!(cmd, Command::Prompt { .. }) {
+                            held_remote_control.push_back(cmd);
                             continue;
                         }
                         // The work a cancel stopped shows the client nothing after it was
@@ -2160,13 +3014,36 @@ async fn run_loop(
                                         replay.extend(child.buffered);
                                         held_behind_mcp.clear();
                                         stream_ended = false;
+                                        // The old child's EOF is behind us: the fresh
+                                        // child's stream is live again.
+                                        eof_seen = false;
                                         machine = fresh_context_machine(
                                             forward_subagent_text,
                                             stops_workflows_on_cancel,
                                         );
                                         map_state = fresh_map_state(&ext, forward_subagent_text);
-                                        tasks = AsyncTaskRuntime::new(ext.air_supports("asyncTasks"));
+                                        tasks = AsyncTaskRuntime::new(ext.air_supports("asyncTasks"))
+        // T4B hook 1: the native subagent runtime lives beside the task runtime.
+        .with_subagent_form(ext.caps.subagent_form, &session_id);
                                         live_background.clear();
+                                        // The old context's open client forms are gone
+                                        // with its control channel: withdraw them and
+                                        // forget its awaiting-user tokens.
+                                        abort_pending_elicitations(&mut pending_elicitations);
+                                        for (_, (reply, response)) in pending_ask.drain() {
+                                            let _ = reply.send(response);
+                                        }
+                                        pending_await_tokens.clear();
+                                        // F3 (B-109): the old context's lifecycle is
+                                        // closed `cancelled` — dropping a pending hook
+                                        // summary — and replaced by a brand-new one,
+                                        // exactly as the fresh consumer upstream builds a
+                                        // new `ContextCompactionLifecycle`
+                                        // (`acp-agent.ts:4542`). The terminal is published
+                                        // after the restart's own state updates, like the
+                                        // old consumer's result `finally` (`acp-agent.ts:7488`).
+                                        let old_compaction_updates =
+                                            ext.t2a.compaction.interrupt();
                                         reset_ext_for_fresh_context(&mut ext);
                                         emitted_assistant_text = false;
                                         assistant_had_error = false;
@@ -2176,6 +3053,13 @@ async fn run_loop(
                                         let state::RestartPlan { reset, turn, queued } = plan;
                                         let prompt_uuid = turn.prompt_uuid().to_string();
                                         publish_restart_state(&mut ext, &reset, &update_tx, &session_id);
+                                        publish_compaction_updates(
+                                            &mut ext,
+                                            &mut map_state,
+                                            old_compaction_updates,
+                                            &update_tx,
+                                            &session_id,
+                                        );
                                         machine.adopt_restarted_turn(turn);
                                         // The prompts queued behind it keep their place:
                                         // their frames never reached this child, so they
@@ -2226,12 +3110,39 @@ async fn run_loop(
                                 prompt_text,
                                 reply,
                             } => {
+                                // P-06 (`session-mode.ts:287-290`,
+                                // `acp-agent.ts:3863-3864`): the initial auto-mode
+                                // clamp's fallback warning is deferred to the first
+                                // prompt, and shown at most once per session.
+                                if ext.config.pending_auto_fallback_warning {
+                                    ext.config.pending_auto_fallback_warning = false;
+                                    if !ext.auto_mode_fallback_warning_shown {
+                                        ext.auto_mode_fallback_warning_shown = true;
+                                        let _ = update_tx.send(SessionOutbound::RawUpdate(
+                                            auto_mode_fallback_update(
+                                                &session_id,
+                                                ext.supports_notices(),
+                                            ),
+                                        ));
+                                    }
+                                }
                                 // The title context comes from the plain ACP text
                                 // chunks (Node `onPrompt(params.prompt)`), never from
                                 // the converted frame, whose blocks carry embedded
                                 // `<context ref=…>` file contents and `[@name](uri)`
                                 // links.
                                 ext.titles.on_prompt(&prompt_text);
+                                // The stale-prediction clear and the `/usage`
+                                // registration (`acp-agent.ts:3722-3734`,
+                                // `3887-3898`), shared with a steer that starts a
+                                // detached turn.
+                                prompt_preamble(
+                                    &uuid,
+                                    &frame,
+                                    &mut ext,
+                                    &update_tx,
+                                    &session_id,
+                                );
                                 // G8 (Decision 16): a submitted `/goal …` prompt
                                 // publishes its optimistic AIR update before the CLI's
                                 // own frames are read (`publishGoalFromPrompt`,
@@ -2259,8 +3170,16 @@ async fn run_loop(
                                     let command_tx = command_tx.clone();
                                     let prompt_uuid = uuid.clone();
                                     tokio::spawn(async move {
-                                        let prepared =
-                                            crate::mcp_command::run_mcp_command(&control, &command).await;
+                                        // The producer always re-enters: a panic in the
+                                        // control run answers "keep the CLI text" so the
+                                        // held result (and the turn) still settle.
+                                        let inner = tokio::spawn(async move {
+                                            crate::mcp_command::run_mcp_command(&control, &command)
+                                                .await
+                                        });
+                                        let prepared = join_produced(inner)
+                                            .await
+                                            .unwrap_or_default();
                                         let _ = command_tx.send(Command::McpPrepared {
                                             uuid: prompt_uuid,
                                             prepared,
@@ -2272,12 +3191,59 @@ async fn run_loop(
                                 ext.mcp.insert(&uuid, command);
                             }
                             Command::McpPrepared { uuid, prepared } => {
+                                let reconnected = prepared.reconnected.clone();
+                                let mut live_turn = false;
                                 if let Some(turn) = ext.mcp.get_mut(&uuid) {
                                     turn.prepared = Some(prepared);
+                                    live_turn = true;
                                 }
                                 // The replacement is ready: the result (and the session
                                 // frames queued behind it) that waited for it go on, in
                                 // stream order.
+                                release_held_frames(&mut replay, &mut held_behind_mcp);
+                                // S-02/A-01: a reconnect starts OAuth for the ACP
+                                // servers it tried, as session start does. A cancelled
+                                // turn (its `/mcp` state cleared) starts none.
+                                if live_turn {
+                                    let follow = crate::mcp_command::filter_reconnected_for_oauth(
+                                        &reconnected,
+                                        &acp_mcp_servers,
+                                    );
+                                    if !follow.is_empty() {
+                                        let _ = command_tx.send(Command::StartMcpAuth {
+                                            servers: follow,
+                                            configured: false,
+                                        });
+                                    }
+                                }
+                            }
+                            Command::StartUsage { uuid } => {
+                                // The producer runs off-actor (INV-27): the control
+                                // request carries its own 5 s timeout, and its answer
+                                // re-enters as [`Command::UsagePrepared`]. Every stage
+                                // is bounded and a panic answers "keep the CLI text":
+                                // `UsagePrepared` is what releases the held frames, so
+                                // it must always arrive.
+                                let control = control.clone();
+                                let command_tx = command_tx.clone();
+                                tokio::spawn(async move {
+                                    let inner = tokio::spawn(async move {
+                                        let zone = crate::usage::system_zone_bounded().await?;
+                                        crate::usage::structured_usage_markdown(&control, &zone)
+                                            .await
+                                    });
+                                    let markdown = join_produced(inner).await.unwrap_or(None);
+                                    let _ = command_tx.send(Command::UsagePrepared { uuid, markdown });
+                                });
+                            }
+                            Command::UsagePrepared { uuid, markdown } => {
+                                if let Some(turn) = ext.t2a.usage_turns.get_mut(&uuid) {
+                                    if turn.aborted {
+                                        turn.prepared.get_or_insert(None);
+                                    } else {
+                                        turn.prepared = Some(markdown);
+                                    }
+                                }
                                 release_held_frames(&mut replay, &mut held_behind_mcp);
                             }
                             Command::Cancel => {
@@ -2295,25 +3261,49 @@ async fn run_loop(
                                 // dropping the `reply` oneshot makes control.rs's
                                 // on-request handler resolve with the R28 deny payload,
                                 // so the pending permission settles `Cancelled` (INV-21 /
-                                // INV-27) while the actor stays free.
-                                for handle in pending_permissions.values() {
-                                    handle.abort();
-                                }
-                                pending_permissions.clear();
+                                // INV-27) while the actor stays free. The RFD form keeps
+                                // the requests of a child that can keep running after a
+                                // parent cancel (`agentclientprotocol/agent-client-protocol#2308`,
+                                // `native-subagents.ts:570-580`).
+                                cancel_parent_round_trips(
+                                    &mut tasks,
+                                    &mut map_state,
+                                    &mut PendingClientRequests {
+                                        permissions: &mut pending_permissions,
+                                        elicitations: &mut pending_elicitations,
+                                        ask: &mut pending_ask,
+                                        await_tokens: &mut pending_await_tokens,
+                                    },
+                                    &update_tx,
+                                    &session_id,
+                                );
                                 // A request still waiting for its tool use is withdrawn by
                                 // the interrupt: dropping `reply` makes control.rs answer
                                 // with the R28 deny.
                                 parked_permissions.clear();
-                                // Review follow-up 3.17-D: clear every per-tool-call field
-                                // tracker entry on cancel, so interrupted/refused tool calls
-                                // that never emit a tool_result do not leak tracker entries.
-                                map_state.clear_tool_tracker();
                                 // `cancelTurns` forgets the pending ExitPlanMode lanes.
                                 ext.t2a.exit_plan.clear();
                                 // G12: a cancelled `/mcp` turn publishes nothing, and its
                                 // spawned control run's late result is dropped. What waited
                                 // for that run goes on (the cancelled result is dropped).
                                 ext.mcp.clear();
+                                // S-01: a cancelled `/usage` producer is aborted
+                                // (`localCommandAbort.abort()`), so its output is not
+                                // published.
+                                ext.t2a.usage_turns.abort_all();
+                                // `compaction.interrupt()` at the turn boundary
+                                // (`acp-agent.ts:8468-8474`): an in-progress
+                                // `compaction_update` entity is closed `cancelled`,
+                                // and the abandoned work's late frames and hooks
+                                // are ignored until a new turn begins.
+                                let updates = ext.t2a.compaction.interrupt();
+                                publish_compaction_updates(
+                                    &mut ext,
+                                    &mut map_state,
+                                    updates,
+                                    &update_tx,
+                                    &session_id,
+                                );
                                 release_held_frames(&mut replay, &mut held_behind_mcp);
                                 // 8.9: settle swept queued turns, then interrupt.
                                 let events = machine.cancel();
@@ -2332,6 +3322,7 @@ async fn run_loop(
                                 map_state.begin_stopped_work();
                             settle_events(
                                 events,
+                                &mut tasks,
                                 &mut map_state,
                                 &live_background,
                                 &mut pending,
@@ -2343,6 +3334,7 @@ async fn run_loop(
                                 None,
                                 &mut ext.titles,
         &mut ext.t2a.failures,
+        &mut ext.t2a.usage_turns,
                             );
                                 // Arm the force-cancel backstop at most once per turn
                                 // (11.2, INV-22): if the interrupt below doesn't make the
@@ -2421,7 +3413,25 @@ async fn run_loop(
                                     &mut pending_permissions,
                                     &mut parked_permissions,
                                 );
-                                map_state.clear_tool_tracker();
+                                // Close is the session's abort (`signal.aborted`):
+                                // the close-only latch stops an OAuth flow.
+                                let _ = elicit_cancel_tx.send(true);
+                                cancel_parent_round_trips(
+                                    &mut tasks,
+                                    &mut map_state,
+                                    &mut PendingClientRequests {
+                                        permissions: &mut pending_permissions,
+                                        elicitations: &mut pending_elicitations,
+                                        ask: &mut pending_ask,
+                                        await_tokens: &mut pending_await_tokens,
+                                    },
+                                    &update_tx,
+                                    &session_id,
+                                );
+                                // A prompt held behind a `/remote-control` command
+                                // ends `cancelled`, as the close ends a queued turn
+                                // (`acp-agent.ts:3906-3912`).
+                                cancel_held_remote_control_prompts(&mut held_remote_control);
                                 // `cancelTurns` forgets the pending ExitPlanMode lanes.
                                 ext.t2a.exit_plan.clear();
                                 ext.mcp.clear();
@@ -2429,6 +3439,7 @@ async fn run_loop(
                                 let events = machine.cancel();
                                 settle_events(
                                     events,
+                                    &mut tasks,
                                     &mut map_state,
                                     &live_background,
                                     &mut pending,
@@ -2440,6 +3451,7 @@ async fn run_loop(
                                     None,
                                     &mut ext.titles,
         &mut ext.t2a.failures,
+        &mut ext.t2a.usage_turns,
                                 );
                                 for uuid in machine.take_abandoned() {
                                     if control
@@ -2475,6 +3487,7 @@ async fn run_loop(
                                 let events = machine.on_stream_end();
                                 settle_events(
                                     events,
+                                    &mut tasks,
                                     &mut map_state,
                                     &live_background,
                                     &mut pending,
@@ -2486,8 +3499,9 @@ async fn run_loop(
                                     None,
                                     &mut ext.titles,
         &mut ext.t2a.failures,
+        &mut ext.t2a.usage_turns,
                                 );
-                                finish_async_tasks(&mut tasks, "stopped", &update_tx, &session_id, ext.logger.as_deref());
+                                finish_async_tasks(&mut tasks, &mut map_state, "stopped", &update_tx, &session_id, ext.logger.as_deref());
                                 let (flush_tx, flush_rx) = oneshot::channel();
                                 let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
                                 tokio::spawn(async move {
@@ -2528,6 +3542,7 @@ async fn run_loop(
                                 // (`acp-agent.ts:10219`).
                                 let home_dir = ext.env.get_path("HOME");
                                 handle_permission(
+                                    &mut tasks,
                                     frame,
                                     reply,
                                     machine.foreground_target(),
@@ -2536,6 +3551,10 @@ async fn run_loop(
                                     &update_tx,
                                     &session_id,
                                     &mut pending_permissions,
+                                    &mut pending_await_tokens,
+                                    &mut pending_ask,
+                                    &elicit_cancel_rx,
+                                    ext.caps.elicitation_form,
                                     &ext.cwd,
                                     &available_modes,
                                     pre_plan_mode,
@@ -2543,6 +3562,375 @@ async fn run_loop(
                                     ext.usage.used_percent(),
                                     &command_tx,
                                 );
+                            }
+                            Command::ElicitationControl { frame, reply } => {
+                                // F23b/R-10: forward an MCP elicitation to the
+                                // client from a spawned task; the answer re-enters
+                                // as `ElicitationControlAnswered`. A cancel or the
+                                // session close answers the pending request with
+                                // the CANCEL outcome itself, so it never settles as
+                                // a decline.
+                                let support = crate::elicitation::ElicitationSupport {
+                                    form: ext.caps.elicitation_form,
+                                    url: ext.caps.elicitation_url,
+                                };
+                                let request_id = frame
+                                    .get("request_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                let cancel_response = json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "success",
+                                        "request_id": request_id,
+                                        "response": { "action": "cancel" },
+                                    },
+                                });
+                                let update_tx = update_tx.clone();
+                                let command_tx = command_tx.clone();
+                                let session_id = session_id.clone();
+                                let cancel = elicit_cancel_rx.clone();
+                                let request_id_for_task = request_id.clone();
+                                let handle = tokio::spawn(async move {
+                                    let send_tx = update_tx.clone();
+                                    let response =
+                                        crate::elicitation::handle_elicitation_control_request(
+                                            &frame,
+                                            &session_id,
+                                            support,
+                                            move |params| {
+                                                let (ptx, prx) = oneshot::channel();
+                                                let _ = send_tx.send(
+                                                    SessionOutbound::CreateElicitation {
+                                                        params,
+                                                        reply: ptx,
+                                                    },
+                                                );
+                                                async move {
+                                                    prx.await.unwrap_or_else(|_| {
+                                                        Err("Tool use aborted".to_string())
+                                                    })
+                                                }
+                                            },
+                                            cancel,
+                                        )
+                                        .await;
+                                    let _ = command_tx.send(
+                                        Command::ElicitationControlAnswered {
+                                            request_id: request_id_for_task,
+                                            response,
+                                        },
+                                    );
+                                });
+                                pending_elicitations
+                                    .insert(request_id, (reply, cancel_response, handle));
+                            }
+                            Command::ElicitationControlAnswered {
+                                request_id,
+                                response,
+                            } => {
+                                if let Some((reply, _, _)) =
+                                    pending_elicitations.remove(&request_id)
+                                {
+                                    let _ = reply.send(response);
+                                }
+                            }
+                            Command::UserDialogControl { frame, reply } => {
+                                // F23b/R-08: the refusal-fallback consent dialog,
+                                // rendered as a form elicitation off the actor.
+                                let support = crate::elicitation::ElicitationSupport {
+                                    form: ext.caps.elicitation_form,
+                                    url: ext.caps.elicitation_url,
+                                };
+                                let request_id = frame
+                                    .get("request_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                let cancel_response = json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "success",
+                                        "request_id": request_id,
+                                        "response": { "behavior": "cancelled" },
+                                    },
+                                });
+                                let update_tx = update_tx.clone();
+                                let command_tx = command_tx.clone();
+                                let session_id = session_id.clone();
+                                let cancel = elicit_cancel_rx.clone();
+                                let request_id_for_task = request_id.clone();
+                                let handle = tokio::spawn(async move {
+                                    let send_tx = update_tx.clone();
+                                    let response =
+                                        crate::elicitation::handle_user_dialog_control_request(
+                                            &frame,
+                                            &session_id,
+                                            support,
+                                            move |params| {
+                                                let (ptx, prx) = oneshot::channel();
+                                                let _ = send_tx.send(
+                                                    SessionOutbound::CreateElicitation {
+                                                        params,
+                                                        reply: ptx,
+                                                    },
+                                                );
+                                                async move {
+                                                    prx.await.unwrap_or_else(|_| {
+                                                        Err("Tool use aborted".to_string())
+                                                    })
+                                                }
+                                            },
+                                            cancel,
+                                        )
+                                        .await;
+                                    let _ = command_tx.send(Command::UserDialogAnswered {
+                                        request_id: request_id_for_task,
+                                        response,
+                                    });
+                                });
+                                pending_elicitations
+                                    .insert(request_id, (reply, cancel_response, handle));
+                            }
+                            Command::UserDialogAnswered {
+                                request_id,
+                                response,
+                            } => {
+                                if let Some((reply, _, _)) =
+                                    pending_elicitations.remove(&request_id)
+                                {
+                                    let _ = reply.send(response);
+                                }
+                            }
+                            Command::AskUserQuestionAnswered {
+                                request_id,
+                                response,
+                            } => {
+                                // The question was presented: the child's request
+                                // ended (`awaitingUser`'s finally).
+                                if let Some(token) = pending_await_tokens.remove(&request_id) {
+                                    let outs = tasks.subagents().awaiting_user_end(token, false);
+                                    publish_subagent_outs(
+                                        &mut tasks,
+                                        &mut map_state,
+                                        outs,
+                                        &update_tx,
+                                        &session_id,
+                                        None,
+                                    );
+                                }
+                                if let Some((reply, _)) = pending_ask.remove(&request_id) {
+                                    let _ = reply.send(response);
+                                }
+                            }
+                            Command::ElicitationWithdrawn { request_id } => {
+                                // The CLI withdrew the request (`control_cancel_request`,
+                                // or the control channel moved to a fresh child on a
+                                // clear-context restart): the client's form is cancelled
+                                // (`$/cancel_request`), and the child's request ends as
+                                // withdrawn (`awaitingUser`'s aborted finally).
+                                //
+                                // A request parked in the cancel window is not in
+                                // `pending_permissions`: drop it here so its bounded
+                                // release never presents a dialog nobody waits for
+                                // (`requestPermissionFromClient` throws before sending
+                                // anything, `acp-agent.ts:9800-9815`).
+                                parked_permissions.retain(|(_, frame, _)| {
+                                    frame.get("request_id").and_then(Value::as_str)
+                                        != Some(request_id.as_str())
+                                });
+                                withdraw_request(
+                                    &mut tasks,
+                                    &mut map_state,
+                                    &mut PendingClientRequests {
+                                        permissions: &mut pending_permissions,
+                                        elicitations: &mut pending_elicitations,
+                                        ask: &mut pending_ask,
+                                        await_tokens: &mut pending_await_tokens,
+                                    },
+                                    &update_tx,
+                                    &session_id,
+                                    &request_id,
+                                );
+                            }
+                            Command::AwaitEnded { request_id } => {
+                                // The permission round trip ended without an answer
+                                // (the client errored or the request dropped): the
+                                // child's request ends, un-aborted (`awaitingUser`'s
+                                // finally), so it reports `running` again.
+                                end_await_request(
+                                    &mut tasks,
+                                    &mut map_state,
+                                    &mut pending_await_tokens,
+                                    &update_tx,
+                                    &session_id,
+                                    &request_id,
+                                );
+                            }
+                            Command::StartMcpAuth {
+                                servers,
+                                configured,
+                            } => {
+                                // F23c/A-01: start OAuth for the ACP servers this
+                                // session was created with. Runs off the actor so an
+                                // interactive browser flow never delays a response;
+                                // one run per session (upstream `mcpAuthentications`).
+                                if configured {
+                                    acp_mcp_servers = servers.clone();
+                                }
+                                if !ext.caps.elicitation_url || servers.is_empty() {
+                                    continue;
+                                }
+                                if mcp_auth_running {
+                                    continue;
+                                }
+                                mcp_auth_running = true;
+                                let control = control.clone();
+                                let command_tx = command_tx.clone();
+                                let session_id = session_id.clone();
+                                let cancel = elicit_cancel_rx.clone();
+                                let logger = ext.logger.clone();
+                                let update_tx = update_tx.clone();
+                                tokio::spawn(async move {
+                                    let statuses = tokio::time::timeout(
+                                        MCP_CONTROL_TIMEOUT,
+                                        control.mcp_status(),
+                                    )
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok);
+                                    if let Some(statuses) = statuses {
+                                        let list = statuses
+                                            .pointer("/response/response/mcpServers")
+                                            .and_then(Value::as_array)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        for status in list {
+                                            let name = status
+                                                .get("name")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
+                                            if !crate::elicitation::server_needs_auth(&status)
+                                                || !servers.iter().any(|s| s == name)
+                                            {
+                                                continue;
+                                            }
+                                            let result = authenticate_mcp_server(
+                                                &control,
+                                                &session_id,
+                                                name,
+                                                &update_tx,
+                                                cancel.clone(),
+                                            )
+                                            .await;
+                                            if let Err(error) = result {
+                                                if let Some(logger) = &logger {
+                                                    logger.error(&format!(
+                                                        "Failed to authenticate MCP server {name}: {error}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let _ = command_tx.send(Command::McpAuthFinished);
+                                });
+                            }
+                            Command::McpAuthFinished => {
+                                mcp_auth_running = false;
+                            }
+                            Command::MessageIds { reply } => {
+                                let _ = reply.send(map_state.message_ids());
+                            }
+                            Command::SeedMessageIds { map } => {
+                                map_state.seed_message_ids(map);
+                            }
+                            Command::RemoteControlPrompt { command, reply } => {
+                                // F24/S-03: answer the prompt without a model turn.
+                                // The control call runs off the actor (the reply
+                                // bypasses the turn queue, as upstream's
+                                // `runRemoteControlCommand`).
+                                //
+                                // The busy refusal is made HERE, atomically with
+                                // the turn queue (`acp-agent.ts:3824-3832`).
+                                if let Some(error) =
+                                    remote_control_busy_error(&machine, restart.is_some())
+                                {
+                                    let _ = reply.send(Err(error.into()));
+                                    continue;
+                                }
+                                if remote_control_pending {
+                                    let _ = reply.send(Err(SessionError::InvalidRequest(
+                                        "Remote Control is already being changed. Try again in a moment."
+                                            .to_string(),
+                                    )
+                                    .into()));
+                                    continue;
+                                }
+                                remote_control_pending = true;
+                                let control = control.clone();
+                                let command_tx = command_tx.clone();
+                                tokio::spawn(async move {
+                                    let action = command.action.clone();
+                                    let outcome = match &command.action {
+                                        crate::control::RemoteControlAction::Disconnect => {
+                                            control.enable_remote_control(false, None).await
+                                        }
+                                        crate::control::RemoteControlAction::Connect { name } => {
+                                            control
+                                                .enable_remote_control(true, name.as_deref())
+                                                .await
+                                        }
+                                    };
+                                    let text = match &outcome {
+                                        Ok(value) => crate::control::format_remote_control_result(
+                                            &action,
+                                            Ok(value),
+                                        ),
+                                        Err(error) => {
+                                            let message = error.to_string();
+                                            crate::control::format_remote_control_result(
+                                                &action,
+                                                Err(&message),
+                                            )
+                                        }
+                                    };
+                                    let _ = command_tx.send(Command::RemoteControlDone { text, reply });
+                                });
+                            }
+                            Command::RemoteControlDone { text, reply } => {
+                                remote_control_pending = false;
+                                // The prompts held behind the command go on, in
+                                // arrival order.
+                                replay_commands.extend(held_remote_control.drain(..));
+                                let chunk =
+                                    ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                                let update = SessionUpdate::AgentMessageChunk(chunk);
+                                let notif = SessionNotification::new(
+                                    session_id.clone(),
+                                    update,
+                                );
+                                let _ = reply.send(Ok(PromptReply {
+                                    stop_reason: "end_turn".to_string(),
+                                    usage: None,
+                                    quota: None,
+                                    updates: vec![notif],
+                                    flush_rx: None,
+                                    ack: None,
+                                }));
+                            }
+                            Command::RemoteControlAvailability { reply } => {
+                                let offered = ext.commands.iter().any(|command| {
+                                    command.get("name").and_then(Value::as_str)
+                                        == Some("remote-control")
+                                        && !ext
+                                            .terminal_slash_commands
+                                            .as_ref()
+                                            .is_some_and(|names| {
+                                                names.iter().any(|n| n == "remote-control")
+                                            })
+                                });
+                                let _ = reply.send(!offered);
                             }
                             Command::Steer {
                                 uuid,
@@ -2604,7 +3992,18 @@ async fn run_loop(
                                     Some("startedNewTurn") => {
                                         // Idle, no opt-in: start a detached turn like a
                                         // normal prompt (it streams updates and settles
-                                        // internally; nothing awaits its oneshot).
+                                        // internally; nothing awaits its oneshot). It
+                                        // goes through `prompt()` upstream, so it runs
+                                        // the same preamble: the stale prediction is
+                                        // cleared and a `/usage` prompt registers its
+                                        // producer (`acp-agent.ts:4353`).
+                                        prompt_preamble(
+                                            &uuid,
+                                            &frame,
+                                            &mut ext,
+                                            &update_tx,
+                                            &session_id,
+                                        );
                                         let (ptx, _prx) = oneshot::channel();
                                         let _ = control.send_user(frame).await;
                                         machine.enqueue(Turn::new(uuid.clone(), is_local_only));
@@ -2648,9 +4047,56 @@ async fn run_loop(
                                     });
                                 }
                             }
+                            Command::CancelChild {
+                                session_id: child_session,
+                                reply,
+                            } => {
+                                // `NativeSubagentRuntime.cancelChild`: accepting the
+                                // stop is no evidence that the child stopped, so
+                                // nothing is reported here; the SDK's task events
+                                // report the child `idle cancelled`
+                                // (`native-subagents.ts:594-603`).
+                                match tasks.subagents().cancel_child(&child_session) {
+                                    Some(task_id) => {
+                                        let control = control.clone();
+                                        let logger = ext.logger.clone();
+                                        let root = session_id.clone();
+                                        let child = child_session.clone();
+                                        tokio::spawn(async move {
+                                            let outcome = control
+                                                .send_request(json!({
+                                                    "subtype": "stop_task",
+                                                    "task_id": task_id,
+                                                }))
+                                                .await;
+                                            let failure = match outcome {
+                                                Ok(receipt) => control_response_error(&receipt),
+                                                Err(error) => Some(error.to_string()),
+                                            };
+                                            if let (Some(error), Some(logger)) =
+                                                (failure, logger)
+                                            {
+                                                logger.error(&format!(
+                                                    "Session {root}: failed to stop the task {task_id} of subagent session {child}: {error}"
+                                                ));
+                                            }
+                                        });
+                                        let _ = reply.send(true);
+                                    }
+                                    None => {
+                                        let _ = reply.send(false);
+                                    }
+                                }
+                            }
                             Command::TaskStopped { task_id, reply } => {
                                 let stopped = tasks.task_stopped(&task_id);
-                                emit_raw_updates(stopped.updates, &update_tx, &session_id);
+                                emit_task_updates(
+                                    &mut tasks,
+                                    &map_state,
+                                    stopped.updates,
+                                    &update_tx,
+                                    &session_id,
+                                );
                                 if let Some(name) = stopped.notice_name {
                                     // The only acknowledgement the user gets: the SDK
                                     // injects nothing for a stopped task. A client on
@@ -2936,6 +4382,19 @@ async fn run_loop(
                                 }
                             }
                             Command::PermissionAnswered { value, ctx, request_id, tool_use_id, tool_input, reply } => {
+                                // The client answered: the child's request ended
+                                // (`awaitingUser`'s finally, `native-subagents.ts:633-644`).
+                                if let Some(token) = pending_await_tokens.remove(&request_id) {
+                                    let outs = tasks.subagents().awaiting_user_end(token, false);
+                                    publish_subagent_outs(
+                                        &mut tasks,
+                                        &mut map_state,
+                                        outs,
+                                        &update_tx,
+                                        &session_id,
+                                        None,
+                                    );
+                                }
                                 // Node resolves the answer after the client's response
                                 // (`acp-agent.js:10219-10237`): the Auto check uses the
                                 // model current NOW, the fallback rewrite warns for any
@@ -2964,6 +4423,42 @@ async fn run_loop(
                                     let _ = reply.send(Err(format!("Unknown config option: {config_id}")));
                                     continue;
                                 };
+                                // M-37 (`acp-agent.ts:8963-8967`, `12464-12478`):
+                                // Fast mode carries a boolean (for Clients that
+                                // opted into boolean config options) or the
+                                // "on"/"off" select fallback, so it bypasses the
+                                // string-only validation below.
+                                if config_id == crate::session_config::FAST_MODE_CONFIG_ID {
+                                    match crate::session_config::resolve_fast_mode_enabled(Some(&value)) {
+                                        Err(message) => {
+                                            let _ = reply.send(Err(message));
+                                        }
+                                        Ok(enabled) => {
+                                            // A-02: apply the SDK flag first so a
+                                            // rejected control request leaves both
+                                            // the session state and the option
+                                            // untouched (`applyFastMode`,
+                                            // `acp-agent.ts:10771-10781`).
+                                            let control = control.clone();
+                                            let command_tx = command_tx.clone();
+                                            tokio::spawn(async move {
+                                                let outcome = control
+                                                    .send_request(json!({
+                                                        "subtype": "apply_flag_settings",
+                                                        "settings": {"fastMode": enabled},
+                                                    }))
+                                                    .await;
+                                                let result = outcome.map(|_| ()).map_err(|e| e.to_string());
+                                                let _ = command_tx.send(Command::FastModeApplied {
+                                                    enabled,
+                                                    result,
+                                                    reply,
+                                                });
+                                            });
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let Some(val_str) = value.as_str() else {
                                     let _ = reply.send(Err(format!("Invalid value for config option {config_id}: {value}")));
                                     continue;
@@ -3055,6 +4550,7 @@ async fn run_loop(
                                             result: model_result,
                                             reply,
                                             notify_client: false,
+                                            inline: false,
                                         });
                                     });
                                 } else if config_id == crate::session_config::EFFORT_CONFIG_ID {
@@ -3079,6 +4575,40 @@ async fn run_loop(
                                             reply,
                                         });
                                     });
+                                } else if config_id == crate::session_config::AGENT_CONFIG_ID {
+                                    // A-03 (`acp-agent.ts:10676-10688`): a live
+                                    // agent switch needs no subprocess restart.
+                                    // Apply the SDK flag first; `null` clears the
+                                    // flag layer back to the standard agent.
+                                    let control = control.clone();
+                                    let command_tx = command_tx.clone();
+                                    let value = resolved_val.clone();
+                                    let payload = crate::session_config::agent_flag_settings(&value);
+                                    tokio::spawn(async move {
+                                        let outcome = control
+                                            .send_request(json!({
+                                                "subtype": "apply_flag_settings",
+                                                "settings": payload,
+                                            }))
+                                            .await;
+                                        let result = outcome.map(|_| ()).map_err(|e| e.to_string());
+                                        let _ = command_tx.send(Command::AgentApplied {
+                                            value,
+                                            result,
+                                            reply,
+                                        });
+                                    });
+                                } else {
+                                    // `applyConfigOptionValue`'s final `else`
+                                    // (`acp-agent.ts:10717-10721`): any other option id
+                                    // just records the resolved value and returns the
+                                    // options — no SDK round trip, no update.
+                                    for opt in &mut ext.config.config_options {
+                                        if opt.id == config_id {
+                                            opt.current_value = resolved_val.clone();
+                                        }
+                                    }
+                                    let _ = reply.send(Ok(ext.config.config_options.clone()));
                                 }
                             }
                             Command::ConfigModeApplied {
@@ -3137,6 +4667,7 @@ async fn run_loop(
                                 result,
                                 reply,
                                 notify_client,
+                                inline,
                             } => {
                                 match result {
                                     Err(e) => {
@@ -3161,22 +4692,22 @@ async fn run_loop(
                                             ext.usage.authoritative = seeded.authoritative;
                                         }
                                         let new_model_info = ext.config.model_infos.iter().find(|m| m.value == model_val).cloned();
-                                        let mut mode_downgraded = false;
-                                        if ext.config.modes.current_mode_id == "auto"
-                                            && auto_mode_downgrade_needed(new_model_info.as_ref())
+                                        // `reconcileForModel` (`session-mode.ts:225-244`):
+                                        // the SDK sync is awaited before the effort sync below
+                                        // (SDK control requests are serialized).
+                                        let mode_downgraded = ext.config.modes.current_mode_id == "auto"
+                                            && auto_mode_downgrade_needed(new_model_info.as_ref());
+                                        if mode_downgraded {
+                                            ext.config.modes.current_mode_id =
+                                                crate::session_config::AUTO_MODE_FALLBACK.to_string();
+                                        }
+                                        // O-31 (`acp-agent.ts:10537-10539`): a
+                                        // `model_not_allowed` reason described the model we just
+                                        // left, so it must not follow us onto the new one.
+                                        if ext.config.fast_mode_disabled_reason.as_deref()
+                                            == Some("model_not_allowed")
                                         {
-                                            {
-                                                ext.config.modes.current_mode_id = crate::session_config::AUTO_MODE_FALLBACK.to_string();
-                                                let fallback = crate::session_config::AUTO_MODE_FALLBACK.to_string();
-                                                let control = control.clone();
-                                                tokio::spawn(async move {
-                                                    let _ = control.send_request(json!({
-                                                        "subtype": "set_permission_mode",
-                                                        "mode": &fallback,
-                                                    })).await;
-                                                });
-                                                mode_downgraded = true;
-                                            }
+                                            ext.config.fast_mode_disabled_reason = None;
                                         }
                                         let pinned_effort = ext.config.effort_pinned.clone();
                                         let effort_was_pinned = pinned_effort.is_some();
@@ -3199,90 +4730,238 @@ async fn run_loop(
                                         // MAJOR 3/4 / P4: rebuild config options for the new
                                         // model honouring the client's `useRecommendedValue`
                                         // (AIR) capability, matching the session-start seed.
-                                        let use_recommended_value = ext
-                                            .air
-                                            .as_ref()
-                                            .is_some_and(|a| a.supports("recommendedValue"));
-                                        ext.config.config_options = crate::session_config::build_config_options(
-                                            &ext.config.modes,
-                                            &ext.config.available_models,
-                                            &ext.config.current_model_id,
-                                            &ext.config.model_infos,
-                                            seed_effort.as_deref(),
-                                            use_recommended_value,
-                                        );
+                                        // O-31: the Fast mode toggle follows the new model and
+                                        // keeps the retained user intent; the Agent picker is
+                                        // rebuilt from the discovered agents.
+                                        let recommended = use_recommended_value(&ext);
+                                        let current_effort_before = ext
+                                            .config
+                                            .config_options
+                                            .iter()
+                                            .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
+                                            .map(|o| o.current_value.clone());
+                                        let applied_before =
+                                            crate::session_config::applied_effort_before_switch(
+                                                ext.config.applied_effort.as_deref(),
+                                                recommended,
+                                                current_effort_before.as_deref(),
+                                                pinned_effort.as_deref(),
+                                            );
+                                        ext.config.config_options =
+                                            rebuild_config_options(&ext, seed_effort.as_deref());
                                         // MAJOR 4 / P4 (acp-agent.js:7975-7989): sync effort on
                                         // every switch for opted-in (AIR) clients; for a legacy
                                         // non-AIR client only when a user pin was clamped away —
                                         // and then send `effortLevel:null` (`toSdkEffortLevel
                                         // (undefined)`) to clear the flag layer, never the
                                         // displayed value.
-                                        let should_sync = use_recommended_value
+                                        let should_sync = recommended
                                             || (effort_was_pinned && !effort_pinned_for_new);
-                                        if should_sync {
-                                            let new_effort_opt = ext.config.config_options.iter().find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID);
-                                            let new_effort = new_effort_opt.map(|o| o.current_value.clone());
-                                            let sync_value = if use_recommended_value { new_effort.as_deref() } else { None };
-                                            let effort_payload = crate::session_config::effort_flag_settings(sync_value, ext.config.ultracode);
-                                            let control = control.clone();
-                                            tokio::spawn(async move {
-                                                let _ = control.send_request(json!({
-                                                    "subtype": "apply_flag_settings",
-                                                    "settings": effort_payload,
-                                                })).await;
-                                            });
-                                            ext.config.effort_pinned = if effort_pinned_for_new { pinned_effort } else { None };
-                                        }
+                                        let new_effort = should_sync.then(|| {
+                                            ext.config
+                                                .config_options
+                                                .iter()
+                                                .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
+                                                .map(|o| o.current_value.clone())
+                                        }).flatten();
+                                        let sync_value = if recommended { new_effort.as_deref() } else { None };
+                                        let effort_payload = should_sync.then(|| {
+                                            crate::session_config::effort_flag_settings(
+                                                sync_value,
+                                                ext.config.ultracode,
+                                            )
+                                        });
+                                        let downgraded_to = mode_downgraded
+                                            .then_some(crate::session_config::AUTO_MODE_FALLBACK);
                                         // Review PC-1 (3): the fallback updates, then config_option_update for
                                         // an external switch; a user-driven change returns its options in `reply`.
                                         let warn = mode_downgraded && !ext.auto_mode_fallback_warning_shown;
                                         if warn {
                                             ext.auto_mode_fallback_warning_shown = true;
                                         }
-                                        let downgraded_to = mode_downgraded.then_some(crate::session_config::AUTO_MODE_FALLBACK);
-                                        let updates = if notify_client {
-                                            external_switch_updates(
-                                                &session_id,
-                                                &ext.config.config_options,
-                                                downgraded_to,
-                                                warn,
-                                                ext.supports_notices(),
-                                            )
-                                        } else {
-                                            fallback_updates(
-                                                &session_id,
-                                                downgraded_to,
-                                                warn,
-                                                ext.supports_notices(),
-                                            )
-                                        };
-                                        for update in updates {
-                                            let _ = update_tx.send(SessionOutbound::RawUpdate(update));
+                                        let control = control.clone();
+                                        let command_tx = command_tx.clone();
+                                        let reply_model = model_val.clone();
+                                        let pinned_before = pinned_effort.clone();
+                                        let downgraded = downgraded_to.map(String::from);
+                                        // Node's `syncModelAfterExternalSwitch` runs inline in
+                                        // the consumer loop for the refusal fallback and
+                                        // detached for the PostModelSwitch hook; only the
+                                        // former holds stream frames behind the switch's
+                                        // control round trips and `config_option_update`.
+                                        if notify_client && inline {
+                                            inline_external_switches_in_flight += 1;
                                         }
-                                        if model_changed {
-                                            let control = control.clone();
-                                            let tx = command_tx.clone();
-                                            let model_id = model_val.clone();
-                                            tokio::spawn(async move {
-                                                if let Ok(res) = control
-                                                    .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
-                                                    .await
-                                                {
-                                                    if let Some(raw) = crate::usage::raw_max_tokens(&res) {
-                                                        let _ = tx.send(Command::UpdateContextWindow { size: raw, model_id });
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        let options = ext.config.config_options.clone();
-                                        let (flush_tx, flush_rx) = oneshot::channel();
-                                        let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
                                         tokio::spawn(async move {
-                                            let _ = flush_rx.await;
-                                            let _ = reply.send(Ok(options));
+                                            if let Some(mode) = downgraded.as_deref() {
+                                                let _ = control
+                                                    .send_request(json!({
+                                                        "subtype": "set_permission_mode",
+                                                        "mode": mode,
+                                                    }))
+                                                    .await;
+                                            }
+                                            let effort_result = match effort_payload {
+                                                Some(payload) => Some(
+                                                    control
+                                                        .send_request(json!({
+                                                            "subtype": "apply_flag_settings",
+                                                            "settings": payload,
+                                                        }))
+                                                        .await
+                                                        .map(|_| ())
+                                                        .map_err(|e| e.to_string()),
+                                                ),
+                                                None => None,
+                                            };
+                                            let _ = command_tx.send(Command::ModelSwitchSynced {
+                                                model_val: reply_model,
+                                                effort_result,
+                                                pinned_before,
+                                                applied_before,
+                                                effort_pinned_for_new,
+                                                new_effort,
+                                                use_recommended_value: recommended,
+                                                downgraded_to: downgraded.clone(),
+                                                warn,
+                                                notify_client,
+                                                inline,
+                                                model_changed,
+                                                reply,
+                                            });
                                         });
                                     }
                                 }
+                            }
+                            Command::ModelSwitchSynced {
+                                model_val,
+                                effort_result,
+                                pinned_before,
+                                applied_before,
+                                effort_pinned_for_new,
+                                new_effort,
+                                use_recommended_value,
+                                downgraded_to,
+                                warn,
+                                notify_client,
+                                inline,
+                                model_changed,
+                                reply,
+                            } => {
+                                if notify_client && inline {
+                                    inline_external_switches_in_flight =
+                                        inline_external_switches_in_flight.saturating_sub(1);
+                                }
+                                match effort_result {
+                                    Some(Err(error)) => {
+                                        // A-09 (`acp-agent.ts:10637-10668`): the switch
+                                        // already succeeded, so effort synchronization is
+                                        // best-effort. Preserve the old SDK/pin bookkeeping
+                                        // and never advertise the unapplied value: restore
+                                        // the last applied value when the new model can
+                                        // select it, otherwise omit the effort option until
+                                        // a later successful switch rebuilds it.
+                                        ext.config.effort_pinned = pinned_before.clone();
+                                        ext.config.applied_effort = applied_before.clone();
+                                        let still_selectable = applied_before.as_deref().is_some_and(|value| {
+                                            ext.config
+                                                .config_options
+                                                .iter()
+                                                .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
+                                                .is_some_and(|o| {
+                                                    o.option_type == "select"
+                                                        && o.options.iter().any(|option| option.value == value)
+                                                })
+                                        });
+                                        if still_selectable {
+                                            if let Some(option) = ext
+                                                .config
+                                                .config_options
+                                                .iter_mut()
+                                                .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
+                                            {
+                                                option.current_value =
+                                                    applied_before.clone().unwrap_or_default();
+                                            }
+                                        } else {
+                                            ext.config.config_options.retain(|o| {
+                                                o.id != crate::session_config::EFFORT_CONFIG_ID
+                                            });
+                                        }
+                                        if let Some(logger) = &ext.logger {
+                                            logger.error(&format!(
+                                                "Failed to synchronize effort after model switch to \"{model_val}\": {error}"
+                                            ));
+                                        }
+                                    }
+                                    Some(Ok(())) => {
+                                        ext.config.effort_pinned = if effort_pinned_for_new {
+                                            pinned_before
+                                        } else {
+                                            None
+                                        };
+                                        ext.config.applied_effort =
+                                            crate::session_config::applied_effort_after_sync(
+                                                use_recommended_value,
+                                                new_effort.as_deref(),
+                                            );
+                                    }
+                                    None => {
+                                        if effort_pinned_for_new {
+                                            ext.config.effort_pinned = pinned_before.clone();
+                                            ext.config.applied_effort = pinned_before;
+                                        }
+                                    }
+                                }
+                                let updates = if notify_client {
+                                    external_switch_updates(
+                                        &session_id,
+                                        &ext.config.config_options,
+                                        downgraded_to.as_deref(),
+                                        warn,
+                                        ext.supports_notices(),
+                                    )
+                                } else {
+                                    fallback_updates(
+                                        &session_id,
+                                        downgraded_to.as_deref(),
+                                        warn,
+                                        ext.supports_notices(),
+                                    )
+                                };
+                                for update in updates {
+                                    let _ = update_tx.send(SessionOutbound::RawUpdate(update));
+                                }
+                                // The inline switch is finished: the frames it
+                                // held behind its control round trips and its
+                                // `config_option_update` enter the stream now, in
+                                // their original order (`acp-agent.ts:6702`).
+                                if notify_client && inline && inline_external_switches_in_flight == 0
+                                {
+                                    release_held_frames(&mut replay, &mut held_behind_mcp);
+                                }
+                                if model_changed {
+                                    let control = control.clone();
+                                    let tx = command_tx.clone();
+                                    let model_id = model_val.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(res) = control
+                                            .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
+                                            .await
+                                        {
+                                            if let Some(raw) = crate::usage::raw_max_tokens(&res) {
+                                                let _ = tx.send(Command::UpdateContextWindow { size: raw, model_id });
+                                            }
+                                        }
+                                    });
+                                }
+                                let options = ext.config.config_options.clone();
+                                let (flush_tx, flush_rx) = oneshot::channel();
+                                let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
+                                tokio::spawn(async move {
+                                    let _ = flush_rx.await;
+                                    let _ = reply.send(Ok(options));
+                                });
                             }
                             Command::EffortApplied {
                                 effort_val,
@@ -3300,15 +4979,58 @@ async fn run_loop(
                                             }
                                         }
                                         ext.config.current_effort = Some(effort_val.clone());
-                                        // `appliedEffortLevel`: "default" clears the flag layer,
-                                        // handing effort back to the CLI's own resolution.
+                                        // O-55 `appliedEffortLevel` (`acp-agent.ts:10704`):
+                                        // "default" clears the flag layer, handing effort
+                                        // back to the CLI's own resolution.
                                         ext.config.applied_effort =
-                                            (effort_val != "default").then(|| effort_val.clone());
+                                            crate::session_config::applied_effort_after_pick(&effort_val);
                                         ext.config.effort_pinned = if effort_val != "default" {
                                             Some(effort_val)
                                         } else {
                                             None
                                         };
+                                        let _ = reply.send(Ok(ext.config.config_options.clone()));
+                                    }
+                                }
+                            }
+                            Command::FastModeApplied {
+                                enabled,
+                                result,
+                                reply,
+                            } => {
+                                match result {
+                                    Err(e) => {
+                                        // A-02: the rejected flag leaves the
+                                        // session state and option untouched.
+                                        let _ = reply.send(Err(e));
+                                    }
+                                    Ok(()) => {
+                                        ext.config.fast_mode_enabled = enabled;
+                                        refresh_fast_mode_option(
+                                            &mut ext.config,
+                                            enabled,
+                                            ext.caps.boolean_config,
+                                        );
+                                        let _ = reply.send(Ok(ext.config.config_options.clone()));
+                                    }
+                                }
+                            }
+                            Command::AgentApplied {
+                                value,
+                                result,
+                                reply,
+                            } => {
+                                match result {
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e));
+                                    }
+                                    Ok(()) => {
+                                        ext.config.current_agent = value.clone();
+                                        for opt in &mut ext.config.config_options {
+                                            if opt.id == crate::session_config::AGENT_CONFIG_ID {
+                                                opt.current_value = value.clone();
+                                            }
+                                        }
                                         let _ = reply.send(Ok(ext.config.config_options.clone()));
                                     }
                                 }
@@ -3349,6 +5071,7 @@ async fn run_loop(
                                 reply,
                             } => {
                                 handle_hook_callback(
+                                    &mut tasks,
                                     HookCall {
                                         request_id: &request_id,
                                         callback_id: &callback_id,
@@ -3367,8 +5090,43 @@ async fn run_loop(
                             }
                         }
                     }
-                    msg = next_stream_line(&mut replay, &mut stream) => {
+                    msg = next_stream_line(&mut replay, &mut stream),
+                        if !(eof_seen && inline_external_switches_in_flight > 0) => {
                         let Some(line) = msg else {
+                            // An inline external switch still in flight at EOF: its
+                            // control round trips can never be answered (the child
+                            // that reads them is gone), and its replies arrive on
+                            // this very stream. `close()` alone would NOT settle
+                            // them — it only stops answering inbound requests, and
+                            // the pending map lives until the control task exits —
+                            // so the switch's `ModelSwitchSynced` would never come
+                            // and its `config_option_update` would be lost.
+                            // `fail_pending` settles the round trips; the switch
+                            // task then publishes its updates (before the held
+                            // frames, as the awaited inline sync does upstream,
+                            // `acp-agent.ts:6702`) and drops the counter, which
+                            // re-enables the stream branch (its gate above).
+                            if inline_external_switches_in_flight > 0 {
+                                if !eof_seen {
+                                    let _ = control.fail_pending();
+                                    eof_seen = true;
+                                }
+                                // What was held behind an unfinished `/mcp` run
+                                // still counts: its result carries the turn's
+                                // usage and stop reason. It stays queued for
+                                // replay until the switch releases the stream.
+                                // This move is only a shortcut of the `/mcp`-EOF
+                                // path: without it, `ModelSwitchSynced` releases
+                                // the frames itself, and a `/mcp` result held
+                                // again is released by the `/mcp`-EOF path when
+                                // the next `None` arrives, in the same order (M4
+                                // in review-T5FA4 survives this block's removal).
+                                if !held_behind_mcp.is_empty() {
+                                    stream_ended = true;
+                                    release_held_frames(&mut replay, &mut held_behind_mcp);
+                                }
+                                continue;
+                            }
                             // What was held behind an unfinished `/mcp` run still counts:
                             // its result carries the turn's usage and stop reason.
                             if !held_behind_mcp.is_empty() {
@@ -3383,10 +5141,19 @@ async fn run_loop(
                             let _ = control.close();
                             let error_text = error_text.exit_error_text();
                             let air_failures = ext.air_supports("sessionFailure");
+                            // `finishLifecycle` at the end of a stream uses
+                            // `failed`/`failed` unless a cancel is pending
+                            // (`acp-agent.ts:5782-5786`, `8257`). Read it before
+                            // the settle lanes below mutate the machine.
+                            let stream_end_cancelled = machine.is_cancelled();
                             // V-06: a clean end after `worker_shutting_down` fails
                             // the active turn with `worker_shutdown`; a held,
                             // cancelled-away or absent turn gets the session-scoped
-                            // failure instead (`acp-agent.ts:5750-5767`).
+                            // failure instead (`acp-agent.ts:5750-5767`). The
+                            // session-scoped failure is published BEFORE
+                            // `finishLifecycle`'s interrupt (`acp-agent.ts:5762-5764`
+                            // vs `4645`), while an active turn is failed by
+                            // `failActiveWithSessionFailure`, which interrupts first.
                             let mut shutdown_events = Vec::new();
                             if std::mem::take(&mut ext.t2a.pending_worker_shutdown)
                                 && child_exit != Some(true)
@@ -3404,6 +5171,19 @@ async fn run_loop(
                                     let _ = update_tx.send(SessionOutbound::RawUpdate(update));
                                 }
                             }
+                            // F2 (B-109): `finishLifecycle` starts with
+                            // `compaction.interrupt()` (`acp-agent.ts:4645`): an
+                            // entity the dead runtime left open gets its
+                            // `cancelled` terminal before any turn settles, and
+                            // the pending hook summary is dropped.
+                            let updates = ext.t2a.compaction.interrupt();
+                            publish_compaction_updates(
+                                &mut ext,
+                                &mut map_state,
+                                updates,
+                                &update_tx,
+                                &session_id,
+                            );
                             let events = match child_exit {
                                 // The child died: the SDK throws from `next()` and
                                 // `failAllTurns` rejects every in-flight turn with that
@@ -3492,6 +5272,7 @@ async fn run_loop(
                             let events = shutdown_events;
                             settle_events(
                                 events,
+                                &mut tasks,
                                 &mut map_state,
                                 &live_background,
                                 &mut pending,
@@ -3503,9 +5284,20 @@ async fn run_loop(
                                 None,
                                 &mut ext.titles,
         &mut ext.t2a.failures,
+        &mut ext.t2a.usage_turns,
                             );
                             // 3.5: close every live async task at teardown (`finish_all`).
-                            finish_async_tasks(&mut tasks, "stopped", &update_tx, &session_id, ext.logger.as_deref());
+                            // A cancel ends them `stopped` (and their children
+                            // `cancelled`); a crash without a cancel reports
+                            // `failed`, as upstream does (`acp-agent.ts:5782-5786`).
+                            finish_async_tasks(
+                                &mut tasks,
+                                &mut map_state,
+                                if stream_end_cancelled { "stopped" } else { "failed" },
+                                &update_tx,
+                                &session_id,
+                                ext.logger.as_deref(),
+                            );
                             ext.mcp.clear();
                             break;
                         };
@@ -3515,15 +5307,34 @@ async fn run_loop(
                             child_exit = Some(abnormal);
                             continue;
                         }
-                        // A `/mcp` turn's replacement comes from a spawned control run whose
-                        // replies arrive on THIS stream, behind the CLI's output and result.
-                        // Node awaits the run where the output shape appears and the result
-                        // follows; here a result that beats the run's completion waits for
-                        // its [`McpPrepared`], with every session frame behind it, while
-                        // control traffic (the run's own replies) keeps flowing.
+                        // The refusal path's external switch is awaited inline:
+                        // Node does not read the child's next frame until its
+                        // control round trips and its `config_option_update` are
+                        // done (`acp-agent.ts:6702`). Those round trips' replies
+                        // arrive on THIS stream, so a control line keeps flowing
+                        // and every other frame is held (in the same queue a
+                        // `/mcp` run uses) until the last inline switch finishes.
+                        if !stream_ended && inline_external_switches_in_flight > 0 {
+                            if matches!(
+                                dispatch::route(&StreamMsg::new(line.clone()), &dispatch::TurnView::default()),
+                                Route::Control
+                            ) {
+                                let _ = control_in_tx.send(line);
+                            } else {
+                                held_behind_mcp.push(line);
+                            }
+                            continue;
+                        }
+                        // A `/mcp` or `/usage` turn's replacement comes from a spawned
+                        // control run whose replies arrive on THIS stream, behind the
+                        // CLI's output and result. Node awaits the run where the output
+                        // shape appears and the result follows; here a frame that beats
+                        // the run's completion waits for its [`McpPrepared`] /
+                        // [`Command::UsagePrepared`], with every session frame behind it,
+                        // while control traffic (the run's own replies) keeps flowing.
                         if !stream_ended
                             && (!held_behind_mcp.is_empty()
-                                || holds_for_mcp_run(&line, &machine, &ext.mcp))
+                                || holds_for_local_command_run(&line, &machine, &mut ext))
                         {
                             if matches!(
                                 dispatch::route(&StreamMsg::new(line.clone()), &dispatch::TurnView::default()),
@@ -3554,7 +5365,7 @@ async fn run_loop(
                         let is_idle_transition = line.get("type").and_then(Value::as_str) == Some("system")
                             && line.get("subtype").and_then(Value::as_str) == Some("session_state_changed")
                             && line.get("state").and_then(Value::as_str) == Some("idle");
-                        dispatch_stream(
+                        let reset = dispatch_stream(
                             StreamMsg::new(line),
                             &control_in_tx,
                             &mut machine,
@@ -3570,10 +5381,15 @@ async fn run_loop(
                             &mut ext,
                         )
                         .await;
+                        if reset {
+                            pending_await_tokens.clear();
+                        }
                         for effect in std::mem::take(&mut ext.t2a.effects) {
                             match effect {
                                 state::Effect::SyncModel(model) => {
-                                    request_external_model_sync(&ext, &command_tx, &model);
+                                    // The refusal fallback awaits its sync before the
+                                    // loop reads on (`acp-agent.ts:6702`).
+                                    request_external_model_sync(&ext, &command_tx, &model, true);
                                 }
                                 state::Effect::ExitPlanRestart => {
                                     let Some(plan) = ext.t2a.restart_plan.take() else {
@@ -3587,10 +5403,21 @@ async fn run_loop(
                                     replay.clear();
                                     held_behind_mcp.clear();
                                     stream_ended = false;
+                                    eof_seen = false;
                                     abort_pending_permissions(
                                         &mut pending_permissions,
                                         &mut parked_permissions,
                                     );
+                                    // The control channel moves to the fresh child:
+                                    // every client form the old child opened is
+                                    // withdrawn (upstream's per-request signal aborts
+                                    // on rebind), and the old runtime's awaiting-user
+                                    // tokens are stale.
+                                    abort_pending_elicitations(&mut pending_elicitations);
+                                    for (_, (reply, response)) in pending_ask.drain() {
+                                        let _ = reply.send(response);
+                                    }
+                                    pending_await_tokens.clear();
                                     let _ = control.close();
                                     let Some(init) = restarter.as_mut() else {
                                         settle_restart_turn!(
@@ -3685,6 +5512,14 @@ async fn run_loop(
     // forwarding side send `$/cancel_request` (Node's cleanup aborts every
     // pending permission). Parked requests nobody will release are dropped.
     abort_pending_permissions(&mut pending_permissions, &mut parked_permissions);
+    // F23a/F23b: a client elicitation or dialog still open is withdrawn with its
+    // CANCEL outcome; aborting the task drops the client request's reply, so the
+    // forwarding side sends `$/cancel_request`.
+    let _ = elicit_cancel_tx.send(true);
+    abort_pending_elicitations(&mut pending_elicitations);
+    for (_, (reply, response)) in pending_ask.drain() {
+        let _ = reply.send(response);
+    }
     if let Some(sink) = final_state_sink {
         let _ = sink.send(Some((
             ext.config.modes.clone(),
@@ -3694,6 +5529,23 @@ async fn run_loop(
 }
 
 /// Abort every pending permission round-trip and forget the parked ones.
+/// End every open permission request of a native subagent child as withdrawn
+/// (`awaitingUser`'s finally with `signal.aborted`, `native-subagents.ts:633-644`):
+/// Claude Code withdrew them when the interrupt stopped the work.
+fn withdraw_awaiting_requests(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    tokens: &mut HashMap<String, crate::native_subagents::AwaitToken>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    let tokens: Vec<_> = tokens.drain().map(|(_, token)| token).collect();
+    for token in tokens {
+        let outs = tasks.subagents().awaiting_user_end(token, true);
+        publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, None);
+    }
+}
+
 fn abort_pending_permissions(
     pending_permissions: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     parked_permissions: &mut Vec<ParkedPermission>,
@@ -3703,6 +5555,149 @@ fn abort_pending_permissions(
     }
     pending_permissions.clear();
     parked_permissions.clear();
+}
+
+/// The client round-trips a session can have open, bundled so the cancel and
+/// withdraw helpers take one handle instead of four.
+struct PendingClientRequests<'a> {
+    permissions: &'a mut HashMap<String, tokio::task::JoinHandle<()>>,
+    elicitations:
+        &'a mut HashMap<String, (oneshot::Sender<Value>, Value, tokio::task::JoinHandle<()>)>,
+    ask: &'a mut HashMap<String, (oneshot::Sender<Value>, Value)>,
+    await_tokens: &'a mut HashMap<String, crate::native_subagents::AwaitToken>,
+}
+
+/// Withdraw every pending client elicitation/dialog: abort the task waiting on
+/// the client (which sends `$/cancel_request`) and answer the CLI with the
+/// request's CANCEL outcome.
+fn abort_pending_elicitations(
+    pending: &mut HashMap<String, (oneshot::Sender<Value>, Value, tokio::task::JoinHandle<()>)>,
+) {
+    for (_, (reply, response, handle)) in pending.drain() {
+        handle.abort();
+        let _ = reply.send(response);
+    }
+}
+
+/// The parent-cancel prelude shared by `session/cancel` and the close
+/// (`cancelTurns`, `acp-agent.ts:8437-8502`):
+///
+/// - abort every pending permission round-trip (dropping the reply makes the
+///   control handler answer the R28 deny), EXCEPT in the RFD form the requests
+///   of a child that can keep running after a parent cancel (issue #2308): they
+///   stay open until the client answers or the CLI withdraws them;
+/// - withdraw every open client elicitation/dialog with its CANCEL outcome;
+/// - end AIR's children as cancelled (the RFD form only counts the cancel);
+/// - in the non-RFD form clear the per-call eager sessions and field tracker,
+///   and end the open child requests as withdrawn.
+fn cancel_parent_round_trips(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    pending: &mut PendingClientRequests<'_>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    let rfd = tasks.subagents().form() == Some(crate::acp_subagents::SubagentForm::Rfd);
+    let keep: std::collections::HashSet<String> = if rfd {
+        pending.await_tokens.keys().cloned().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    pending.permissions.retain(|id, handle| {
+        if keep.contains(id) {
+            true
+        } else {
+            handle.abort();
+            false
+        }
+    });
+    // An MCP elicitation or dialog is not a child permission request: it is
+    // always withdrawn with its CANCEL outcome.
+    abort_pending_elicitations(pending.elicitations);
+    let drained: Vec<(String, (oneshot::Sender<Value>, Value))> = pending.ask.drain().collect();
+    for (id, (reply, response)) in drained {
+        if keep.contains(&id) {
+            pending.ask.insert(id, (reply, response));
+        } else {
+            let _ = reply.send(response);
+        }
+    }
+    // B-40/B-96 (`acp-agent.ts:8485-8502`): AIR's draft ends every child here
+    // as cancelled, so a later update of an ended child's tool call is dropped
+    // instead of reaching that child's session. The RFD form only counts the
+    // cancel: a background subagent can keep running after a parent cancel.
+    let outs = tasks.subagents().parent_cancelled();
+    publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, None);
+    if !rfd {
+        map_state.clear_eager_sessions();
+        map_state.clear_tool_tracker();
+        withdraw_awaiting_requests(
+            tasks,
+            map_state,
+            pending.await_tokens,
+            update_tx,
+            session_id,
+        );
+    }
+}
+
+/// Withdraw one request the CLI cancelled (`control_cancel_request`, or a
+/// clear-context restart moving the control channel): abort the client
+/// round-trip (which sends `$/cancel_request`), forget the pending answer, and
+/// end the child's awaiting-user token as withdrawn.
+fn withdraw_request(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    pending: &mut PendingClientRequests<'_>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    request_id: &str,
+) {
+    if let Some((_, _, handle)) = pending.elicitations.remove(request_id) {
+        handle.abort();
+    }
+    pending.ask.remove(request_id);
+    if let Some(handle) = pending.permissions.remove(request_id) {
+        handle.abort();
+    }
+    if let Some(token) = pending.await_tokens.remove(request_id) {
+        let outs = tasks.subagents().awaiting_user_end(token, true);
+        publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, None);
+    }
+}
+
+/// End the awaiting-user token of a permission request that ended without an
+/// answer (the client errored or the request dropped): `awaitingUser`'s
+/// `finally` reports the child `running` when its signal was not aborted.
+fn end_await_request(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    pending_await_tokens: &mut HashMap<String, crate::native_subagents::AwaitToken>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    request_id: &str,
+) {
+    if let Some(token) = pending_await_tokens.remove(request_id) {
+        let outs = tasks.subagents().awaiting_user_end(token, false);
+        publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, None);
+    }
+}
+
+/// End the prompts held behind a `/remote-control` command as `cancelled`, as
+/// the close ends a queued turn (`acp-agent.ts:3906-3912`).
+fn cancel_held_remote_control_prompts(held: &mut std::collections::VecDeque<Command>) {
+    for command in held.drain(..) {
+        if let Command::Prompt { reply, .. } = command {
+            let _ = reply.send(Ok(PromptReply {
+                stop_reason: "cancelled".to_string(),
+                usage: None,
+                quota: None,
+                updates: Vec::new(),
+                flush_rx: None,
+                ack: None,
+            }));
+        }
+    }
 }
 
 /// Kick off the turn-end title lookup off the actor thread. The actor must
@@ -3920,14 +5915,18 @@ fn publish_task_plan(
 /// (`toAcpNotifications`, `acp-agent.ts:13232-13253`), so resolving every
 /// result in a pass before mapping would reorder a multi-result frame.
 fn handle_user_frame_blocks(
+    io: SendIo<'_>,
     line: &Value,
     blocks: &[Value],
     map_state: &mut MapState,
     ext: &mut SessionExt,
-    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
-    session_id: &str,
     turn: Option<&str>,
 ) {
+    let SendIo {
+        tasks,
+        update_tx,
+        session_id,
+    } = io;
     // PC-1.5: the frame's `tool_use_result` belongs to a single tool result;
     // with several results it cannot be attributed, so it is null.
     let tool_result_count = blocks
@@ -4049,7 +6048,8 @@ fn handle_user_frame_blocks(
             }
         }
         note_tool_updates(&updates, true, turn, map_state);
-        emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
+        let filtered = map_state.filter_updates(updates);
+        send_updates(tasks, map_state, filtered, update_tx, session_id, turn);
         // U-24: an approved plan of the main conversation becomes the session's
         // markdown plan after the tool call's result. A clear-context approval
         // ends the tool with an error, and the restart publishes its plan.
@@ -4095,7 +6095,7 @@ fn note_background_bash(
     );
     if let Some(task) = &task {
         let updates = tasks.task_backgrounded(task);
-        publish_task_updates(tasks, updates, update_tx, session_id);
+        publish_task_updates(tasks, map_state, updates, update_tx, session_id);
     }
     let tool_call_id = task
         .as_ref()
@@ -4125,7 +6125,7 @@ fn note_background_bash(
         }
     }
     let updates = tasks.tool_results(&content);
-    publish_task_updates(tasks, updates, update_tx, session_id);
+    publish_task_updates(tasks, map_state, updates, update_tx, session_id);
     ext.t2a.background.backgrounded = crate::async_tasks::backgrounded_bash_tool_call_ids(
         &content,
         &tool_use_of,
@@ -4223,6 +6223,129 @@ fn external_switch_updates(
     out
 }
 
+/// Whether the client opted into the AIR `recommendedValue` capability
+/// (`clientSupportsRecommendedConfigValue`, `session_config.rs`).
+fn use_recommended_value(ext: &SessionExt) -> bool {
+    ext.air
+        .as_ref()
+        .is_some_and(|a| a.supports("recommendedValue"))
+}
+
+/// Rebuild the session's config options from the actor's live state
+/// (`buildConfigOptions`, `acp-agent.ts:12497-12562`): the Fast mode toggle
+/// follows the current model's support with the retained user intent, and the
+/// Agent picker is composed from the discovered agents.
+fn rebuild_config_options(
+    ext: &SessionExt,
+    current_effort: Option<&str>,
+) -> Vec<crate::session_config::ConfigOption> {
+    let fast_mode = crate::session_config::FastModeOptionState {
+        supported: crate::session_config::model_supports_fast_mode(
+            &ext.config.model_infos,
+            &ext.config.current_model_id,
+        ),
+        enabled: ext.config.fast_mode_enabled,
+        use_boolean_option: ext.caps.boolean_config,
+        disabled_reason: ext.config.fast_mode_disabled_reason.clone(),
+    };
+    crate::session_config::build_config_options_with(&crate::session_config::ConfigOptionsInput {
+        modes: &ext.config.modes,
+        available_models: &ext.config.available_models,
+        current_model_id: &ext.config.current_model_id,
+        model_infos: &ext.config.model_infos,
+        current_effort,
+        agents: &ext.config.agents,
+        current_agent: &ext.config.current_agent,
+        fast_mode: Some(&fast_mode),
+        use_recommended_value: use_recommended_value(ext),
+    })
+}
+
+/// Replace the Fast mode option in place so it reflects `enabled`
+/// (`refreshFastModeOption`, `acp-agent.ts:10759-10770`). A no-op when the
+/// option isn't present.
+fn refresh_fast_mode_option(
+    config: &mut crate::session_config::SessionConfigState,
+    enabled: bool,
+    use_boolean_option: bool,
+) {
+    let refreshed = crate::session_config::create_fast_mode_config_option(
+        enabled,
+        use_boolean_option,
+        config.fast_mode_disabled_reason.as_deref(),
+    );
+    for option in &mut config.config_options {
+        if option.id == crate::session_config::FAST_MODE_CONFIG_ID {
+            *option = refreshed.clone();
+        }
+    }
+}
+
+/// The live notice/transcript line of a Fast mode flip the SDK forced off
+/// (`syncFastModeState`, `acp-agent.ts:10834-10852`).
+fn fast_mode_flip_update(session_id: &str, explanation: &str, supports_notices: bool) -> Value {
+    let notice = crate::notices::SessionNotice::new(
+        "warning",
+        "Fast mode turned off",
+        Some(format!("{}.", crate::notices::sentence_case(explanation))),
+    );
+    let transcript = format!("**Fast mode turned off:** {explanation}.");
+    json!({
+        "sessionId": session_id,
+        "update": crate::notices::notice_or_transcript_update(
+            &notice,
+            supports_notices,
+            Some(&transcript),
+            None,
+        ),
+    })
+}
+
+/// Reconcile the retained Fast mode toggle with an SDK-reported
+/// `fast_mode_state` (`syncFastModeState`, `acp-agent.ts:10805-10860`). Returns
+/// the updates to publish: the once-only flip explanation (when the SDK refuses
+/// a toggle the user turned on) and the `config_option_update`.
+fn sync_fast_mode_state(
+    ext: &mut SessionExt,
+    state: Option<&str>,
+    reason: Option<&str>,
+    session_id: &str,
+) -> Vec<Value> {
+    let has_option = ext
+        .config
+        .config_options
+        .iter()
+        .any(|o| o.id == crate::session_config::FAST_MODE_CONFIG_ID);
+    let Some(sync) = crate::session_config::reconcile_fast_mode(
+        state,
+        reason,
+        ext.config.fast_mode_enabled,
+        ext.config.fast_mode_disabled_reason.as_deref(),
+        has_option,
+    ) else {
+        return Vec::new();
+    };
+    ext.config.fast_mode_enabled = sync.enabled;
+    ext.config.fast_mode_disabled_reason = sync.disabled_reason;
+    refresh_fast_mode_option(&mut ext.config, sync.enabled, ext.caps.boolean_config);
+    let mut out = Vec::new();
+    if let Some(explanation) = sync.explanation {
+        out.push(fast_mode_flip_update(
+            session_id,
+            &explanation,
+            ext.supports_notices(),
+        ));
+    }
+    out.push(json!({
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "config_option_update",
+            "configOptions": ext.config.config_options,
+        },
+    }));
+    out
+}
+
 /// PC-1.1 (acp-agent.ts:10724 syncModelAfterExternalSwitch): the model value a
 /// PostModelSwitch hook must sync to, or `None` when the adapter already tracks it.
 /// The SDK-reported model maps to an option value (display names resolve); an
@@ -4243,10 +6366,16 @@ fn external_switch_target(
 /// clamp, effort sync) runs in the actor's ModelApplied handler; no SDK
 /// set_model is sent (the SDK already switched). Nothing happens when the
 /// adapter already tracks the model.
+///
+/// `inline` is true for the refusal fallback, whose caller awaits the sync
+/// before the consumer loop reads on (`acp-agent.ts:6702`); the PostModelSwitch
+/// hook runs it detached (`setImmediate`, `acp-agent.ts:11328-11337`), so the
+/// stream keeps flowing behind it.
 fn request_external_model_sync(
     ext: &SessionExt,
     command_tx: &mpsc::UnboundedSender<Command>,
     to_model: &str,
+    inline: bool,
 ) {
     let Some(target) = external_switch_target(
         &ext.config.model_infos,
@@ -4262,6 +6391,7 @@ fn request_external_model_sync(
         result: Ok(()),
         reply: no_reply,
         notify_client: true,
+        inline,
     });
 }
 
@@ -4296,6 +6426,19 @@ struct HookCall<'a> {
     tool_use_id: Option<&'a str>,
 }
 
+/// JavaScript truthiness of an optional JSON value (`!input.agent_id`): a
+/// missing key, `null`, `false`, `0` and `""` are falsy; every object, array and
+/// non-empty string is truthy.
+fn js_truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Array(_) | Value::Object(_)) => true,
+    }
+}
+
 /// The channels a hook callback may use: session output, the actor's own command
 /// queue (re-entry, e.g. PostModelSwitch), and the session id.
 struct HookIo<'a> {
@@ -4305,6 +6448,7 @@ struct HookIo<'a> {
 }
 
 fn handle_hook_callback(
+    tasks: &mut AsyncTaskRuntime,
     call: HookCall<'_>,
     map_state: &mut MapState,
     ext: &mut SessionExt,
@@ -4364,10 +6508,18 @@ fn handle_hook_callback(
                         map_state.filter_hook_meta(update)
                     });
                     if let Some(update) = update {
-                        let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
-                            "sessionId": session_id,
-                            "update": update
-                        })));
+                        send_update(
+                            tasks,
+                            map_state,
+                            serde_json::json!({
+                                "sessionId": session_id,
+                                "update": update
+                            }),
+                            None,
+                            update_tx,
+                            session_id,
+                            None,
+                        );
                     }
                 }
                 map_state.finish_hook_tool_tracker(id);
@@ -4380,17 +6532,25 @@ fn handle_hook_callback(
                 && input.get("source").and_then(Value::as_str) != Some("resume")
             {
                 if let Some(to_model) = input.get("to_model").and_then(Value::as_str) {
-                    request_external_model_sync(ext, command_tx, to_model);
+                    // Detached upstream (`setImmediate`): the hook answers first and
+                    // the consumer loop keeps reading the stream.
+                    request_external_model_sync(ext, command_tx, to_model, false);
                 }
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
         crate::hooks::POST_COMPACT_HOOK_ID => {
             // PC-1.1 (acp-agent.ts:11350-11360): a root-session PostCompact records the
-            // compaction summary; subagent compactions (with agent_id) do not.
-            if input.get("agent_id").is_none() {
-                if let Some(summary) = input.get("compact_summary").and_then(Value::as_str) {
-                    ext.last_compaction_summary = Some(summary.to_string());
+            // compaction summary; subagent compactions (with a TRUTHY agent_id) do
+            // not. JS truthiness (`!input.agent_id`): null, "", 0 and false do not
+            // skip a root summary. The lifecycle keeps the cleaned summary and
+            // rides it on the compaction's terminal update (`recordSummary`).
+            if !js_truthy(input.get("agent_id")) {
+                if let Some(summary) = input.get("compact_summary") {
+                    if let Some(text) = summary.as_str() {
+                        ext.last_compaction_summary = Some(text.to_string());
+                    }
+                    ext.t2a.compaction.record_summary(Some(summary));
                 }
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
@@ -4490,7 +6650,7 @@ async fn dispatch_stream(
     high_water: &AtomicUsize,
     tasks: &mut AsyncTaskRuntime,
     ext: &mut SessionExt,
-) {
+) -> bool {
     // `active_goal` is emitted by the Claude runtime but is not part of the
     // SDK's public message union; Node handles it before the exhaustive
     // switch (`acp-agent.ts:5935-5942`) and never feeds the turn machine.
@@ -4500,7 +6660,7 @@ async fn dispatch_stream(
         if let Some(published) = ext.goal.note_runtime(goal) {
             publish_goal(ext.air.is_some(), &published, update_tx, session_id);
         }
-        return;
+        return false;
     }
     // `command_lifecycle` (`msg_lifecycle_v1`) is not in the SDK's public message
     // union either: Node handles it ahead of the exhaustive switch and `continue`s
@@ -4512,6 +6672,15 @@ async fn dispatch_stream(
             .and_then(Value::as_str)
             .unwrap_or("");
         let state = msg.line.get("state").and_then(Value::as_str).unwrap_or("");
+        // F1 (B-109): a `started` frame for a turn we still hold proves the
+        // interrupted command's tail has drained in the SDK's FIFO stream, so
+        // the lifecycle accepts compaction frames again (`compaction.resume()`,
+        // `acp-agent.ts:5846-5848`). A `/compact` is echo-less: its frames
+        // arrive before the turn activates at its result, and this is the only
+        // resume they get.
+        if state == "started" && machine.has_unsettled_turn(uuid) {
+            ext.t2a.compaction.resume();
+        }
         if let Some(diagnostic) = machine.on_command_lifecycle(uuid, state) {
             if let Some(logger) = &ext.logger {
                 logger.error(&match diagnostic {
@@ -4524,14 +6693,16 @@ async fn dispatch_stream(
                 });
             }
         }
-        return;
+        return false;
     }
     let view = dispatch::TurnView::default();
+    let mut reset = false;
     match dispatch::route(&msg, &view) {
         Route::Control => {
             let _ = control_in_tx.send(msg.line);
         }
         Route::Session => {
+            reset = msg.frame_type() == "conversation_reset";
             handle_session_frame(
                 msg.line,
                 machine,
@@ -4552,6 +6723,7 @@ async fn dispatch_stream(
         }
         Route::Ignore => {}
     }
+    reset
 }
 
 /// Drive the turn machine with one session frame, in stream order (8.8).
@@ -4570,11 +6742,26 @@ fn handle_session_frame(
     tasks: &mut AsyncTaskRuntime,
     ext: &mut SessionExt,
 ) {
-    let frame_type = line.get("type").and_then(Value::as_str).unwrap_or("");
-    match frame_type {
+    let frame_type = line
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match frame_type.as_str() {
         // The CLI re-emits the user message (--replay-user-messages); its echo
         // promotes the queued turn. The turn's own echo is not forwarded.
         "user" => {
+            // B-29: record the ACP messageId -> SDK uuid mapping (including a
+            // replayed echo) before the echo/tool-result handling.
+            if let Some(message_id) = crate::mcp_command::message_id_of(&line) {
+                if let Some(uuid) = line
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .filter(|uuid| !uuid.is_empty())
+                {
+                    map_state.record_message_id(&message_id, uuid);
+                }
+            }
             let mut matched_echo = false;
             let uuid_opt = line.get("uuid").and_then(Value::as_str);
             if let Some(uuid) = uuid_opt {
@@ -4583,6 +6770,7 @@ fn handle_session_frame(
                 // (`acp-agent.ts:7728-7730`).
                 ext.goal.note_started(uuid);
                 let events = machine.on_echo(uuid);
+                start_usage_producers(&events, ext);
                 if machine.take_text_stretch_closed() {
                     *emitted_assistant_text = false;
                 }
@@ -4602,6 +6790,7 @@ fn handle_session_frame(
                 sync_after_activation(&events, machine, live_background, map_state);
                 settle_events(
                     events,
+                    tasks,
                     map_state,
                     live_background,
                     pending,
@@ -4613,6 +6802,7 @@ fn handle_session_frame(
                     None,
                     &mut ext.titles,
                     &mut ext.t2a.failures,
+                    &mut ext.t2a.usage_turns,
                 );
             }
             // Phase 15 (Item 3): a `user` frame also carries tool results. When
@@ -4645,6 +6835,12 @@ fn handle_session_frame(
                         _ => false,
                     }
                 };
+            // Node breaks on a queued turn's echo (7796) and on any `isReplay`
+            // frame with a uuid (7798-7812) BEFORE the local-command output
+            // handling (7898): a replayed stdout frame is dropped, never
+            // published a second time.
+            let replay_echo =
+                uuid_opt.is_some() && line.get("isReplay").and_then(Value::as_bool) == Some(true);
             // The work a cancel stopped ends its tools with error results. Until the
             // client is told that the work ended, they close the tool calls it
             // opened; everything else that work sends is dropped, and so is
@@ -4654,9 +6850,10 @@ fn handle_session_frame(
                 && !machine.is_running_background_subagent_output(
                     line.get("parent_tool_use_id").and_then(Value::as_str),
                 );
-            if !is_echo && stopped_work {
-                if !machine.work_end_reported() {
+            if stopped_work {
+                if !is_echo && !machine.work_end_reported() {
                     send_interrupted_tool_results(
+                        tasks,
                         &line,
                         map_state,
                         update_tx,
@@ -4664,38 +6861,134 @@ fn handle_session_frame(
                         machine.foreground_target(),
                     );
                 }
-            } else if !is_echo {
-                // T-12: a SendMessage result that resumed a finished subagent
-                // registers it live again, so the turn holds for it
-                // (`acp-agent.ts:8058-8080`; the native-session update is F35).
-                if let Some(agent_id) =
-                    frames::resumed_native_subagent_id(line.get("tool_use_result"))
-                {
-                    machine.resume_live_task(&agent_id);
-                    sync_live_tasks(machine, live_background, map_state);
+            } else {
+                // S-06 / S-07 (`acp-agent.ts:7898-7947`): a live user frame can
+                // carry a local command's output as a plain string. The stdout
+                // shape is stripped of its markers and mapped as a user chunk (a
+                // marker-only frame is logged instead); the stderr shape is
+                // logged as an error and never published. A replayed frame or a
+                // uuid-matched echo never reaches here (Node breaks first).
+                if !replay_echo && !is_uuid_matched {
+                    if let Value::String(text) = &content {
+                        if text.contains("<local-command-stdout>") {
+                            match crate::transcript::strip_local_command_metadata(content.clone()) {
+                                Some(Value::String(stripped)) => {
+                                    let mut frame = line.clone();
+                                    frame["message"]["content"] = Value::String(stripped);
+                                    let updates = map::map_user_frame(&frame, map_state);
+                                    note_tool_updates(
+                                        &updates,
+                                        true,
+                                        machine.foreground_target(),
+                                        map_state,
+                                    );
+                                    let filtered = map_state.filter_updates(updates);
+                                    send_updates(
+                                        tasks,
+                                        map_state,
+                                        filtered,
+                                        update_tx,
+                                        session_id,
+                                        machine.foreground_target(),
+                                    );
+                                }
+                                _ => {
+                                    if let Some(logger) = &ext.logger {
+                                        logger.log(text);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        if text.contains("<local-command-stderr>") {
+                            if let Some(logger) = &ext.logger {
+                                logger.error(text);
+                            }
+                            return;
+                        }
+                    }
                 }
-                if let Value::Array(blocks) = &content {
-                    map::remember_user_frame_tool_names(&line, map_state);
-                    note_background_bash(
-                        &line, tasks, machine, map_state, ext, update_tx, session_id,
-                    );
-                    handle_user_frame_blocks(
-                        &line,
-                        blocks,
-                        map_state,
-                        ext,
-                        update_tx,
-                        session_id,
-                        machine.foreground_target(),
-                    );
-                } else {
-                    let updates = map::map_user_frame(&line, map_state);
-                    note_tool_updates(&updates, true, machine.foreground_target(), map_state);
-                    emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
+                if !is_echo {
+                    // T-12: a SendMessage result that resumed a finished subagent
+                    // registers it live again, so the turn holds for it, and the
+                    // native subagent runtime opens the new generation
+                    // (`acp-agent.ts:8058-8080`).
+                    if let Some(agent_id) =
+                        frames::resumed_native_subagent_id(line.get("tool_use_result"))
+                    {
+                        // The SendMessage calls whose result carried the resume;
+                        // read before the mapper drops their cache entries.
+                        let result_ids: Vec<String> = content
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|block| block["type"].as_str() == Some("tool_result"))
+                            .filter_map(|block| {
+                                block
+                                    .get("tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string)
+                            })
+                            .collect();
+                        let resume = crate::native_subagents::send_message_resume(
+                            &map_state.tool_uses_in_order(),
+                            &agent_id,
+                            &result_ids,
+                        );
+                        // In the RFD form the result can arrive after the run it
+                        // started ended, and then resumes nothing.
+                        let resume_id = resume.as_ref().map(|r| r.tool_use_id.as_str());
+                        if !tasks.subagents().is_ended_delegation(&agent_id, resume_id) {
+                            machine.resume_live_task(&agent_id);
+                            sync_live_tasks(machine, live_background, map_state);
+                            let outs = tasks.subagents().send_message_resumed(
+                                &agent_id,
+                                resume.as_ref().and_then(|r| r.text.as_deref()),
+                                resume_id,
+                            );
+                            publish_subagent_outs(
+                                tasks, map_state, outs, update_tx, session_id, None,
+                            );
+                        }
+                    }
+                    if let Value::Array(blocks) = &content {
+                        map::remember_user_frame_tool_names(&line, map_state);
+                        note_background_bash(
+                            &line, tasks, machine, map_state, ext, update_tx, session_id,
+                        );
+                        handle_user_frame_blocks(
+                            SendIo {
+                                tasks,
+                                update_tx,
+                                session_id,
+                            },
+                            &line,
+                            blocks,
+                            map_state,
+                            ext,
+                            machine.foreground_target(),
+                        );
+                    } else {
+                        let updates = map::map_user_frame(&line, map_state);
+                        note_tool_updates(&updates, true, machine.foreground_target(), map_state);
+                        let filtered = map_state.filter_updates(updates);
+                        send_updates(
+                            tasks,
+                            map_state,
+                            filtered,
+                            update_tx,
+                            session_id,
+                            machine.foreground_target(),
+                        );
+                    }
                 }
             }
         }
         "result" => {
+            // The CLI predicts the next prompt right after this result, so a
+            // `prompt_suggestion` from here on belongs to the turn just ended
+            // (`acp-agent.ts:6786-6787`).
+            ext.t2a.prompt_suggestion_expected = true;
             // Decided BEFORE `on_result` (a folded-prompt result names a pending
             // turn that `on_result` may promote or settle).
             let autonomous = machine.result_is_autonomous(&line);
@@ -4703,70 +6996,23 @@ fn handle_session_frame(
             // `releaseHeld` is the first statement of upstream's result handler
             // (`acp-agent.ts:6790`): a held task is announced before the `/mcp`
             // chunk or the `/goal` rollback this result brings.
-            emit_raw_updates(tasks.release_held(), update_tx, session_id);
+            let released = tasks.release_held();
+            emit_task_updates(tasks, map_state, released, update_tx, session_id);
 
-            // G12 (Decision 21): a `/mcp` turn's CLI output shape was held
-            // back above; publish its replacement (or the kept CLI text) here,
-            // ahead of the result's usage update and the prompt response. The
-            // chunk keeps the message id of the shape that carried the CLI
-            // text (`messageIdForGrouping`). A held output shape is published
-            // even for a non-success result (Node publishes it at the output
-            // frame); a result-only turn follows Node's success-path
-            // `shouldForwardResult`, and a non-success result keeps its text
-            // for the failure message.
+            // N-31 (`acp-agent.ts:6805-6816`): reconcile the Fast mode toggle
+            // with the SDK's reported state, gated to user-driven turns like
+            // every other side effect; it runs even when the turn errors or was
+            // cancelled. An autonomous cycle's state lands on the next user
+            // turn's result.
             if !autonomous {
-                if let Some(uuid) = machine.foreground_target().map(str::to_string) {
-                    let result_is_success = line.get("subtype").and_then(Value::as_str)
-                        == Some("success")
-                        && line.get("is_error").and_then(Value::as_bool) != Some(true)
-                        && !matches!(
-                            line.get("stop_reason").and_then(Value::as_str),
-                            Some("max_tokens" | "refusal")
-                        );
-                    let mcp_chunk = ext.mcp.get_mut(&uuid).and_then(|turn| {
-                        if turn.delivered {
-                            return None;
-                        }
-                        if turn.original_output.is_none() && !result_is_success {
-                            return None;
-                        }
-                        let result_text = line.get("result").and_then(Value::as_str).unwrap_or("");
-                        let original = turn
-                            .original_output
-                            .clone()
-                            .unwrap_or_else(|| result_text.to_string());
-                        let rendered = turn
-                            .prepared
-                            .as_ref()
-                            .and_then(|prepared| prepared.render(&original));
-                        let text = rendered.unwrap_or(original);
-                        let message_id = turn
-                            .message_id
-                            .clone()
-                            .or_else(|| crate::mcp_command::message_id_of(&line));
-                        turn.delivered = true;
-                        Some((text, message_id, result_is_success))
-                    });
-                    if let Some((text, message_id, suppress_result)) = mcp_chunk {
-                        // A published top-level message chunk feeds the title
-                        // context (Node's `sendUpdate`, `acp-agent.ts:4618-4622`).
-                        ext.titles.on_assistant_text(&text);
-                        let mut chunk =
-                            ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
-                        if let Some(id) = message_id.filter(|id| !id.is_empty()) {
-                            chunk = chunk.message_id(MessageId::new(id));
-                        }
-                        let _ = update_tx.send(SessionOutbound::Update(SessionNotification::new(
-                            session_id.to_string(),
-                            SessionUpdate::AgentMessageChunk(chunk),
-                        )));
-                        if suppress_result {
-                            if let Some(map) = line.as_object_mut() {
-                                map.insert("result".to_string(), Value::String(String::new()));
-                            }
-                        }
-                    }
-                    ext.mcp.remove(&uuid);
+                for update in sync_fast_mode_state(
+                    ext,
+                    line.get("fast_mode_state").and_then(Value::as_str),
+                    line.get("fast_mode_disabled_reason")
+                        .and_then(Value::as_str),
+                    session_id,
+                ) {
+                    let _ = update_tx.send(SessionOutbound::RawUpdate(update));
                 }
             }
 
@@ -4794,6 +7040,7 @@ fn handle_session_frame(
             // an echo-less promotion reports no stale usage from the previous turn.
             let mut begin = machine.on_result_begin(&line);
             let begin_events = std::mem::take(&mut begin.events);
+            start_usage_producers(&begin_events, ext);
             // A held turn settled by `ensureActiveTurn` closes the stretch before
             // the result reads `deliveredAssistantText` (`acp-agent.ts:6886`).
             if machine.take_text_stretch_closed() {
@@ -4811,6 +7058,7 @@ fn handle_session_frame(
                 sync_after_activation(&begin_events, machine, live_background, map_state);
                 settle_events(
                     begin_events,
+                    tasks,
                     map_state,
                     live_background,
                     pending,
@@ -4822,6 +7070,7 @@ fn handle_session_frame(
                     None,
                     &mut ext.titles,
                     &mut ext.t2a.failures,
+                    &mut ext.t2a.usage_turns,
                 );
             }
 
@@ -4955,7 +7204,95 @@ fn handle_session_frame(
                     || line.get("subtype").and_then(Value::as_str) != Some("success");
                 let _ = update_tx.send(SessionOutbound::Board(BoardEvent::TurnFailed(failed)));
             }
-            let events = machine.on_result_finish(&line, *emitted_assistant_text, begin);
+            // S-05 / S-01 / N-10: the #453 result-text fallback is also the
+            // local-command output lane. Only a plain `success` result that
+            // reaches upstream's success arm claims the turn's structured
+            // replacement for its text (`acp-agent.ts:7351-7375`); every other
+            // outcome (cancel, refusal, the steered-error lane, `/login`,
+            // `max_tokens`, provider errors) exits before it and keeps its
+            // result text. The chunk goes out after the goal rollback and the
+            // result `usage_update`, just before the turn settles.
+            let compaction_delivered = ext.t2a.compaction_output_delivered;
+            if !autonomous
+                && machine.result_reaches_forward(&line)
+                && machine.should_forward_result(
+                    &line,
+                    *emitted_assistant_text,
+                    compaction_delivered,
+                )
+            {
+                // The turn this result belongs to, post-`ensureActiveTurn`
+                // (`session.activeTurn ?? firstUnsettledQueuedTurn()`): a held
+                // turn settled at `on_result_begin` hands the result to the
+                // promoted head, never to itself.
+                if machine.foreground_target().is_some() {
+                    let result_text = line
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let take = take_local_command_markdown(machine, ext, &result_text);
+                    match take {
+                        // The frame was held until the producer re-entered; if
+                        // it was not, keep the CLI text rather than drop it.
+                        LocalCommandTake::Pending => {}
+                        // A mirror of an output shape already delivered: the
+                        // replacement is not published twice, and the original
+                        // result text is suppressed.
+                        LocalCommandTake::Suppress => {
+                            if let Some(map) = line.as_object_mut() {
+                                map.insert("result".to_string(), Value::String(String::new()));
+                            }
+                        }
+                        LocalCommandTake::Replace(text) => {
+                            publish_local_command_chunk(
+                                &text,
+                                crate::mcp_command::message_id_of(&line),
+                                update_tx,
+                                session_id,
+                                emitted_assistant_text,
+                                ext,
+                            );
+                            if let Some(map) = line.as_object_mut() {
+                                map.insert("result".to_string(), Value::String(String::new()));
+                            }
+                        }
+                        // Not a local-command turn (or its producer failed):
+                        // the result text goes out through the #453 fallback.
+                        LocalCommandTake::Keep => {}
+                    }
+                }
+            }
+            // The turn's result is its local-command boundary: the turn's
+            // producers are spent (`Turn` goes away when it settles).
+            if !autonomous {
+                if let Some(uuid) = machine.foreground_target().map(str::to_string) {
+                    ext.mcp.remove(&uuid);
+                    ext.t2a.usage_turns.remove(&uuid);
+                }
+            }
+            let events = machine.on_result_finish(
+                &line,
+                *emitted_assistant_text,
+                compaction_delivered,
+                begin,
+            );
+            // A result closes the compaction lifecycle (`compaction.reset()`,
+            // `acp-agent.ts:7477-7489`): an in-progress `compaction_update`
+            // entity gets its `cancelled` terminal before the prompt response,
+            // and the next turn's stale synthetic frame is no longer suppressed
+            // by this turn's output. A result that failed the turn goes through
+            // `failActiveWithSessionFailure`, which interrupts first (clearing a
+            // pending hook summary the abandoned work left behind,
+            // `acp-agent.ts:5565`); the finally's reset is then a no-op.
+            if !autonomous {
+                let updates = if events.iter().any(|e| matches!(e, TurnEvent::Failed { .. })) {
+                    ext.t2a.compaction.interrupt()
+                } else {
+                    ext.t2a.compaction.reset()
+                };
+                publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
+            }
             // An accepted clear-context plan: the machine handed the pending turn
             // over at this result, with the usage it has earned. The run loop
             // continues it in a fresh context.
@@ -4980,8 +7317,9 @@ fn handle_session_frame(
                 map_state.clear_tool_tracker();
             }
             sync_after_activation(&events, machine, live_background, map_state);
-            settle_events(
+            let incomplete_tool_call = settle_events(
                 events,
+                tasks,
                 map_state,
                 live_background,
                 pending,
@@ -4993,7 +7331,17 @@ fn handle_session_frame(
                 line.get("uuid").and_then(Value::as_str),
                 &mut ext.titles,
                 &mut ext.t2a.failures,
+                &mut ext.t2a.usage_turns,
             );
+            // An `end_turn` result the gate turned into an `IncompleteToolCall`
+            // failure is `failActiveWithSessionFailure` upstream, which
+            // interrupts (`acp-agent.ts:5469`, `5565`): the pending hook summary
+            // is dropped and late compaction frames are ignored. The reset above
+            // already published the terminal, so this yields nothing.
+            if incomplete_tool_call && !autonomous {
+                let updates = ext.t2a.compaction.interrupt();
+                publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
+            }
         }
         "system" => {
             let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or("");
@@ -5010,6 +7358,18 @@ fn handle_session_frame(
                         let caps: Vec<&str> =
                             capabilities.iter().filter_map(Value::as_str).collect();
                         machine.latch_capabilities(&caps);
+                    }
+                    // N-03 (`acp-agent.ts:5961-5975`): a fresh init frame (e.g.
+                    // after a reinitialize) can carry an updated Fast mode state;
+                    // reconcile it with what session creation seeded.
+                    for update in sync_fast_mode_state(
+                        ext,
+                        line.get("fast_mode_state").and_then(Value::as_str),
+                        line.get("fast_mode_disabled_reason")
+                            .and_then(Value::as_str),
+                        session_id,
+                    ) {
+                        let _ = update_tx.send(SessionOutbound::RawUpdate(update));
                     }
                     // D5 (Decision 9, `acp-agent.ts:5976-5998`): latch the
                     // terminal-bound slash command names. The session/new
@@ -5029,7 +7389,7 @@ fn handle_session_frame(
                         if ext.terminal_slash_commands.as_ref() != Some(&names) {
                             ext.terminal_slash_commands = Some(names.clone());
                             let commands = Value::Array(ext.commands.clone());
-                            emit_commands_changed(&commands, &names, update_tx, session_id);
+                            emit_commands_changed(&commands, &names, ext, update_tx, session_id);
                         }
                     }
                     if let Some(errors) = line.get("plugin_errors").and_then(Value::as_array) {
@@ -5116,8 +7476,11 @@ fn handle_session_frame(
                         ],
                     );
                     note_hidden_tool_call(&line, tasks, map_state);
+                    // T4B hook 3: the subagent runtime sees the frame first (`acp-agent.ts:6458`).
+                    let outs = tasks.subagent_task_started(&line);
+                    publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, None);
                     let updates = tasks.task_started(&started);
-                    publish_task_updates(tasks, updates, update_tx, session_id);
+                    publish_task_updates(tasks, map_state, updates, update_tx, session_id);
                 }
                 "task_progress" => {
                     // 3.5: async-task progress (AIR `asyncTasks` clients only).
@@ -5134,56 +7497,72 @@ fn handle_session_frame(
                     );
                     note_hidden_tool_call(&line, tasks, map_state);
                     let updates = tasks.task_progress(&progress);
-                    publish_task_updates(tasks, updates, update_tx, session_id);
+                    publish_task_updates(tasks, map_state, updates, update_tx, session_id);
                 }
                 "task_notification" => {
                     // N-18 / N-35 (`acp-agent.ts:6479-6517`): the task settled, so no
                     // further tool call can originate from it.
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
-                    let notification = pick_fields(
-                        &line,
-                        &["task_id", "status", "summary", "output_file", "tool_use_id"],
-                    );
-                    note_hidden_tool_call(&line, tasks, map_state);
-                    let updates = tasks.task_notification(&notification);
-                    publish_task_updates(tasks, updates, update_tx, session_id);
-                    if let Some(parent) = line
+                    let tool_use_id = line
                         .get("tool_use_id")
                         .and_then(Value::as_str)
-                        .filter(|parent| !parent.is_empty())
-                    {
-                        // The subagent streams no more text under this parent.
-                        forget_subagent_streams(parent, machine, map_state);
-                    }
-                    end_background_terminal(task_id, ext, update_tx, session_id);
-                    if line.get("status").and_then(Value::as_str) == Some("stopped") {
-                        let parent = line.get("tool_use_id").and_then(Value::as_str);
-                        close_stopped_subagent_calls(
-                            parent, machine, map_state, update_tx, session_id,
+                        .filter(|parent| !parent.is_empty());
+                    // T4B hook 4 (`acp-agent.ts:6489`): in the RFD form a resumed
+                    // child runs under the call that resumed it, and the end of an
+                    // earlier delegation ends nothing. Node returns from the whole
+                    // case, so the async-task notification, the stopped-call close
+                    // and the live-task settle are skipped too — the live task
+                    // still belongs to the new run.
+                    if !tasks.subagents().is_stale_end(task_id, tool_use_id) {
+                        let notification = pick_fields(
+                            &line,
+                            &["task_id", "status", "summary", "output_file", "tool_use_id"],
+                        );
+                        note_hidden_tool_call(&line, tasks, map_state);
+                        let outs = tasks.subagent_task_notification(&line);
+                        publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, None);
+                        let updates = tasks.task_notification(&notification);
+                        publish_task_updates(tasks, map_state, updates, update_tx, session_id);
+                        if let Some(parent) = tool_use_id {
+                            // The subagent streams no more text under this parent.
+                            forget_subagent_streams(parent, machine, map_state);
+                        }
+                        end_background_terminal(task_id, ext, update_tx, session_id);
+                        if line.get("status").and_then(Value::as_str) == Some("stopped") {
+                            close_stopped_subagent_calls(
+                                tasks,
+                                tool_use_id,
+                                machine,
+                                map_state,
+                                update_tx,
+                                session_id,
+                            );
+                        }
+                        let events = settle_live_task(task_id, machine, live_background, map_state);
+                        settle_events(
+                            events,
+                            tasks,
+                            map_state,
+                            live_background,
+                            pending,
+                            update_tx,
+                            session_id,
+                            high_water,
+                            &ext.failure_ctx,
+                            ext.air.as_ref(),
+                            None,
+                            &mut ext.titles,
+                            &mut ext.t2a.failures,
+                            &mut ext.t2a.usage_turns,
                         );
                     }
-                    let events = settle_live_task(task_id, machine, live_background, map_state);
-                    settle_events(
-                        events,
-                        map_state,
-                        live_background,
-                        pending,
-                        update_tx,
-                        session_id,
-                        high_water,
-                        &ext.failure_ctx,
-                        ext.air.as_ref(),
-                        None,
-                        &mut ext.titles,
-                        &mut ext.t2a.failures,
-                    );
                 }
                 "task_updated" => {
                     // N-18 / N-36 (`acp-agent.ts:6518-6575`).
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
                     let patch = line.get("patch").cloned().unwrap_or(Value::Null);
                     let updates = tasks.task_updated(task_id, &patch);
-                    publish_task_updates(tasks, updates, update_tx, session_id);
+                    publish_task_updates(tasks, map_state, updates, update_tx, session_id);
                     // A task moved to the background no longer blocks the tool call
                     // that spawned it, nor its requests the foreground work.
                     if let Some(backgrounded) = patch.get("is_backgrounded") {
@@ -5192,6 +7571,26 @@ fn handle_session_frame(
                         // closes only the calls of foreground subagents.
                         sync_live_tasks(machine, live_background, map_state);
                     }
+                    // T4B hook 5 (`acp-agent.ts:6531-6575`): upstream ends the
+                    // child after `asyncTasks.taskUpdated` and the backgrounded
+                    // sync. A `running`/`pending` patch resumes a finished child
+                    // with the SendMessage text that resumed it
+                    // (`sendMessageResumePrompt(session.toolUseCache, task_id)`).
+                    // Only those patches need the prompt; building it copies the
+                    // whole tool-use cache, including Write contents.
+                    let resume_prompt = match patch.get("status").and_then(Value::as_str) {
+                        Some("running" | "pending") => {
+                            crate::native_subagents::send_message_resume_prompt(
+                                &map_state.tool_uses_in_order(),
+                                task_id,
+                                &[],
+                            )
+                        }
+                        _ => None,
+                    };
+                    let outs =
+                        tasks.subagent_task_updated(task_id, &patch, resume_prompt.as_deref());
+                    publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, None);
                     match patch.get("status").and_then(Value::as_str) {
                         // The terminal-status patch is guaranteed per transition
                         // (the notification is deduplicated), so it prunes too.
@@ -5203,6 +7602,7 @@ fn handle_session_frame(
                             end_background_terminal(task_id, ext, update_tx, session_id);
                             if patch.get("status").and_then(Value::as_str) == Some("killed") {
                                 close_stopped_subagent_calls(
+                                    tasks,
                                     parent.as_deref(),
                                     machine,
                                     map_state,
@@ -5214,6 +7614,7 @@ fn handle_session_frame(
                                 settle_live_task(task_id, machine, live_background, map_state);
                             settle_events(
                                 events,
+                                tasks,
                                 map_state,
                                 live_background,
                                 pending,
@@ -5225,6 +7626,7 @@ fn handle_session_frame(
                                 None,
                                 &mut ext.titles,
                                 &mut ext.t2a.failures,
+                                &mut ext.t2a.usage_turns,
                             );
                         }
                         // The SDK can resume a finished subagent under the same
@@ -5243,7 +7645,7 @@ fn handle_session_frame(
                 "background_tasks_changed" => {
                     let level = line.get("tasks").cloned().unwrap_or(Value::Null);
                     let updates = tasks.background_tasks_changed(&level);
-                    publish_task_updates(tasks, updates, update_tx, session_id);
+                    publish_task_updates(tasks, map_state, updates, update_tx, session_id);
                     let live: std::collections::HashSet<String> = level
                         .as_array()
                         .into_iter()
@@ -5255,47 +7657,29 @@ fn handle_session_frame(
                     sync_live_tasks(machine, live_background, map_state);
                 }
                 "compact_boundary" => {
-                    if let Some(compact_meta) =
-                        line.get("compact_metadata").and_then(Value::as_object)
-                    {
-                        let mut raw_output = serde_json::Map::new();
-                        let trigger = compact_meta
-                            .get("trigger")
-                            .and_then(Value::as_str)
-                            .map(|t| if t == "auto" { "automatic" } else { "manual" })
-                            .unwrap_or("manual");
-                        raw_output.insert("trigger".into(), json!(trigger));
-                        if let Some(pre) = compact_meta.get("pre_tokens") {
-                            raw_output.insert("preTokens".into(), pre.clone());
-                        }
-                        if let Some(post) = compact_meta.get("post_tokens") {
-                            raw_output.insert("postTokens".into(), post.clone());
-                        }
-                        if let Some(dur) = compact_meta.get("duration_ms") {
-                            raw_output.insert("durationMs".into(), dur.clone());
-                        }
-                        let mut tool_call_update = serde_json::Map::new();
-                        tool_call_update.insert("sessionUpdate".into(), json!("tool_call"));
-                        if let Some(uuid) = line.get("uuid").and_then(Value::as_str) {
-                            tool_call_update.insert("toolCallId".into(), json!(uuid));
-                        }
-                        tool_call_update.insert("title".into(), json!("Compact conversation"));
-                        tool_call_update.insert("kind".into(), json!("think"));
-                        tool_call_update.insert("status".into(), json!("completed"));
-                        tool_call_update.insert("rawOutput".into(), Value::Object(raw_output));
-                        tool_call_update.insert(
-                            "_meta".into(),
-                            json!({
-                                "claudeCode": {
-                                    "toolName": "compact"
-                                }
-                            }),
-                        );
-                        let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
-                            "sessionId": session_id,
-                            "update": Value::Object(tool_call_update)
-                        })));
-                    }
+                    // N-08 (`acp-agent.ts:6033-6069`): the boundary ends the
+                    // compaction. `enrichTerminal` opens the lifecycle even
+                    // without metadata (`context-compaction.ts:326`): this
+                    // session delivered a compaction output, so a stale synthetic
+                    // assistant frame of an earlier attempt is suppressed and the
+                    // #453 result fallback stays off (`hasDeliveredOutput`).
+                    let facts = line
+                        .get("compact_metadata")
+                        .and_then(Value::as_object)
+                        .map(|metadata| {
+                            crate::context_compaction::metadata_from_boundary(&Value::Object(
+                                metadata.clone(),
+                            ))
+                        })
+                        .unwrap_or_default();
+                    let uuid = line.get("uuid").and_then(Value::as_str).unwrap_or("");
+                    let updates = ext.t2a.compaction.finish(
+                        uuid,
+                        crate::context_compaction::CompactionStatus::Completed,
+                        &facts,
+                        true,
+                    );
+                    publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
 
                     let used_tokens = line
                         .pointer("/compact_metadata/post_tokens")
@@ -5335,6 +7719,20 @@ fn handle_session_frame(
                         if machine.take_text_stretch_closed() {
                             *emitted_assistant_text = false;
                         }
+                        // F7 (B-109): an idle never resets the lifecycle. A held
+                        // or cancelled turn settled here was already closed at
+                        // its result/cancel, and a lagging owed idle from a
+                        // previous turn must not erase the next turn's compaction
+                        // state (`compaction.reset()` runs at the result only,
+                        // `acp-agent.ts:7478`). Only the #825 fail interrupts,
+                        // through `failActiveWithSessionFailure`
+                        // (`acp-agent.ts:5565`).
+                        if events.iter().any(|e| matches!(e, TurnEvent::Failed { .. })) {
+                            let updates = ext.t2a.compaction.interrupt();
+                            publish_compaction_updates(
+                                ext, map_state, updates, update_tx, session_id,
+                            );
+                        }
                         // An interrupt can pre-empt the turn's result entirely
                         // (nothing ran the result-case `finally`), so the cancelled
                         // settle closes the delivery stretch here: stale partial-text
@@ -5353,6 +7751,7 @@ fn handle_session_frame(
                         }
                         settle_events(
                             events,
+                            tasks,
                             map_state,
                             live_background,
                             pending,
@@ -5364,21 +7763,62 @@ fn handle_session_frame(
                             None,
                             &mut ext.titles,
                             &mut ext.t2a.failures,
+                            &mut ext.t2a.usage_turns,
                         );
                     }
                 }
-                // G12 (Decision 21 / R11): a `/mcp` turn's CLI output is held
-                // back here and replaced by the produced Markdown at the result
-                // frame, exactly as Node awaits the producer at this shape.
+                // N-10 / S-06 (`acp-agent.ts:6070-6087`): the dedicated system
+                // shape of a local command's output. Node awaits the turn's
+                // structured replacement at this shape and publishes it (or the
+                // CLI's own text); a mirror of an already-delivered output is
+                // suppressed, and a cancelled local-command turn publishes
+                // nothing. The run loop already held this frame until a pending
+                // replacement arrived.
                 "local_command_output" => {
-                    let content = line.get("content").and_then(Value::as_str).unwrap_or("");
+                    let content = line
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    // T-100 (`acp-agent.ts:6070-6072`): Claude also emits a
+                    // failed manual compaction's error as local-command stdout;
+                    // consume that one duplicate after the lifecycle carried it.
+                    if ext.t2a.compaction.consume_duplicate_error_output(&content) {
+                        return;
+                    }
                     let message_id = crate::mcp_command::message_id_of(&line);
-                    if let Some(uuid) = machine.foreground_target() {
-                        if let Some(turn) = ext.mcp.get_mut(uuid) {
-                            if turn.original_output.is_none() {
-                                turn.original_output = Some(content.to_string());
-                                turn.message_id = message_id;
-                            }
+                    let cancelled_local = machine
+                        .foreground_target()
+                        .is_some_and(|uuid| is_local_command_turn(ext, uuid))
+                        && machine.is_cancelled();
+                    let take = take_local_command_markdown(machine, ext, &content);
+                    if cancelled_local {
+                        return;
+                    }
+                    match take {
+                        // The run loop holds the frame while the producer is
+                        // pending; if it could not (defensive), keep the CLI
+                        // text rather than drop the output.
+                        LocalCommandTake::Pending | LocalCommandTake::Keep => {
+                            publish_local_command_chunk(
+                                &content,
+                                message_id,
+                                update_tx,
+                                session_id,
+                                emitted_assistant_text,
+                                ext,
+                            );
+                        }
+                        LocalCommandTake::Suppress => {}
+                        LocalCommandTake::Replace(text) => {
+                            publish_local_command_chunk(
+                                &text,
+                                message_id,
+                                update_tx,
+                                session_id,
+                                emitted_assistant_text,
+                                ext,
+                            );
                         }
                     }
                 }
@@ -5386,9 +7826,48 @@ fn handle_session_frame(
                     // A model request that serves none of the prompts a cancel
                     // stopped is new work (a follow-up after a background command
                     // finished): it ends the cancelled window, as an activation
-                    // does (`acp-agent.ts:6002-6021`, N-06).
+                    // does (`acp-agent.ts:6002-6021`, N-06). The drained tail of
+                    // the interrupted command also ends the compaction
+                    // interruption (`compaction.resume()`).
                     if machine.on_status(&line) {
                         map_state.end_stopped_work();
+                        ext.t2a.compaction.resume();
+                    }
+                    // N-07 (`acp-agent.ts:6014-6032`): the CLI's `compacting`
+                    // status opens the lifecycle, a `compact_result` ends it. The
+                    // output counts as delivered from the opening status and from
+                    // either terminal result, so the #453 fallback and a stale
+                    // synthetic frame stay suppressed even without a boundary.
+                    let status = line.get("status").and_then(Value::as_str);
+                    let compact_result = line.get("compact_result").and_then(Value::as_str);
+                    let uuid = line.get("uuid").and_then(Value::as_str).unwrap_or("");
+                    if status == Some("compacting") {
+                        let updates = ext.t2a.compaction.start(uuid);
+                        publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
+                    } else if compact_result == Some("success") {
+                        let updates = ext.t2a.compaction.finish(
+                            uuid,
+                            crate::context_compaction::CompactionStatus::Completed,
+                            &crate::context_compaction_meta::CompactionFacts::default(),
+                            false,
+                        );
+                        publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
+                    } else if compact_result == Some("failed") {
+                        let facts = crate::context_compaction_meta::CompactionFacts {
+                            error: line
+                                .get("compact_error")
+                                .and_then(Value::as_str)
+                                .filter(|error| !error.is_empty())
+                                .map(String::from),
+                            ..crate::context_compaction_meta::CompactionFacts::default()
+                        };
+                        let updates = ext.t2a.compaction.finish(
+                            uuid,
+                            crate::context_compaction::CompactionStatus::Failed,
+                            &facts,
+                            false,
+                        );
+                        publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
                     }
                 }
                 // N-13: the SDK failed to persist session history; log it so the
@@ -5425,6 +7904,25 @@ fn handle_session_frame(
                 // (`acp-agent.ts:6576-6585`).
                 "worker_shutting_down" => {
                     ext.t2a.pending_worker_shutdown = true;
+                }
+                // N-37 (`acp-agent.ts:6586-6600`): a url-mode MCP elicitation
+                // finished server-side; the client dismisses any UI it opened.
+                // Only meaningful for a url-capable client; failures are ignored.
+                "elicitation_complete" => {
+                    // Sent inline in stream order (upstream awaits it), so a
+                    // following frame's update cannot overtake it.
+                    if ext.caps.elicitation_url {
+                        let elicitation_id = line
+                            .get("elicitation_id")
+                            .or_else(|| line.get("elicitationId"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if !elicitation_id.is_empty() {
+                            let _ = update_tx.send(SessionOutbound::CompleteElicitation {
+                                params: json!({ "elicitationId": elicitation_id }),
+                            });
+                        }
+                    }
                 }
                 // N-38: a retry of the API call is a warning on the turn, for
                 // clients that read AIR session failures (`acp-agent.ts:6606-6631`).
@@ -5514,10 +8012,14 @@ fn handle_session_frame(
                         ext.caps.subagent_form.is_some(),
                     );
                     if let Some(denied) = denied {
-                        emit_updates(
-                            &map_state.filter_updates(vec![denied]),
+                        let filtered = map_state.filter_updates(vec![denied]);
+                        send_updates(
+                            tasks,
+                            map_state,
+                            filtered,
                             update_tx,
                             session_id,
+                            machine.foreground_target(),
                         );
                     }
                 }
@@ -5526,12 +8028,13 @@ fn handle_session_frame(
                     // command list is authoritative and replaces the stored
                     // one; the advertisement filters it with the latched
                     // terminal list. Node also resets `session.skillPaths`
-                    // here; the Rust port has no skill-path cache (no AIR
-                    // skill meta is emitted), so the reset is vacuous.
+                    // here; the port resolves skill paths per advertisement
+                    // (its container scan cache lives for one pass), so the
+                    // reset is vacuous.
                     let commands = line.get("commands").cloned().unwrap_or(Value::Null);
                     ext.commands = commands.as_array().cloned().unwrap_or_default();
                     let terminal = ext.terminal_slash_commands.clone().unwrap_or_default();
-                    emit_commands_changed(&commands, &terminal, update_tx, session_id);
+                    emit_commands_changed(&commands, &terminal, ext, update_tx, session_id);
                 }
                 _ => {}
             }
@@ -5566,10 +8069,64 @@ fn handle_session_frame(
             }
         }
         "stream_event" | "assistant" => {
+            // B-29: a consolidated assistant message records its ACP messageId
+            // -> SDK uuid mapping before any gate can drop it.
+            if frame_type == "assistant" {
+                if let Some(message_id) = crate::mcp_command::message_id_of(&line) {
+                    if let Some(uuid) = line
+                        .get("uuid")
+                        .and_then(Value::as_str)
+                        .filter(|uuid| !uuid.is_empty())
+                    {
+                        map_state.record_message_id(&message_id, uuid);
+                    }
+                }
+            }
             // F16c (B-61): a model cycle Claude Code started on its own becomes the
             // foreground work at its first main-conversation output
             // (`startAutonomousCycle`, run before the message switch).
             machine.start_autonomous_cycle(&line);
+            // N-32 (`acp-agent.ts:7493-7510`): the API's compaction block streams
+            // the retained summary text. `content` is null on the opening block
+            // and on a failed compaction, but the block itself still opens the
+            // legacy tool call. Only the root conversation's compaction is the
+            // session's: a subagent compacting its own context must not touch it.
+            // It runs BEFORE the stopped-work gate, like upstream (the heartbeat
+            // is the first thing in `case "stream_event"`, `acp-agent.ts:7493`
+            // vs the gate at `7612`): a client that cancelled mid-compaction
+            // still gets its `in_progress` re-assert, and the summary chunks of
+            // an announced entity keep flowing.
+            if frame_type == "stream_event" {
+                let nested = line.get("parent_tool_use_id").is_none_or(|v| !v.is_null());
+                let event_type = line.pointer("/event/type").and_then(Value::as_str);
+                let block_content = match event_type {
+                    Some("content_block_start")
+                        if line
+                            .pointer("/event/content_block/type")
+                            .and_then(Value::as_str)
+                            == Some("compaction") =>
+                    {
+                        Some(
+                            line.pointer("/event/content_block/content")
+                                .and_then(Value::as_str),
+                        )
+                    }
+                    Some("content_block_delta")
+                        if line.pointer("/event/delta/type").and_then(Value::as_str)
+                            == Some("compaction_delta") =>
+                    {
+                        Some(line.pointer("/event/delta/content").and_then(Value::as_str))
+                    }
+                    _ => None,
+                };
+                if !nested {
+                    if let Some(content) = block_content {
+                        let uuid = line.get("uuid").and_then(Value::as_str).unwrap_or("");
+                        let updates = ext.t2a.compaction.heartbeat(uuid, content);
+                        publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
+                    }
+                }
+            }
             // F16b: the work a cancel stopped. A consolidated message of a
             // cancelled session is dropped whole (before it can touch the usage
             // snapshot or the failure context), except a running background
@@ -5588,6 +8145,19 @@ fn handle_session_frame(
                 machine.note_stream_message_start(
                     line.get("parent_tool_use_id").and_then(Value::as_str),
                 );
+            }
+            // Synthetic assistant frames carry the CLI's local-command output. On
+            // resume the SDK can replay a stale frame from an earlier compact
+            // attempt after a later compaction completed: upstream drops it
+            // BEFORE the usage/failure snapshot (`acp-agent.ts:7838-7845`), so a
+            // stale usage-limit or error frame can never poison the turn's
+            // failure category.
+            if frame_type == "assistant"
+                && line.get("parent_tool_use_id") == Some(&Value::Null)
+                && line.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+                && ext.t2a.compaction_output_delivered
+            {
+                return;
             }
             // Strict null check per Decision 18 and authoring rules: missing is NOT top-level
             let is_strict_top_level = line.get("parent_tool_use_id") == Some(&Value::Null);
@@ -5782,22 +8352,48 @@ fn handle_session_frame(
                     }
                 }
             }
-            // G12 (Decision 21): a synthetic top-level assistant message is the
-            // other shape of a local command's output. Hold its text (and its
-            // message id) back for the replacement; do not map or emit it.
+            // S-06 (`acp-agent.ts:7839-7895`): a synthetic top-level assistant
+            // message is the other shape of a local command's output. On resume
+            // the SDK can replay a stale frame from an earlier compact attempt
+            // after a later compaction completed: suppress it while a compaction
+            // output was delivered. Otherwise claim the turn's structured
+            // replacement; a non-local frame (or a failed producer) maps
+            // normally, a mirror publishes nothing, and a cancelled
+            // local-command turn publishes nothing.
             if frame_type == "assistant"
                 && line.get("parent_tool_use_id") == Some(&Value::Null)
                 && line.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
             {
-                let text = crate::mcp_command::assistant_text(line.get("message"));
-                if let Some(uuid) = machine.foreground_target() {
-                    if let Some(turn) = ext.mcp.get_mut(uuid) {
-                        if turn.original_output.is_none() {
-                            turn.original_output = text;
-                            turn.message_id = crate::mcp_command::message_id_of(&line);
-                        }
+                let text =
+                    crate::mcp_command::assistant_text(line.get("message")).unwrap_or_default();
+                let cancelled_local = machine
+                    .foreground_target()
+                    .is_some_and(|uuid| is_local_command_turn(ext, uuid))
+                    && machine.is_cancelled();
+                let take = take_local_command_markdown(machine, ext, &text);
+                if cancelled_local {
+                    return;
+                }
+                match take {
+                    // Defensive: the frame was held while the producer ran, so
+                    // a `Pending` here means it could not be; map the CLI text
+                    // like a non-local frame rather than drop it.
+                    LocalCommandTake::Pending => {}
+                    LocalCommandTake::Suppress => return,
+                    LocalCommandTake::Replace(markdown) => {
+                        publish_local_command_chunk(
+                            &markdown,
+                            crate::mcp_command::message_id_of(&line),
+                            update_tx,
+                            session_id,
+                            emitted_assistant_text,
+                            ext,
+                        );
                         return;
                     }
+                    // Not a local-command turn (or its producer failed): the
+                    // synthetic frame maps like any consolidated assistant one.
+                    LocalCommandTake::Keep => {}
                 }
             }
             // V-04: the CLI's own "Please run /login" reply fails the turn as
@@ -5812,12 +8408,19 @@ fn handle_session_frame(
                     .get("message")
                     .and_then(crate::session_failure::assistant_message_text)
                     .unwrap_or_default();
+                // `failActiveWithSessionFailure("auth_required")` interrupts the
+                // compaction of the turn it fails (`acp-agent.ts:5565`).
+                if machine.has_active() {
+                    let updates = ext.t2a.compaction.interrupt();
+                    publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
+                }
                 let events = machine.fail_active_auth_required(&title);
                 if machine.take_text_stretch_closed() {
                     *emitted_assistant_text = false;
                 }
                 settle_events(
                     events,
+                    tasks,
                     map_state,
                     live_background,
                     pending,
@@ -5829,6 +8432,7 @@ fn handle_session_frame(
                     None,
                     &mut ext.titles,
                     &mut ext.t2a.failures,
+                    &mut ext.t2a.usage_turns,
                 );
                 return;
             }
@@ -5852,6 +8456,40 @@ fn handle_session_frame(
                     return;
                 }
             }
+            // S-06 / S-07 (`acp-agent.ts:7898-7947`): a string-content live
+            // frame can carry a local command's output. Strip its markers and
+            // map the rest; a marker-only stdout frame is logged, and a stderr
+            // frame is logged as an error and never published.
+            if let Some(text) = line
+                .pointer("/message/content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                if text.contains("<local-command-stdout>") {
+                    match crate::transcript::strip_local_command_metadata(Value::String(
+                        text.clone(),
+                    )) {
+                        Some(Value::String(stripped)) => {
+                            if let Some(message) =
+                                line.get_mut("message").and_then(Value::as_object_mut)
+                            {
+                                message.insert("content".to_string(), Value::String(stripped));
+                            }
+                        }
+                        _ => {
+                            if let Some(logger) = &ext.logger {
+                                logger.log(&text);
+                            }
+                            return;
+                        }
+                    }
+                } else if text.contains("<local-command-stderr>") {
+                    if let Some(logger) = &ext.logger {
+                        logger.error(&text);
+                    }
+                    return;
+                }
+            }
             let updates = if frame_type == "stream_event" {
                 map::map_stream_event(&line, map_state)
             } else {
@@ -5859,6 +8497,26 @@ fn handle_session_frame(
                 // its stream did not already deliver (`unstreamedRemainder`,
                 // Decision 18), plus tool/image/plan blocks.
                 map::map_consolidated_assistant(&line, map_state)
+            };
+            // `sendUpdate` (`acp-agent.ts:4605-4618`): a top-level text chunk
+            // that repeats a failed compaction's error, which the lifecycle
+            // already carried, is consumed instead of published.
+            let updates: Vec<SessionUpdate> = if is_strict_top_level {
+                updates
+                    .into_iter()
+                    .filter(|update| match update {
+                        SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                            ContentBlock::Text(text) => !ext
+                                .t2a
+                                .compaction
+                                .consume_duplicate_error_output(&text.text),
+                            _ => true,
+                        },
+                        _ => true,
+                    })
+                    .collect()
+            } else {
+                updates
             };
             for update in &updates {
                 if is_top_level_text(update, &line) {
@@ -5874,7 +8532,15 @@ fn handle_session_frame(
             // turn's foreground work.
             let top_level = line.get("parent_tool_use_id").is_none_or(Value::is_null);
             note_tool_updates(&updates, top_level, machine.foreground_target(), map_state);
-            emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
+            let filtered = map_state.filter_updates(updates);
+            send_updates(
+                tasks,
+                map_state,
+                filtered,
+                update_tx,
+                session_id,
+                machine.foreground_target(),
+            );
         }
         // N-20: a tool progress beat updates the call it reports on
         // (`acp-agent.ts:8125-8176`).
@@ -5882,7 +8548,8 @@ fn handle_session_frame(
             let air = map_state.is_air();
             if let Some(beat) = frames::tool_progress_update(&line, map_state, live_background, air)
             {
-                emit_updates(&map_state.filter_updates(vec![beat]), update_tx, session_id);
+                let filtered = map_state.filter_updates(vec![beat]);
+                send_updates(tasks, map_state, filtered, update_tx, session_id, None);
             }
         }
         // N-44 (`acp-agent.ts:8191-8213`): the SDK switched to a fresh
@@ -5890,9 +8557,16 @@ fn handle_session_frame(
         // independent of the previous one. Everything keyed to the old one goes
         // before any follow-up prompt can republish stale state.
         "conversation_reset" => {
+            // `finishLifecycle("failed", ...)` starts with
+            // `compaction.interrupt()` (`acp-agent.ts:8191-8195`): the old
+            // conversation's open entity is closed `cancelled` and its pending
+            // hook summary dropped before the reset clears the rest.
+            let updates = ext.t2a.compaction.interrupt();
+            publish_compaction_updates(ext, map_state, updates, update_tx, session_id);
             // `finishLifecycle("failed", ...)`: live async tasks end as failed.
             finish_async_tasks(
                 tasks,
+                map_state,
                 "failed",
                 update_tx,
                 session_id,
@@ -5900,6 +8574,7 @@ fn handle_session_frame(
             );
             tasks.clear();
             map_state.clear_resolved_tool_names();
+            map_state.clear_eager_sessions();
             map_state.clear_tool_tracker();
             ext.hooks.clear();
             ext.task_state.clear();
@@ -5908,11 +8583,23 @@ fn handle_session_frame(
             // describes the session: re-evaluate at the next turn end.
             ext.titles.reset();
             // The follow-up prompt was predicted from the transcript the reset
-            // dropped. Nothing publishes predictions yet (F24), so the clear is
-            // vacuous: the client holds none.
+            // dropped, so it no longer follows from anything
+            // (`acp-agent.ts:8214`).
+            publish_prompt_suggestion(ext.air.is_some(), &mut ext.t2a, None, update_tx, session_id);
         }
         "prompt_suggestion" => {
-            // Consumed without error (Item 3.3 / INV-65). Publishing is AIR-only and skipped.
+            // The CLI predicts the next prompt after the turn's `result`
+            // (`acp-agent.ts:8216-8227`). A prediction the user outran — the
+            // next prompt was sent before it was read off the stream — answers
+            // a turn that is already settled, so it is dropped.
+            if !ext.t2a.prompt_suggestion_expected {
+                return;
+            }
+            ext.t2a.prompt_suggestion_expected = false;
+            let text = crate::prompt_suggestions::prompt_suggestion_text(
+                line.get("suggestion").and_then(Value::as_str),
+            );
+            publish_prompt_suggestion(ext.air.is_some(), &mut ext.t2a, text, update_tx, session_id);
         }
         _ => {}
     }
@@ -6073,6 +8760,7 @@ fn note_exit_plan_interruption(
 /// The actor never awaits the client round-trip inline (INV-27).
 #[allow(clippy::too_many_arguments)]
 fn handle_permission(
+    tasks: &mut AsyncTaskRuntime,
     frame: Value,
     reply: oneshot::Sender<Value>,
     turn: Option<&str>,
@@ -6081,6 +8769,10 @@ fn handle_permission(
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     pending_permissions: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    pending_await_tokens: &mut HashMap<String, crate::native_subagents::AwaitToken>,
+    pending_ask: &mut HashMap<String, (oneshot::Sender<Value>, Value)>,
+    elicit_cancel: &watch::Receiver<bool>,
+    elicitation_form: bool,
     cwd: &std::path::Path,
     available_modes: &[String],
     pre_plan_mode: Option<&str>,
@@ -6114,13 +8806,143 @@ fn handle_permission(
     if let Some(preview) = &preview {
         map_state.pin_approval_preview(&can.tool_use_id, surfaced.as_mut(), preview);
     }
+    // `toolUseOwner` (`acp-agent.ts:9943-9956`): the session of an eagerly
+    // emitted tool call and of its requests is the subagent's announced child
+    // session, else the root. The RFD form only announces a child it can place.
+    let permission_session_id = can
+        .agent_id
+        .as_deref()
+        .filter(|_| tasks.subagents().form().is_some())
+        .and_then(|agent_id| tasks.subagents().child(agent_id))
+        .filter(|child| child.announced)
+        .map(|child| child.session_id.clone())
+        .unwrap_or_else(|| session_id.to_string());
     if let Some(update) = surfaced {
         note_permission_surfaced(&update, &can.tool_name, parent.is_none(), turn, map_state);
-        emit_updates(
-            &map_state.filter_updates(vec![update]),
-            update_tx,
-            session_id,
+        // `ensureToolCallEmitted` records the session the call surfaced in
+        // (`acp-agent.ts:9906`), and sends the call there with
+        // `client.sessionUpdate` — NOT through `sendUpdate`, so the routing and
+        // its foreground bookkeeping do not run for it
+        // (`acp-agent.ts:9916`).
+        map_state.record_eager_session(&can.tool_use_id, &permission_session_id);
+        // The field tracker (and the AIR changed-`_meta` filter) records what the
+        // client now holds, so the later streamed refinement and the result do
+        // not repeat it.
+        for update in map_state.filter_updates(vec![update]) {
+            let notif = SessionNotification::new(permission_session_id.clone(), update);
+            let value = serde_json::to_value(&notif).unwrap_or(Value::Null);
+            let _ = send_notification(value, update_tx);
+        }
+    }
+
+    // F23a/U-42 (`acp-agent.ts:10093-10112`): AskUserQuestion reaches `canUseTool`
+    // as a permission check whenever a callback is registered. A form-capable
+    // client gets it as an ACP form elicitation whose answers become the tool's
+    // `updatedInput`; it must never reach `build_options`, which refuses it by
+    // design (P-58).
+    if can.tool_name == "AskUserQuestion" {
+        if !elicitation_form {
+            // Unreachable with the CLI's `--disallowedTools` gate (O-135); deny
+            // rather than let the permission builder panic on model input.
+            let _ = reply.send(ask_deny_response(
+                &can.request_id,
+                &can.tool_use_id,
+                permission::DENY_MESSAGE,
+            ));
+            return;
+        }
+        let Some(questions) = crate::elicitation::extract_ask_user_questions(&can.tool_input)
+        else {
+            let _ = reply.send(ask_deny_response(
+                &can.request_id,
+                &can.tool_use_id,
+                "AskUserQuestion called with no valid questions.",
+            ));
+            return;
+        };
+        // `withChildAwaitingUser`: an announced RFD child is `requires_action`
+        // until the question is answered.
+        let (await_token, awaiting_outs) = tasks
+            .subagents()
+            .awaiting_user_begin(&permission_session_id);
+        publish_subagent_outs(tasks, map_state, awaiting_outs, update_tx, session_id, turn);
+        if let Some(token) = await_token {
+            pending_await_tokens.insert(request_id.clone(), token);
+        }
+        let create_request = crate::elicitation::ask_user_questions_to_create_request(
+            &questions,
+            &permission_session_id,
+            Some(&can.tool_use_id),
+            map_state.is_air(),
         );
+        let aborted = ask_aborted_response(&can.request_id);
+        pending_ask.insert(request_id.clone(), (reply, aborted));
+        let update_tx = update_tx.clone();
+        let command_tx = command_tx.clone();
+        let mut cancel = elicit_cancel.clone();
+        let request_id_for_task = can.request_id.clone();
+        let tool_use_id = can.tool_use_id.clone();
+        let tool_input = can.tool_input.clone();
+        let handle = tokio::spawn(async move {
+            let (ptx, prx) = oneshot::channel();
+            let _ = update_tx.send(SessionOutbound::CreateElicitation {
+                params: create_request,
+                reply: ptx,
+            });
+            // Abortable by `session/cancel` / the session close (INV-27): the
+            // actor aborts this task and answers the pending request with the
+            // CANCEL outcome itself, so this task's late answer is ignored.
+            let first = tokio::select! {
+                biased;
+                () = crate::elicitation::wait_cancelled(&mut cancel) => None,
+                res = prx => Some(res),
+            };
+            let response = match first {
+                None => ask_aborted_response(&request_id_for_task),
+                Some(Ok(Ok(resp))) => {
+                    if *cancel.borrow() {
+                        ask_aborted_response(&request_id_for_task)
+                    } else {
+                        match crate::elicitation::apply_ask_elicitation_response(
+                            &resp,
+                            &tool_input,
+                            &questions,
+                        ) {
+                            crate::elicitation::AskUserQuestionOutcome::Answered {
+                                updated_input,
+                            } => ask_allow_response(
+                                &request_id_for_task,
+                                &tool_use_id,
+                                &updated_input,
+                            ),
+                            crate::elicitation::AskUserQuestionOutcome::Cancel => {
+                                ask_aborted_response(&request_id_for_task)
+                            }
+                        }
+                    }
+                }
+                // A client error denies; a cancel that raced it still aborts.
+                Some(Ok(Err(_))) => {
+                    if *cancel.borrow() {
+                        ask_aborted_response(&request_id_for_task)
+                    } else {
+                        ask_deny_response(
+                            &request_id_for_task,
+                            &tool_use_id,
+                            "Could not present the question to the user.",
+                        )
+                    }
+                }
+                // The forwarding side dropped the reply (the session is gone).
+                Some(Err(_)) => ask_aborted_response(&request_id_for_task),
+            };
+            let _ = command_tx.send(Command::AskUserQuestionAnswered {
+                request_id: request_id_for_task,
+                response,
+            });
+        });
+        pending_permissions.insert(request_id, handle);
+        return;
     }
 
     // Build the `request_permission` params (10.1) before moving `can` into the
@@ -6181,7 +9003,12 @@ fn handle_permission(
     let options = permission_options::build_options(&ctx);
     let mut params = serde_json::Map::new();
     params.insert("options".into(), Value::Array(options));
-    params.insert("sessionId".into(), Value::String(session_id.to_string()));
+    // `sessionId: permissionSessionId` (`acp-agent.ts:10199`): the request goes
+    // to the session that holds the tool call.
+    params.insert(
+        "sessionId".into(),
+        Value::String(permission_session_id.clone()),
+    );
     // Only AIR gets the permission presentation (`_meta.jetbrains.air.permission`).
     if map_state.is_air() {
         params.insert(
@@ -6200,6 +9027,17 @@ fn handle_permission(
     }
     params.insert("toolCall".into(), tool_call);
     let params = Value::Object(params);
+
+    // `withChildAwaitingUser` (`acp-agent.ts:9562-9572`): a request of an
+    // announced RFD child makes that child `requires_action` until its last open
+    // request ends. The root session (and every AIR child) has no such state.
+    let (await_token, awaiting_outs) = tasks
+        .subagents()
+        .awaiting_user_begin(&permission_session_id);
+    publish_subagent_outs(tasks, map_state, awaiting_outs, update_tx, session_id, turn);
+    if let Some(token) = await_token {
+        pending_await_tokens.insert(request_id.clone(), token);
+    }
 
     // Spawn the round-trip (D14): ask the agent layer to send
     // `session/request_permission` and await the client's answer. The answer is
@@ -6227,12 +9065,18 @@ fn handle_permission(
             }
             // The request errored or the round-trip was dropped (e.g. the client
             // closed / cancelled): refuse the tool (R28 deny) so the turn settles
-            // on the next `result` (INV-21).
+            // on the next `result` (INV-21). The child's awaiting-user token ends
+            // here too: nobody will answer this request, so `PermissionAnswered`
+            // never runs (`awaitingUser`'s finally reports `running` when the
+            // signal was not aborted).
             Ok(Err(_)) | Err(_) => {
                 let _ = reply.send(permission::deny_control_response(
                     &can.request_id,
                     &can.tool_use_id,
                 ));
+                let _ = command_tx.send(Command::AwaitEnded {
+                    request_id: can.request_id.clone(),
+                });
             }
         }
     });
@@ -6808,6 +9652,7 @@ fn note_hidden_tool_call(line: &Value, tasks: &mut AsyncTaskRuntime, map_state: 
 /// (async tasks, plan state, the ExitPlanMode flow) belong to the stopped work,
 /// which stays dropped.
 fn send_interrupted_tool_results(
+    tasks: &mut AsyncTaskRuntime,
     line: &Value,
     map_state: &mut MapState,
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
@@ -6845,13 +9690,15 @@ fn send_interrupted_tool_results(
     let updates = map::map_user_frame(&filtered, map_state);
     let top_level = line.get("parent_tool_use_id").is_none_or(Value::is_null);
     note_tool_updates(&updates, top_level, turn, map_state);
-    emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
+    let filtered = map_state.filter_updates(updates);
+    send_updates(tasks, map_state, filtered, update_tx, session_id, turn);
 }
 
 /// `closeStoppedSubagentToolCalls` (`acp-agent.ts:5320-5326`): the SDK reported
 /// the subagent of the Agent call `agent_tool_use_id` stopped, after a cancel
 /// stopped it and the work that waited on it ended. Nothing else ends its calls.
 fn close_stopped_subagent_calls(
+    tasks: &mut AsyncTaskRuntime,
     agent_tool_use_id: Option<&str>,
     machine: &TurnMachine,
     map_state: &mut MapState,
@@ -6866,7 +9713,8 @@ fn close_stopped_subagent_calls(
         machine.work_end_reported(),
         agent_tool_use_id,
     );
-    emit_updates(&map_state.filter_updates(closing), update_tx, session_id);
+    let filtered = map_state.filter_updates(closing);
+    send_updates(tasks, map_state, filtered, update_tx, session_id, None);
 }
 
 /// `settleLiveTask`: the task is no longer live; a subagent stays resumable. The
@@ -7005,6 +9853,7 @@ fn note_tool_updates(
 #[allow(clippy::too_many_arguments)]
 fn settle_events(
     events: Vec<TurnEvent>,
+    tasks: &mut AsyncTaskRuntime,
     map_state: &mut MapState,
     live_background: &HashMap<String, String>,
     pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, PromptFailure>>>,
@@ -7016,7 +9865,8 @@ fn settle_events(
     final_message_id: Option<&str>,
     titles: &mut crate::session_titles::SessionTitles,
     failures: &mut failures::SessionFailures,
-) {
+    usage_turns: &mut crate::usage::UsageTurns,
+) -> bool {
     // Node's `activateTurn` clears `session.cancelled`, ending the stopped-work
     // window whenever a turn activates (whether by user echo or ensure_active_turn).
     // The turn it hands off from settles first and closes its tool calls under the
@@ -7027,7 +9877,20 @@ fn settle_events(
     let background: std::collections::HashSet<&str> =
         live_background.values().map(String::as_str).collect();
     let (events, closing) = crate::unfinished::gate_events(events, map_state, &background);
-    emit_updates(&map_state.filter_updates(closing), update_tx, session_id);
+    // A turn the gate converted to `IncompleteToolCall` went through
+    // `failActiveWithSessionFailure`, which interrupts the compaction
+    // (`acp-agent.ts:5469`, `5565`): the caller drops a pending summary.
+    let incomplete_tool_call = events.iter().any(|e| {
+        matches!(
+            e,
+            TurnEvent::Failed {
+                kind: FailureKind::IncompleteToolCall,
+                ..
+            }
+        )
+    });
+    let filtered = map_state.filter_updates(closing);
+    send_updates(tasks, map_state, filtered, update_tx, session_id, None);
     if activated {
         map_state.end_stopped_work();
     }
@@ -7037,6 +9900,14 @@ fn settle_events(
     for event in &events {
         if let TurnEvent::FinalText { text } | TurnEvent::RefusalText { text } = event {
             titles.on_assistant_text(text);
+        }
+    }
+    // A settled turn's `/usage` producer is spent, whatever settled it (a
+    // result, a cancel, an idle-abandon or an echo hand-off): drop the entry so
+    // the map cannot grow for the session's lifetime.
+    for event in &events {
+        if let TurnEvent::Settled { prompt_uuid, .. } = event {
+            usage_turns.remove(prompt_uuid);
         }
     }
     handle_events(
@@ -7050,17 +9921,24 @@ fn settle_events(
         final_message_id,
         failures,
     );
+    incomplete_tool_call
 }
 
 /// Emit a `commands_changed` / `system/init` command list as an
-/// `AvailableCommandsUpdate`, filtered by the latched terminal-bound names.
+/// `AvailableCommandsUpdate`, filtered by the latched terminal-bound names. An
+/// AIR client also gets the `kind`/`skillPath` meta of its skill commands
+/// (`acp-agent.ts:6278-6284`).
 fn emit_commands_changed(
     commands: &Value,
     terminal: &[String],
+    ext: &SessionExt,
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
 ) {
-    let update = map::map_commands_changed(commands, terminal);
+    let air_cwd = ext.air.as_ref().map(|_| ext.cwd.as_path());
+    let home = ext.env.get_path("HOME");
+    let update =
+        map::map_commands_changed_with_skills(commands, terminal, air_cwd, home.as_deref());
     // Decision 8: raw JSON so a command without an argument hint carries
     // `input: null` like Node (the typed update would omit the field).
     emit_raw_updates(
@@ -7068,18 +9946,6 @@ fn emit_commands_changed(
         update_tx,
         session_id,
     );
-}
-
-/// Send a batch of updates to the client as `session/update` notifications.
-fn emit_updates(
-    updates: &[SessionUpdate],
-    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
-    session_id: &str,
-) {
-    for update in updates {
-        let notif = SessionNotification::new(session_id.to_string(), update.clone());
-        let _ = update_tx.send(SessionOutbound::Update(notif));
-    }
 }
 
 /// Apply a `get_context_usage` answer to the session's window (D1 / Decision
@@ -7143,26 +10009,403 @@ fn emit_raw_updates(
     }
 }
 
+/// `client.sessionUpdate`: a value the native subagent runtime publishes as it
+/// is (`publish`, `native-subagents.ts:170`).
+fn subagent_publish(
+    notification: Value,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+) -> Result<(), String> {
+    update_tx
+        .send(SessionOutbound::RawUpdate(notification))
+        .map_err(|error| error.to_string())
+}
+
+/// `isFinalToolCallStatus` (`tool-calls/renderer.ts:40-42`): a status that ends
+/// the call.
+fn is_final_tool_call_status(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "failed" | "cancelled"))
+}
+
+/// `sendUpdate`'s `toolCallId` (`acp-agent.ts:4555-4558`): only a tool call or
+/// tool call update has one.
+fn notification_tool_call_id(notification: &Value) -> Option<&str> {
+    let update = notification.get("update")?;
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("tool_call" | "tool_call_update") => update.get("toolCallId").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// The `_meta.claudeCode.parentToolUseId` of a notification: the Agent/Task
+/// call that started the subagent the update belongs to.
+fn notification_parent_tool_use_id(notification: &Value) -> Option<&str> {
+    notification
+        .pointer("/update/_meta/claudeCode/parentToolUseId")
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty())
+}
+
+/// The session's sends a `user` frame's block mapping needs: the async-task /
+/// native subagent runtime, the update channel and the session id.
+struct SendIo<'a> {
+    tasks: &'a mut AsyncTaskRuntime,
+    update_tx: &'a mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &'a str,
+}
+
+/// Send one notification the session's `sendUpdate` produced. A notification
+/// that still fits the typed `SessionUpdate` goes through the typed channel
+/// (the forwarder materialises the ACP tool-call defaults); anything else (the
+/// runtime's own AIR/RFD shapes) goes raw with the same materialisation.
+fn send_notification(
+    notification: Value,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+) -> Result<(), String> {
+    if let Ok(typed) = serde_json::from_value::<SessionNotification>(notification.clone()) {
+        return update_tx
+            .send(SessionOutbound::Update(typed))
+            .map_err(|error| error.to_string());
+    }
+    let mut value = notification;
+    if let Some(update) = value.get_mut("update") {
+        crate::map::materialize_tool_call_defaults(update);
+        crate::map::materialize_diff_old_text(update);
+    }
+    update_tx
+        .send(SessionOutbound::RawUpdate(value))
+        .map_err(|error| error.to_string())
+}
+
+/// How a routed notification is sent (`sendUpdate`'s tail): a typed update goes
+/// through the typed channel; a raw value the caller already had stays verbatim;
+/// a value the runtime built is materialised as raw.
+enum RoutedPayload {
+    Typed(Box<SessionUpdate>),
+    /// A raw JSON value the session received as such (a hook update): keep it
+    /// verbatim, so explicit nulls and unknown keys survive.
+    VerbatimRaw,
+    /// A value the native subagent runtime built: materialise the ACP defaults.
+    RuntimeRaw,
+}
+
+/// The post-routing tail of `sendUpdate` (`acp-agent.ts:4576-4633`): the
+/// tool-call bookkeeping and the send. `routed` is what the runtime returned
+/// (`None` never reaches here); it is not routed again.
+fn deliver_routed(
+    map_state: &mut MapState,
+    routed: Value,
+    payload: RoutedPayload,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    turn: Option<&str>,
+) -> Result<(), String> {
+    let kind = routed
+        .pointer("/update/sessionUpdate")
+        .and_then(Value::as_str);
+    let status = routed.pointer("/update/status").and_then(Value::as_str);
+    let final_status = kind == Some("tool_call_update") && is_final_tool_call_status(status);
+    let tool_call_id = notification_tool_call_id(&routed).map(ToString::to_string);
+    let parent = notification_parent_tool_use_id(&routed);
+    let moved = routed.get("sessionId").and_then(Value::as_str) != Some(session_id);
+    if let Some(id) = &tool_call_id {
+        if parent.is_some() || moved || final_status {
+            // A later stream frame can attribute an eager permission call to a
+            // child. It must no longer count as this turn's foreground work.
+            map_state.books.forget_foreground(id);
+        } else if kind == Some("tool_call") && map_state.has_emitted(id) {
+            map_state.books.record_foreground(turn, id);
+        }
+    }
+    // A typed update that the route did not change (it only moved the
+    // notification to another session) goes through the typed channel, so the
+    // forwarder materialises it exactly as before the routing hook.
+    let unchanged = match &payload {
+        RoutedPayload::Typed(update) => {
+            serde_json::to_value(update.as_ref()).ok() == routed.get("update").cloned()
+        }
+        RoutedPayload::VerbatimRaw | RoutedPayload::RuntimeRaw => false,
+    };
+    let sent = match payload {
+        RoutedPayload::Typed(update) if unchanged => {
+            let routed_session = routed
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or(session_id)
+                .to_string();
+            update_tx
+                .send(SessionOutbound::Update(SessionNotification::new(
+                    routed_session,
+                    *update,
+                )))
+                .map_err(|error| error.to_string())
+        }
+        // A value the caller already had as raw JSON stays verbatim (nulls and
+        // unknown keys included), as before the routing hook.
+        RoutedPayload::VerbatimRaw => update_tx
+            .send(SessionOutbound::RawUpdate(routed))
+            .map_err(|error| error.to_string()),
+        RoutedPayload::Typed(_) | RoutedPayload::RuntimeRaw => send_notification(routed, update_tx),
+    };
+    if let Some(id) = tool_call_id.filter(|_| final_status) {
+        // The call ended: its eager session and dispatched record go.
+        map_state.forget_eager_session(&id);
+        map_state.books.forget(&id);
+    }
+    sent
+}
+
+/// The session's `sendUpdate` (`acp-agent.ts:4551-4639`): every
+/// `session/update` the session emits passes here. A notification is routed
+/// through the native subagent runtime first (child-owned tool calls and
+/// subagent output go to the child session; a client without native subagent
+/// sessions gets it back unchanged), then sent.
+fn send_update(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    notification: Value,
+    typed: Option<SessionUpdate>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    turn: Option<&str>,
+) {
+    let update = notification.get("update").cloned().unwrap_or(Value::Null);
+    let kind = notification
+        .pointer("/update/sessionUpdate")
+        .and_then(Value::as_str);
+    let status = notification
+        .pointer("/update/status")
+        .and_then(Value::as_str);
+    let final_status = kind == Some("tool_call_update") && is_final_tool_call_status(status);
+    let tool_call_id = notification_tool_call_id(&notification).map(ToString::to_string);
+    let parent = notification_parent_tool_use_id(&notification);
+    // Before routing, which can buffer or drop the update: a cancel still has
+    // to know the parent of a call that is open here. A later update can be the
+    // first to name it, for a call that a permission request emitted.
+    if let Some(id) = &tool_call_id {
+        if final_status {
+            map_state.forget_tool_call_parent(id);
+        } else if let Some(parent) = parent {
+            if map_state.has_emitted(id) {
+                map_state.record_tool_call_parent(id, parent);
+            }
+        }
+    }
+    let eager = tool_call_id
+        .as_deref()
+        .and_then(|id| map_state.eager_session(id));
+    let crate::native_subagents::RouteResult { outs, routed } =
+        tasks.subagents().route(&notification, eager.as_deref());
+    publish_subagent_outs(tasks, map_state, outs, update_tx, session_id, turn);
+    let Some(routed) = routed else {
+        // Native Agent/Task control calls are intentionally not transcript
+        // tools. Do not let the mapper's pre-send de-duplication mark make a
+        // later permission request believe that a suppressed call exists.
+        if let Some(id) = tool_call_id {
+            if crate::native_subagents::is_native_subagent_control_update(&update) {
+                map_state.unmark_emitted(&id);
+            }
+        }
+        return;
+    };
+    let payload = match typed {
+        Some(update) => RoutedPayload::Typed(Box::new(update)),
+        None => RoutedPayload::VerbatimRaw,
+    };
+    let _ = deliver_routed(map_state, routed, payload, update_tx, session_id, turn);
+}
+
+/// Send a batch of typed updates through [`send_update`].
+fn send_updates(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    updates: Vec<SessionUpdate>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    turn: Option<&str>,
+) {
+    for update in updates {
+        let notif = SessionNotification::new(session_id.to_string(), update.clone());
+        let value = serde_json::to_value(&notif).unwrap_or(Value::Null);
+        send_update(
+            tasks,
+            map_state,
+            value,
+            Some(update),
+            update_tx,
+            session_id,
+            turn,
+        );
+    }
+}
+
+/// Drain the native subagent runtime's diagnostics into the session logger
+/// (`NativeSubagentRuntime.logs`), so a long session does not accumulate them.
+fn log_subagent_logs(tasks: &mut AsyncTaskRuntime, map_state: &MapState) {
+    let logs = tasks.subagents().take_logs();
+    if let Some(logger) = map_state.logger() {
+        for line in logs {
+            logger.log(&line);
+        }
+    }
+}
+
+/// Send the publications of the native subagent runtime, in order (T4B): each
+/// `Out` is sent through the session's `sendUpdate` tail, with the eager session
+/// lookup and the post-routing bookkeeping of the live path.
+fn publish_subagent_outs(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    outs: Vec<crate::native_subagents::Out>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    turn: Option<&str>,
+) {
+    log_subagent_logs(tasks, map_state);
+    if outs.is_empty() {
+        return;
+    }
+    let eager: HashMap<String, String> = map_state.eager_snapshot();
+    let mut publish = |notification: Value| subagent_publish(notification, update_tx);
+    let mut deliver = |notification: Value| {
+        deliver_routed(
+            map_state,
+            notification,
+            RoutedPayload::RuntimeRaw,
+            update_tx,
+            session_id,
+            turn,
+        )
+    };
+    let mut eager_session_of = |id: &str| eager.get(id).cloned();
+    let _ = tasks.publish_subagent_outs(
+        outs,
+        crate::async_tasks::SubagentSends {
+            publish: &mut publish,
+            deliver: &mut deliver,
+            eager_session_of: &mut eager_session_of,
+        },
+    );
+}
+
+/// Close the native subagents that still run (`finishAll`, `acp-agent.ts:4637-4660`).
+fn finish_all_subagents(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    state: crate::acp_subagents::SubagentState,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) -> Vec<String> {
+    let eager: HashMap<String, String> = map_state.eager_snapshot();
+    let mut publish = |notification: Value| subagent_publish(notification, update_tx);
+    let mut deliver = |notification: Value| {
+        deliver_routed(
+            map_state,
+            notification,
+            RoutedPayload::RuntimeRaw,
+            update_tx,
+            session_id,
+            None,
+        )
+    };
+    let mut eager_session_of = |id: &str| eager.get(id).cloned();
+    tasks.finish_all_subagents_with(
+        state,
+        crate::async_tasks::SubagentSends {
+            publish: &mut publish,
+            deliver: &mut deliver,
+            eager_session_of: &mut eager_session_of,
+        },
+    )
+}
+
 /// Send the updates an async-task call produced. The runtime records a field as
 /// published when it returns the update, upstream only after the send resolved
 /// (`recordPublished`, `async-tasks.ts:690-704`): when the update channel is
 /// gone the call's records are rolled back, so a retry carries the same fields.
 fn publish_task_updates(
     tasks: &mut AsyncTaskRuntime,
+    map_state: &MapState,
     updates: Vec<Value>,
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
 ) {
     for update in updates {
-        let sent = update_tx.send(SessionOutbound::RawUpdate(json!({
-            "sessionId": session_id,
-            "update": update,
-        })));
-        if sent.is_err() {
+        let routed = route_async_task_update(tasks, map_state, update, session_id);
+        if update_tx.send(SessionOutbound::RawUpdate(routed)).is_err() {
             tasks.rollback();
             return;
         }
     }
+}
+
+/// Route one async-task update to the child session that owns its call
+/// (`task.route`, `async-tasks.ts:749-753`), else the root.
+fn route_async_task_update(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &MapState,
+    update: Value,
+    session_id: &str,
+) -> Value {
+    let task_id = update
+        .get("asyncTaskId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let eager = tasks
+        .tool_call_id_of(&task_id)
+        .and_then(|tool_call_id| map_state.eager_session(&tool_call_id));
+    tasks.route_task_update(&task_id, update, session_id, eager.as_deref())
+}
+
+/// Send a batch of async-task updates through the same route as
+/// [`publish_task_updates`] (the user stop, the held release and the stream-end
+/// finish: every update an async task sends goes through `task.route`).
+fn emit_task_updates(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &MapState,
+    updates: Vec<Value>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    for update in updates {
+        let routed = route_async_task_update(tasks, map_state, update, session_id);
+        let _ = update_tx.send(SessionOutbound::RawUpdate(routed));
+    }
+}
+
+/// `publishPromptSuggestion` (`acp-agent.ts:4220-4238`): publish the follow-up
+/// prompt the CLI predicted for the next turn, or `None` to clear the one the
+/// client holds. Only AIR renders it, so only AIR gets the update; an
+/// unchanged prediction is not re-sent, and a clear before the first prediction
+/// goes nowhere (the client holds nothing).
+fn publish_prompt_suggestion(
+    air: bool,
+    state: &mut state::T2aState,
+    text: Option<String>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    // A clear ends the window the turn's result opened: whatever prediction is
+    // still in flight answers a turn the user has already moved past.
+    if text.is_none() {
+        state.prompt_suggestion_expected = false;
+    }
+    // `undefined` and `null` collapse to `None`, so a clear before the first
+    // prediction matches and stops here.
+    if state.last_published_prompt_suggestion.as_deref() == text.as_deref() {
+        return;
+    }
+    if !air {
+        return;
+    }
+    state.last_published_prompt_suggestion = text.clone();
+    let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "session_info_update",
+            "_meta": crate::prompt_suggestions::prompt_suggestions_meta(text.as_deref()),
+        },
+    })));
 }
 
 /// Publish one goal snapshot (or its removal) as an AIR-only
@@ -7199,6 +10442,36 @@ mod tests_t2a;
 
 #[cfg(test)]
 mod tests_t3a;
+
+#[cfg(test)]
+mod tests_t4a;
+
+#[cfg(test)]
+mod tests_t4fa;
+
+#[cfg(test)]
+mod tests_t4a2;
+
+#[cfg(test)]
+mod tests_t4fd;
+
+#[cfg(test)]
+mod tests_t5a;
+
+#[cfg(test)]
+mod tests_t5a2;
+
+#[cfg(test)]
+mod tests_t5fa;
+
+#[cfg(test)]
+mod tests_t5fa4;
+
+#[cfg(test)]
+mod tests_t5fa5;
+
+#[cfg(test)]
+mod tests_t5fa6;
 
 #[cfg(test)]
 mod tests_t1ga;
@@ -7302,12 +10575,15 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let blocks = line["message"]["content"].as_array().unwrap();
         handle_user_frame_blocks(
+            SendIo {
+                tasks: &mut AsyncTaskRuntime::new(false),
+                update_tx: &update_tx,
+                session_id: "s",
+            },
             &line,
             blocks,
             &mut map_state,
             &mut ext,
-            &update_tx,
-            "s",
             None,
         );
         let out: Vec<SessionOutbound> = std::iter::from_fn(|| update_rx.try_recv().ok()).collect();
@@ -7356,12 +10632,15 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let blocks = line["message"]["content"].as_array().unwrap();
         handle_user_frame_blocks(
+            SendIo {
+                tasks: &mut AsyncTaskRuntime::new(false),
+                update_tx: &update_tx,
+                session_id: "s",
+            },
             &line,
             blocks,
             &mut map_state,
             &mut ext,
-            &update_tx,
-            "s",
             None,
         );
         let out: Vec<SessionOutbound> = std::iter::from_fn(|| update_rx.try_recv().ok()).collect();
@@ -7620,6 +10899,7 @@ mod tests {
         let mut run = |input: Value, ext: &mut SessionExt| {
             let (reply, _reply_rx) = oneshot::channel();
             handle_hook_callback(
+                &mut AsyncTaskRuntime::new(false),
                 HookCall {
                     request_id: "r",
                     callback_id: crate::hooks::TASK_CREATED_HOOK_ID,
@@ -7700,6 +10980,7 @@ mod tests {
         let mut run = |input: Value, ext: &mut SessionExt| {
             let (reply, _reply_rx) = oneshot::channel();
             handle_hook_callback(
+                &mut AsyncTaskRuntime::new(false),
                 HookCall {
                     request_id: "r",
                     callback_id: crate::hooks::POST_COMPACT_HOOK_ID,
@@ -8428,6 +11709,7 @@ mod tests {
         let (reply_tx, _reply_rx) = oneshot::channel();
         pending.insert("p1".to_string(), reply_tx);
         let mut map_state = MapState::default();
+        let mut tasks = AsyncTaskRuntime::new(false);
         let live_background = HashMap::new();
         let mut titles = crate::session_titles::SessionTitles::new();
         let events = vec![
@@ -8444,6 +11726,7 @@ mod tests {
         ];
         settle_events(
             events,
+            &mut tasks,
             &mut map_state,
             &live_background,
             &mut pending,
@@ -8455,6 +11738,7 @@ mod tests {
             None,
             &mut titles,
             &mut failures::SessionFailures::default(),
+            &mut crate::usage::UsageTurns::default(),
         );
         assert_eq!(
             titles.context.as_deref(),
@@ -9411,7 +12695,10 @@ mod tests {
             a,
             control_in_rx,
             ControlOptions {
-                on_request: Some(build_permission_request_handler(tx.clone())),
+                on_request: Some(build_permission_request_handler(
+                    tx.clone(),
+                    crate::elicitation::ElicitationSupport::default(),
+                )),
             },
         );
         let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
@@ -9558,6 +12845,7 @@ mod tests {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Command>();
         let (reply_tx, reply_rx) = oneshot::channel();
         handle_permission(
+            &mut AsyncTaskRuntime::new(false),
             json!({"type":"control_request","request_id":"permreq1","request":{
                 "subtype":"can_use_tool","tool_name":"ExitPlanMode",
                 "input":{"plan":"x"},"tool_use_id":"toolu_1",
@@ -9569,6 +12857,10 @@ mod tests {
             &update_tx,
             "s",
             &mut pending_permissions,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &watch::channel(false).1,
+            false,
             std::path::Path::new("/repo"),
             &[
                 "default".to_string(),
@@ -9855,7 +13147,10 @@ mod tests {
             a,
             control_in_rx,
             ControlOptions {
-                on_request: Some(build_permission_request_handler(tx.clone())),
+                on_request: Some(build_permission_request_handler(
+                    tx.clone(),
+                    crate::elicitation::ElicitationSupport::default(),
+                )),
             },
         );
         let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
@@ -10414,6 +13709,7 @@ mod tests {
         let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         let (command_tx, _command_rx) = mpsc::unbounded_channel::<Command>();
         handle_permission(
+            &mut AsyncTaskRuntime::new(false),
             frame,
             reply_tx,
             None,
@@ -10422,6 +13718,10 @@ mod tests {
             &utx,
             "s",
             &mut pending_permissions,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &watch::channel(false).1,
+            false,
             std::path::Path::new(""),
             &[],
             None,
@@ -11687,7 +14987,7 @@ mod tests {
     /// Spawn a bare session actor (no child process) and return its command
     /// sender, outbound receiver, stream sender, and the control writer's
     /// sender (kept alive by the caller).
-    fn spawn_bare_actor() -> (
+    pub(super) fn spawn_bare_actor() -> (
         mpsc::UnboundedSender<Command>,
         mpsc::UnboundedReceiver<SessionOutbound>,
         mpsc::UnboundedSender<Value>,

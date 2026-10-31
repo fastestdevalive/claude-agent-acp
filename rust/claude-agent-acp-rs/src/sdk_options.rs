@@ -254,6 +254,25 @@ pub struct ClaudeOptions {
     pub forward_subagent_text: Option<bool>,
     /// `emitRawSDKMessages` (U-10).
     pub raw_sdk_messages: RawSdkMessages,
+    /// `forkSession` -> `--fork-session` when truthy (O-125).
+    pub fork_session: bool,
+    /// `resumeSessionAt` -> `--resume-session-at=<uuid>` when non-empty
+    /// (O-125).
+    pub resume_session_at: Option<String>,
+    /// `resumeDropsTurn` -> `--resume-drops-turn=<v>` whenever the key is
+    /// present, even `false`/`null` (`!== undefined`, O-125).
+    pub resume_drops_turn: Option<String>,
+}
+
+/// `String(value)` for the one `--resume-drops-turn` value.
+fn js_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
 /// JavaScript truthiness for the option values Node tests with `if (value)`.
@@ -964,6 +983,9 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
                 .and_then(|meta| meta.get("claudeCode"))
                 .and_then(|claude| claude.get("emitRawSDKMessages")),
         ),
+        fork_session: js_truthy(opts.get("forkSession")),
+        resume_session_at: opt_str(&opts, "resumeSessionAt").filter(|value| !value.is_empty()),
+        resume_drops_turn: opts.get("resumeDropsTurn").map(js_string),
     }
 }
 

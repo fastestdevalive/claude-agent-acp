@@ -37,8 +37,8 @@ cargo build --manifest-path "$MANIFEST" --workspace --bins
 echo "==> prewarm upstream cache"
 run_timeout 300 bash "$ROOT/porting/capture.sh" --install-only
 
-echo "==> test"
-run_timeout 300 cargo test --manifest-path "$MANIFEST" --workspace -- --test-threads=4
+echo "==> test (timeout ${GATE_TEST_TIMEOUT:-300}s)"
+run_timeout "${GATE_TEST_TIMEOUT:-300}" cargo test --manifest-path "$MANIFEST" --workspace -- --test-threads=4
 
 echo "==> cross-target check: x86_64-pc-windows-gnu"
 cargo check --manifest-path "$MANIFEST" --workspace --target x86_64-pc-windows-gnu

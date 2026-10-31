@@ -153,6 +153,21 @@ pub struct SessionConfigState {
     pub is_air: bool,
     pub ultracode: bool,
     pub pre_plan_mode: Option<String>,
+    /// The custom main-thread agents the SDK's `initialize` reported
+    /// (`discoverCustomAgents`, `acp-agent.ts:12324-12355`).
+    pub agents: Vec<AgentInfo>,
+    /// The selected Agent picker value (`session.currentAgent`).
+    pub current_agent: String,
+    /// The user's retained Fast mode intent (`session.fastModeEnabled`). Kept
+    /// across a model switch so it is correct when a supporting model is
+    /// reselected (`acp-agent.ts:10575-10600`).
+    pub fast_mode_enabled: bool,
+    /// The latest explainable `fast_mode_disabled_reason`
+    /// (`session.fastModeDisabledReason`).
+    pub fast_mode_disabled_reason: Option<String>,
+    /// The initial auto-mode clamp's fallback warning is deferred to the first
+    /// prompt (`session.autoModeFallbackWarningPending`, `acp-agent.ts:3863-3864`).
+    pub pending_auto_fallback_warning: bool,
     /// Backend key for the cross-session context-window cache (F5b/B-70).
     pub provider_cache_key: String,
 }
@@ -570,7 +585,7 @@ pub fn applied_effort_after_sync(
 /// User-facing explanations for the SDK's `fast_mode_disabled_reason` values a
 /// user can act on. Deliberately partial: `sdk_opt_in_required`, `preference`,
 /// `pending`, `unknown` and any future reason are not surfaced.
-fn fast_mode_unavailable_explanation(reason: &str) -> Option<&'static str> {
+pub fn fast_mode_unavailable_explanation(reason: &str) -> Option<&'static str> {
     match reason {
         "free" => Some("not available on the free plan"),
         "extra_usage_disabled" => Some("requires extra usage to be enabled for this account"),
@@ -594,6 +609,88 @@ pub fn normalize_fast_mode_disabled_reason(reason: Option<&str>) -> Option<Strin
     reason
         .filter(|r| fast_mode_unavailable_explanation(r).is_some())
         .map(String::from)
+}
+
+/// Whether the current model advertises Fast mode support
+/// (`currentModelInfo?.supportsFastMode ?? false`).
+pub fn model_supports_fast_mode(model_infos: &[ModelInfo], current_model_id: &str) -> bool {
+    model_infos
+        .iter()
+        .find(|m| m.value == current_model_id)
+        .and_then(|m| m.supports_fast_mode)
+        .unwrap_or(false)
+}
+
+/// The reconciled Fast mode toggle from an SDK-reported state
+/// (`syncFastModeState`, `acp-agent.ts:10805-10860`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastModeSync {
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+    /// The explanation to say out loud once, when the SDK refuses a toggle the
+    /// user turned on (`session.fastModeEnabled && !enabled`).
+    pub explanation: Option<String>,
+}
+
+/// Reconcile an SDK-reported `fast_mode_state` / `fast_mode_disabled_reason`
+/// with the retained toggle. Returns `None` when nothing the user can see
+/// changes, mirroring upstream's guards in order: absent state, no Fast mode
+/// option (the current model lacks support, so the report reflects capability,
+/// not intent — never clobber the retained setting), `cooldown` (a transient
+/// suspension; leave the toggle as-is), and an unchanged (enabled, reason)
+/// pair. A reason only describes an off state, so an `on` report drops it.
+pub fn reconcile_fast_mode(
+    state: Option<&str>,
+    reason: Option<&str>,
+    current_enabled: bool,
+    current_reason: Option<&str>,
+    has_option: bool,
+) -> Option<FastModeSync> {
+    let state = state?;
+    if !has_option {
+        return None;
+    }
+    if state == "cooldown" {
+        return None;
+    }
+    let enabled = state == "on";
+    let next_reason = if enabled {
+        None
+    } else {
+        normalize_fast_mode_disabled_reason(reason)
+    };
+    if enabled == current_enabled && next_reason.as_deref() == current_reason {
+        return None;
+    }
+    let explanation = next_reason
+        .as_deref()
+        .and_then(fast_mode_unavailable_explanation)
+        .filter(|_| current_enabled && !enabled)
+        .map(String::from);
+    Some(FastModeSync {
+        enabled,
+        disabled_reason: next_reason,
+        explanation,
+    })
+}
+
+/// The `appliedEffortLevel` the switch path compares against
+/// (`appliedEffortBeforeSwitch`, `acp-agent.ts:10554-10558`).
+pub fn applied_effort_before_switch(
+    applied: Option<&str>,
+    use_recommended_value: bool,
+    current_effort: Option<&str>,
+    pinned: Option<&str>,
+) -> Option<String> {
+    applied
+        .map(String::from)
+        .or_else(|| {
+            (use_recommended_value
+                && current_effort.is_some_and(|effort| effort != DEFAULT_MODEL_ID))
+            .then(|| current_effort.map(String::from))
+            .flatten()
+        })
+        .or_else(|| pinned.map(String::from))
 }
 
 /// Whether the client advertised boolean session config options
@@ -1047,5 +1144,92 @@ mod tests {
             .options
             .iter()
             .any(|o| o.value == "bypassPermissions")); // bypass not allowed
+    }
+
+    /// N-45 (`syncFastModeState`, `acp-agent.ts:10805-10860`): the guards in
+    /// order — absent state, no Fast mode option, cooldown, unchanged pair — and
+    /// the once-only flip explanation.
+    #[test]
+    fn t5a2_reconcile_fast_mode_matches_upstream_guards() {
+        assert_eq!(reconcile_fast_mode(None, None, false, None, true), None);
+        // The current model lacks support: capability, not intent.
+        assert_eq!(
+            reconcile_fast_mode(Some("on"), None, false, None, false),
+            None
+        );
+        // A rate-limit cooldown is transient either way.
+        assert_eq!(
+            reconcile_fast_mode(Some("cooldown"), None, true, None, true),
+            None
+        );
+        assert_eq!(
+            reconcile_fast_mode(Some("cooldown"), None, false, None, true),
+            None
+        );
+        // Unchanged, including a routine reason that normalizes away.
+        assert_eq!(
+            reconcile_fast_mode(Some("off"), Some("sdk_opt_in_required"), false, None, true),
+            None
+        );
+        // A reason-only update carries the explanation but no flip notice.
+        assert_eq!(
+            reconcile_fast_mode(Some("off"), Some("not_first_party"), false, None, true),
+            Some(FastModeSync {
+                enabled: false,
+                disabled_reason: Some("not_first_party".into()),
+                explanation: None,
+            })
+        );
+        // The SDK refuses a toggle the user turned on: explain once.
+        assert_eq!(
+            reconcile_fast_mode(Some("off"), Some("extra_usage_disabled"), true, None, true),
+            Some(FastModeSync {
+                enabled: false,
+                disabled_reason: Some("extra_usage_disabled".into()),
+                explanation: Some("requires extra usage to be enabled for this account".into()),
+            })
+        );
+        // Coming back on drops any retained reason.
+        assert_eq!(
+            reconcile_fast_mode(
+                Some("on"),
+                Some("network_error"),
+                false,
+                Some("network_error"),
+                true
+            ),
+            Some(FastModeSync {
+                enabled: true,
+                disabled_reason: None,
+                explanation: None,
+            })
+        );
+    }
+
+    /// O-55 (`appliedEffortBeforeSwitch`, `acp-agent.ts:10554-10558`): the last
+    /// applied level, else the AIR client's displayed concrete value, else the
+    /// pin.
+    #[test]
+    fn t5a2_applied_effort_before_switch_falls_back() {
+        assert_eq!(
+            applied_effort_before_switch(Some("low"), true, Some("medium"), Some("high")),
+            Some("low".into())
+        );
+        assert_eq!(
+            applied_effort_before_switch(None, true, Some("medium"), Some("high")),
+            Some("medium".into())
+        );
+        assert_eq!(
+            applied_effort_before_switch(None, true, Some("default"), Some("high")),
+            Some("high".into())
+        );
+        assert_eq!(
+            applied_effort_before_switch(None, false, Some("medium"), Some("high")),
+            Some("high".into())
+        );
+        assert_eq!(
+            applied_effort_before_switch(None, false, Some("medium"), None),
+            None
+        );
     }
 }

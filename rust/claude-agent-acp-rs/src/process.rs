@@ -326,6 +326,13 @@ pub struct SpawnOptions {
     pub plugins: Vec<crate::sdk_options::Plugin>,
     /// `--await-initialize` when plugins are delivered over initialize.
     pub plugin_delivery: crate::sdk_options::PluginDelivery,
+    /// `--fork-session` when the SDK option is truthy (O-125).
+    pub fork_session: bool,
+    /// `--resume-session-at=<uuid>` when set (O-125).
+    pub resume_session_at: Option<String>,
+    /// `--resume-drops-turn=<v>` whenever the SDK option key was present
+    /// (O-125).
+    pub resume_drops_turn: Option<String>,
     /// `--no-session-persistence` when explicitly `persistSession:false` (O-124).
     pub persist_session: Option<bool>,
     /// `--continue` (O-108); suppressed when `session_mirror` is set.
@@ -385,6 +392,9 @@ impl Default for SpawnOptions {
             executable_args: Vec::new(),
             plugins: Vec::new(),
             plugin_delivery: crate::sdk_options::PluginDelivery::Argv,
+            fork_session: false,
+            resume_session_at: None,
+            resume_drops_turn: None,
             persist_session: None,
             continue_conversation: false,
             task_budget: None,
@@ -604,6 +614,18 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
                 plugin.path.as_deref().unwrap_or_default()
             ));
         }
+    }
+
+    // `forkSession`, `resumeSessionAt` and `resumeDropsTurn` precede
+    // `--session-id` in the SDK's argv (O-125).
+    if opts.fork_session {
+        argv.push("--fork-session".into());
+    }
+    if let Some(at) = &opts.resume_session_at {
+        argv.push(format!("--resume-session-at={at}"));
+    }
+    if let Some(drops) = &opts.resume_drops_turn {
+        argv.push(format!("--resume-drops-turn={drops}"));
     }
 
     if let Some(session_id) = &opts.session_id {

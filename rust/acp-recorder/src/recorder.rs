@@ -274,7 +274,28 @@ async fn run_script(
             Step::Initialize {
                 client_capabilities_meta,
                 client_capabilities,
+                raw_capabilities,
             } => {
+                if *raw_capabilities {
+                    // Send the capability object verbatim (T5FA): the typed
+                    // `ClientCapabilities` would drop `session.compaction`,
+                    // which this SDK build gates behind a cargo feature.
+                    let mut params = json!({"protocolVersion": 1});
+                    let mut caps = client_capabilities.clone().unwrap_or_else(|| json!({}));
+                    if let Some(meta) = client_capabilities_meta {
+                        let mut merged = caps
+                            .get("_meta")
+                            .and_then(serde_json::Value::as_object)
+                            .cloned()
+                            .unwrap_or_default();
+                        merged.extend(meta.as_object().cloned().unwrap_or_default());
+                        caps["_meta"] = serde_json::Value::Object(merged);
+                    }
+                    params["clientCapabilities"] = caps;
+                    let request = UntypedMessage::new("initialize", params)?;
+                    let _response = connection.send_request(request).block_task().await?;
+                    continue;
+                }
                 // F1: carry the whole capability object. A malformed object is
                 // a script error (the recorder is a test client, not a lenient
                 // one); the meta-only form stays the additive default.

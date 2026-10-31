@@ -31,7 +31,7 @@ use crate::tools;
 
 /// The R28 deny payload — the `canUseTool` return for a rejection, written as
 /// the `control_response` so the CLI does not interrupt (INV-21).
-const DENY_MESSAGE: &str = "User refused permission to run tool";
+pub(crate) const DENY_MESSAGE: &str = "User refused permission to run tool";
 
 /// The outcome a client selected for a `session/request_permission`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -684,6 +684,64 @@ impl TurnMachine {
         self.active.as_ref().is_some_and(is_held_turn)
     }
 
+    /// `shouldForwardResult` (`acp-agent.ts:7351-7360`): the result text is the
+    /// answer only when nothing streamed (`deliveredAssistantText`), no
+    /// compaction output was delivered, the turn generated no tokens (the
+    /// cache-replay signature) and the text is not a repeat of an informational
+    /// notice — or the prompt was a local-only command.
+    pub fn should_forward_result(
+        &self,
+        result: &Value,
+        assistant_text_delivered: bool,
+        compaction_output_delivered: bool,
+    ) -> bool {
+        let result_text = result.get("result").and_then(Value::as_str).unwrap_or("");
+        let is_local = self
+            .active
+            .as_ref()
+            .is_some_and(Turn::is_local_only_command);
+        let output_tokens = result
+            .get("usage")
+            .and_then(|usage| usage.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let repeats_notice = self.active.as_ref().is_some_and(|turn| {
+            turn.notice_texts
+                .contains(&crate::notices::normalize_notice_text(result_text))
+        });
+        is_local
+            || (!assistant_text_delivered
+                && !compaction_output_delivered
+                && output_tokens == 0
+                && !repeats_notice)
+    }
+
+    /// Whether this result reaches upstream's `case "success"` arm
+    /// (`acp-agent.ts:7057-7374`), where the local-command replacement is
+    /// claimed for its text. Everything else exits before that arm: the
+    /// cancelled guard, the autonomous break, the empty-interruption swallow,
+    /// an ExitPlanMode interruption, a refusal, the steered-error lane,
+    /// `max_tokens`, `is_error` (`/login`, provider errors) and every
+    /// non-`success` subtype. Read-only.
+    pub fn result_reaches_forward(&self, result: &Value) -> bool {
+        if self.cancelled || self.result_is_autonomous(result) {
+            return false;
+        }
+        if self.result_is_swallowed_diagnostic(result) || self.exit_plan_interruption.is_some() {
+            return false;
+        }
+        if result.get("stop_reason").and_then(Value::as_str) == Some("refusal")
+            || self.result_is_steer_diagnostic(result)
+        {
+            return false;
+        }
+        if result.get("is_error").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        result.get("stop_reason").and_then(Value::as_str) != Some("max_tokens")
+            && result.get("subtype").and_then(Value::as_str) == Some("success")
+    }
+
     /// The `prompt_uuid` of the active unsettled turn (`session.activeTurn?.promptUuid`).
     pub fn active_prompt_uuid(&self) -> Option<&str> {
         self.active
@@ -852,6 +910,17 @@ impl TurnMachine {
             .iter_mut()
             .chain(self.queue.iter_mut())
             .find(|t| t.prompt_uuid == uuid && !t.settled)
+    }
+
+    /// Whether `uuid` names an unsettled turn (`findUnsettledTurn(frame.command_uuid)`,
+    /// `acp-agent.ts:5846`). A `command_lifecycle` "started" for it is the proof
+    /// that the interrupted command's tail drained (`compaction.resume()`).
+    #[must_use]
+    pub fn has_unsettled_turn(&self, uuid: &str) -> bool {
+        self.active
+            .iter()
+            .chain(self.queue.iter())
+            .any(|t| t.prompt_uuid == uuid && !t.settled)
     }
 
     fn orphan_state(&self, uuid: &str) -> Option<OrphanState> {
@@ -1492,7 +1561,7 @@ impl TurnMachine {
     /// client before this result (the actor tracks `emittedAssistantText`).
     pub fn on_result(&mut self, result: &Value, assistant_text_delivered: bool) -> Vec<TurnEvent> {
         let begin = self.on_result_begin(result);
-        self.on_result_finish(result, assistant_text_delivered, begin)
+        self.on_result_finish(result, assistant_text_delivered, false, begin)
     }
 
     /// The first half of [`Self::on_result`]: everything upstream runs BEFORE the
@@ -1558,6 +1627,7 @@ impl TurnMachine {
         &mut self,
         result: &Value,
         assistant_text_delivered: bool,
+        compaction_output_delivered: bool,
         begin: ResultBegin,
     ) -> Vec<TurnEvent> {
         let ResultBegin {
@@ -1818,29 +1888,16 @@ impl TurnMachine {
                     return events;
                 }
                 // #453 result-text fallback: forward the result text when no
-                // assistant text was delivered and the turn produced no output
-                // tokens (the cache-replay signature), or for a local-only
-                // command. Only the success arm and only after the max_tokens
-                // break (`ADP:2804-2809`; review 04 #13).
-                let output_tokens = result
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let is_local = self
-                    .active
-                    .as_ref()
-                    .map(Turn::is_local_only_command)
-                    .unwrap_or(false);
-                // A notice is not an answer: a result that only repeats the
-                // informational text shown for this turn is not forwarded again.
-                let repeats_notice = self.active.as_ref().is_some_and(|turn| {
-                    turn.notice_texts
-                        .contains(&crate::notices::normalize_notice_text(result_text))
-                });
-                if (is_local
-                    || (!assistant_text_delivered && output_tokens == 0 && !repeats_notice))
-                    && !result_text.is_empty()
+                // assistant text was delivered, no compaction output was
+                // delivered and the turn produced no output tokens (the
+                // cache-replay signature), or for a local-only command. Only the
+                // success arm and only after the max_tokens break
+                // (`ADP:2804-2809`; review 04 #13).
+                if self.should_forward_result(
+                    result,
+                    assistant_text_delivered,
+                    compaction_output_delivered,
+                ) && !result_text.is_empty()
                 {
                     events.push(TurnEvent::FinalText {
                         text: result_text.to_string(),

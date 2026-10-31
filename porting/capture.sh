@@ -28,13 +28,24 @@
 #
 # Usage: capture.sh [name ...]   — names default to every corpus transcript.
 #        capture.sh --install-only   — install + assert the pinned adapter, exit 0.
+#        capture.sh --v2 initialize  — capture the experimental ACP v2
+#                                      initialize golden into fixtures-v2.
+#
+# v2 mode is selected ONLY by `--v2` (never by an exported
+# CLAUDE_AGENT_ACP_EXPERIMENTAL_V2), accepts only the `initialize` name, and
+# writes only under porting/fixtures-v2: `initialize.frames.jsonl` (the wire
+# frames) and `initialize.result.json` (the result object, a distinct name from
+# the v1 shared `initialize.json`). The result is validated against the pinned
+# SDK's v2 schema, resolved from the install cache; a missing schema or a
+# missing `$defs.InitializeResponse` is a hard error, never a silent skip.
 #
 # Output directory override: every file this script writes (*.frames.jsonl,
 # *.argv.json, initialize.json, and the intermediate/temp *.raw files) goes to
-# $CAPTURE_OUT_DIR when set, otherwise to porting/fixtures. This lets tests
-# capture into a fresh temp dir without ever writing to the committed fixture
-# directory (2.T1). The default (unset) output directory is byte-identical to
-# the pre-override behaviour.
+# $CAPTURE_OUT_DIR when set, otherwise to porting/fixtures (or
+# porting/fixtures-v2 in --v2 mode). This lets tests capture into a fresh temp
+# dir without ever writing to the committed fixture directory (2.T1). The
+# default (unset) output directory is byte-identical to the pre-override
+# behaviour.
 #
 # Env:
 #   UPSTREAM_VERSION   override the pin (REFUSED unless CAPTURE_OUT_DIR is set,
@@ -49,6 +60,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 OUT_DIR="${CAPTURE_OUT_DIR:-$ROOT/porting/fixtures}"
+V2_MODE=0
+FILTERED_ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--v2" ]; then
+    V2_MODE=1
+  else
+    FILTERED_ARGS+=("$arg")
+  fi
+done
+set -- "${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}"
+
+# v2 mode is selected ONLY by `--v2`; an exported
+# CLAUDE_AGENT_ACP_EXPERIMENTAL_V2 in a dev shell must never turn a v1 refresh
+# into a v2 capture (it would write into fixtures-v2 and clobber the golden).
+if [ "$V2_MODE" -eq 1 ]; then
+  OUT_DIR="${CAPTURE_OUT_DIR:-$ROOT/porting/fixtures-v2}"
+fi
 mkdir -p "$OUT_DIR"
 
 FAKE="$ROOT/rust/target/debug/fake-claude"
@@ -156,11 +184,23 @@ echo "==> building rust binaries"
 cargo build --manifest-path "$ROOT/rust/Cargo.toml" --workspace --bins >/dev/null 2>&1
 
 names=("$@")
-if [ "${#names[@]}" -eq 0 ]; then
-  for t in "$ROOT"/porting/corpus/*.transcript.jsonl; do
-    base="$(basename "$t" .transcript.jsonl)"
-    names+=("$base")
+if [ "$V2_MODE" -eq 1 ]; then
+  for name in "${names[@]}"; do
+    if [ "$name" != "initialize" ]; then
+      echo "v2 capture supports only 'initialize' (got '$name')" >&2
+      exit 1
+    fi
   done
+fi
+if [ "${#names[@]}" -eq 0 ]; then
+  if [ "$V2_MODE" -eq 1 ]; then
+    names=("initialize")
+  else
+    for t in "$ROOT"/porting/corpus/*.transcript.jsonl; do
+      base="$(basename "$t" .transcript.jsonl)"
+      names+=("$base")
+    done
+  fi
 fi
 
 # A fresh HOME + CLAUDE_CONFIG_DIR per SCRIPT (created inside the loop below) so
@@ -263,8 +303,10 @@ normalize_object() {
         if (isTimestamp(v)) return ph(v);
         // Control request_id values are short random lowercase ids (e.g. the
         // initialize request_id); normalise them too so initialize.json
-        // is byte-stable across runs.
-        if (/^[a-z0-9]{8,20}$/.test(v)) return ph(v);
+        // is byte-stable across runs. The v2 object golden is an ordinary ACP
+        // result (no request_id), so mode `v2` must keep short words such as
+        // "terminal" verbatim.
+        if (mode !== "v2" && /^[a-z0-9]{8,20}$/.test(v)) return ph(v);
         return normPath(replaceUuids(v));
       }
       if (Array.isArray(v)) return v.map((x) => walk(x, topKey));
@@ -288,6 +330,100 @@ normalize_object() {
 }
 
 for name in "${names[@]}"; do
+  if [ "$V2_MODE" -eq 1 ] && [ "$name" = "initialize" ]; then
+    frames="$OUT_DIR/initialize.frames.jsonl"
+    # Distinct from the v1 shared `initialize.json` (a fake-claude
+    # control_request); this file is the Node v2 initialize RESULT object.
+    init="$OUT_DIR/initialize.result.json"
+    raw="$frames.raw"
+    init_raw="$init.raw"
+
+    rm -rf "$FAKE_HOME"
+    FAKE_HOME="$(mktemp -d)"
+    mkdir -p "$FAKE_HOME/.claude"
+
+    echo "==> capturing v2 initialize"
+    init_req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"v2-client","version":"1.0.0"},"capabilities":{"auth":{"terminal":{}}}}}'
+
+    resp_json="$(env -i \
+      PATH="$PATH" \
+      TMPDIR="${TMPDIR:-/tmp}" \
+      LANG="${LANG:-C}" \
+      HOME="$FAKE_HOME" \
+      CLAUDE_CONFIG_DIR="$FAKE_HOME/.claude" \
+      CLAUDE_CODE_EXECUTABLE="$FAKE" \
+      CLAUDE_AGENT_ACP_EXPERIMENTAL_V2=1 \
+      node -e '
+        const cp = require("child_process");
+        const dist = process.argv[1];
+        const req = process.argv[2];
+        const p = cp.spawn("node", [dist], { env: process.env, stdio: ["pipe", "pipe", "inherit"] });
+        let out = "";
+        p.stdout.on("data", (d) => { out += d; });
+        p.stdin.write(req + "\n");
+        p.stdin.end();
+        p.on("close", () => {
+          process.stdout.write(out.trim());
+        });
+      ' "$DIST" "$init_req")"
+
+    # npm hoists the pinned SDK's schema to the cache root, not under the
+    # adapter package (and the repo has no node_modules); fail loudly instead of
+    # silently skipping the check.
+    V2_SCHEMA_PATH="$CACHE/node_modules/@agentclientprotocol/sdk/schema/v2/schema.unstable.json"
+    if [ ! -f "$V2_SCHEMA_PATH" ]; then
+      echo "v2 schema not found at $V2_SCHEMA_PATH (the pinned SDK must ship it)" >&2
+      exit 1
+    fi
+    echo "==> validating v2 initialize against schema"
+    # ajv is hoisted to the cache too; resolve it from there.
+    NODE_PATH="$CACHE/node_modules" node -e '
+      const fs = require("fs");
+      const Ajv = require("ajv/dist/2020");
+      const addFormats = require("ajv-formats");
+      const schema = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const resp = JSON.parse(process.argv[2]);
+      if (!schema.$defs || !schema.$defs.InitializeResponse) {
+        console.error("v2 schema has no $defs.InitializeResponse");
+        process.exit(1);
+      }
+      const ajv = new Ajv({ strict: false, allErrors: true });
+      addFormats(ajv);
+      for (const [format, max] of [
+        ["uint16", 2 ** 16 - 1],
+        ["uint32", 2 ** 32 - 1],
+        ["uint64", 2 ** 64 - 1],
+      ]) {
+        ajv.addFormat(format, {
+          type: "number",
+          validate: (value) => Number.isInteger(value) && value >= 0 && value <= max,
+        });
+      }
+      ajv.addSchema(schema, "v2");
+      const validate = ajv.getSchema("v2#/$defs/InitializeResponse");
+      if (!validate) {
+        console.error("could not compile the v2 InitializeResponse schema");
+        process.exit(1);
+      }
+      if (!validate(resp.result)) {
+        console.error("v2 schema validation failed:", validate.errors);
+        process.exit(1);
+      }
+    ' "$V2_SCHEMA_PATH" "$resp_json"
+
+    echo "{\"direction\":\"send\",\"frame\":$init_req}" > "$raw"
+    echo "{\"direction\":\"recv\",\"frame\":$resp_json}" >> "$raw"
+    node -e 'const r = JSON.parse(process.argv[1]); process.stdout.write(JSON.stringify(r.result, null, 2) + "\n");' "$resp_json" > "$init_raw"
+
+    echo "==> normalising v2 initialize"
+    normalize_frames "$raw" "$frames"
+    normalize_object "$init_raw" "$init" v2
+    rm -f "$raw" "$init_raw"
+    rm -rf "$FAKE_HOME"
+    FAKE_HOME=""
+    continue
+  fi
+
   transcript="$ROOT/porting/corpus/$name.transcript.jsonl"
   script="$ROOT/porting/corpus/$name.acp.json"
   frames="$OUT_DIR/$name.frames.jsonl"
