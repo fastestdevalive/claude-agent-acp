@@ -780,3 +780,69 @@ async fn inv_53_goal_params_wire() {
     drop(result);
     let _ = timeout(Duration::from_secs(5), serve_task).await;
 }
+
+/// G4 / T-PORT — `acp-agent.test.ts` > "rejects when the session is unknown":
+/// `_session/steering` for a session the registry does not hold answers the
+/// internal error carrying "Session not found", before any turn work.
+#[tokio::test]
+async fn g4_tport_steering_rejects_an_unknown_session() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("acp-agent-steer-unknown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let transcript = tmp.join("unknown.transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"expect\":{\"type\":\"control_request\",\"request\":{\"subtype\":\"initialize\"}},\"emit\":[{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$REQ\",\"response\":{\"models\":[],\"commands\":[]}}}]}\n",
+    )
+    .expect("write transcript");
+    let opts = ServeOptions {
+        claude_path: Some(fake_claude_binary()),
+        extra_env: vec![(
+            "FAKE_CLAUDE_SCRIPT".to_string(),
+            transcript.to_string_lossy().into_owned(),
+        )],
+        default_cwd: Some(root),
+        ..Default::default()
+    };
+    let (agent_channel, client_channel) = Channel::duplex();
+    let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
+
+    let result = Client
+        .builder()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                connection
+                    .send_request(UntypedMessage::new(
+                        "initialize",
+                        json!({ "protocolVersion": 1 }),
+                    )?)
+                    .block_task()
+                    .await?;
+                let err = connection
+                    .send_request(UntypedMessage::new(
+                        "_session/steering",
+                        json!({
+                            "sessionId": "missing",
+                            "prompt": [ { "type": "text", "text": "hi" } ]
+                        }),
+                    )?)
+                    .block_task()
+                    .await
+                    .expect_err("an unknown session is rejected");
+                let value = serde_json::to_value(&err).expect("the error serializes");
+                assert_eq!(
+                    value.get("code").and_then(|c| c.as_i64()),
+                    Some(-32603),
+                    "{value}"
+                );
+                assert!(value.to_string().contains("Session not found"), "{value}");
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "the unknown-session drive resolves");
+    let _ = timeout(Duration::from_secs(5), serve_task).await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}

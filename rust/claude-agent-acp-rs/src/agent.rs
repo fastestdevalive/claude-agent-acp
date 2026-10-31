@@ -2341,6 +2341,17 @@ fn validate_cwd(cwd: Option<&str>) -> Result<(), Error> {
     Ok(())
 }
 
+/// The replay future's result: the rebuilt Task* state, the last published plan
+/// title, the failure book, the message-id map, and the read error when the
+/// history could not be read (M-132).
+type ReplayOutcome = (
+    Vec<(String, crate::hooks::TaskStateEntry)>,
+    Option<String>,
+    crate::session::failures::SessionFailures,
+    crate::message_ids::MessageIdMap,
+    Option<String>,
+);
+
 /// Validate the optional `systemPrompt` (after `validate_cwd`, before any spawn)
 /// and fold it, the legacy `_meta.systemPrompt` and AIR `customInstructions`
 /// into the `initialize` options (rust-air-gaps G3/G5, Decision 10; F4a
@@ -2351,7 +2362,10 @@ fn initialize_options_for(
     air: Option<&AirClient>,
     v2: bool,
 ) -> Result<InitializeOptions, Error> {
-    let (system_prompt, append_system_prompt) = system_prompt::initialize_fields(params)?;
+    let fields = system_prompt::initialize_fields(params)?;
+    let system_prompt = fields.system_prompt;
+    let append_system_prompt = fields.append_system_prompt;
+    let exclude_dynamic_sections = fields.exclude_dynamic_sections;
     let opts = crate::sdk_options::claude_options(params);
     // Node defaults `promptSuggestions` on unless the client passes a value
     // (`acp-agent.ts:11235`).
@@ -2388,11 +2402,17 @@ fn initialize_options_for(
     Ok(InitializeOptions {
         system_prompt,
         append_system_prompt,
+        exclude_dynamic_sections,
         // T-105: a v2 connection also registers the PreToolUse hook of the
         // change previews, so an auto-approved Edit or Write shows its exact
         // patch before it runs (`acp-agent.ts:11284-11291`); a v1 client gets
-        // the input's diff and waits on no hook.
-        hooks: Some(crate::hooks::init_hooks_payload_with_v2(v2)),
+        // the input's diff and waits on no hook. O-169: the client's own hook
+        // tables are spread first, the adapter's entries appended
+        // (`acp-agent.ts:11280-11390`).
+        hooks: Some(crate::hooks::init_hooks_payload_with_user(
+            v2,
+            opts.hooks.as_ref(),
+        )),
         // O-144: `_meta.claudeCode.options.agents` goes to `initialize` verbatim.
         agents: opts.agents,
         prompt_suggestions: Some(prompt_suggestions),
@@ -2942,6 +2962,33 @@ fn recreate_cancelled(env: &ResumeEnv) -> bool {
         .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst))
 }
 
+/// U-49 (`SessionFailureController.restore`, `session-failure-extension.ts:420-446`):
+/// a replay records a restored failure only after its `session/update`
+/// publication succeeded. A send that failed (the client is gone) drops the
+/// active record and its revision, and logs the miss. Returns whether a record
+/// was rolled back.
+fn rollback_unpublished_failure(
+    value: &Value,
+    error: &agent_client_protocol::Error,
+    failure_book: &mut crate::session::failures::SessionFailures,
+    session_id: &str,
+    logger: Option<&crate::logger::Logger>,
+) -> bool {
+    let Some(id) = value
+        .pointer("/update/_meta/jetbrains/air/sessionFailure/id")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    failure_book.rollback_restored(id);
+    if let Some(logger) = logger {
+        logger.error(&format!(
+            "Session {session_id}: failed to publish AIR session failure: {error}"
+        ));
+    }
+    true
+}
+
 /// Start (or restart) the session `session_id` from its stored transcript
 /// (`--resume`) and answer a `session/load`, `session/resume` or `session/fork`
 /// request; the new session is registered and its proactive command list sent.
@@ -3033,9 +3080,36 @@ async fn start_resumed(
         // `createSessionWhileReplaying`) and reads the transcript off the async
         // runtime; the response waits for both, so the replay frames still
         // precede it.
+        //
+        // M-132: a failed CLI start stops the replay (`pending.stopped` in
+        // Node): the start future sets the flag, and the replay checks it before
+        // every frame and before the `loadReplayEnd` marker. A history that
+        // cannot be read fails the load instead of replaying nothing.
         let air = env.air.is_some();
+        let start_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start_failed_for_replay = Arc::clone(&start_failed);
+        // `nativeReplayEnabled` / `forwardSubagentText` (`acp-agent.ts:9068-9084`):
+        // AIR's draft replays launches and inline sidechains into synthetic
+        // children; a client without native subagent sessions gets nested text
+        // on the root only when it asked for the flattened transcript.
+        let native_air_replay =
+            env.caps.subagent_form == Some(crate::client_caps::SubagentForm::Air);
+        let forward_subagent_text =
+            env.caps.subagent_form.is_none() && initialize.forward_subagent_text;
         let replay_future = async {
-            let messages = crate::transcript::session_messages_async(&opts.env, &session_id).await;
+            let messages =
+                match crate::transcript::session_messages_async(&opts.env, &session_id).await {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        return (
+                            Vec::new(),
+                            None,
+                            crate::session::failures::SessionFailures::default(),
+                            crate::message_ids::MessageIdMap::default(),
+                            Some(error),
+                        );
+                    }
+                };
             let mut failure_book = crate::session::failures::SessionFailures::default();
             // B-45: replay restores background task cards for a client that
             // takes AIR async tasks; B-55: the loop yields to the event loop
@@ -3068,6 +3142,8 @@ async fn start_resumed(
                         // B-50: a client that takes ID-addressed compaction
                         // updates replays a compact summary as an entity.
                         compaction: env.caps.compaction,
+                        native_air_replay,
+                        forward_subagent_text,
                     },
                     &mut yielder,
                     subagents,
@@ -3080,8 +3156,11 @@ async fn start_resumed(
             let mut replay_stopped = false;
             for mut value in notifications {
                 // A cancelled recreate stops replaying into a connection that is
-                // ending.
-                if recreate_cancelled(env) {
+                // ending; a failed CLI start stops it too (the client would get
+                // history for a session it does not have).
+                if recreate_cancelled(env)
+                    || start_failed_for_replay.load(std::sync::atomic::Ordering::SeqCst)
+                {
                     replay_stopped = true;
                     break;
                 }
@@ -3102,8 +3181,16 @@ async fn start_resumed(
                     }
                     continue;
                 }
-                if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                    let _ = connection.send_notification(msg);
+                if let Ok(msg) = UntypedMessage::new("session/update", value.clone()) {
+                    if let Err(error) = connection.send_notification(msg) {
+                        rollback_unpublished_failure(
+                            &value,
+                            &error,
+                            &mut failure_book,
+                            &session_id,
+                            opts.logger.as_deref(),
+                        );
+                    }
                 }
             }
             if let Some(v2) = &v2 {
@@ -3111,8 +3198,12 @@ async fn start_resumed(
             }
             // B-53: a client with `loadReplayEnd` gets one more update after
             // the whole replay (`acp-agent.ts:9529-9544`). A stopped replay
-            // does not get it.
-            if env.caps.load_replay_end && !recreate_cancelled(env) && !replay_stopped {
+            // does not get it (a failed CLI start, an empty history included).
+            if env.caps.load_replay_end
+                && !recreate_cancelled(env)
+                && !replay_stopped
+                && !start_failed_for_replay.load(std::sync::atomic::Ordering::SeqCst)
+            {
                 let marker = crate::transcript::load_replay_end_marker(&session_id);
                 match &v2 {
                     Some(v2) => {
@@ -3127,18 +3218,28 @@ async fn start_resumed(
                     }
                 }
             }
-            (task_state, last_published, failure_book, replay_message_ids)
+            (
+                task_state,
+                last_published,
+                failure_book,
+                replay_message_ids,
+                None,
+            )
         };
-        let no_replay: (
-            Vec<(String, crate::hooks::TaskStateEntry)>,
-            Option<String>,
-            crate::session::failures::SessionFailures,
-            crate::message_ids::MessageIdMap,
-        ) = (Vec::new(), None, Default::default(), Default::default());
+        let no_replay: ReplayOutcome = (
+            Vec::new(),
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+        );
         // The guard is created the moment the start returns, so a session that is
         // waiting for the replay to finish is already covered.
         let start_future = async {
             let result = Session::start(sess_opts, session_id.clone()).await;
+            if result.is_err() {
+                start_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let guard = UnwiredSessionGuard(
                 result
                     .as_ref()
@@ -3177,6 +3278,17 @@ async fn start_resumed(
     match start_result {
         Ok((session, update_rx)) => {
             timing.phase("session-ready", "");
+            let (task_state, last_published, failure_book, replay_message_ids, replay_error) =
+                replayed;
+            // M-132: the history could not be read, so the load fails
+            // (`getSessionMessages` rejecting); the started query is closed and
+            // nothing is registered.
+            if let Some(error) = replay_error {
+                drop(update_rx);
+                session.close().await;
+                return responder
+                    .respond_with_error(Error::internal_error().data(json!({ "details": error })));
+            }
             // The recreate was cancelled while the child started (the client
             // closed the session, or the connection is ending): the new session
             // is neither registered nor left running.
@@ -3217,7 +3329,6 @@ async fn start_resumed(
             // the Task* state it rebuilt into the live actor so a status-only
             // TaskUpdate after the load still applies.
             if replay {
-                let (task_state, last_published, failure_book, replay_message_ids) = replayed;
                 let _ = session.seed_task_state(task_state, last_published).await;
                 let _ = session.seed_failures(failure_book).await;
                 session.seed_message_ids(replay_message_ids);
@@ -3404,7 +3515,10 @@ pub(crate) async fn handle_v1_request(
                     connection.send_notification(msg)
                 })
             }));
-            registry.index.negotiate(registry.air.as_ref());
+            registry.index.negotiate(
+                registry.air.as_ref(),
+                registry.protocol == crate::v2::ProtocolMode::V2,
+            );
             let (executable, argv) = process_entrypoint();
             let v1_resp = initialize_response(
                 registry.air.as_ref(),
@@ -3728,8 +3842,19 @@ pub(crate) async fn handle_v1_request(
                 return Ok(());
             } else if let Some(session) = live.as_ref() {
                 if replay {
+                    // M-132: a live load whose history cannot be read fails
+                    // instead of replaying an empty one (`readResumedSession`).
                     let messages =
-                        crate::transcript::session_messages_async(&opts.env, &session_id).await;
+                        match crate::transcript::session_messages_async(&opts.env, &session_id)
+                            .await
+                        {
+                            Ok(messages) => messages,
+                            Err(error) => {
+                                return responder.respond_with_error(
+                                    Error::internal_error().data(json!({ "details": error })),
+                                );
+                            }
+                        };
                     let typed_failures = registry
                         .air
                         .as_ref()
@@ -3752,14 +3877,25 @@ pub(crate) async fn handle_v1_request(
                         opts,
                     )
                     .await;
+                    let native_air_replay =
+                        registry.caps.subagent_form == Some(crate::client_caps::SubagentForm::Air);
+                    let forward_subagent_text = registry.caps.subagent_form.is_none()
+                        && (registry.caps.subagent_transcript
+                            || crate::sdk_options::claude_options(&params).forward_subagent_text
+                                == Some(true));
                     let (notifications, task_state, last_published) =
                         crate::transcript::replay_with_failures_rfd(
                             &messages,
                             &session_id,
                             registry.air.is_some(),
                             registry.caps.plan,
-                            registry.caps.compaction,
-                            typed_failures.then_some(&mut failure_book),
+                            crate::transcript::ReplaySinks {
+                                failures: typed_failures.then_some(&mut failure_book),
+                                compaction: registry.caps.compaction,
+                                native_air_replay,
+                                forward_subagent_text,
+                                ..crate::transcript::ReplaySinks::default()
+                            },
                             subagents,
                         );
                     let v2 = registry.v2_outbound.clone();
@@ -3782,12 +3918,38 @@ pub(crate) async fn handle_v1_request(
                             }
                             continue;
                         }
-                        if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                            let _ = connection.send_notification(msg);
+                        if let Ok(msg) = UntypedMessage::new("session/update", value.clone()) {
+                            if let Err(error) = connection.send_notification(msg) {
+                                rollback_unpublished_failure(
+                                    &value,
+                                    &error,
+                                    &mut failure_book,
+                                    &session_id,
+                                    opts.logger.as_deref(),
+                                );
+                            }
                         }
                     }
                     if let Some(v2) = &v2 {
                         v2.end_replay(&session_id);
+                    }
+                    // B-53 / M-131: an already-live `session/load` replay ends
+                    // with the same AIR `loadReplayEnd` marker as a fresh load
+                    // (`acp-agent.ts:9529-9544`), before the response.
+                    if registry.caps.load_replay_end {
+                        let marker = crate::transcript::load_replay_end_marker(&session_id);
+                        match &v2 {
+                            Some(v2) => {
+                                if let Some(update) = marker.get("update") {
+                                    v2.translate(&session_id, update.clone());
+                                }
+                            }
+                            None => {
+                                if let Ok(msg) = UntypedMessage::new("session/update", marker) {
+                                    let _ = connection.send_notification(msg);
+                                }
+                            }
+                        }
                     }
                     // Node forgets the published plan before a replay and shares
                     // the live `taskState` with it; seed the rebuilt state so the
@@ -5030,6 +5192,8 @@ mod providers;
 mod recreate;
 
 #[cfg(test)]
+mod tests_g1;
+#[cfg(test)]
 mod tests_t1ha;
 #[cfg(test)]
 mod tests_t2b;
@@ -5892,6 +6056,57 @@ mod tests {
         )
         .unwrap();
         assert!(opted_in.enable_file_checkpointing);
+    }
+
+    /// O-169 (`create-session-options.test.ts` > "merges user-provided hooks
+    /// with ACP hooks"): the client's hook tables are spread first and the
+    /// adapter's entries appended, so a user PreToolUse survives and
+    /// PostToolUse carries both.
+    #[test]
+    fn t8d_user_hooks_merge_with_acp_hooks() {
+        let plain = ClientCapabilities::default();
+        let params = json!({"_meta": {"claudeCode": {"options": {"hooks": {
+            "PreToolUse": [{"hooks": [{"command": "echo pre"}]}],
+            "PostToolUse": [{"hooks": [{"command": "echo user-post"}]}],
+        }}}}});
+        let v1 = initialize_options_for(&params, &plain, None, false).unwrap();
+        let request = v1.build_request();
+        assert_eq!(
+            request["hooks"]["PreToolUse"],
+            json!([{"hooks": [{"command": "echo pre"}]}]),
+            "the user's PreToolUse is preserved: {request}"
+        );
+        assert_eq!(
+            request["hooks"]["PostToolUse"].as_array().map(Vec::len),
+            Some(2),
+            "user and adapter hooks: {request}"
+        );
+        assert_eq!(
+            request["hooks"]["PostToolUse"][0],
+            json!({"hooks": [{"command": "echo user-post"}]})
+        );
+        assert_eq!(
+            request["hooks"]["PostToolUse"][1],
+            json!({"hookCallbackIds": ["hook_0"]})
+        );
+
+        // On v2 the preview hook follows the user's PreToolUse entry and the
+        // callbacks are numbered in registration order.
+        let v2 = initialize_options_for(&params, &plain, None, true).unwrap();
+        let request = v2.build_request();
+        assert_eq!(
+            request["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(2),
+            "{request}"
+        );
+        assert_eq!(
+            request["hooks"]["PreToolUse"][1],
+            json!({"matcher": "Edit|Write", "hookCallbackIds": ["hook_0"]})
+        );
+        assert_eq!(
+            request["hooks"]["PostToolUse"][1],
+            json!({"hookCallbackIds": ["hook_1"]})
+        );
     }
 
     /// T-105 (`create-session-options.test.ts`: "registers the PreToolUse hook

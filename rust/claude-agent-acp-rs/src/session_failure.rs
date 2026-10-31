@@ -603,3 +603,43 @@ mod tests {
         assert!(ctx.title.is_none());
     }
 }
+
+#[cfg(test)]
+mod t8c_tests {
+    use super::*;
+    use crate::hide_claude_auth::CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON;
+
+    /// `authorization.test.ts` > "session failure reason field": `reason` rides
+    /// the payload only when the publisher passes one.
+    #[test]
+    fn t8c_session_failure_reason_is_optional() {
+        let failure = PublishedSessionFailure {
+            id: "s1:error".into(),
+            revision: 1,
+            kind: ClaudeFailureKind::AuthRequired,
+            category: "access",
+            severity: "error",
+            title: "Sign in to continue using Claude.".into(),
+            details: Some(
+                "This integration does not support using claude.ai subscriptions.".into(),
+            ),
+            reason: Some(CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON.into()),
+            actions: vec!["login".into()],
+        };
+        let meta = session_failure_meta(&failure);
+        assert_eq!(
+            meta["jetbrains"]["air"]["sessionFailure"]["reason"],
+            "claude_subscription_not_supported"
+        );
+
+        let without = PublishedSessionFailure {
+            reason: None,
+            details: Some("Authentication required.".into()),
+            ..failure
+        };
+        let meta = session_failure_meta(&without);
+        assert!(meta["jetbrains"]["air"]["sessionFailure"]
+            .get("reason")
+            .is_none());
+    }
+}

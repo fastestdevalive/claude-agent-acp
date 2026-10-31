@@ -510,6 +510,7 @@ async fn t4a2_a_child_permission_request_is_awaiting_user() {
         &watch::channel(false).1,
         false,
         std::path::Path::new("/repo"),
+        None,
         &[],
         None,
         None,
@@ -548,6 +549,194 @@ async fn t4a2_a_child_permission_request_is_awaiting_user() {
         .find(|v| v["update"]["sessionUpdate"] == "subagent_update")
         .expect("the child reports running again");
     assert_eq!(running["update"]["state"]["state"], "running");
+    pending_permissions.clear();
+}
+
+/// T8A — the PostToolUse hook update of a child's Edit goes to the child's
+/// session through the parent attribution it carries.
+#[test]
+fn t8a_a_child_hook_update_routes_to_the_child() {
+    let mut rig = T4Rig::new(Some(SubagentForm::Rfd));
+    rig.rig.echo("p1");
+    rig.start_child("t1", "toolu_A");
+    rig.child_tool_call("toolu_A", "toolu_C");
+    let _ = rig.notifications();
+    let update = crate::hooks::build_post_tool_use_update(
+        "toolu_C",
+        "Edit",
+        Some("toolu_A"),
+        &json!({
+            "filePath": "/repo/x.ts",
+            "oldString": "a",
+            "newString": "b",
+            "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+                "lines": ["-a", "+b"]}],
+        }),
+    );
+    send_update(
+        &mut rig.rig.tasks,
+        &mut rig.rig.map_state,
+        json!({"sessionId": "s", "update": update}),
+        None,
+        &rig.rig.tx,
+        "s",
+        None,
+    );
+    let notes = rig.notifications();
+    let hook = notes
+        .iter()
+        .find(|v| v["update"]["toolCallId"] == "toolu_C");
+    assert!(hook.is_some(), "{notes:?}");
+    let hook = hook.unwrap();
+    assert_eq!(hook["sessionId"], "t1", "the child owns the Edit");
+    assert!(hook["update"]["content"].is_array());
+}
+
+/// T8A — the RFD form sends no AIR draft (`subagent_spawned` /
+/// `subagent_state_update`), only its `subagent_update` lifecycle.
+#[test]
+fn t8a_rfd_sends_no_air_draft() {
+    let mut rig = T4Rig::new(Some(SubagentForm::Rfd));
+    rig.rig.echo("p1");
+    rig.rig
+        .feed(json!({"type":"assistant","parent_tool_use_id":null,
+        "message":{"id":"msg_a","role":"assistant",
+        "content":[{"type":"tool_use","id":"toolu_A","name":"Agent",
+            "input":{"description":"Fix","prompt":"Make it pass"}}]}}));
+    rig.rig
+        .feed(json!({"type":"system","subtype":"task_started",
+        "task_id":"t1","tool_use_id":"toolu_A","subagent_type":"general-purpose",
+        "description":"Fix","prompt":"Make it pass"}));
+    let notes = rig.notifications();
+    assert!(
+        notes
+            .iter()
+            .any(|v| v["update"]["sessionUpdate"] == "subagent_update"),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().all(|v| {
+            v["update"]["sessionUpdate"] != "subagent_spawned"
+                && v["update"]["sessionUpdate"] != "subagent_state_update"
+        }),
+        "no AIR draft for an RFD client: {notes:?}"
+    );
+}
+
+/// T8A — a permission request of an announced child goes to the child session,
+/// and so does the tool call it surfaces.
+#[tokio::test]
+async fn t8a_child_permission_request_session_is_the_child() {
+    let mut rig = T4Rig::new(Some(SubagentForm::Rfd));
+    rig.start_child("t1", "toolu_A");
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut tokens: HashMap<String, crate::native_subagents::AwaitToken> = HashMap::new();
+    let (command_tx, _command_rx) = mpsc::unbounded_channel::<Command>();
+    handle_permission(
+        &mut rig.rig.tasks,
+        json!({"type":"control_request","request_id":"perm1","request":{
+            "subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},
+            "tool_use_id":"toolu_P","agent_id":"t1","permission_suggestions":[]}}),
+        reply_tx,
+        None,
+        &mut rig.rig.map_state,
+        &mut rig.rig.live_background,
+        &rig.rig.tx,
+        "s",
+        &mut pending_permissions,
+        &mut tokens,
+        &mut HashMap::new(),
+        &watch::channel(false).1,
+        false,
+        std::path::Path::new("/repo"),
+        None,
+        &[],
+        None,
+        None,
+        None,
+        &command_tx,
+    );
+    let mut request_session = None;
+    let mut call_session = None;
+    while let Ok(item) = rig.rig.rx.try_recv() {
+        match item {
+            SessionOutbound::RequestPermission { params, .. } => {
+                request_session = params["sessionId"].as_str().map(str::to_string);
+            }
+            SessionOutbound::Update(notif) => {
+                let value = serde_json::to_value(&notif).unwrap();
+                if value["update"]["toolCallId"] == "toolu_P" {
+                    call_session = Some(notif.session_id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(request_session.as_deref(), Some("t1"));
+    assert_eq!(call_session.as_deref(), Some("t1"));
+    pending_permissions.clear();
+}
+
+/// T8A — a permission of a child that is known but not yet announced stays on
+/// the root until the child is announced.
+#[tokio::test]
+async fn t8a_raced_permission_stays_on_the_root_until_announced() {
+    let mut rig = T4Rig::new(Some(SubagentForm::Rfd));
+    rig.rig.echo("p1");
+    // The child starts before its launching Agent frame, so it is registered but
+    // not announced.
+    rig.rig.feed(
+        json!({"type":"system","subtype":"task_started","task_id":"t1",
+        "tool_use_id":"toolu_A","description":"Investigate",
+        "subagent_type":"Explore","task_type":"local_agent"}),
+    );
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut tokens: HashMap<String, crate::native_subagents::AwaitToken> = HashMap::new();
+    let (command_tx, _command_rx) = mpsc::unbounded_channel::<Command>();
+    handle_permission(
+        &mut rig.rig.tasks,
+        json!({"type":"control_request","request_id":"perm1","request":{
+            "subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},
+            "tool_use_id":"toolu_P","agent_id":"t1","permission_suggestions":[]}}),
+        reply_tx,
+        None,
+        &mut rig.rig.map_state,
+        &mut rig.rig.live_background,
+        &rig.rig.tx,
+        "s",
+        &mut pending_permissions,
+        &mut tokens,
+        &mut HashMap::new(),
+        &watch::channel(false).1,
+        false,
+        std::path::Path::new("/repo"),
+        None,
+        &[],
+        None,
+        None,
+        None,
+        &command_tx,
+    );
+    let mut request_session = None;
+    let mut call_session = None;
+    while let Ok(item) = rig.rig.rx.try_recv() {
+        match item {
+            SessionOutbound::RequestPermission { params, .. } => {
+                request_session = params["sessionId"].as_str().map(str::to_string);
+            }
+            SessionOutbound::Update(notif) => {
+                let value = serde_json::to_value(&notif).unwrap();
+                if value["update"]["toolCallId"] == "toolu_P" {
+                    call_session = Some(notif.session_id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(request_session.as_deref(), Some("s"));
+    assert_eq!(call_session.as_deref(), Some("s"));
     pending_permissions.clear();
 }
 

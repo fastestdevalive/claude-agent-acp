@@ -1685,6 +1685,19 @@ mod tests {
         delete(&root, "not-an-id").expect("invalid id");
     }
 
+    /// T8B — deleting one session leaves another project's transcript alone.
+    #[test]
+    fn t8b_delete_leaves_other_sessions() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        write_session(&root, "-p", A, &user_line("u1", None, "/p", "a"), 10);
+        write_session(&root, "-q", B, &user_line("u2", None, "/q", "b"), 20);
+        delete(&root, A).expect("delete A");
+        assert!(find_transcripts(&root, A).is_empty());
+        assert_eq!(find_transcripts(&root, B).len(), 1, "B survives");
+        assert!(root.join("-q").join(format!("{B}.jsonl")).exists());
+    }
+
     #[test]
     fn inv_52_fork_remaps_and_titles() {
         let tmp = TempDir::new();

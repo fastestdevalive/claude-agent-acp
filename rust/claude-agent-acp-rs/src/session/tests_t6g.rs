@@ -329,3 +329,233 @@ fn t6g_a_failed_turn_reports_the_v1_error_as_idle() {
     assert_eq!(update["stopReason"], "error");
     assert_eq!(update["error"]["message"], error.message);
 }
+
+// ---------------------------------------------------------------- G4 / B-113
+
+/// The upstream turn-events trace: `inserted <uuid>` for a `user_message`, the
+/// foreground state (with its stop reason), and the update kinds.
+fn b113_trace(updates: &[Value]) -> Vec<String> {
+    updates
+        .iter()
+        .map(|update| {
+            let kind = update["sessionUpdate"].as_str().unwrap_or("");
+            match kind {
+                "user_message" => {
+                    format!("inserted {}", update["messageId"].as_str().unwrap_or(""))
+                }
+                "state_update" => match update["stopReason"].as_str() {
+                    Some(reason) => format!("{} {reason}", update["state"].as_str().unwrap_or("")),
+                    None => update["state"].as_str().unwrap_or("").to_string(),
+                },
+                "agent_message_chunk" => "chunk".to_string(),
+                _ => String::new(),
+            }
+        })
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn apply_turn_events(rig: &mut Rig, events: Vec<TurnEvent>) {
+    rig.map_state.v2.after_events(&events, false);
+    drain_v2(&mut rig.map_state, &rig.tx, "s");
+}
+
+/// Feed one frame through the real `dispatch_stream` (the lifecycle branch lives
+/// there, not in `handle_session_frame`).
+async fn feed_stream(rig: &mut Rig, line: Value) {
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    dispatch_stream(
+        StreamMsg::new(line),
+        &control_tx,
+        &mut rig.machine,
+        &mut rig.map_state,
+        &mut rig.live_background,
+        &mut rig.pending,
+        &mut rig.emitted_assistant_text,
+        &mut rig.assistant_had_error,
+        &rig.tx,
+        "s",
+        &rig.high_water,
+        &mut rig.tasks,
+        &mut rig.ext,
+    )
+    .await;
+}
+
+fn lifecycle_started(uuid: &str) -> Value {
+    json!({"type":"command_lifecycle","command_uuid":uuid,"state":"started"})
+}
+
+/// `turn-events.test.ts` > "reports a turn inserted when Claude Code starts it,
+/// before output that comes before its echo": the `started` lifecycle inserts
+/// the turn (and answers the intake) before the answer's chunk, which itself
+/// precedes the echo.
+#[tokio::test]
+async fn g4_b113_inserted_before_output_that_precedes_the_echo() {
+    let mut rig = rig_v2();
+    let _intake = queue_v2(&mut rig, "p1");
+    feed_stream(&mut rig, lifecycle_started("p1")).await;
+    let (updates, answers) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["inserted p1", "running"]);
+    assert_eq!(answers, vec![Ok("p1".to_string())]);
+
+    rig.feed(json!({"type":"assistant","parent_tool_use_id":null,
+        "message":{"id":"msg_answer","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"Hello"}],
+            "usage":{"input_tokens":1,"output_tokens":1}}}));
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["chunk"]);
+
+    echo(&mut rig, "p1");
+    rig.feed(result_frame("end_turn"));
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["idle end_turn"]);
+}
+
+/// `turn-events.test.ts` > "reports a turn inserted only after a held turn
+/// before it ended": a second prompt's `started` does not insert while the
+/// first turn is held; its echo hands the first turn off and inserts it.
+#[tokio::test]
+async fn g4_b113_inserted_only_after_a_held_turn_before_it_ended() {
+    let mut rig = rig_v2();
+    let _first = queue_v2(&mut rig, "p1");
+    feed_stream(&mut rig, lifecycle_started("p1")).await;
+    echo(&mut rig, "p1");
+    rig.tool_use(
+        "toolu_AG",
+        "Agent",
+        json!({"description":"Research","prompt":"x"}),
+    );
+    rig.feed(subagent_started("sub1"));
+    rig.feed(result_frame("end_turn"));
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(
+        b113_trace(&updates),
+        vec!["inserted p1", "running", "idle end_turn"],
+        "the held turn's work ends at its result"
+    );
+    assert!(rig.machine.has_active(), "v1 still holds the turn");
+
+    let _second = queue_v2(&mut rig, "p2");
+    feed_stream(&mut rig, lifecycle_started("p2")).await;
+    let (updates, _) = v2_out(&mut rig);
+    assert!(
+        updates.is_empty(),
+        "the held turn owns the foreground until the hand-off: {updates:?}"
+    );
+
+    echo(&mut rig, "p2");
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["inserted p2", "running"]);
+    rig.feed(result_frame("end_turn"));
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["idle end_turn"]);
+}
+
+/// `turn-events.test.ts` > "reports waiting on a request that Claude Code opens
+/// for a started turn before its echo": the inserted turn waits at once, then
+/// resumes when the request is answered, all before its echo.
+#[tokio::test]
+async fn g4_b113_waits_on_a_request_opened_before_the_echo() {
+    let mut rig = rig_v2();
+    let _intake = queue_v2(&mut rig, "p1");
+    feed_stream(&mut rig, lifecycle_started("p1")).await;
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["inserted p1", "running"]);
+
+    rig.map_state.v2.open_input("req-bg", None);
+    drain_v2(&mut rig.map_state, &rig.tx, "s");
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["requires_action"]);
+
+    rig.map_state.v2.close_input("req-bg", false);
+    drain_v2(&mut rig.map_state, &rig.tx, "s");
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["running"]);
+
+    echo(&mut rig, "p1");
+    rig.feed(result_frame("end_turn"));
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["idle end_turn"]);
+}
+
+/// `turn-events.test.ts` > "awaits the user while any request in the session is
+/// open, also one opened before the turn": the new turn starts `running` then
+/// `requires_action` for the earlier request, stays waiting through its own
+/// answered request, and resumes only when the earlier one is answered too.
+#[tokio::test]
+async fn g4_b113_awaits_a_request_opened_before_the_turn() {
+    let mut rig = rig_v2();
+    let _first = queue_v2(&mut rig, "p1");
+    feed_stream(&mut rig, lifecycle_started("p1")).await;
+    echo(&mut rig, "p1");
+    rig.feed(result_frame("end_turn"));
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(
+        b113_trace(&updates),
+        vec!["inserted p1", "running", "idle end_turn"]
+    );
+
+    // A request no active turn opened, such as a background task's.
+    rig.map_state.v2.open_input("req-bg", None);
+    drain_v2(&mut rig.map_state, &rig.tx, "s");
+    let (updates, _) = v2_out(&mut rig);
+    assert!(updates.is_empty(), "no work to report: {updates:?}");
+
+    let _second = queue_v2(&mut rig, "p2");
+    feed_stream(&mut rig, lifecycle_started("p2")).await;
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(
+        b113_trace(&updates),
+        vec!["inserted p2", "running", "requires_action"]
+    );
+
+    // Its own request opens and is answered; the earlier one still blocks it.
+    rig.map_state.v2.open_input("req-own", None);
+    drain_v2(&mut rig.map_state, &rig.tx, "s");
+    let (updates, _) = v2_out(&mut rig);
+    assert!(updates.is_empty(), "already waiting: {updates:?}");
+    rig.map_state.v2.close_input("req-own", false);
+    drain_v2(&mut rig.map_state, &rig.tx, "s");
+    let (updates, _) = v2_out(&mut rig);
+    assert!(updates.is_empty(), "still waiting: {updates:?}");
+
+    rig.map_state.v2.close_input("req-bg", false);
+    drain_v2(&mut rig.map_state, &rig.tx, "s");
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["running"]);
+
+    echo(&mut rig, "p2");
+    rig.feed(result_frame("end_turn"));
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(b113_trace(&updates), vec!["idle end_turn"]);
+}
+
+/// `turn-events.test.ts` > "does not insert a turn that a cancel ended while the
+/// previous turn was handed off": the swept queued turn's intake answers
+/// `cancelled` and no `user_message` is emitted for it.
+#[test]
+fn g4_b113_a_cancelled_queued_turn_is_not_inserted() {
+    let mut rig = rig_v2();
+    let _first = queue_v2(&mut rig, "p1");
+    echo(&mut rig, "p1");
+    v2_out(&mut rig);
+    let _second = queue_v2(&mut rig, "p2");
+    v2_out(&mut rig);
+
+    let events = rig.machine.cancel();
+    apply_turn_events(&mut rig, events);
+    let (updates, answers) = v2_out(&mut rig);
+    assert!(
+        updates
+            .iter()
+            .all(|update| update["sessionUpdate"] != "user_message"),
+        "the cancelled turn is never inserted: {updates:?}"
+    );
+    assert!(
+        answers
+            .iter()
+            .any(|answer| answer == &Err(V2IntakeError::Cancelled)),
+        "the swept turn's intake answers cancelled: {answers:?}"
+    );
+}

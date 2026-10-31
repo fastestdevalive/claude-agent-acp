@@ -320,6 +320,73 @@ async fn b116_v2_resume_replays_a_compact_summary_before_the_answer() {
     harness.shutdown().await;
 }
 
+/// C-24 — a v2 replay of a Write carries no v1 diff (`WriteReporter.toolUse`:
+/// `inputDiff = capabilities.v2 ? false : …`), so its content is `[]`.
+#[tokio::test]
+async fn t9a_g3_v2_replay_of_a_write_has_no_v1_diff() {
+    let mut harness = Harness::start("write", None);
+    let init = harness.initialize().await;
+    assert_eq!(init["response"]["result"]["protocolVersion"], 2);
+    let (created, _) = harness
+        .request_until_answer(
+            2,
+            "session/new",
+            json!({"cwd": repo_root().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    assert!(created.get("error").is_none(), "{created}");
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+    let file = repo_root().join("a.ts");
+    seed_session(
+        &harness.tmp,
+        &session_id,
+        &[
+            entry(
+                "assistant",
+                "msg_write",
+                None,
+                &session_id,
+                json!({"role":"assistant","content":[{"type":"tool_use","id":"toolu_w",
+                    "name":"Write","input":{"file_path":file.to_string_lossy(),"content":"x\n"}}]}),
+            ),
+            entry(
+                "user",
+                "result-w",
+                Some("msg_write"),
+                &session_id,
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_w",
+                    "content":format!("File created successfully at: {}", file.to_string_lossy())}]}),
+            ),
+        ],
+    );
+    let (answer, updates) = harness
+        .request_until_answer(
+            3,
+            "session/resume",
+            json!({"sessionId": session_id, "cwd": repo_root().to_string_lossy(),
+                "replayFrom": {"type": "start"}}),
+        )
+        .await;
+    assert!(answer.get("error").is_none(), "{answer}");
+    let write = updates
+        .iter()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update" && update["toolCallId"] == "toolu_w"
+        })
+        .unwrap_or_else(|| panic!("the Write replays: {updates:?}"));
+    assert!(
+        write["title"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("Write ") && title.ends_with("a.ts")),
+        "the Write's title: {write}"
+    );
+    assert_eq!(write["content"], json!([]), "{write}");
+    harness.shutdown().await;
+}
+
 /// B-116 — an approved ExitPlanMode plan replays as the session's markdown plan.
 #[tokio::test]
 async fn b116_v2_resume_replays_an_approved_plan_as_markdown() {

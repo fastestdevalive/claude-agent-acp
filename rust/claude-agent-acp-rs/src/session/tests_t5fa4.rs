@@ -92,7 +92,9 @@ impl Actor {
             _control_in: control_in_tx,
             written,
         };
-        let _ = actor.tx.send(Command::InitConfig { config });
+        let _ = actor.tx.send(Command::InitConfig {
+            config: Box::new(config),
+        });
         actor
     }
 
@@ -212,6 +214,7 @@ fn base(models: Vec<ModelInfo>, current: &str, recommended: bool) -> SessionConf
         fast_mode_disabled_reason: None,
         pending_auto_fallback_warning: false,
         provider_cache_key: String::new(),
+        effort_settings_override: None,
     }
 }
 

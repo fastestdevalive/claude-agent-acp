@@ -855,3 +855,131 @@ async fn t3b_a_steer_that_starts_a_turn_runs_the_guard() {
     .await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// `authorization.test.ts` > "allows a session after gateway authenticate":
+/// the legacy gateway switches the subscription guard off, so a session on a
+/// subscription account is created after `authenticate`.
+#[tokio::test]
+async fn t8c_gateway_authenticate_allows_the_session() {
+    let tmp = temp_dir("gateway-guard");
+    let opts = options(&tmp, &json!({"subscriptionType": "pro"}));
+    with_agent(opts, true, move |connection, _statuses| async move {
+        call(&connection, "initialize", json!({"protocolVersion": 1})).await?;
+        let cwd = repo_root().to_string_lossy().into_owned();
+        let refused = call(&connection, "session/new", new_session(&cwd)).await;
+        assert!(refused.is_err(), "the subscription is refused first");
+        call(
+            &connection,
+            "authenticate",
+            json!({"methodId": "gateway",
+                "_meta": {"gateway": {"baseUrl": "https://gateway.example", "headers": {}}}}),
+        )
+        .await?;
+        let created = call(&connection, "session/new", new_session(&cwd)).await?;
+        assert!(created["sessionId"].is_string(), "{created}");
+        Ok(())
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A transcript for the Central-helper case: the CLI's `auth status` output,
+/// the initialize handshake's account, and one answering turn.
+fn central_transcript(tmp: &Path, account: &Value, status: &Value) -> PathBuf {
+    let path = tmp.join("central.transcript.jsonl");
+    let init = json!({
+        "expect": {"type": "control_request", "request": {"subtype": "initialize"}},
+        "emit": [{"type": "control_response", "response": {
+            "subtype": "success", "request_id": "$REQ",
+            "response": {"models": [], "commands": [], "account": account}
+        }}]
+    });
+    let turn = json!({
+        "expect": {"type": "user"},
+        "emit": [
+            {"type": "user", "uuid": "$MATCH.uuid", "isReplay": true,
+             "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
+            {"type": "result", "subtype": "success", "stop_reason": "end_turn",
+             "is_error": false, "result": "done",
+             "usage": {"input_tokens": 1, "output_tokens": 1,
+                 "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}
+        ]
+    });
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{init}\n{turn}\n",
+            json!({"auth_status_stdout": status})
+        ),
+    )
+    .expect("write transcript");
+    path
+}
+
+/// `auth-status.test.ts` > "pushes Central from the effective pre-session
+/// settings and suppresses duplicates": the settings' `apiKeyHelper` classifies
+/// the CLI's API key as the AIR gateway, and the session account and the
+/// start-of-prompt probe (the same identity) push nothing more. Neither the
+/// helper command nor the base URL reaches the payload.
+#[tokio::test]
+async fn t8c_pushes_central_from_the_effective_pre_session_settings_and_suppresses_duplicates() {
+    let tmp = temp_dir("central-settings");
+    let config = tmp.join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(
+        config.join("settings.json"),
+        json!({
+            "apiKeyHelper": "central proxy start --return-key",
+            "env": {"ANTHROPIC_BASE_URL": "https://example.invalid/private-route"}
+        })
+        .to_string(),
+    )
+    .expect("settings.json");
+    let status = json!({"loggedIn": true, "authMethod": "none",
+        "apiProvider": "firstParty", "apiKeySource": "apiKeyHelper"});
+    let script = central_transcript(
+        &tmp,
+        &json!({"apiProvider": "firstParty", "apiKeySource": "apiKeyHelper"}),
+        &status,
+    );
+    let config_str = config.to_string_lossy().into_owned();
+    let opts = ServeOptions {
+        claude_path: Some(fake_claude_binary()),
+        extra_env: vec![
+            (
+                "FAKE_CLAUDE_SCRIPT".to_string(),
+                script.to_string_lossy().into_owned(),
+            ),
+            ("CLAUDE_CONFIG_DIR".to_string(), config_str.clone()),
+        ],
+        default_cwd: Some(repo_root()),
+        env: EnvSnapshot::from_pairs([("CLAUDE_CONFIG_DIR", config_str.as_str())]),
+        ..Default::default()
+    };
+    with_agent(opts, false, move |connection, mut statuses| async move {
+        call(&connection, "initialize", json!({"protocolVersion": 1})).await?;
+        let first = next_status(&mut statuses).await.expect("initialize probe");
+        assert_eq!(
+            first["authStatus"],
+            json!({"kind": "gateway", "label": "JetBrains Air Gateway"})
+        );
+        let cwd = repo_root().to_string_lossy().into_owned();
+        let created = call(&connection, "session/new", new_session(&cwd)).await?;
+        let session_id = created["sessionId"]
+            .as_str()
+            .expect("a session id")
+            .to_string();
+        let prompt = call(&connection, "session/prompt", prompt_params(&session_id)).await;
+        assert!(prompt.is_ok(), "{prompt:?}");
+        // The session account and the start-of-prompt probe describe the same
+        // identity, so nothing more is pushed.
+        assert_eq!(
+            next_status(&mut statuses).await,
+            None,
+            "duplicates suppressed"
+        );
+        Ok(())
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}

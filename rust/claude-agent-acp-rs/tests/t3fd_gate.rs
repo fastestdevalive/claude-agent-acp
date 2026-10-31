@@ -491,3 +491,151 @@ async fn t3fd_a_slow_resume_does_not_hold_back_another_sessions_prompt() {
     .await
     .expect("the exchange finished in time");
 }
+
+/// `providers.test.ts` > "switches every loaded session through proxy
+/// replacements and back to native routing": each `providers/set` and the
+/// `providers/disable` recreate both live sessions (the cursor advances by two
+/// per update), and the last spawn carries native routing.
+#[tokio::test]
+async fn t9b_switches_every_loaded_session_through_replacements_and_back() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
+        let first = stub_gateway(Duration::from_millis(0)).await;
+        let second = stub_gateway(Duration::from_millis(0)).await;
+        let segments: Vec<Vec<String>> = (0..8).map(|_| vec![initialize_step(None)]).collect();
+        let mut harness = Harness::start("every-session", &segments);
+        let cursor = |harness: &Harness| -> u64 {
+            std::fs::read_to_string(harness.tmp.join("cursor"))
+                .expect("cursor")
+                .trim()
+                .parse()
+                .expect("cursor number")
+        };
+        harness.initialize().await;
+        let _first_session = harness.open_session(2).await;
+        let _second_session = harness.open_session(3).await;
+        assert_eq!(cursor(&harness), 2);
+
+        harness.send_json(provider_set(4, &first)).await;
+        harness.read_response(4).await;
+        assert_eq!(cursor(&harness), 4, "both sessions recreated");
+        harness.send_json(provider_set(5, &second)).await;
+        harness.read_response(5).await;
+        assert_eq!(cursor(&harness), 6, "both sessions recreated again");
+        harness
+            .send_json(json!({"jsonrpc":"2.0","id":6,"method":"providers/disable",
+                "params":{"providerId":"main"}}))
+            .await;
+        harness.read_response(6).await;
+        assert_eq!(
+            cursor(&harness),
+            8,
+            "both sessions recreated for native routing"
+        );
+
+        let argv = std::fs::read_to_string(harness.tmp.join("argv.json")).expect("argv record");
+        assert!(!argv.contains(&first), "{argv}");
+        assert!(!argv.contains(&second), "{argv}");
+        harness.finish().await;
+    })
+    .await
+    .expect("the exchange finished in time");
+}
+
+/// `providers.test.ts` > "clears a providers/set that is still listing when
+/// logout arrives": the logout's own update wins the gate, so the listing that
+/// was in flight cannot leave the override installed.
+#[tokio::test]
+async fn t9b_logout_clears_a_provider_set_that_is_still_listing() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
+        let slow = stub_gateway(Duration::from_millis(300)).await;
+        let mut harness = Harness::start("logout-listing", &[vec![initialize_step(None)]]);
+        std::fs::create_dir_all(harness.tmp.join("config")).expect("config dir");
+        harness.initialize().await;
+        harness.send_json(provider_set(2, &slow)).await;
+        harness
+            .send_json(json!({"jsonrpc":"2.0","id":3,"method":"logout","params":{}}))
+            .await;
+        let frames = harness.read_responses(&[2, 3]).await;
+        assert_eq!(response_of(&frames, 2)["result"], json!({}), "{frames:?}");
+        assert_eq!(response_of(&frames, 3)["result"], json!({}), "{frames:?}");
+        harness
+            .send_json(json!({"jsonrpc":"2.0","id":4,"method":"providers/list","params":{}}))
+            .await;
+        let listed = harness.read_response(4).await;
+        assert_eq!(
+            listed["result"]["providers"][0]["current"],
+            json!({"apiType": "anthropic", "baseUrl": "https://api.anthropic.com"}),
+            "{listed}"
+        );
+        harness.finish().await;
+    })
+    .await
+    .expect("the exchange finished in time");
+}
+
+/// `providers.test.ts` > "recreates live sessions without the cleared provider
+/// on logout": the live session is respawned on native routing after logout.
+#[tokio::test]
+async fn t9b_logout_recreates_live_sessions_without_the_provider() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
+        let gateway = stub_gateway(Duration::from_millis(0)).await;
+        let segments: Vec<Vec<String>> = (0..2).map(|_| vec![initialize_step(None)]).collect();
+        let mut harness = Harness::start("logout-recreate", &segments);
+        std::fs::create_dir_all(harness.tmp.join("config")).expect("config dir");
+        let cursor = |harness: &Harness| -> u64 {
+            std::fs::read_to_string(harness.tmp.join("cursor"))
+                .expect("cursor")
+                .trim()
+                .parse()
+                .expect("cursor number")
+        };
+        harness.initialize().await;
+        harness.send_json(provider_set(2, &gateway)).await;
+        harness.read_response(2).await;
+        let _session = harness.open_session(3).await;
+        assert_eq!(cursor(&harness), 1);
+        harness
+            .send_json(json!({"jsonrpc":"2.0","id":4,"method":"logout","params":{}}))
+            .await;
+        harness.read_response(4).await;
+        assert_eq!(cursor(&harness), 2, "the live session was recreated");
+        let argv = std::fs::read_to_string(harness.tmp.join("argv.json")).expect("argv record");
+        assert!(!argv.contains(&gateway), "{argv}");
+        harness.finish().await;
+    })
+    .await
+    .expect("the exchange finished in time");
+}
+
+/// `providers.test.ts` > "leaves live sessions alone on logout without a routing
+/// override": no provider was set, so logout recreates nothing.
+#[tokio::test]
+async fn t9b_logout_leaves_live_sessions_alone_without_a_override() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
+        let segments: Vec<Vec<String>> = (0..2).map(|_| vec![initialize_step(None)]).collect();
+        let mut harness = Harness::start("logout-native", &segments);
+        std::fs::create_dir_all(harness.tmp.join("config")).expect("config dir");
+        let cursor = |harness: &Harness| -> u64 {
+            std::fs::read_to_string(harness.tmp.join("cursor"))
+                .expect("cursor")
+                .trim()
+                .parse()
+                .expect("cursor number")
+        };
+        harness.initialize().await;
+        let _session = harness.open_session(2).await;
+        assert_eq!(cursor(&harness), 1);
+        harness
+            .send_json(json!({"jsonrpc":"2.0","id":3,"method":"logout","params":{}}))
+            .await;
+        harness.read_response(3).await;
+        assert_eq!(cursor(&harness), 1, "no recreate without an override");
+        harness.finish().await;
+    })
+    .await
+    .expect("the exchange finished in time");
+}

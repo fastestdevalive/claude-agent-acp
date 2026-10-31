@@ -176,6 +176,11 @@ pub struct ClaudeOptions {
     /// `agents` (O-144): custom subagent definitions, passed to the SDK's
     /// `initialize` request verbatim. Only a truthy value is sent.
     pub agents: Option<Value>,
+    /// `hooks` (O-169): the client's own hook tables, merged with the adapter's
+    /// ACP hooks in the `initialize` request (`acp-agent.ts:11280-11390`).
+    /// Only an object is usable; a non-object is dropped like Node's spread of
+    /// a non-object (`...null` is a no-op, other primitives spread nothing).
+    pub hooks: Option<Value>,
     pub include_hook_events: bool,
     pub additional_directories: Vec<PathBuf>,
     /// `persistSession`; only an explicit `false` emits `--no-session-persistence`.
@@ -924,6 +929,9 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
             .get("agents")
             .filter(|value| js_truthy(Some(value)))
             .cloned(),
+        // O-169: Node spreads `userProvidedOptions?.hooks`; an absent or
+        // non-object value contributes nothing.
+        hooks: opts.get("hooks").filter(|value| value.is_object()).cloned(),
         include_hook_events: opts
             .get("includeHookEvents")
             .and_then(Value::as_bool)

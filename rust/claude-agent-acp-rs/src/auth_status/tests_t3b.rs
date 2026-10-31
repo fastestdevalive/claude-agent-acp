@@ -432,3 +432,202 @@ fn t3b_the_vendor_bag_is_part_of_the_payload() {
     assert!(same_status(Some(&first), &first.clone()));
     assert!(pro("a@b.c").to_json().get("vendor").is_none());
 }
+
+/// `authorization.test.ts` > "reports the identity the respawned session
+/// logged back in with": each `SessionCreated` publishes its account, so a
+/// recreate reports the new login without a probe.
+#[tokio::test]
+async fn t8c_a_recreated_session_publishes_the_new_identity() {
+    let (probe, _runs, _seen) = counting(ProbeOutcome::LoggedOut);
+    let (handle, mut pushes) = actor(probe, AuthActorConfig::default());
+    handle.send(AuthCmd::SessionCreated {
+        session_id: Some("s1".into()),
+        cwd: PathBuf::from("/a"),
+        account: Some(json!({ "apiKeySource": "ANTHROPIC_API_KEY" })),
+        api_key_helper: None,
+        epoch: None,
+    });
+    let first = next_push(&mut pushes).await.expect("first identity");
+    assert_eq!(first["kind"], "api_key");
+    assert_eq!(first["detail"], "ANTHROPIC_API_KEY");
+    // The respawned session signed in with a helper key.
+    handle.send(AuthCmd::SessionCreated {
+        session_id: Some("s1".into()),
+        cwd: PathBuf::from("/a"),
+        account: Some(json!({ "apiKeySource": "apiKeyHelper" })),
+        api_key_helper: Some("my-helper".into()),
+        epoch: None,
+    });
+    let second = next_push(&mut pushes).await.expect("second identity");
+    assert_eq!(second["kind"], "api_key");
+    assert_eq!(second["detail"], "API key helper");
+}
+
+/// `authorization.test.ts` > "never marks a session whose account named no
+/// identity": an OAuth token carries no identity signal, so there is no kind
+/// to compare and the probe never flags the session.
+#[tokio::test]
+async fn t8c_an_account_without_an_identity_is_never_marked() {
+    let config = AuthActorConfig {
+        hide_claude_auth: true,
+        logger: None,
+    };
+    let (probe, _runs, _seen) = counting(ProbeOutcome::Status(pro("a@b.c")));
+    let (handle, mut pushes) = actor(probe, config);
+    handle.send(AuthCmd::SessionCreated {
+        session_id: Some("s1".into()),
+        cwd: PathBuf::from("/a"),
+        account: Some(json!({ "tokenSource": "CLAUDE_CODE_OAUTH_TOKEN" })),
+        api_key_helper: None,
+        epoch: None,
+    });
+    // The account carries no identity signal, so nothing is published.
+    assert_eq!(next_push(&mut pushes).await, None);
+    handle.probe(PathBuf::from("/a"), true);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!handle.needs_respawn("s1").await);
+}
+
+/// B-83 — one in-flight probe serves every reader: a second read that does not
+/// ask to be fresh joins the running one instead of spawning another process.
+#[tokio::test]
+async fn t9b_probe_is_shared_between_readers() {
+    let (probe, runs, _seen) = counting(ProbeOutcome::Status(pro("a@b.c")));
+    let (handle, mut pushes) = actor(probe, AuthActorConfig::default());
+    handle.probe(PathBuf::from("/a"), false);
+    handle.probe(PathBuf::from("/a"), false);
+    assert_eq!(
+        next_push(&mut pushes).await.expect("the shared read")["account"]["email"],
+        "a@b.c"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "two readers, one CLI process"
+    );
+    assert_eq!(next_push(&mut pushes).await, None);
+}
+
+/// B-84 — a probe that started before `logout` is discarded even when it lands
+/// after the logout's own read; only the fresh read publishes.
+#[tokio::test]
+async fn t9b_stale_probe_landing_after_logout_is_discarded() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let probe: ProbeFn = Box::new(move |_request| {
+        let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if first {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                ProbeOutcome::Status(pro("stale@b.c"))
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ProbeOutcome::LoggedOut
+            }
+        })
+    });
+    let (handle, mut pushes) = actor(probe, AuthActorConfig::default());
+    handle.probe(PathBuf::from("/a"), false);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle.send(AuthCmd::Logout {
+        cwd: PathBuf::from("/a"),
+        reply: reply_tx,
+    });
+    reply_rx.await.expect("the post-logout read finished");
+    assert_eq!(
+        next_push(&mut pushes).await,
+        Some(not_logged_in().to_json()),
+        "the fresh read reports logged out"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        next_push(&mut pushes).await,
+        None,
+        "the pre-logout read never resurrects the identity"
+    );
+}
+
+/// U-62 — a client provider override does not suppress the agent-owned probe.
+#[tokio::test]
+async fn t9b_probes_under_a_provider_override() {
+    let (probe, runs, _seen) = counting(ProbeOutcome::Status(pro("a@b.c")));
+    let (handle, mut pushes) = actor(probe, AuthActorConfig::default());
+    handle.send(AuthCmd::SetRouting {
+        provider_override: true,
+        routing_active: true,
+    });
+    handle.probe(PathBuf::from("/a"), false);
+    assert_eq!(
+        next_push(&mut pushes).await.expect("the probe")["kind"],
+        "account"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}
+
+/// U-62 — a session account with no identity signal keeps the probed API key;
+/// a richer account upgrades the identity.
+#[tokio::test]
+async fn t9b_session_account_upgrades_and_uninformative_account_keeps_key() {
+    let key = api_key();
+    let (probe, _runs, _seen) = counting(ProbeOutcome::Status(key.clone()));
+    let (handle, mut pushes) = actor(probe, AuthActorConfig::default());
+    handle.probe(PathBuf::from("/a"), false);
+    assert_eq!(
+        next_push(&mut pushes).await.expect("the key")["kind"],
+        "api_key"
+    );
+    for account in [json!({"apiProvider": "firstParty"}), json!({})] {
+        handle.send(AuthCmd::SessionCreated {
+            session_id: Some("s1".into()),
+            cwd: PathBuf::from("/a"),
+            account: Some(account.clone()),
+            api_key_helper: None,
+            epoch: None,
+        });
+        assert_eq!(
+            next_push(&mut pushes).await,
+            None,
+            "an uninformative account keeps the probed key: {account}"
+        );
+    }
+    handle.send(AuthCmd::SessionCreated {
+        session_id: Some("s1".into()),
+        cwd: PathBuf::from("/a"),
+        account: Some(
+            json!({"apiProvider": "firstParty", "subscriptionType": "pro",
+            "email": "u@x.com"}),
+        ),
+        api_key_helper: None,
+        epoch: None,
+    });
+    let upgraded = next_push(&mut pushes).await.expect("the account");
+    assert_eq!(upgraded["kind"], "account");
+    assert_eq!(upgraded["account"]["email"], "u@x.com");
+}
+
+/// The effective pre-session helper turns both the probe and the session
+/// account into the gateway identity, so the second read publishes nothing and
+/// no helper command reaches the payload.
+#[tokio::test]
+async fn t9b_central_settings_push_suppresses_the_duplicate() {
+    let gateway = status("gateway", "JetBrains Air Gateway");
+    let (probe, _runs, _seen) = counting(ProbeOutcome::Status(gateway.clone()));
+    let (handle, mut pushes) = actor(probe, AuthActorConfig::default());
+    handle.probe(PathBuf::from("/a"), false);
+    let first = next_push(&mut pushes).await.expect("the gateway");
+    assert_eq!(first, gateway.to_json());
+    assert!(!first.to_string().contains("proxy"));
+    handle.send(AuthCmd::SessionCreated {
+        session_id: Some("s1".into()),
+        cwd: PathBuf::from("/a"),
+        account: Some(json!({"apiProvider": "firstParty", "apiKeySource": "apiKeyHelper"})),
+        api_key_helper: Some("central proxy start --return-key".into()),
+        epoch: None,
+    });
+    assert_eq!(
+        next_push(&mut pushes).await,
+        None,
+        "the same gateway identity is not re-pushed"
+    );
+}

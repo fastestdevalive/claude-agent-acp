@@ -270,7 +270,7 @@ T1-G7a-fix2 DONE: agy-medium `care-1-a-bf6817ea`, committed 9a38128 via cherry-p
 T1-G14 (LD-3) DONE: agy-medium `care-1-a-ec9e8e3f`, committed 180ace9 via cherry-pick of par-c 33e3a7e (clean; gate + Opus review pending; both test normalisers deleted, 95 differential scenarios green). T1-G16 (PC-4 docs + T1 closing verification, docs only) lane A in par-c at 180ace9 -> agy-medium `care-1-a-ec176fbe` (tmux).
 Gate OK for 180ace9 (G14) but Opus review CHANGES-NEEDED (scratchpad/review-G14.md): fixtures byte-identical to Node, materialiser coverage OK; 8 findings: diff fix-up rewrites rawInput/rawOutput/_meta (Medium), blocking project-dir scan on the actor each idle (Medium), title context from converted message incl embedded files (Medium), result text not collected, batch id restore keeps last mapping, id maps never pruned, AIR permission toolCall gets locations:[], T-40 DONE overclaimed + nonexistent test citations. Queued group G14-fix (prompt t1-g14fix-body.md).
 agy-medium hit its usage quota (resets in ~2h19m) mid-work; per the user's recipe (agy-medium preferred, deepseek fallback) both interrupted groups resume on deepseek from their saved trees (quota stop, not a model failure): T1-G7a-fix3 (agy `care-1-a-0ba8f878`, 15 files edited) -> deepseek `care-1-a-14e28df4` in par-b; T1-G16 (agy `care-1-a-ec176fbe`, docs edited) -> deepseek `care-1-a-3faf9a11` in par-c.
-T1-G16 (PC-4 docs + T1 closing summary) DONE: agy `care-1-a-ec176fbe` (cut off by quota) -> deepseek `care-1-a-3faf9a11` (finished), committed e63320c via cherry-pick of par-c f5ce8ac (clean). Remaining T1-package non-DONE rows: 22, all with owners (see progress-G16.md). T1-G14-fix (8 Opus findings on LD-3) lane A in par-c -> deepseek `care-1-a-b83ff30a`.
+T1-G16 (PC-4 docs + T1 closing summary) DONE: agy `care-1-a-ec176fbe` (cut off by quota) -> deepseek `care-1-a-3faf9a11` (finished), committed e63320c via cherry-pick of par-c f5ce8ac (clean). Remaining T1-package non-DONE rows: 22, all with owners (progress-G16.md, a scratch file removed in the T9 closeout). T1-G14-fix (8 Opus findings on LD-3) lane A in par-c -> deepseek `care-1-a-b83ff30a`.
 T1-G7a-fix3 DONE: deepseek (resumed from agy edits) `care-1-a-14e28df4`, committed 5cace28 via cherry-pick of par-b f2ceff0 (clean). Opus round-4 (scratchpad/review-G7afix3.md): 5 of 8 FIXED, 3 PARTLY; no regressions in the unix reaper (tests 10/10 x3); mutation-proven debounce test; remaining small items accepted into T1-G7a-fix4 (auth actor bypasses managed injection + 5 tests read host managed paths; HKLM malformed fallthrough; unsafe scoping unenforced; probe blocks async worker; poll default 20ms) lane B in par-b at 5cace28 -> deepseek `care-1-a-9e393929`. This is the LAST fix round for this package unless the gate/readback shows a real regression.
 USER (chat): agy-medium limits reset, move back. T1-G7a-fix4 deepseek `care-1-a-9e393929` -> agy-medium `care-1-a-1e35d2d3` (par-b, resumed from tree); T1-G14-fix deepseek `care-1-a-b83ff30a` -> agy-medium `care-1-a-3710982a` (par-c, resumed from tree). Switch is a model move, not a failure.
 T1-G7a-fix4 integrated as 8fba009 BUT my independent gate FAILED: the new D8 check counts the doc comment at process.rs:8 as a second allow(unsafe_code) (count 2 != 1) although the author reported gate OK (false self-report; lesson: only the orchestrator's detached gate counts). T1-G7a-fix5 (tiny: exclude comment lines + selftest with fixture trees) lane B in par-b at 8fba009 -> agy-medium `care-1-a-c524c9d2`.
@@ -278,7 +278,7 @@ INCIDENT (2026-10-24 ~16:30): load average ~190 from 4,693 live `in_process --re
 Gate OK for 7164086 (T1-G14-fix + T1-G7a-fix5 integrated): LD-3 fixes accepted (T-40 back to PARTIAL), D8 check fixed. The ae2e6b6 failure of inv_26_transport_parity_polluted_host_env was load-induced (load avg ~190 from the reaper-probe recursion; passes 3/3 directly). Until G7a-fix6 lands, the detached gate worktrees' `examples/in_process` binaries are renamed to *.disabled after each build (the recursion root) and a quiet watchdog (threshold 150, exact PIDs, own paths only) is armed. LESSON: tests that can spawn processes must count descendants; only the orchestrator's own detached gate result counts.
 
 === TURN 1 COMPLETE (2026-10-24) ===
-Gate OK for e426b22 (T1-G7a-fix6 integrated; post-gate leftover example/reaper processes: 0; load avg 9.8). The reaper probe recursion is fixed (registration-only reaper, CLAUDE_ACP_REAPER_GUARD, five process-count tests). Branch head e426b22 + bookkeeping. FEATURES: DONE 432, PARTIAL 166, MISSING 316 (start of the 5-turn plan: DONE 269 / PARTIAL 241 / MISSING 403 at the first counted commit; before that 317/176/449 raw audit counts were against a 942-row draft). 28 integrated groups, each with a polluted detached gate run by the orchestrator; Opus reviews found real defects in LD-3, G2c, G7a (4 rounds), G10a, which were fixed. Remaining T1-package rows (22 in progress-G16.md) all have later owners. Next: Turn 2 (hazard turn: turn machine / settle path, one package per group, fresh Opus on every group).
+Gate OK for e426b22 (T1-G7a-fix6 integrated; post-gate leftover example/reaper processes: 0; load avg 9.8). The reaper probe recursion is fixed (registration-only reaper, CLAUDE_ACP_REAPER_GUARD, five process-count tests). Branch head e426b22 + bookkeeping. FEATURES: DONE 432, PARTIAL 166, MISSING 316 (start of the 5-turn plan: DONE 269 / PARTIAL 241 / MISSING 403 at the first counted commit; before that 317/176/449 raw audit counts were against a 942-row draft). 28 integrated groups, each with a polluted detached gate run by the orchestrator; Opus reviews found real defects in LD-3, G2c, G7a (4 rounds), G10a, which were fixed. Remaining T1-package rows (22 in progress-G16.md, removed in the T9 closeout) all have later owners. Next: Turn 2 (hazard turn: turn machine / settle path, one package per group, fresh Opus on every group).
 Operational rules learned in T1: (1) only the orchestrator's own detached gate counts; sessions' self-reports were wrong twice; (2) tests that spawn processes must count descendants and leave none; (3) run detached gates from a non-UUID path without CARGO_TARGET_DIR; (4) one fresh session per group; (5) agy-medium is ~5x faster than deepseek but has a quota (~2h reset); (6) watchdog kills only exact PIDs under my own paths.
 TURN 2 started. T2-G1 (AG-2 sessionFailure + AIR failure policy; may edit turn.rs/unfinished.rs for the Failed.usage field and mechanical test updates; --lib turn before/after; STOP rules) in par-c at dbb6432 -> agy-medium `care-1-a-46f1f727` (tmux). Hazard sequence is strictly one package at a time; fresh Opus review of every group before acceptance.
 
@@ -381,3 +381,146 @@ TURN 7 carry-over (audit): still open, carried to the next fix round.
 - Model log: lanes A, B, C, D, integration, auditor and fix round 1 all ran on DeepSeek vst subagents. Lane C and D were first started on agy-medium and stopped by agy quota exhaustion, then re-run on DeepSeek. From the user's usage-limit instruction onward: one DeepSeek subagent at a time, no Claude or Opus reviewers.
 - Counts after T7: FEATURES 887 rows (870 DONE per the integration, N-35 re-assessed DONE in fix round 1), TEST-MAP unclassified 1112.
 - Next: T8 and T9 (TEST-MAP classification, then --forbid-unclassified flip and PROGRAMS-AUDIT), T10 FINAL-AUDIT.
+
+## TURN 8 COMPLETE (TEST-MAP classification, part 1)
+
+- Packages T8A (acp-agent.test.ts first half, 0ad24ff), T8B (second half, ddd17e7), T8C (tools/permission-options/authorization, de9ced7), T8D (session-index/create-session-options, e0ccac7). T8A/T8B ran sequentially in this worktree; T8C and T8D ran in the detached worktree par-t8c (two lanes at once after the user raised the cap to two). Gap lists: porting/parity/T8-gaps-T8{A,B,C,D}.md (rows kept missing:<id> with a FEATURES/MISSING.md ticket) - fixed in the T9 G1/G2 packages; the scratch files were removed in the T9 closeout.
+- TEST-MAP unclassified: 1112 -> 413. FEATURES header recounted from the table: 920 rows, DONE 891, PARTIAL 24, MISSING 5 (older headers undercounted rows added by lanes B/C/D).
+- Model log: every package ran on DeepSeek vst subagents; at most two at a time (disjoint sets, own build dirs); no Claude/Opus agents. Integration conflicts (FEATURES C-24 note, header, MISSING.md) resolved by the orchestrator.
+
+## TURN 9 COMPLETE (2026-10-28)
+
+T9 closed the classification programme and the gate flip. Branch head after this
+commit: `feat/rust-port` on top of a8802c1 (G3/INTG3) + the closeout commit.
+No push, tag or squash was performed.
+
+### Packages (all DeepSeek vst subagents; at most two lanes at once)
+
+| Package | Scope | Commit(s) |
+|---|---|---|
+| T9A | TEST-MAP classification set 4: the 190 rows of acp-v2 / native-subagents / async-tasks / tool-call-contract / resumed-session / clear-context-coordinator / session-load / event-loop-yield. Ported 166, covered 0, different 8; the 16 genuinely absent behaviours went to `T9-gaps-T9A.md` (C-24, M-131, B-113, B-74). | 3f445f4 |
+| T9B | Classification set 5: the 223 remaining rows (acp-scenarios, auth-status, model-resolution, providers, incomplete-tools, folded-prompt, session-*, live-capability, next-preview-version). Ported 156, covered 1, different 66, missing 0; no gap file. | abd9f2b |
+| G1 | T8A/T8B gap fixes (43 PKG-DONE rows: T-09, U-101 replay, U-49, U-68, C-24 v2 cancelled, P-01, M-22, U-11); every product change mutation-checked. U-101 and C-24 stay PARTIAL with honest notes. | 4af3a32 (+ READY 5b4a2c4) |
+| G2 | T8C/T8D gap fixes + the 15 auth-status rows: C-24 closing report, M-130 v2 index negotiation, M-131 live-load marker, M-132 failed-start replay, M-133 OS-seeded sidecar names, O-168 excludeDynamicSections, O-169 user-hook merge. | ae5741f |
+| INTG1 | G1 cherry-pick integration onto G2; conflicts in `agent.rs`, FEATURES (one C-24 row), MISSING and TEST-MAP resolved with both intents; the G1 closing test moved to `session::send_closing`. | 3758c91 + 8eef6eb |
+| G3 | T9A gap fixes (16 rows): M-131 live-load replay marker, C-24 v2 replay diff strip + aborted/interrupted/cancelled statuses, B-113 close withdrawal, B-74/Q-06 Fast-mode restore on a fresh context. | a8802c1 (via INTG3) |
+| G4 | T9 reconciliation: all remaining `missing:<id>` rows except G3's acp-v2/clear-context set — F10 21, F25 18, F11 13, T-PORT 11, B-113 6, F34/F21/F14 6 (75 rows: 68 ported, 7 different). | 7eec559, 32481eb, f0eff50, 86bc9f5, 2f2608b, 3e3fbf2, 48c5e14, 6a87e86, 4689c57 |
+| INTG3 | G3 cherry-pick integration onto G2+G4; conflicts in `agent.rs` (one shared `loadReplayEnd` send), FEATURES (one row per ID, header recomputed), MISSING and TEST-MAP resolved; G3's closing test uses `send_closing`. | a8802c1 |
+
+### Counts (recomputed from the files, not copied)
+
+- **TEST-MAP**: 2,400 rows — `ported:` 2,087, `covered:` 129, `different:` 184,
+  `missing:` 0, `T-UNCLASSIFIED` 0; unmapped 0, stale 0, broken targets 0,
+  bad syntax 0. `test-map-check --map --forbid-unclassified` PASS (snapshot and
+  real-export halves), and `gate-parity.sh` PASS.
+- **FEATURES**: 920 rows (91 module rows), **DONE 905, PARTIAL 15, MISSING 0**.
+  Per-section recount from the table cells matches header lines 8-9:
+  1 M 106 · 2 U 97 · 3 C 40 · 4 O 141 · 5 S 23 · 6 A 27 / R 9 / N 74 / B 122 ·
+  7 T 104 / P 62 · 8 V 21 · 9 Q 91 · 10 D 3.
+- **MODULE-MAP**: 107 rows — 1:1 55, merged 31, split 19, different 2,
+  `missing:` 0, `not ported:` 0; unmapped 0, stale 0, bad relationship 0,
+  bad rust path 0. `module-map-check --map` PASS.
+
+### Gate flip (Decision 7)
+
+- `rust/scripts/parity/gate-parity.sh` now sets `FORBID="--forbid-unclassified"`,
+  so both its snapshot half and its real-export half run
+  `test-map-check --map --forbid-unclassified`; `rust/scripts/rust-gate.sh`
+  (the canonical gate) inherits it through the `==> parity maps` stage.
+- Negative check (reverted): one TEST-MAP row was temporarily rewritten to
+  `missing:T-UNCLASSIFIED` (with a temporary MISSING.md ticket) — without the
+  flag the run warns and PASSes; with the flag it prints
+  `UNCLASSIFIED ... (forbidden at this stage)` and exits 1. The real file was
+  not modified.
+- The checker has no `--forbid-missing` mode (`missing:` rows only warn), so no
+  such flag was enabled; MISSING.md is empty because both maps carry zero
+  `missing:` rows.
+- CI note: this fork has no Rust CI workflow, and `.github/workflows/` is
+  upstream-owned (guard G7), so the flip lives in the one canonical gate
+  entrypoint (`rust-gate.sh` -> `gate-parity.sh`) that any CI job would run;
+  `.github/` was not edited.
+- `tests/parity_maps.rs`: `inv_71` now runs `test-map-check --map
+  --forbid-unclassified`; `inv_74` rewrites a plain explicit row (the old
+  `missing:` seed it relied on no longer exists).
+
+### MISSING.md
+
+- Pruned to an empty table (header + status note). Every ticket whose row left
+  `missing:` was removed by the package that ported it: T9A/T9B classification
+  and G1..G4 (F10, F25, F11, T-PORT, B-113, F14, F21, F34, C-24 v2 statuses,
+  B-74, M-131, M-130..M-133, O-168, O-169). Reality check: TEST-MAP `missing:`
+  0, MODULE-MAP `missing:`/`not ported:` 0, FEATURES MISSING 0; both checkers
+  PASS with the empty file.
+
+### Housekeeping
+
+- `git rm` of 52 tracked scratch files: 46 `progress-*.md`, `turn-1-progress.md`,
+  `T8-gaps-T8{A,B,C,D}.md`, `T9-gaps-T9A.md`. Their content is folded into
+  FEATURES/TEST-MAP/STATUS (package rows above).
+- `audit-T7.md` kept. Grep confirmed no script under `rust/scripts/`,
+  `porting/*.sh` or the READMEs referenced any deleted file; the historical
+  STATUS and plan prose references were annotated as removed.
+- `progress-T9CLOSE.md` is left untracked (not committed), per the order.
+
+### Remaining PARTIAL FEATURES rows (15, each with a written reason and `[pkg:]`)
+
+| Row | Reason |
+|---|---|
+| M-118 | v2 untagged extension-method drop is wired and unit-tested, but no production path emits an untagged extension method, so the drop cannot be observed e2e `[pkg:F38b]` |
+| U-75 | the forwarder's failed-write rollback is not tied to the failing call, so a late report can undo a later call's records `[pkg:U-75]` |
+| U-86 | v2 subagent state validation and the child `state_update` mirror are live but only unit-covered (`t6g_a_replayed_subagent_state_goes_out_after_the_replay`); no e2e scenario drives a subagent on a v2 connection `[pkg:F36]` |
+| U-101 | AIR inline-sidechain replay, legacy text filtering and parent stamping are ported/tested; the AIR replay does not read a child's persisted transcript file into the `:replay-subagent:` child `[pkg:G1]` |
+| C-01 | everything but `agentInfo.version` matches; the composed version string is the deliberate D7 divergence awaiting the user's decision `[pkg:F2b]` |
+| C-24 | v2 cancelled statuses, closing reports and the v2 replay diff strip are done; a streamed live Edit/Write still builds a v1 diff in `tools.rs`, which v2 cannot take `[pkg:F38b] [pkg:G3]` |
+| O-01 | `--version/-v/-V` print only the version; only the D7 composed string differs `[pkg:F2b]` |
+| O-60 | watcher, 100 ms debounce, `onChange` and `setCwd` are verified (incl. paused time); an active session still reads settings via `settings::load` on a model switch instead of `SettingsManager::getSettings` `[pkg:F5a]` |
+| B-07 | `closeCycleToolCalls` exists and is wired on `CycleEnded`; no test exercises the close of an open tool call at a cycle end `[pkg:F16c]` |
+| B-114 | a held turn's result and its follow-up running->idle cycle are unit-covered; no e2e scenario drives a cycle Claude Code starts on its own `[pkg:F16c]` |
+| T-44 | v1/AIR diffPatch is done; the v2 PostToolUse branch and the v2 no-input-diff rule are not wired because the crate renders v1 and translates to v2 afterwards `[pkg:F9]` |
+| V-12 | Windows liveness fails open: `OpenProcess`/`GetExitCodeProcess` need a `windows-sys` feature and a `Cargo.toml` edit, awaiting user decision D11 `[pkg:F26b]` |
+| Q-59 | module behaviours complete except the session-side live consumption (O-60) and the auth-probe context (O-67) `[pkg:F5a]` |
+| Q-72 | Write/Edit facts, NotebookEdit AIR rendering, created-file diff and the PreToolUse preview hook are done; the `capabilities.v2` branches are not wired because the crate serves v1 tool calls and translates v2 afterwards `[pkg:F9]` |
+| D-03 | initialize golden and loud schema check done; `capture.sh --v2` accepts only the initialize name, so no second/third v2 scenario golden can be captured hermetically `[pkg:INFRA-2]` |
+
+### Model log
+
+- Every T9 package (T9A, T9B, G1, G2, G3, G4, INTG1, INTG3) ran on **DeepSeek**
+  vst subagents; at most two lanes at once, in disjoint sets with their own
+  build dirs. T9A/T9B ran sequentially in this worktree; G1/G3 ran in the
+  detached worktree `par-t8c`, G2/G4 in this worktree, and the two INTG packages
+  integrated here. No Claude, agy or Opus agents were used in T9 (the user's
+  recipe for this turn).
+- Session ids were not preserved in the tracked scratch files (the `progress-*`
+  files are removed above); the package-to-commit map is the audit trail.
+
+### Carry-over from the T7 audit (still open, unchanged)
+
+- **M4** — B-17's evidence still does not prove the actor wiring: `t7a_b17`
+  drains through a local `drain()` that calls the yielder itself, and
+  `t7a_b63` passes with the yielder removed because `run_loop`'s `select!` is
+  `biased` with commands first; only the standalone yielder test fails without
+  the pause.
+- **M6** — a cancel during the v1/v2 file-change report preview still delays the
+  prompt response up to the 2 s preview timeout (`cancel_collecting` flags and
+  publishes; the deferred task still awaits `run_report` before replying).
+- **M7** — held v2 emissions can still be overtaken: `settle_events` takes
+  `map_state.v2.take_out()` and emits the idle from a spawned task, so the actor
+  can process the next prompt/stream frame and emit its `user_message` before
+  the previous turn's `idle`.
+- **L10** — `TrackedToolCall::record_meta` still compares `Value::to_string()`
+  where Node uses `JSON.stringify`; integral floats (`1.0` vs `1`) differ, so a
+  repeated meta can emit a spurious update.
+- **L13** — two deferred v1 report tasks in one batch still run concurrently
+  and release their stale ack early, so responses can leave in
+  report-completion order rather than settle order (Node awaits the reports
+  sequentially in `settleActive`).
+
+### Checks (this closeout)
+
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -D warnings` clean.
+- `cargo build --workspace` clean.
+- `test-map-check --map --forbid-unclassified` PASS; `module-map-check --map`
+  PASS (CARGO_TARGET_DIR=/private/tmp/claude-501/par-t9c-target).
+- The full `rust-gate.sh` was deliberately NOT run by this package; the
+  orchestrator runs it.

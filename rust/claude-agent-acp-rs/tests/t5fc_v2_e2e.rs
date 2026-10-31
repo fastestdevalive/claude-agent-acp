@@ -138,3 +138,52 @@ async fn t5fc_v2_initialize_matches_golden_then_later_requests_are_method_not_fo
         "a v2 connection must not receive v1 session updates: {notifications:?}"
     );
 }
+
+/// G4 / B-113 — `turn-events.test.ts` > "rejects a prompt that it refuses before
+/// starting a turn, and reports nothing": a v2 `session/prompt` for a session
+/// the registry does not hold is the internal error "Session not found", and no
+/// turn event is reported.
+#[tokio::test]
+async fn g4_b113_v2_prompt_rejects_an_unknown_session() {
+    let (send, _recv) = golden_frames();
+    let golden_params = send["params"].clone();
+    let (agent_channel, client_channel) = Channel::duplex();
+    let serve_task = tokio::spawn(async move { serve(agent_channel, v2_options()).await });
+
+    let result = timeout(
+        Duration::from_secs(30),
+        Client.builder().connect_with(
+            client_channel,
+            move |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(UntypedMessage::new("initialize", golden_params)?)
+                    .block_task()
+                    .await?;
+                let err = connection
+                    .send_request(UntypedMessage::new(
+                        "session/prompt",
+                        serde_json::json!({
+                            "sessionId": "no-such-session",
+                            "prompt": [{ "type": "text", "text": "hello" }],
+                        }),
+                    )?)
+                    .block_task()
+                    .await
+                    .expect_err("an unknown session is refused before a turn starts");
+                assert_eq!(i32::from(err.code), -32603, "{err:?}");
+                assert!(
+                    serde_json::to_string(&err)
+                        .unwrap()
+                        .contains("Session not found"),
+                    "{err:?}"
+                );
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+        ),
+    )
+    .await;
+    result
+        .expect("the v2 prompt drive finished in time")
+        .expect("the v2 prompt drive succeeded");
+    let _ = timeout(Duration::from_secs(10), serve_task).await;
+}

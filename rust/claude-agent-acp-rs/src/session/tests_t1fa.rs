@@ -202,18 +202,40 @@ struct LoopRig {
     tx: mpsc::UnboundedSender<Command>,
     stream_tx: Option<mpsc::UnboundedSender<Value>>,
     update_rx: mpsc::UnboundedReceiver<SessionOutbound>,
+    written: mpsc::UnboundedReceiver<String>,
     actor: tokio::task::JoinHandle<()>,
-    _writer: tokio::io::DuplexStream,
 }
 
 impl LoopRig {
     fn spawn() -> Self {
+        Self::spawn_with(None, crate::client_caps::ClientCapabilities::default())
+    }
+
+    fn spawn_with(air: Option<AirClient>, caps: crate::client_caps::ClientCapabilities) -> Self {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
         let control = Control::spawn(a, control_in_rx, ControlOptions { on_request: None });
         let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        let (written_tx, written) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            let _ = written_tx.send(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        });
         let actor = tokio::spawn(run_loop(
             commands,
             tx.clone(),
@@ -224,8 +246,8 @@ impl LoopRig {
             Duration::from_secs(30),
             "s1".into(),
             Arc::new(AtomicUsize::new(0)),
-            None,
-            crate::client_caps::ClientCapabilities::default(),
+            air,
+            caps,
             std::env::temp_dir(),
             false,
             false,
@@ -238,8 +260,23 @@ impl LoopRig {
             tx,
             stream_tx: Some(stream_tx),
             update_rx,
+            written,
             actor,
-            _writer: b,
+        }
+    }
+
+    /// The next user frame the actor wrote to the child (an injected steer or a
+    /// prompt), parsed.
+    async fn next_written_user(&mut self) -> Value {
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(10), self.written.recv())
+                .await
+                .expect("the actor writes a user frame")
+                .expect("the stdin reader is alive");
+            let value: Value = serde_json::from_str(&line).expect("a JSON line");
+            if value.get("type").and_then(Value::as_str) == Some("user") {
+                return value;
+            }
         }
     }
 
@@ -312,6 +349,316 @@ async fn t1fa_permission_in_the_close_window_is_withdrawn() {
         "a dialog opened in the close window outlives the session"
     );
     let _ = tokio::time::timeout(Duration::from_secs(10), &mut rig.actor).await;
+}
+
+// ---------------------------------------------------------------- T8A eager permission tool calls
+
+impl LoopRig {
+    /// Send a `can_use_tool` control request through the actor.
+    fn permission_frame(&self, frame: Value) {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Permission {
+                frame,
+                reply: reply_tx,
+            })
+            .unwrap();
+    }
+
+    /// The next `session/request_permission`, with the updates the actor sent
+    /// before it.
+    async fn next_request_after(&mut self) -> (Vec<Value>, oneshot::Sender<Result<Value, String>>) {
+        let mut updates = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), self.update_rx.recv())
+                .await
+                .expect("an outbound arrives")
+            {
+                Some(SessionOutbound::RequestPermission { reply, .. }) => {
+                    return (updates, reply);
+                }
+                Some(SessionOutbound::Update(notif)) => {
+                    let mut value = serde_json::to_value(&notif.update).unwrap();
+                    crate::map::materialize_tool_call_defaults(&mut value);
+                    crate::map::materialize_diff_old_text(&mut value);
+                    updates.push(value);
+                }
+                Some(SessionOutbound::RawUpdate(value)) => {
+                    updates.push(value["update"].clone());
+                }
+                Some(_) => {}
+                None => panic!("the update channel closed"),
+            }
+        }
+    }
+}
+
+fn can_use_tool(tool: &str, input: Value, id: &str, extra: Value) -> Value {
+    let mut request = json!({
+        "subtype": "can_use_tool",
+        "tool_name": tool,
+        "input": input,
+        "tool_use_id": id,
+        "permission_suggestions": [],
+    });
+    if let Value::Object(extra) = extra {
+        for (key, value) in extra {
+            request[key] = value;
+        }
+    }
+    json!({"type": "control_request", "request_id": format!("req-{id}"), "request": request})
+}
+
+fn air_client() -> AirClient {
+    AirClient::from_client_capabilities(&json!({
+        "_meta": {"jetbrains": {"air": {"version": 1}}}
+    }))
+    .expect("an AIR client")
+}
+
+/// T8A — the eager `tool_call` of an AIR session precedes the permission request
+/// and carries the command title.
+#[tokio::test]
+async fn t8a_eager_tool_call_precedes_the_permission_request() {
+    let mut rig = LoopRig::spawn_with(Some(air_client()), Default::default());
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "git diff", "description": "Show current diff"}),
+        "tool-1",
+        json!({"decision_reason": "This action requires interactive safety approval."}),
+    ));
+    let (updates, reply) = rig.next_request_after().await;
+    assert_eq!(
+        updates.len(),
+        1,
+        "only the tool_call precedes it: {updates:?}"
+    );
+    assert_eq!(updates[0]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[0]["toolCallId"], "tool-1");
+    assert_eq!(updates[0]["status"], "pending");
+    assert_eq!(updates[0]["title"], "git diff");
+    assert_eq!(updates[0]["_meta"]["claudeCode"]["toolName"], "Bash");
+    assert_eq!(
+        updates[0]["_meta"]["jetbrains"]["air"]["commandTitle"],
+        "Show current diff"
+    );
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+/// T8A — PowerShell's eager call carries its description like Bash.
+#[tokio::test]
+async fn t8a_eager_powershell_carries_its_command_title() {
+    let mut rig = LoopRig::spawn_with(Some(air_client()), Default::default());
+    rig.permission_frame(can_use_tool(
+        "PowerShell",
+        json!({"command": "Get-ChildItem", "description": "List files"}),
+        "tool-1",
+        json!({}),
+    ));
+    let (updates, reply) = rig.next_request_after().await;
+    assert_eq!(updates[0]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[0]["toolCallId"], "tool-1");
+    assert_eq!(updates[0]["title"], "Get-ChildItem");
+    assert_eq!(updates[0]["_meta"]["claudeCode"]["toolName"], "PowerShell");
+    assert_eq!(
+        updates[0]["_meta"]["jetbrains"]["air"]["commandTitle"],
+        "List files"
+    );
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+/// T8A — a tool call the eager path already surfaced is not emitted again.
+#[tokio::test]
+async fn t8a_eager_call_is_not_reemitted() {
+    let mut rig = LoopRig::spawn_with(Some(air_client()), Default::default());
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "ls"}),
+        "tool-1",
+        json!({}),
+    ));
+    let (first, reply) = rig.next_request_after().await;
+    assert_eq!(first[0]["sessionUpdate"], "tool_call");
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "ls"}),
+        "tool-1",
+        json!({}),
+    ));
+    let (second, reply) = rig.next_request_after().await;
+    assert!(
+        second
+            .iter()
+            .all(|u| u["sessionUpdate"] != "tool_call" && u["sessionUpdate"] != "tool_call_update"),
+        "no duplicate call: {second:?}"
+    );
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+/// T8A — a plan-rendered TodoWrite still surfaces a `tool_call` before its
+/// permission request (issue #851).
+#[tokio::test]
+async fn t8a_eager_todowrite_call_precedes_the_permission_request() {
+    let mut rig = LoopRig::spawn();
+    rig.permission_frame(can_use_tool(
+        "TodoWrite",
+        json!({"todos": [{"content": "x", "status": "pending"}]}),
+        "todo-1",
+        json!({}),
+    ));
+    let (updates, reply) = rig.next_request_after().await;
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(updates[0]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[0]["toolCallId"], "todo-1");
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+/// T8A — a terminal-capable client's eager Bash call carries
+/// `_meta.terminal_info` so the later terminal output can attach.
+#[tokio::test]
+async fn t8a_eager_bash_call_carries_terminal_info() {
+    let caps = crate::client_caps::ClientCapabilities {
+        terminal_output: true,
+        ..Default::default()
+    };
+    let mut rig = LoopRig::spawn_with(None, caps);
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "ls"}),
+        "tool-1",
+        json!({}),
+    ));
+    let (updates, reply) = rig.next_request_after().await;
+    assert_eq!(updates[0]["sessionUpdate"], "tool_call");
+    assert_eq!(updates[0]["toolCallId"], "tool-1");
+    assert_eq!(
+        updates[0]["_meta"]["terminal_info"],
+        json!({"terminal_id": "tool-1"})
+    );
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+impl LoopRig {
+    /// The next `session/request_permission` params, with its reply sender.
+    async fn next_request_params(&mut self) -> (Value, oneshot::Sender<Result<Value, String>>) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), self.update_rx.recv())
+                .await
+                .expect("an outbound arrives")
+            {
+                Some(SessionOutbound::RequestPermission { reply, params }) => {
+                    return (params, reply);
+                }
+                Some(_) => {}
+                None => panic!("the update channel closed"),
+            }
+        }
+    }
+}
+
+/// T8A — an ask that carries a `decision_reason` is still presented to the
+/// client (the CLI's bypass evaluation never bypasses a forced ask).
+#[tokio::test]
+async fn t8a_an_ask_with_a_decision_reason_prompts() {
+    let mut rig = LoopRig::spawn();
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "ls"}),
+        "tool-1",
+        json!({"decision_reason": "This action requires interactive safety approval."}),
+    ));
+    let (params, reply) = rig.next_request_params().await;
+    assert_eq!(params["sessionId"], "s1");
+    assert_eq!(params["toolCall"]["toolCallId"], "tool-1");
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+/// T8A — an ask forced by a `matchedAskRule` still prompts the client.
+#[tokio::test]
+async fn t8a_a_matched_ask_rule_prompts() {
+    let mut rig = LoopRig::spawn();
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "terraform destroy"}),
+        "tool-1",
+        json!({"matched_ask_rule": {
+            "source": "projectSettings",
+            "toolName": "Bash",
+            "ruleContent": "Bash(terraform:*)",
+        }}),
+    ));
+    let (params, reply) = rig.next_request_params().await;
+    assert_eq!(params["toolCall"]["toolCallId"], "tool-1");
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+/// T8A — a suppressed persistent rule offers no always-allow option, and the
+/// AIR meta names the command.
+#[tokio::test]
+async fn t8a_a_suppressed_persistent_rule_offers_no_always_allow() {
+    let mut rig = LoopRig::spawn_with(Some(air_client()), Default::default());
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "rm -rf build"}),
+        "tool-1",
+        json!({
+            "suppress_always_allow_rule": true,
+            "permission_suggestions": [{
+                "type": "addRules",
+                "rules": [{"toolName": "Bash", "ruleContent": "rm:*"}],
+                "behavior": "allow",
+                "destination": "localSettings",
+            }],
+        }),
+    ));
+    let (params, reply) = rig.next_request_params().await;
+    let ids: Vec<&str> = params["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|option| option["optionId"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["allow-once", "reject"]);
+    assert_eq!(
+        params["_meta"]["jetbrains"]["air"]["permission"],
+        json!({"version": 1, "title": "rm -rf build"})
+    );
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "allow-once"})));
+}
+
+/// T8A — `defaultToNo` leads with the reject option and rides the AIR meta.
+#[tokio::test]
+async fn t8a_default_to_no_leads_with_reject_and_forwards_the_hint() {
+    let mut rig = LoopRig::spawn_with(Some(air_client()), Default::default());
+    rig.permission_frame(can_use_tool(
+        "Bash",
+        json!({"command": "rm -rf build"}),
+        "tool-1",
+        json!({
+            "default_to_no": true,
+            "permission_suggestions": [{
+                "type": "addRules",
+                "rules": [{"toolName": "Bash", "ruleContent": "rm:*"}],
+                "behavior": "allow",
+                "destination": "localSettings",
+            }],
+        }),
+    ));
+    let (params, reply) = rig.next_request_params().await;
+    let kinds: Vec<&str> = params["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|option| option["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, vec!["reject_once", "allow_once", "allow_always"]);
+    assert_eq!(
+        params["_meta"]["jetbrains"]["air"]["permission"],
+        json!({"version": 1, "title": "rm -rf build", "defaultToNo": true})
+    );
+    let _ = reply.send(Ok(json!({"outcome": "selected", "optionId": "reject"})));
 }
 
 // ---------------------------------------------------------------- finding 8
@@ -616,4 +963,186 @@ async fn t1fa_eof_keeps_a_result_held_behind_a_mcp_run() {
     assert_eq!(reply.stop_reason, "max_tokens");
     let usage = reply.usage.expect("usage");
     assert_eq!((usage.input_tokens, usage.output_tokens), (11, 7));
+}
+
+// ---------------------------------------------------------------- G4 / T-PORT
+
+fn steer_frame(text: &str) -> Value {
+    json!({"type":"user","message":{"role":"user",
+        "content":[{"type":"text","text":text}]}})
+}
+
+fn permission_frame(tool_use_id: &str, request_id: &str, input: Value) -> Value {
+    json!({"type":"control_request","request_id":request_id,
+        "request":{"subtype":"can_use_tool","tool_name":"Bash","input":input,
+        "tool_use_id":tool_use_id,"permission_suggestions":[]}})
+}
+
+/// `acp-agent.test.ts` > "keeps concurrent permission requests independent even
+/// for the same tool call": two requests for one tool_use_id each carry their
+/// own input and settle independently.
+#[tokio::test]
+async fn g4_tport_concurrent_permission_requests_stay_independent() {
+    let mut rig = LoopRig::spawn();
+    for (request_id, command) in [("req-one", "one"), ("req-two", "two")] {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        // Keep the receiver alive so the round trip is not seen as withdrawn.
+        std::mem::forget(reply_rx);
+        rig.tx
+            .send(Command::Permission {
+                frame: permission_frame("tool-shared", request_id, json!({"command": command})),
+                reply: reply_tx,
+            })
+            .unwrap();
+    }
+    let mut raw_inputs = Vec::new();
+    while raw_inputs.len() < 2 {
+        match tokio::time::timeout(Duration::from_secs(10), rig.update_rx.recv())
+            .await
+            .expect("both permission requests reach the client")
+        {
+            Some(SessionOutbound::RequestPermission { params, reply }) => {
+                raw_inputs.push(params["toolCall"]["rawInput"].clone());
+                let _ = reply.send(Ok(json!({
+                    "outcome": {"outcome": "selected", "optionId": "allow-once"}
+                })));
+            }
+            Some(_) => {}
+            None => panic!("the update channel closed"),
+        }
+    }
+    assert_eq!(
+        raw_inputs,
+        vec![json!({"command": "one"}), json!({"command": "two"})]
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(10), &mut rig.actor).await;
+}
+
+/// `acp-agent.test.ts` > "lets the host retry promptRequired content through
+/// session/prompt exactly once": the idle steer consumes nothing (no push, no
+/// turn), so the same content starts one normal turn through `session/prompt`.
+#[tokio::test]
+async fn g4_tport_prompt_required_content_is_retried_once_through_prompt() {
+    let mut rig = LoopRig::spawn();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rig.tx
+        .send(Command::Steer {
+            uuid: "steer-1".into(),
+            frame: steer_frame("late follow-up"),
+            is_local_only: false,
+            is_prompt_required: true,
+            reply: reply_tx,
+        })
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), reply_rx)
+        .await
+        .expect("the steer replies")
+        .expect("the actor replies");
+    assert_eq!(
+        outcome,
+        json!({"outcome": "promptRequired", "reason": "noRunningTurn"})
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rig.written.recv())
+            .await
+            .is_err(),
+        "the idle steer pushes nothing"
+    );
+
+    let (preply, _prx) = oneshot::channel();
+    std::mem::forget(_prx);
+    rig.tx
+        .send(Command::Prompt {
+            uuid: "p2".into(),
+            frame: steer_frame("late follow-up"),
+            is_local_only: false,
+            prompt_text: "late follow-up".into(),
+            reply: preply,
+        })
+        .unwrap();
+    let written = rig.next_written_user().await;
+    assert!(
+        written.get("priority").is_none(),
+        "a normal prompt carries no priority: {written}"
+    );
+    assert!(
+        serde_json::to_string(&written["message"]["content"])
+            .unwrap()
+            .contains("late follow-up"),
+        "{written}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(10), &mut rig.actor).await;
+}
+
+/// `acp-agent.test.ts` > "uses priority:'now' again once $name is withdrawn,
+/// though its client never settles it": while a client round trip is open a
+/// steer uses `later`; once the CLI withdraws it the next steer uses `now` again.
+#[tokio::test]
+async fn g4_tport_steer_uses_now_again_after_the_request_is_withdrawn() {
+    let mut rig = LoopRig::spawn();
+    let (preply, prx) = oneshot::channel();
+    std::mem::forget(prx);
+    rig.tx
+        .send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: steer_frame("start"),
+            is_local_only: false,
+            prompt_text: "start".into(),
+            reply: preply,
+        })
+        .unwrap();
+    let _ = rig.next_written_user().await;
+
+    let (perm_reply, perm_rx) = oneshot::channel();
+    std::mem::forget(perm_rx);
+    rig.tx
+        .send(Command::Permission {
+            frame: permission_frame("toolu_perm", "req-toolu_perm", json!({"command": "ls"})),
+            reply: perm_reply,
+        })
+        .unwrap();
+    let mut client_reply = rig.next_request().await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rig.tx
+        .send(Command::Steer {
+            uuid: crate::agent::uuid_v4(),
+            frame: steer_frame("while open"),
+            is_local_only: false,
+            is_prompt_required: false,
+            reply: reply_tx,
+        })
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), reply_rx)
+        .await
+        .expect("the steer replies")
+        .expect("the actor replies");
+    assert_eq!(outcome, json!({"outcome": "injected"}));
+    assert_eq!(rig.next_written_user().await["priority"], json!("later"));
+
+    // The CLI withdraws the request; the client never settles it.
+    rig.tx
+        .send(Command::ElicitationWithdrawn {
+            request_id: "req-toolu_perm".into(),
+        })
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), client_reply.closed()).await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rig.tx
+        .send(Command::Steer {
+            uuid: crate::agent::uuid_v4(),
+            frame: steer_frame("after withdrawal"),
+            is_local_only: false,
+            is_prompt_required: false,
+            reply: reply_tx,
+        })
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), reply_rx)
+        .await
+        .expect("the steer replies")
+        .expect("the actor replies");
+    assert_eq!(outcome, json!({"outcome": "injected"}));
+    assert_eq!(rig.next_written_user().await["priority"], json!("now"));
+    let _ = tokio::time::timeout(Duration::from_secs(10), &mut rig.actor).await;
 }

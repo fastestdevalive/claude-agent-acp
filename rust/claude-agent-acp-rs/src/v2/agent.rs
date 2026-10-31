@@ -801,6 +801,27 @@ impl V2Outbound {
         notifications
     }
 
+    /// The report without its v1 diff content blocks. A replay keeps the
+    /// `content` key (as `[]`) so the v2 update still replaces the client's
+    /// content, like Node's replay for a v2 client.
+    fn strip_v1_diffs(report: &Value) -> Value {
+        let mut report = report.clone();
+        let Some(content) = report
+            .as_object_mut()
+            .and_then(|object| object.get_mut("content"))
+        else {
+            return report;
+        };
+        let Some(items) = content.as_array_mut() else {
+            return report;
+        };
+        items.retain(|item| {
+            !(item.get("type").and_then(Value::as_str) == Some("diff")
+                && !super::tool_call::is_v2_diff(item))
+        });
+        report
+    }
+
     /// The v2 updates of a v1 update: for a tool call report, its terminal
     /// updates first, then the report with the `_meta` keys it changes, and the
     /// `_meta` patch of a replayed start (`v2Updates`, `v2/agent.ts:305-336`).
@@ -827,6 +848,16 @@ impl V2Outbound {
         };
         let starts = report.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call");
         let replaying = self.replays.contains_key(session_id);
+        // C-24: a replay for a v2 client builds its tool calls without a v1
+        // diff (`WriteReporter.toolUse`: `inputDiff = capabilities.v2 ? false
+        // : …`, `reporters/file-edit.ts:35-50`). The v1 history still carries
+        // one, so the replay drops it before translating: a v2 client cannot
+        // take a v1 diff, and the call's content is `[]` like Node's.
+        let report = if replaying {
+            Self::strip_v1_diffs(&report)
+        } else {
+            report
+        };
         let reports = self
             .tool_call_meta
             .apply(session_id, &report, starts, replaying);

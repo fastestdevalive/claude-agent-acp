@@ -127,10 +127,14 @@ pub enum MetaPrompt {
     /// A non-empty string replaces the built-in preset entirely.
     Replace(String),
     /// An object is merged into the preset: `type`/`preset` are locked to
-    /// `preset`/`claude_code`, every other key (e.g. `append`) is forwarded.
+    /// `preset`/`claude_code`, every other key (e.g. `append`,
+    /// `excludeDynamicSections`) is forwarded.
     Preset {
         /// `append` (a string, when present).
         append: Option<String>,
+        /// `excludeDynamicSections` forwarded verbatim (O-168); `None` when
+        /// the key is absent.
+        exclude_dynamic_sections: Option<Value>,
     },
 }
 
@@ -144,9 +148,22 @@ pub fn meta_system_prompt(meta: Option<&Value>) -> Option<MetaPrompt> {
                 .get("append")
                 .and_then(Value::as_str)
                 .map(String::from),
+            exclude_dynamic_sections: object.get("excludeDynamicSections").cloned(),
         }),
         _ => None,
     }
+}
+
+/// The `initialize` control_request system-prompt fields.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SystemPromptFields {
+    /// A replacing prompt as `[text]` (the ACP `systemPrompt` override or the
+    /// legacy `_meta.systemPrompt` string).
+    pub system_prompt: Option<Value>,
+    /// The `appendSystemPrompt` of the `claude_code` preset.
+    pub append_system_prompt: Option<String>,
+    /// The preset's `excludeDynamicSections` (O-168), forwarded verbatim.
+    pub exclude_dynamic_sections: Option<Value>,
 }
 
 /// Resolve the `initialize` control_request system-prompt fields from a
@@ -157,22 +174,41 @@ pub fn meta_system_prompt(meta: Option<&Value>) -> Option<MetaPrompt> {
 /// 2. `_meta.systemPrompt` (string replaces, object merges);
 /// 3. the ACP `systemPrompt` field wins over the `_meta` extension.
 ///
-/// Returns `(systemPrompt, appendSystemPrompt)` in SDK initialize-request form:
-/// a replacing string becomes `[text]`; a preset contributes only `append`.
+/// Returns [`SystemPromptFields`] in SDK initialize-request form: a replacing
+/// string becomes `[text]`; a preset contributes `append` and forwards
+/// `excludeDynamicSections` (O-168).
 ///
 /// # Errors
 /// The ACP `systemPrompt` fails validation (unsupported mode / non-text block).
-pub fn initialize_fields(params: &Value) -> Result<(Option<Value>, Option<String>), Error> {
+pub fn initialize_fields(params: &Value) -> Result<SystemPromptFields, Error> {
     let client_prompt = client_system_prompt(params.get("systemPrompt"))?;
     let custom = air_custom_instructions(params.get("_meta"));
     // The spec's `systemPrompt` takes precedence over `_meta.systemPrompt`.
     if let Some(prompt) = client_prompt.as_ref() {
-        return Ok(sdk_initialize_fields(Some(prompt), custom.as_deref()));
+        let (system, append) = sdk_initialize_fields(Some(prompt), custom.as_deref());
+        return Ok(SystemPromptFields {
+            system_prompt: system,
+            append_system_prompt: append,
+            exclude_dynamic_sections: None,
+        });
     }
     Ok(match meta_system_prompt(params.get("_meta")) {
-        Some(MetaPrompt::Replace(text)) => (Some(json!([text])), None),
-        Some(MetaPrompt::Preset { append }) => (None, append),
-        None => (None, custom),
+        Some(MetaPrompt::Replace(text)) => SystemPromptFields {
+            system_prompt: Some(json!([text])),
+            ..SystemPromptFields::default()
+        },
+        Some(MetaPrompt::Preset {
+            append,
+            exclude_dynamic_sections,
+        }) => SystemPromptFields {
+            append_system_prompt: append,
+            exclude_dynamic_sections,
+            ..SystemPromptFields::default()
+        },
+        None => SystemPromptFields {
+            append_system_prompt: custom,
+            ..SystemPromptFields::default()
+        },
     })
 }
 
@@ -378,18 +414,27 @@ mod tests {
         let params = json!({"_meta": {"systemPrompt": "You are a pirate."}});
         assert_eq!(
             initialize_fields(&params).unwrap(),
-            (Some(json!(["You are a pirate."])), None)
+            SystemPromptFields {
+                system_prompt: Some(json!(["You are a pirate."])),
+                ..SystemPromptFields::default()
+            }
         );
 
         // Object merges into the preset (append forwarded; type/preset locked).
         let params = json!({"_meta": {"systemPrompt": {"append": "Extra.", "type": "custom"}}});
         assert_eq!(
             initialize_fields(&params).unwrap(),
-            (None, Some("Extra.".into()))
+            SystemPromptFields {
+                append_system_prompt: Some("Extra.".into()),
+                ..SystemPromptFields::default()
+            }
         );
         // An object without append contributes nothing (the preset stays).
         let params = json!({"_meta": {"systemPrompt": {}}});
-        assert_eq!(initialize_fields(&params).unwrap(), (None, None));
+        assert_eq!(
+            initialize_fields(&params).unwrap(),
+            SystemPromptFields::default()
+        );
 
         // Falsy / non-string / array values are ignored.
         for meta in [json!({"systemPrompt": ""}), json!({"systemPrompt": []})] {
@@ -403,7 +448,10 @@ mod tests {
         });
         assert_eq!(
             initialize_fields(&params).unwrap(),
-            (None, Some("AIR".into()))
+            SystemPromptFields {
+                append_system_prompt: Some("AIR".into()),
+                ..SystemPromptFields::default()
+            }
         );
 
         // ACP `systemPrompt` wins over `_meta.systemPrompt`.
@@ -414,7 +462,10 @@ mod tests {
         });
         assert_eq!(
             initialize_fields(&params).unwrap(),
-            (Some(json!(["ACP"])), None)
+            SystemPromptFields {
+                system_prompt: Some(json!(["ACP"])),
+                ..SystemPromptFields::default()
+            }
         );
         let params = json!({
             "systemPrompt": {"mode": "append",
@@ -423,7 +474,10 @@ mod tests {
         });
         assert_eq!(
             initialize_fields(&params).unwrap(),
-            (None, Some("ACP".into()))
+            SystemPromptFields {
+                append_system_prompt: Some("ACP".into()),
+                ..SystemPromptFields::default()
+            }
         );
     }
 }

@@ -74,10 +74,19 @@ fn inv_70_parity_selftests() {
 #[test]
 fn inv_71_parity_maps_pass_offline() {
     let scripts = scripts_dir();
-    for script in ["test-map-check", "module-map-check"] {
-        let (ok, text) = run(&scripts.join(script), &["--map"], &[]);
-        assert!(ok, "{script} --map failed:\n{text}");
-    }
+    // Decision 7 flip (T9 closeout): every TEST-MAP row is classified, so the
+    // checker runs with --forbid-unclassified, exactly like gate-parity.sh.
+    let (ok, text) = run(
+        &scripts.join("test-map-check"),
+        &["--map", "--forbid-unclassified"],
+        &[],
+    );
+    assert!(
+        ok,
+        "test-map-check --map --forbid-unclassified failed:\n{text}"
+    );
+    let (ok, text) = run(&scripts.join("module-map-check"), &["--map"], &[]);
+    assert!(ok, "module-map-check --map failed:\n{text}");
 
     // PARITY_FORCE_OFFLINE=1 makes fetch-upstream.sh exit 3 without touching
     // git, so the SKIP path is exercised deterministically (a warm
@@ -181,24 +190,28 @@ fn inv_74_broken_ported_target_fails() {
     let mut replaced = false;
     let mut lines = Vec::new();
     for line in text.lines() {
-        // Pick a plain per-case row (no .each/%s or loop-generated title) so
-        // the only fault is the broken ported: target.
+        // Pick a plain explicit per-case row (not a `*` default, no .each/%s or
+        // loop-generated title) so the only fault is the broken ported: target.
+        // Every row is classified since the T9 closeout, so any status works.
+        let title = line.split(" | ").nth(1).unwrap_or("");
         let plain = line.starts_with("src/")
-            && line.contains("missing:T-UNCLASSIFIED")
+            && !title.trim().ends_with('*')
             && !line.contains('%')
             && !line.contains("[dynamic");
         if !replaced && plain {
-            lines.push(line.replacen(
-                "missing:T-UNCLASSIFIED",
-                "ported:tests/agent.rs::no_such_fn",
-                1,
-            ));
-            replaced = true;
+            let mut fields: Vec<&str> = line.split(" | ").collect();
+            if fields.len() >= 3 {
+                fields[2] = "ported:tests/agent.rs::no_such_fn";
+                lines.push(fields.join(" | "));
+                replaced = true;
+            } else {
+                lines.push(line.to_string());
+            }
         } else {
             lines.push(line.to_string());
         }
     }
-    assert!(replaced, "TEST-MAP has no seed row to rewrite");
+    assert!(replaced, "TEST-MAP has no explicit data row to rewrite");
     fs::write(&map, lines.join("\n")).expect("write mutated map");
     fs::copy(&snap_src, &snap).expect("copy snapshot");
 

@@ -193,3 +193,19 @@ fn t3b_the_turn_guard_reports_the_account_first_and_fails_open() {
         2
     );
 }
+
+/// `authorization.test.ts` > "on every prompt" > "lets the turn through when
+/// the live account is not a subscription": the cached key account passes.
+#[test]
+fn t8c_a_key_account_passes_the_turn_guard() {
+    let mut state = GuardState::default();
+    let warn = |_message: &str| panic!("a readable key account must not warn");
+    let account = json!({ "apiKeySource": "ANTHROPIC_API_KEY" });
+    assert!(
+        refuse_claude_subscription_turn("s1", Some(&account), &mut state, &warn, |_| {}).is_none()
+    );
+    let bearer = json!({ "tokenSource": "ANTHROPIC_AUTH_TOKEN" });
+    assert!(
+        refuse_claude_subscription_turn("s1", Some(&bearer), &mut state, &warn, |_| {}).is_none()
+    );
+}

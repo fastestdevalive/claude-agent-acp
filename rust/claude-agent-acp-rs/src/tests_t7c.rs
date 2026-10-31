@@ -1112,3 +1112,405 @@ fn t7c_air_raw_input_carries_the_plan_file_path_instead_of_the_plan_text() {
     assert_eq!(state.raw_input("ExitPlanMode", &missing), missing);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// T9A — tool-call-contract.test.ts rows (report level, as upstream's `report`)
+// ---------------------------------------------------------------------------
+
+/// `tool-call-contract.test.ts` > Bash > "keeps the Zed terminal conventions for
+/// AIR": title, kind, terminal content, rawInput and the AIR/terminal `_meta`,
+/// then the output and the exit as separate updates.
+#[test]
+fn t9a_bash_keeps_the_zed_terminal_conventions_for_air() {
+    let input = json!({"command": "ls", "description": "List files"});
+    let report = report(
+        terminal_air(),
+        "Bash",
+        input.clone(),
+        Some((json!("a\nb"), false, None)),
+    );
+    assert_eq!(report.call["title"], "ls");
+    assert_eq!(report.call["kind"], "execute");
+    assert_eq!(
+        report.call["content"],
+        json!([{"type": "terminal", "terminalId": "t"}])
+    );
+    assert_eq!(report.call["rawInput"], input);
+    assert_eq!(
+        report.call["_meta"]["terminal_info"],
+        json!({"terminal_id": "t"})
+    );
+    assert_eq!(
+        report.call["_meta"]["jetbrains"]["air"],
+        json!({"version": 1, "commandTitle": "List files"})
+    );
+    assert_eq!(
+        report.updates[0]["_meta"]["terminal_output"],
+        json!({"terminal_id": "t", "data": "a\nb"})
+    );
+    assert_eq!(report.updates[1]["status"], "completed");
+    assert_eq!(
+        report.updates[1]["_meta"]["terminal_exit"],
+        json!({"terminal_id": "t", "exit_code": 0, "signal": null})
+    );
+}
+
+/// `tool-call-contract.test.ts` > Bash > "appends output deltas for AIR".
+#[test]
+fn t9a_bash_appends_output_deltas_for_air() {
+    let report = report(
+        air(),
+        "Bash",
+        json!({"command": "ls", "description": "List files"}),
+        Some((json!("a"), false, None)),
+    );
+    assert_eq!(
+        report.updates[0]["_meta"]["terminal_output_delta"],
+        json!({"terminal_id": "t", "data": "a"})
+    );
+}
+
+/// `tool-call-contract.test.ts` > "leaves the Grep text out for AIR only when
+/// the input names a path".
+#[test]
+fn t9a_grep_text_stays_out_for_air_only_with_a_path() {
+    let with_path = report(
+        air(),
+        "Grep",
+        json!({"pattern": "a", "path": "/work/src"}),
+        Some((json!("a.ts"), false, None)),
+    );
+    assert!(with_path.updates[0].get("content").is_none());
+    assert!(with_path.updates[0].get("rawOutput").is_none());
+
+    let without = report(
+        air(),
+        "Grep",
+        json!({"pattern": "a"}),
+        Some((json!("a.ts"), false, None)),
+    );
+    assert_eq!(
+        without.updates[0]["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": "a.ts"}}])
+    );
+}
+
+/// `tool-call-contract.test.ts` > "reads the Grep file_path alias like path".
+#[test]
+fn t9a_grep_reads_the_file_path_alias_like_path() {
+    let aliased = report(
+        air(),
+        "Grep",
+        json!({"pattern": "a", "file_path": "/work/src"}),
+        Some((json!("a.ts"), false, None)),
+    );
+    assert_eq!(aliased.call["title"], "grep \"a\" /work/src");
+    assert!(aliased.updates[0].get("content").is_none());
+
+    let both = report(
+        terminal_air(),
+        "Grep",
+        json!({"pattern": "a", "path": "/p", "file_path": "/f"}),
+        None,
+    );
+    assert_eq!(both.call["title"], "grep \"a\" /p");
+}
+
+/// `tool-call-contract.test.ts` > "reads the Grep -l and -c flags like
+/// output_mode".
+#[test]
+fn t9a_grep_reads_the_l_and_c_flags_like_output_mode() {
+    assert_eq!(
+        report(air(), "Grep", json!({"pattern": "a", "-c": true}), None).call["title"],
+        "grep -c \"a\""
+    );
+    assert_eq!(
+        report(air(), "Grep", json!({"pattern": "a", "-l": "true"}), None).call["title"],
+        "grep -l \"a\""
+    );
+    assert_eq!(
+        report(
+            air(),
+            "Grep",
+            json!({"pattern": "a", "-c": true, "output_mode": "content"}),
+            None
+        )
+        .call["title"],
+        "grep \"a\""
+    );
+}
+
+/// `tool-call-contract.test.ts` > "reads the Bash command_description alias like
+/// description".
+#[test]
+fn t9a_bash_reads_the_command_description_alias_like_description() {
+    let aliased = report(
+        terminal_air(),
+        "Bash",
+        json!({"command": "ls", "command_description": "List files"}),
+        None,
+    );
+    assert_eq!(aliased.call["title"], "ls");
+    assert_eq!(
+        aliased.call["_meta"]["jetbrains"]["air"]["commandTitle"],
+        "List files"
+    );
+
+    let plain = report(
+        plain_air(),
+        "Bash",
+        json!({"command": "ls", "command_description": "List files"}),
+        None,
+    );
+    assert_eq!(
+        plain.call["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": "List files"}}])
+    );
+
+    let both = report(
+        terminal_air(),
+        "Bash",
+        json!({"command": "ls", "description": "Canonical",
+            "command_description": "Alias"}),
+        None,
+    );
+    assert_eq!(
+        both.call["_meta"]["jetbrains"]["air"]["commandTitle"],
+        "Canonical"
+    );
+}
+
+/// `tool-call-contract.test.ts` > "keeps the Read error text for AIR".
+#[test]
+fn t9a_read_keeps_the_error_text_for_air() {
+    let report = report(
+        terminal_air(),
+        "Read",
+        json!({"file_path": "/work/a.ts"}),
+        Some((json!("File does not exist."), true, None)),
+    );
+    assert_eq!(report.updates[0]["status"], "failed");
+    assert!(report.updates[0].get("content").is_some());
+}
+
+/// `tool-call-contract.test.ts` > "reports Grep and Glob hits without a path as
+/// content".
+#[test]
+fn t9a_grep_and_glob_hits_without_a_path_are_content() {
+    let grep = report(
+        terminal_air(),
+        "Grep",
+        json!({"pattern": "todo"}),
+        Some((json!("a.ts:1"), false, None)),
+    );
+    assert_eq!(grep.call["title"], "grep \"todo\"");
+    assert_eq!(
+        grep.updates[0]["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": "a.ts:1"}}])
+    );
+    let glob = report(
+        terminal_air(),
+        "Glob",
+        json!({"pattern": "*.ts"}),
+        Some((json!("a.ts"), false, None)),
+    );
+    assert_eq!(glob.call["title"], "Find `*.ts`");
+    assert_eq!(
+        glob.updates[0]["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": "a.ts"}}])
+    );
+    assert!(glob.updates[0].get("rawOutput").is_none());
+}
+
+/// `tool-call-contract.test.ts` > "shows the WebFetch offset in the title".
+#[test]
+fn t9a_webfetch_offset_in_the_title() {
+    let report = report(
+        terminal_air(),
+        "WebFetch",
+        json!({"url": "https://e.com", "prompt": "Summarize", "offset": 100000}),
+        None,
+    );
+    assert_eq!(
+        report.call["title"],
+        "Fetch https://e.com (from char 100000)"
+    );
+}
+
+/// `tool-call-contract.test.ts` > "shows a requested Agent effort in the title".
+#[test]
+fn t9a_agent_effort_in_the_title() {
+    let report = report(
+        terminal_air(),
+        "Agent",
+        json!({"description": "Explore", "prompt": "Inspect", "effort": "high"}),
+        None,
+    );
+    assert_eq!(report.call["title"], "Explore (high effort)");
+}
+
+/// `tool-call-contract.test.ts` > "does not show an effort for a fork, which
+/// runs at the parent's effort".
+#[test]
+fn t9a_no_effort_for_a_fork() {
+    let report = report(
+        terminal_air(),
+        "Agent",
+        json!({"description": "Explore", "prompt": "Inspect", "effort": "high",
+            "subagent_type": "fork"}),
+        None,
+    );
+    assert_eq!(report.call["title"], "Explore");
+}
+
+/// `tool-call-contract.test.ts` > agent control tools > "sends the ListAgents
+/// result to AIR as plain text".
+#[test]
+fn t9a_list_agents_result_is_plain_text_for_air() {
+    let list = "This session is ultimate-f5.\n\nSubagents (1): reviewer";
+    let report = report(
+        air(),
+        "ListAgents",
+        json!({}),
+        Some((json!(list), false, None)),
+    );
+    assert_eq!(report.updates[0]["status"], "completed");
+    assert_eq!(
+        report.updates[0]["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": list}}])
+    );
+    assert!(report.updates[0].get("rawOutput").is_none());
+}
+
+/// `tool-call-contract.test.ts` > agent control tools > "sends the exact
+/// SendMessage and TaskStop JSON to AIR".
+#[test]
+fn t9a_send_message_and_task_stop_json_for_air() {
+    let json_text = "{\"success\":true,\"message\":\"Message sent\"}";
+    for name in ["SendMessage", "TaskStop"] {
+        let report = report(
+            air(),
+            name,
+            json!({}),
+            Some((json!([{"type": "text", "text": json_text}]), false, None)),
+        );
+        assert_eq!(report.updates[0]["status"], "completed");
+        assert_eq!(
+            report.updates[0]["content"],
+            json!([{"type": "content", "content": {"type": "text", "text": json_text}}]),
+            "{name}"
+        );
+    }
+}
+
+/// `tool-call-contract.test.ts` > agent control tools > "sends an error result
+/// to AIR without a fence".
+#[test]
+fn t9a_agent_control_error_is_unfenced_for_air() {
+    let error = "Permission to use Bash was denied.";
+    for name in ["SendMessage", "TaskStop", "ListAgents", "Monitor"] {
+        let report = report(air(), name, json!({}), Some((json!(error), true, None)));
+        assert_eq!(report.updates[0]["status"], "failed", "{name}");
+        assert_eq!(
+            report.updates[0]["content"],
+            json!([{"type": "content", "content": {"type": "text", "text": error}}]),
+            "{name}"
+        );
+    }
+}
+
+/// `tool-call-contract.test.ts` > agent control tools > "keeps the fenced error
+/// result for a client that is not AIR".
+#[test]
+fn t9a_agent_control_error_is_fenced_for_a_plain_client() {
+    let report = report(
+        plain(),
+        "Monitor",
+        json!({}),
+        Some((json!("Denied"), true, None)),
+    );
+    assert_eq!(report.updates[0]["status"], "failed");
+    assert_eq!(
+        report.updates[0]["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": "```\nDenied\n```"}}])
+    );
+}
+
+/// `tool-call-contract.test.ts` > "reports %s through the generic reporter": a
+/// control tool keeps its name and kind and shows the result text.
+#[test]
+fn t9a_generic_reporter_reports_task_output_and_task_stop() {
+    for name in ["TaskOutput", "TaskStop"] {
+        let report = report(
+            terminal_air(),
+            name,
+            json!({"task_id": "b1"}),
+            Some((json!("done"), false, None)),
+        );
+        assert_eq!(report.call["title"], name);
+        assert_eq!(report.call["kind"], "other");
+        assert_eq!(report.call["content"], json!([]));
+        assert_eq!(
+            report.updates[0]["content"],
+            json!([{"type": "content", "content": {"type": "text", "text": "done"}}])
+        );
+    }
+}
+
+/// `tool-call-contract.test.ts` > "sends the Skill under jetbrains.air.skill
+/// and its confirmation as rawOutput".
+#[test]
+fn t9a_skill_meta_and_confirmation_raw_output() {
+    let report = report(
+        terminal_air(),
+        "Skill",
+        json!({"skill": "commits"}),
+        Some((json!("Launching skill: commits"), false, None)),
+    );
+    assert_eq!(
+        report.call["_meta"],
+        json!({
+            "claudeCode": {"toolName": "Skill"},
+            "jetbrains": {"air": {"version": 1, "skill": {"name": "commits"}}}
+        })
+    );
+    assert_eq!(report.updates[0]["rawOutput"], "Launching skill: commits");
+}
+
+/// `tool-call-contract.test.ts` > "marks an MCP tool call and shows its text
+/// result once".
+#[test]
+fn t9a_mcp_tool_call_is_marked_and_shows_text_once() {
+    let report = report(
+        terminal_air(),
+        "mcp__github__list",
+        json!({"repo": "acp"}),
+        Some((json!([{"type": "text", "text": "3 issues"}]), false, None)),
+    );
+    assert_eq!(report.call["_meta"]["is_mcp_tool_call"], true);
+    assert_eq!(
+        report.updates[0]["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": "3 issues"}}])
+    );
+    assert!(report.updates[0].get("rawOutput").is_none());
+}
+
+/// `tool-call-contract.test.ts` > "sends the MCP server and tool under
+/// jetbrains.air.mcp for AIR only".
+#[test]
+fn t9a_mcp_meta_is_air_only() {
+    let air_report = report(terminal_air(), "mcp__docs__search", json!({"q": "x"}), None);
+    assert_eq!(
+        air_report.call["_meta"],
+        json!({
+            "claudeCode": {"toolName": "mcp__docs__search"},
+            "jetbrains": {"air": {"version": 1, "mcp": {"server": "docs", "tool": "search"}}},
+            "is_mcp_tool_call": true
+        })
+    );
+    let plain_report = report(plain(), "mcp__docs__search", json!({"q": "x"}), None);
+    assert_eq!(
+        plain_report.call["_meta"],
+        json!({"claudeCode": {"toolName": "mcp__docs__search"}})
+    );
+}

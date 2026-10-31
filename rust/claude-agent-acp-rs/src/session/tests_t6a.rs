@@ -391,3 +391,33 @@ fn t6a_v1_reports_no_v2_state() {
     assert!(updates.is_empty());
     assert!(answers.is_empty());
 }
+
+/// acp-v2.test.ts: "answers a queued prompt once Claude Code takes it in, after
+/// the turn before it" — the second prompt waits for the first turn's end and is
+/// answered when its own echo arrives.
+#[test]
+fn t9a_a_queued_v2_prompt_is_answered_after_the_turn_before_it() {
+    let mut rig = rig_v2();
+    let mut first = queue_v2(&mut rig, "p1");
+    let mut second = queue_v2(&mut rig, "p2");
+    echo(&mut rig, "p1");
+    let (updates, answers) = v2_out(&mut rig);
+    assert_eq!(trace(&updates), vec!["user_message", "running"]);
+    assert_eq!(answers, vec![Ok("p1".to_string())]);
+    assert!(
+        second.try_recv().is_err(),
+        "the queued prompt is not answered before its turn"
+    );
+    result(&mut rig, "end_turn");
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(trace(&updates), vec!["idle end_turn"]);
+    echo(&mut rig, "p2");
+    let (updates, answers) = v2_out(&mut rig);
+    assert_eq!(trace(&updates), vec!["user_message", "running"]);
+    assert_eq!(answers, vec![Ok("p2".to_string())]);
+    assert!(first.try_recv().expect("p1 answered").is_ok());
+    assert!(second.try_recv().expect("p2 answered").is_ok());
+    result(&mut rig, "end_turn");
+    let (updates, _) = v2_out(&mut rig);
+    assert_eq!(trace(&updates), vec!["idle end_turn"]);
+}

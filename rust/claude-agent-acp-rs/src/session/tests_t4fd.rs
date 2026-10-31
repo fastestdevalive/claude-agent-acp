@@ -138,6 +138,7 @@ fn run_permission(rig: &mut FdRig, frame: Value) -> PermissionRun {
         &cancel_rx,
         rig.rig.ext.caps.elicitation_form,
         std::path::Path::new("/repo"),
+        None,
         &[],
         None,
         None,
@@ -165,6 +166,106 @@ async fn answered(run: &mut PermissionRun) -> Value {
             return response;
         }
     }
+}
+
+/// T8A — a native child's AskUserQuestion and its tool call go to the child
+/// session.
+#[tokio::test]
+async fn t8a_a_child_ask_question_routes_to_the_child() {
+    let mut rig = FdRig::new(Some(SubagentForm::Rfd));
+    rig.rig.ext.caps.elicitation_form = true;
+    rig.start_child("t1", "toolu_A");
+    let mut frame = ask_frame();
+    frame["request"]["agent_id"] = json!("t1");
+    frame["request"]["tool_use_id"] = json!("toolu_question");
+    let _run = run_permission(&mut rig, frame);
+    let mut params = None;
+    let mut call_session = None;
+    while params.is_none() {
+        let item = tokio::time::timeout(Duration::from_secs(2), rig.rig.rx.recv())
+            .await
+            .expect("the form is sent")
+            .expect("the channel stays open");
+        match item {
+            SessionOutbound::CreateElicitation { params: p, .. } => params = Some(p),
+            SessionOutbound::Update(notif) => {
+                let value = serde_json::to_value(&notif).unwrap();
+                if value["update"]["toolCallId"] == "toolu_question" {
+                    call_session = Some(notif.session_id.to_string());
+                }
+            }
+            SessionOutbound::RawUpdate(value)
+                if value["update"]["toolCallId"] == "toolu_question" =>
+            {
+                call_session = Some(value["sessionId"].as_str().unwrap_or("").to_string());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        params.expect("a form")["sessionId"],
+        json!("t1"),
+        "the question goes to the child"
+    );
+    assert_eq!(call_session.as_deref(), Some("t1"));
+}
+
+/// T8A — a child's elicitation is forwarded to the root when native subagents
+/// were not negotiated.
+#[tokio::test]
+async fn t8a_child_elicitation_goes_to_the_root_without_native_sessions() {
+    let mut rig = FdRig::new(None);
+    rig.rig.ext.caps.elicitation_form = true;
+    let mut frame = ask_frame();
+    frame["request"]["agent_id"] = json!("agent-42");
+    let _run = run_permission(&mut rig, frame);
+    let mut params = None;
+    let mut request_permission = false;
+    while params.is_none() {
+        let item = tokio::time::timeout(Duration::from_secs(2), rig.rig.rx.recv())
+            .await
+            .expect("the form is sent")
+            .expect("the channel stays open");
+        match item {
+            SessionOutbound::CreateElicitation { params: p, .. } => params = Some(p),
+            SessionOutbound::RequestPermission { .. } => request_permission = true,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        params.expect("a form")["sessionId"],
+        json!("s"),
+        "the question stays on the root"
+    );
+    assert!(!request_permission, "no permission request for a question");
+}
+
+/// T8A — a close withdraws a child's open request without reporting it running
+/// again.
+#[test]
+fn t8a_close_withdrawal_reports_no_running() {
+    let mut rig = FdRig::new(Some(SubagentForm::Rfd));
+    rig.start_child("t1", "toolu_A");
+    let mut frame = ask_frame();
+    frame["request"]["agent_id"] = json!("t1");
+    frame["request"]["tool_use_id"] = json!("toolu_question");
+    let mut run = run_permission(&mut rig, frame);
+    let _ = rig.notifications();
+    withdraw_awaiting_requests(
+        &mut rig.rig.tasks,
+        &mut rig.rig.map_state,
+        &mut run.tokens,
+        &rig.rig.tx,
+        "s",
+    );
+    let notes = rig.notifications();
+    assert!(
+        notes.iter().all(|v| {
+            !(v["update"]["sessionUpdate"] == "subagent_update"
+                && v["update"]["state"]["state"] == "running")
+        }),
+        "the withdrawn request does not report running: {notes:?}"
+    );
 }
 
 /// F2 — the allow answer is exactly upstream's

@@ -466,12 +466,13 @@ impl SessionIndexConnection {
     }
 
     /// Sets the index up for the client of `initialize`. ACP v2 does not route the
-    /// session index methods yet (this adapter speaks v1).
-    pub fn negotiate(&mut self, air: Option<&AirClient>) {
+    /// session index methods yet, so a v2 client gets nothing (upstream
+    /// `negotiate(request, {v2})`).
+    pub fn negotiate(&mut self, air: Option<&AirClient>, v2: bool) {
         if let Some(previous) = self.service.take() {
             previous.dispose();
         }
-        if air.is_some_and(|air| air.supports(AIR_SESSION_INDEX_CAPABILITY)) {
+        if !v2 && air.is_some_and(|air| air.supports(AIR_SESSION_INDEX_CAPABILITY)) {
             self.service = Some(SessionIndexService::new(
                 self.paths.projects_root.clone(),
                 self.paths.registry_dir.clone(),

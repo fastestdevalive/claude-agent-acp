@@ -45,3 +45,33 @@ fn t4b_subagents_session_capability_is_air_only() {
         "{air}"
     );
 }
+
+/// T8B — the initialize response advertises the logout capability
+/// (`auth.logout: {}`) for every client (`acp-agent.ts` initialize).
+#[test]
+fn t8b_initialize_advertises_logout() {
+    for caps in [json!({}), json!({"subagents": {}})] {
+        let response = init(caps);
+        assert_eq!(
+            response["agentCapabilities"]["auth"]["logout"],
+            json!({}),
+            "{response}"
+        );
+    }
+}
+
+/// `acp-scenarios.test.ts` > Zed > "keeps promptQueueing and steering": the
+/// initialize response carries `agentCapabilities._meta.claudeCode.promptQueueing`
+/// and the top-level `_meta.steering.supported` marker for every client.
+#[test]
+fn t9b_initialize_advertises_prompt_queueing_and_steering() {
+    let response = init(json!({}));
+    assert_eq!(
+        response.pointer("/agentCapabilities/_meta/claudeCode"),
+        Some(&json!({"promptQueueing": true}))
+    );
+    assert_eq!(
+        response.pointer("/_meta/steering"),
+        Some(&json!({"supported": true}))
+    );
+}

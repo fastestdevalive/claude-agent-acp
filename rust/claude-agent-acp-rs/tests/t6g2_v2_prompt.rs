@@ -657,11 +657,12 @@ async fn t6g2_a_v2_pretool_use_hook_shows_the_patch_before_the_edit() {
     harness.shutdown().await;
 }
 
-/// NEW-3 (`noteSessionState`, `acp-agent.ts:5561, 5572`): a v2 turn's row is
-/// `running` while it runs and `idle` when it settled. The session index is an
-/// AIR extension, so the client declares it.
+/// M-130: a v2 AIR client that declared `sessionIndex` is not routed through the
+/// index (`sessionIndex.negotiate(request, {v2})` enables nothing), so its
+/// `session/list` is the plain SDK list: the row carries no
+/// `_meta.jetbrains.air.state`.
 #[tokio::test]
-async fn t6g2_a_v2_turn_runs_the_session_index_bookkeeping() {
+async fn t6g2_a_v2_session_index_is_not_routed() {
     let steps = vec![
         init_step(),
         json!({
@@ -669,7 +670,7 @@ async fn t6g2_a_v2_turn_runs_the_session_index_bookkeeping() {
             "emit": [echo("stop"), message_start(), delta("stopping")],
         }),
     ];
-    let mut harness = Harness::start("index", &steps);
+    let mut harness = Harness::start("index-v2", &steps);
     let source = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
     harness.seed_session(source, &seeded_transcript(source));
     harness
@@ -692,34 +693,19 @@ async fn t6g2_a_v2_turn_runs_the_session_index_bookkeeping() {
         resumed.get("error").is_none(),
         "the resume failed: {resumed}"
     );
-
-    let session_id = json!(source);
-    let (answer, _) = harness.prompt_until_answer(3, "stop", &session_id).await;
-    assert!(answer["result"]["messageId"].is_string(), "{answer}");
-    // The turn is still running: the row says so.
-    let row = harness.list_row(4, source).await;
-    assert_eq!(
-        row["_meta"]["jetbrains"]["air"]["state"], "running",
-        "the v2 turn's row is running: {row}"
+    let row = harness.list_row(3, source).await;
+    assert!(
+        row["_meta"].pointer("/jetbrains/air/state").is_none(),
+        "ACP v2 routes no session index, so the row carries no air state: {row}"
     );
-
-    // A cancel ends it: the row is idle again.
-    harness
-        .send_json(json!({"jsonrpc":"2.0","method":"session/cancel",
-            "params":{"sessionId":session_id}}))
-        .await;
-    let idle = harness.read_until_idle().await;
-    assert_eq!(idle.last().expect("an idle")["stopReason"], "cancelled");
-    let row = harness.list_row(5, source).await;
-    assert_eq!(
-        row["_meta"]["jetbrains"]["air"]["state"], "idle",
-        "the settled v2 turn's row is idle: {row}"
-    );
+    assert_eq!(row["sessionId"], json!(source), "{row}");
     harness.shutdown().await;
 }
 
-/// NEW-3: a v2 turn that failed marks its row `error`
-/// (`turn_settled(failed)`, `acp-agent.ts:5572`).
+/// `acp-v2.test.ts` > "reports a turn that fails after it was taken in as idle
+/// with the error stop reason": the v2 `idle` carries `stopReason: "error"`.
+/// ACP v2 routes no session index (M-130), so the row carries no air state; the
+/// NEW-3 bookkeeping itself is covered on v1.
 #[tokio::test]
 async fn t6g2_a_failed_v2_turn_marks_its_row_error() {
     let steps = vec![
@@ -734,7 +720,7 @@ async fn t6g2_a_failed_v2_turn_marks_its_row_error() {
             ],
         }),
     ];
-    let mut harness = Harness::start("index-failed", &steps);
+    let mut harness = Harness::start("index-failed-v2", &steps);
     let source = "dddddddd-4444-4444-8444-dddddddddddd";
     harness.seed_session(source, &seeded_transcript(source));
     harness
@@ -757,15 +743,133 @@ async fn t6g2_a_failed_v2_turn_marks_its_row_error() {
         resumed.get("error").is_none(),
         "the resume failed: {resumed}"
     );
-    let session_id = json!(source);
-    let (answer, _) = harness.prompt_until_answer(3, "fail", &session_id).await;
+    let (answer, _) = harness.prompt_until_answer(3, "fail", &json!(source)).await;
     assert!(answer["result"]["messageId"].is_string(), "{answer}");
     let idle = harness.read_until_idle().await;
-    assert_eq!(idle.last().expect("an idle")["stopReason"], "error");
+    assert_eq!(
+        idle.last().expect("an idle")["stopReason"],
+        "error",
+        "the failed turn's idle: {idle:?}"
+    );
+    let row = harness.list_row(4, source).await;
+    assert!(
+        row["_meta"].pointer("/jetbrains/air/state").is_none(),
+        "ACP v2 routes no session index, so the row carries no air state: {row}"
+    );
+    harness.shutdown().await;
+}
+
+/// NEW-3 (`noteSessionState`, `acp-agent.ts:5561, 5572`): a turn's row is
+/// `running` while it runs and `idle` when it settled. The session index is an
+/// AIR extension, so the client declares it; ACP v2 routes no index (M-130), so
+/// this runs on v1.
+#[tokio::test]
+async fn t6g2_a_v1_turn_runs_the_session_index_bookkeeping() {
+    let steps = vec![
+        init_step(),
+        json!({
+            "expect": {"type": "user"},
+            "emit": [echo("stop"), message_start(), delta("stopping")],
+        }),
+    ];
+    let mut harness = Harness::start("index-v1", &steps);
+    let source = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+    harness.seed_session(source, &seeded_transcript(source));
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"protocolVersion":1,
+            "clientCapabilities":{
+                "_meta":{"jetbrains":{"air":{
+                    "version":1, "capabilities":["sessionIndex"]}}}
+            }}}))
+        .await;
+    harness.read_response(1).await;
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":2,"method":"session/resume",
+            "params":{"sessionId":source,"cwd":repo_root().to_string_lossy()}}))
+        .await;
+    let resumed = harness.read_response(2).await;
+    assert!(
+        resumed.get("error").is_none(),
+        "the resume failed: {resumed}"
+    );
+
+    // Prompt without waiting for its answer: the row says `running`.
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+            "params":{"sessionId":source,"prompt":[{"type":"text","text":"stop"}]}}))
+        .await;
+    let row = harness.list_row(4, source).await;
+    assert_eq!(
+        row["_meta"]["jetbrains"]["air"]["state"], "running",
+        "the turn's row is running: {row}"
+    );
+
+    // A cancel ends it: the row is idle again.
+    harness
+        .send_json(json!({"jsonrpc":"2.0","method":"session/cancel",
+            "params":{"sessionId":source}}))
+        .await;
+    let answer = harness.read_response(3).await;
+    assert_eq!(
+        answer["result"]["stopReason"], "cancelled",
+        "the cancel settles the turn: {answer}"
+    );
+    let row = harness.list_row(5, source).await;
+    assert_eq!(
+        row["_meta"]["jetbrains"]["air"]["state"], "idle",
+        "the settled turn's row is idle: {row}"
+    );
+    harness.shutdown().await;
+}
+
+/// NEW-3: a turn that failed marks its row `error`
+/// (`turn_settled(failed)`, `acp-agent.ts:5572`).
+#[tokio::test]
+async fn t6g2_a_v1_failed_turn_marks_its_row_error() {
+    let steps = vec![
+        init_step(),
+        json!({
+            "expect": {"type": "user"},
+            "emit": [
+                echo("fail"),
+                {"type": "result", "subtype": "success", "stop_reason": "end_turn",
+                 "is_error": true, "result": "API Error: 529 Overloaded",
+                 "usage": {"input_tokens": 10, "output_tokens": 2}},
+            ],
+        }),
+    ];
+    let mut harness = Harness::start("index-failed-v1", &steps);
+    let source = "dddddddd-4444-4444-8444-dddddddddddd";
+    harness.seed_session(source, &seeded_transcript(source));
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"protocolVersion":1,
+            "clientCapabilities":{
+                "_meta":{"jetbrains":{"air":{
+                    "version":1, "capabilities":["sessionIndex"]}}}
+            }}}))
+        .await;
+    harness.read_response(1).await;
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":2,"method":"session/resume",
+            "params":{"sessionId":source,"cwd":repo_root().to_string_lossy()}}))
+        .await;
+    let resumed = harness.read_response(2).await;
+    assert!(
+        resumed.get("error").is_none(),
+        "the resume failed: {resumed}"
+    );
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+            "params":{"sessionId":source,"prompt":[{"type":"text","text":"fail"}]}}))
+        .await;
+    let answer = harness.read_response(3).await;
+    assert!(answer.get("error").is_some(), "the turn fails: {answer}");
     let row = harness.list_row(4, source).await;
     assert_eq!(
         row["_meta"]["jetbrains"]["air"]["state"], "error",
-        "a failed v2 turn's row is error: {row}"
+        "a failed turn's row is error: {row}"
     );
     harness.shutdown().await;
 }
@@ -857,6 +961,117 @@ async fn t6g2_a_live_load_replays_a_background_child() {
     assert!(
         child_text["messageId"].as_str().is_some(),
         "the replayed chunk carries its message id: {child_text}"
+    );
+    harness.shutdown().await;
+}
+
+/// B-113 — a `session/close` withdraws the open request like a cancel: the
+/// work reports no `running` before its idle cancelled
+/// (`acp-v2.test.ts:4426`, `cancelTurns` marks the inputs first). The
+/// elicitation is the request `cancel_parent_round_trips` drains (a permission
+/// is aborted before it), so its withdrawn close is the one that would report
+/// `running` without the cancel mark.
+#[tokio::test]
+async fn t9a_g3_a_close_withdraws_a_held_elicitation_without_running() {
+    let steps = vec![
+        init_step(),
+        json!({
+            "expect": {"type": "user"},
+            "emit": [
+                echo("go"),
+                {"type": "control_request", "request_id": "elicit-1", "request": {
+                    "subtype": "elicitation", "serverName": "srv",
+                    "message": "Enter a value", "mode": "form",
+                    "requestedSchema": {"type": "object",
+                        "properties": {"val": {"type": "string"}}}}},
+            ],
+        }),
+    ];
+    let mut harness = Harness::start("close-withdraw", &steps);
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":2,
+                "info":{"name":"v2-test-client","version":"1.0.0"},
+                "capabilities":{"auth":{"terminal":{}},"elicitation":{"form":{}}}}}))
+        .await;
+    let init = harness.read_response(1).await;
+    assert_eq!(init["result"]["protocolVersion"], 2, "{init}");
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":2,"method":"session/new",
+            "params":{"cwd":repo_root().to_string_lossy(),"mcpServers":[]}}))
+        .await;
+    let created = harness.read_response(2).await;
+    assert!(
+        created.get("error").is_none(),
+        "session/new failed: {created}"
+    );
+    let session_id = created["result"]["sessionId"].clone();
+    let sid = session_id.as_str().unwrap_or_default().to_string();
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+            "params":{"sessionId":session_id,"prompt":[{"type":"text","text":"go"}]}}))
+        .await;
+
+    let mut trace = Vec::new();
+    loop {
+        let frame = harness.read_json().await;
+        if frame.get("method").and_then(Value::as_str) != Some("session/update") {
+            continue;
+        }
+        let update = frame["params"]["update"].clone();
+        if update["sessionUpdate"] == "state_update" {
+            let state = update["state"].as_str().unwrap_or("");
+            match update["stopReason"].as_str() {
+                Some(reason) => trace.push(format!("{state} {reason}")),
+                None => trace.push(state.to_string()),
+            }
+        } else if matches!(
+            update["sessionUpdate"].as_str(),
+            Some("user_message" | "user_message_chunk" | "agent_message_chunk")
+        ) {
+            trace.push(update["sessionUpdate"].as_str().unwrap_or("").to_string());
+        }
+        if trace.last().is_some_and(|last| last == "requires_action") {
+            break;
+        }
+    }
+
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":4,"method":"session/close",
+            "params":{"sessionId":sid}}))
+        .await;
+    loop {
+        let frame = harness.read_json().await;
+        if frame.get("id").and_then(Value::as_i64) == Some(4) && frame.get("method").is_none() {
+            assert!(frame.get("error").is_none(), "the close failed: {frame}");
+            break;
+        }
+        if frame.get("method").and_then(Value::as_str) != Some("session/update") {
+            continue;
+        }
+        let update = frame["params"]["update"].clone();
+        if update["sessionUpdate"] == "state_update" {
+            let state = update["state"].as_str().unwrap_or("");
+            match update["stopReason"].as_str() {
+                Some(reason) => trace.push(format!("{state} {reason}")),
+                None => trace.push(state.to_string()),
+            }
+        } else if matches!(
+            update["sessionUpdate"].as_str(),
+            Some("user_message" | "user_message_chunk" | "agent_message_chunk")
+        ) {
+            trace.push(update["sessionUpdate"].as_str().unwrap_or("").to_string());
+        }
+    }
+    assert_eq!(
+        trace,
+        vec![
+            "user_message",
+            "running",
+            "requires_action",
+            "idle cancelled"
+        ],
+        "no running after the close withdrew the request"
     );
     harness.shutdown().await;
 }

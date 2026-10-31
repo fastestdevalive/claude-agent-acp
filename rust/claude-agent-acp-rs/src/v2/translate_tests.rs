@@ -1180,3 +1180,38 @@ fn test_t105_pre_tool_use_preview_hook() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+/// T8C (`tools.test.ts` > "reports an aborted run as cancelled to a v2 client,
+/// and as failed to every other client"): an error result whose
+/// `_meta.claudeCode.nonExecutionKind` says the CLI aborted the run becomes v2
+/// `cancelled`; a refused run stays `failed`, and the kind stays in `_meta`.
+#[test]
+fn t8c_aborted_result_is_cancelled_on_v2() {
+    let report = |kind: &str, status: &str| {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_bash",
+            "status": status,
+            "content": [{"type": "content", "content": {"type": "text", "text": "x"}}],
+            "_meta": {"claudeCode": {"toolName": "Bash", "nonExecutionKind": kind}},
+        })
+    };
+    for kind in ["interrupted", "cancelled"] {
+        let translated = v2_session_update(&report(kind, "failed")).unwrap().unwrap();
+        assert_eq!(translated["status"], "cancelled", "{kind}");
+        assert_eq!(
+            translated["_meta"]["claudeCode"]["nonExecutionKind"], kind,
+            "the kind stays on v2"
+        );
+    }
+    // A refused tool did not run because of a decision: it failed.
+    for kind in ["user-rejected", "permission-rule", "automode-blocked"] {
+        let translated = v2_session_update(&report(kind, "failed")).unwrap().unwrap();
+        assert_eq!(translated["status"], "failed", "{kind}");
+    }
+    // A successful result is never rewritten, whatever the sidecar says.
+    let translated = v2_session_update(&report("interrupted", "completed"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(translated["status"], "completed");
+}

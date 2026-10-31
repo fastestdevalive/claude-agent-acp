@@ -35,6 +35,24 @@ impl Actor {
         caps: crate::client_caps::ClientCapabilities,
         air: bool,
     ) -> Self {
+        Self::new_in(
+            config,
+            caps,
+            air,
+            std::env::temp_dir(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        )
+    }
+
+    /// A running actor whose session reads settings from `cwd` with `env`
+    /// (hermetic: an empty managed-doc list unless `env` carries one).
+    fn new_in(
+        config: SessionConfigState,
+        caps: crate::client_caps::ClientCapabilities,
+        air: bool,
+        cwd: std::path::PathBuf,
+        env: crate::env_snapshot::EnvSnapshot,
+    ) -> Self {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
@@ -87,11 +105,11 @@ impl Actor {
             Arc::new(AtomicUsize::new(0)),
             air_client,
             caps,
-            std::env::temp_dir(),
+            cwd,
             false,
             false,
             crate::sdk_options::RawSdkMessages::Off,
-            crate::env_snapshot::EnvSnapshot::empty(),
+            env,
             None,
             Vec::new(),
         ));
@@ -108,7 +126,9 @@ impl Actor {
     }
 
     fn seed(&self, config: SessionConfigState) {
-        let _ = self.tx.send(Command::InitConfig { config });
+        let _ = self.tx.send(Command::InitConfig {
+            config: Box::new(config),
+        });
     }
 
     /// The next `control_request` line the actor wrote, parsed.
@@ -470,6 +490,7 @@ fn base(
         fast_mode_disabled_reason: None,
         pending_auto_fallback_warning: false,
         provider_cache_key: String::new(),
+        effort_settings_override: None,
     }
 }
 
@@ -1853,5 +1874,320 @@ async fn t5fa3_eof_while_an_inline_switch_holds_processing_the_held_frames() {
     assert!(
         switch.is_some() && switch < chunk,
         "the switch's config_option_update precedes the held frame: {after:?}"
+    );
+}
+
+// ---------------------------------------------------------------- G4 / F11
+
+fn settings_cwd(name: &str, settings: Value) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("g4-f11-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".claude")).expect("create settings dir");
+    std::fs::write(
+        dir.join(".claude").join("settings.json"),
+        settings.to_string(),
+    )
+    .expect("write settings");
+    dir
+}
+
+/// Drive one `SetConfigOption model` switch to its reply, answering the
+/// `set_model` and any `apply_flag_settings` control requests, and return the
+/// effort flag payload (when the actor synced one) with the reply's options.
+async fn switch_model(actor: &mut Actor, model: &str) -> (Option<Value>, Vec<ConfigOption>) {
+    let (reply, reply_rx) = oneshot::channel();
+    let _ = actor.tx.send(Command::SetConfigOption {
+        config_id: "model".into(),
+        value: json!(model),
+        reply,
+    });
+    let mut flag = None;
+    let mut reply_rx = reply_rx;
+    loop {
+        tokio::select! {
+            reply = &mut reply_rx => {
+                let options = reply.expect("the actor replies").expect("the switch succeeds");
+                return (flag, options);
+            }
+            line = actor.written.recv() => {
+                let Some(line) = line else { panic!("the stdin reader ended") };
+                let request: Value = serde_json::from_str(&line).expect("a JSON line");
+                if request.get("type").and_then(Value::as_str) != Some("control_request") {
+                    continue;
+                }
+                let request_id = request["request_id"].as_str().expect("a request id");
+                if request["request"]["subtype"] == "apply_flag_settings" {
+                    flag = Some(request["request"]["settings"].clone());
+                }
+                actor.respond_ok(request_id);
+            }
+            update = actor.updates.recv() => {
+                match update {
+                    Some(SessionOutbound::Flush(ack)) => { let _ = ack.send(()); }
+                    Some(SessionOutbound::Update(notif)) => {
+                        actor.stored.push(serde_json::to_value(&notif).unwrap());
+                    }
+                    Some(SessionOutbound::RawUpdate(value)) => actor.stored.push(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// `session-config-options.test.ts` > "re-seeds switches from retained
+/// programmatic settings before file settings": the file tier says `high`, the
+/// retained programmatic tier says `medium` + a per-model `low`; the switch
+/// displays and applies `low`.
+#[tokio::test]
+async fn g4_f11_switch_reseeds_from_retained_programmatic_settings() {
+    let cwd = settings_cwd("retained", json!({"effortLevel": "high"}));
+    let models = vec![
+        model(
+            "claude-opus-4-5",
+            true,
+            Some(&["low", "medium", "high"]),
+            true,
+        ),
+        model(
+            "claude-sonnet-4-6",
+            true,
+            Some(&["low", "medium", "high"]),
+            true,
+        ),
+    ];
+    let mut config = base(models, "claude-opus-4-5", true, true);
+    config.current_effort = Some("high".into());
+    config.effort_settings_override = Some(json!({
+        "effortLevel": "medium",
+        "modelSettings": {"claude-sonnet-4-6": {"effortLevel": "low"}}
+    }));
+    let mut actor = Actor::new_in(
+        composed(config, true),
+        caps(true, false),
+        true,
+        cwd.clone(),
+        crate::env_snapshot::EnvSnapshot::empty(),
+    );
+    let (flag, options) = switch_model(&mut actor, "claude-sonnet-4-6").await;
+    assert_eq!(flag, Some(json!({"effortLevel": "low"})));
+    assert_eq!(option(&options, "effort").unwrap().current_value, "low");
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// `session-config-options.test.ts` > "seeds effort from the new model's
+/// persisted modelSettings entry on an unpinned switch".
+#[tokio::test]
+async fn g4_f11_switch_seeds_from_the_new_models_settings() {
+    let cwd = settings_cwd(
+        "model-settings",
+        json!({
+            "effortLevel": "high",
+            "modelSettings": {"claude-sonnet-4-6": {"effortLevel": "low"}}
+        }),
+    );
+    let models = vec![
+        model(
+            "claude-opus-4-5",
+            true,
+            Some(&["low", "medium", "high"]),
+            true,
+        ),
+        model(
+            "claude-sonnet-4-6",
+            true,
+            Some(&["low", "medium", "high"]),
+            true,
+        ),
+    ];
+    let mut config = base(models, "claude-opus-4-5", true, true);
+    config.current_effort = Some("high".into());
+    let mut actor = Actor::new_in(
+        composed(config, true),
+        caps(true, false),
+        true,
+        cwd.clone(),
+        crate::env_snapshot::EnvSnapshot::empty(),
+    );
+    let (flag, options) = switch_model(&mut actor, "claude-sonnet-4-6").await;
+    assert_eq!(flag, Some(json!({"effortLevel": "low"})));
+    assert_eq!(option(&options, "effort").unwrap().current_value, "low");
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// `session-config-options.test.ts` > "falls back to the top-level settings
+/// effort when the new model has no per-model entry".
+#[tokio::test]
+async fn g4_f11_switch_falls_back_to_the_top_level_effort() {
+    let cwd = settings_cwd("top-level", json!({"effortLevel": "medium"}));
+    let models = vec![
+        model(
+            "claude-opus-4-5",
+            true,
+            Some(&["low", "medium", "high"]),
+            true,
+        ),
+        model(
+            "claude-sonnet-4-6",
+            true,
+            Some(&["low", "medium", "high"]),
+            true,
+        ),
+    ];
+    let mut config = base(models, "claude-opus-4-5", true, true);
+    config.current_effort = Some("high".into());
+    let mut actor = Actor::new_in(
+        composed(config, true),
+        caps(true, false),
+        true,
+        cwd.clone(),
+        crate::env_snapshot::EnvSnapshot::empty(),
+    );
+    let (flag, options) = switch_model(&mut actor, "claude-sonnet-4-6").await;
+    assert_eq!(flag, Some(json!({"effortLevel": "medium"})));
+    assert_eq!(option(&options, "effort").unwrap().current_value, "medium");
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+fn model_option(current: &str, options: &[&str]) -> ConfigOption {
+    ConfigOption {
+        id: crate::session_config::MODEL_CONFIG_ID.into(),
+        name: "Model".into(),
+        description: String::new(),
+        category: "model".into(),
+        option_type: "select".into(),
+        current_value: current.into(),
+        options: options
+            .iter()
+            .map(|value| crate::session_config::ConfigOptionValue {
+                value: (*value).into(),
+                name: (*value).into(),
+                description: None,
+                _meta: None,
+            })
+            .collect(),
+        _meta: None,
+    }
+}
+
+/// `session-config-options.test.ts` > "resolves a full model id onto its hinted
+/// row via session.modelInfos": both the `[1m]` and `-1m` spellings of the
+/// resolved id select the hinted `sonnet[1m]` picker row.
+#[tokio::test]
+async fn g4_f11_resolves_a_full_model_id_onto_its_hinted_row() {
+    let models = vec![
+        ModelInfo {
+            value: "sonnet".into(),
+            resolved_model: Some("claude-sonnet-5".into()),
+            ..Default::default()
+        },
+        ModelInfo {
+            value: "sonnet[1m]".into(),
+            resolved_model: Some("claude-sonnet-5[1m]".into()),
+            ..Default::default()
+        },
+    ];
+    let mut config = base(models, "sonnet", true, false);
+    config.config_options = vec![model_option("sonnet", &["sonnet", "sonnet[1m]"])];
+    let mut actor = Actor::new(composed(config, false), caps(false, false), false);
+
+    for requested in ["claude-sonnet-5[1m]", "claude-sonnet-5-1m"] {
+        let (reply, reply_rx) = oneshot::channel();
+        let _ = actor.tx.send(Command::SetConfigOption {
+            config_id: "model".into(),
+            value: json!(requested),
+            reply,
+        });
+        let mut reply_rx = reply_rx;
+        let options;
+        loop {
+            tokio::select! {
+                reply = &mut reply_rx => {
+                    options = reply.expect("the actor replies").expect("Ok");
+                    break;
+                }
+                line = actor.written.recv() => {
+                    let Some(line) = line else { panic!("the stdin reader ended") };
+                    let request: Value = serde_json::from_str(&line).expect("a JSON line");
+                    if request.get("type").and_then(Value::as_str) != Some("control_request") {
+                        continue;
+                    }
+                    let request_id = request["request_id"].as_str().expect("a request id");
+                    if request["request"]["subtype"] == "set_model" {
+                        assert_eq!(request["request"]["model"], "sonnet[1m]", "{requested}");
+                    }
+                    actor.respond_ok(request_id);
+                }
+                update = actor.updates.recv() => {
+                    match update {
+                        Some(SessionOutbound::Flush(ack)) => { let _ = ack.send(()); }
+                        Some(SessionOutbound::Update(notif)) => {
+                            actor.stored.push(serde_json::to_value(&notif).unwrap());
+                        }
+                        Some(SessionOutbound::RawUpdate(value)) => actor.stored.push(value),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            option(&options, "model").unwrap().current_value,
+            "sonnet[1m]",
+            "{requested}"
+        );
+    }
+}
+
+/// `session-config-options.test.ts` > "accepts the reported currentValue even
+/// when it has no options entry": a session running an off-list model accepts
+/// its verbatim id back instead of "Invalid value".
+#[tokio::test]
+async fn g4_f11_accepts_the_reported_current_value_without_an_options_entry() {
+    let models = vec![model("claude-offlist-9", true, None, true)];
+    let mut config = base(models, "claude-offlist-9", true, false);
+    config.config_options = vec![model_option("claude-offlist-9", &[])];
+    let mut actor = Actor::new(composed(config, false), caps(false, false), false);
+
+    let (reply, reply_rx) = oneshot::channel();
+    let _ = actor.tx.send(Command::SetConfigOption {
+        config_id: "model".into(),
+        value: json!("claude-offlist-9"),
+        reply,
+    });
+    let mut reply_rx = reply_rx;
+    let options;
+    loop {
+        tokio::select! {
+            reply = &mut reply_rx => {
+                options = reply.expect("the actor replies").expect("Ok");
+                break;
+            }
+            line = actor.written.recv() => {
+                let Some(line) = line else { panic!("the stdin reader ended") };
+                let request: Value = serde_json::from_str(&line).expect("a JSON line");
+                if request.get("type").and_then(Value::as_str) != Some("control_request") {
+                    continue;
+                }
+                let request_id = request["request_id"].as_str().expect("a request id");
+                if request["request"]["subtype"] == "set_model" {
+                    assert_eq!(request["request"]["model"], "claude-offlist-9");
+                }
+                actor.respond_ok(request_id);
+            }
+            update = actor.updates.recv() => {
+                match update {
+                    Some(SessionOutbound::Flush(ack)) => { let _ = ack.send(()); }
+                    Some(SessionOutbound::Update(notif)) => {
+                        actor.stored.push(serde_json::to_value(&notif).unwrap());
+                    }
+                    Some(SessionOutbound::RawUpdate(value)) => actor.stored.push(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        option(&options, "model").unwrap().current_value,
+        "claude-offlist-9"
     );
 }

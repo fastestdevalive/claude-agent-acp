@@ -1984,4 +1984,488 @@ mod tests {
         let context = ctx("AskUserQuestion", serde_json::json!({}));
         build_options(&context);
     }
+
+    /// `permission-options.test.ts` > "offers only one-time allow and reject
+    /// for %s without a representable update".
+    #[test]
+    fn t8c_every_tool_without_a_representable_update_offers_yes_and_no() {
+        for tool in [
+            "Bash",
+            "PowerShell",
+            "Read",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Glob",
+            "Grep",
+            "WebFetch",
+            "SandboxNetworkAccess",
+            "mcp__example__write_tool",
+            "mcp__computer-use__click",
+        ] {
+            let options = build_options(&ctx(tool, json!({})));
+            let names: Vec<&str> = options.iter().filter_map(|o| o["name"].as_str()).collect();
+            assert_eq!(names, vec!["Yes", "No"], "{tool}");
+        }
+    }
+
+    /// `permission-options.test.ts` > "uses generated native effects instead of
+    /// applying an unrelated provider suggestion".
+    #[test]
+    fn t8c_generated_effects_ignore_an_unrelated_suggestion() {
+        let bash_change = vec![json!({
+            "type": "addRules",
+            "rules": [{"toolName": "Bash", "ruleContent": "npm test:*"}],
+            "behavior": "allow",
+            "destination": "session"
+        })];
+        let read = with_changeset(
+            ctx("Read", json!({"file_path": "/workspace/a.ts"})),
+            bash_change.clone(),
+        );
+        assert_eq!(build_options(&read).len(), 2);
+        let webfetch = with_changeset(
+            ctx("WebFetch", json!({"url": "https://example.com"})),
+            bash_change,
+        );
+        assert_eq!(
+            build_options(&webfetch)[1]["name"],
+            "Yes, and don't ask again for example.com"
+        );
+    }
+
+    /// `permission-options.test.ts` > "preserves an MCP tool's exact provider
+    /// suggestion".
+    #[test]
+    fn t8c_mcp_provider_suggestion_is_applied_verbatim() {
+        let tool = "mcp__example__write_tool";
+        let updates = vec![json!({
+            "type": "addRules",
+            "rules": [{"toolName": tool}],
+            "behavior": "allow",
+            "destination": "localSettings"
+        })];
+        let mut c = ctx(tool, json!({}));
+        c.display_name = Some("Write tool".into());
+        let c = with_changeset(c, updates.clone());
+        let offered = build_options(&c);
+        assert_eq!(
+            offered
+                .iter()
+                .filter_map(|o| o["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Yes",
+                "Yes, and don't ask again for Write tool commands",
+                "No"
+            ]
+        );
+        let effect = apply_selection(OPTION_ALLOW_WITH_UPDATES, &c).unwrap();
+        assert_eq!(
+            effect,
+            SelectionOutcome::Allow {
+                updated_permissions: Some(updates),
+                permanent: true,
+            }
+        );
+    }
+
+    /// `permission-options.test.ts` > "offers no misleading durable option for
+    /// unrepresentable %s suggestions".
+    #[test]
+    fn t8c_mcp_unrepresentable_suggestions_offer_only_yes_and_no() {
+        for tool in ["mcp__example__write_tool", "mcp__computer-use__click"] {
+            let cases: Vec<Vec<Value>> = vec![
+                vec![json!({
+                    "type": "addRules", "rules": [{"toolName": tool}],
+                    "behavior": "deny", "destination": "localSettings"
+                })],
+                vec![json!({
+                    "type": "setMode", "mode": "bypassPermissions", "destination": "session"
+                })],
+                vec![json!({
+                    "type": "addRules", "rules": [{"toolName": "mcp__other__tool"}],
+                    "behavior": "allow", "destination": "localSettings"
+                })],
+                vec![
+                    json!({
+                        "type": "addRules", "rules": [{"toolName": tool}],
+                        "behavior": "allow", "destination": "localSettings"
+                    }),
+                    json!({
+                        "type": "addRules", "rules": [{"toolName": "mcp__other__tool"}],
+                        "behavior": "allow", "destination": "localSettings"
+                    }),
+                ],
+                vec![json!({
+                    "type": "addRules",
+                    "rules": [{"toolName": tool, "ruleContent": "target:staging"}],
+                    "behavior": "allow", "destination": "localSettings"
+                })],
+            ];
+            for updates in cases {
+                let c = with_changeset(ctx(tool, json!({})), updates);
+                assert_eq!(
+                    ids(&build_options(&c)),
+                    vec!["allow-once", "reject"],
+                    "{tool}"
+                );
+            }
+        }
+    }
+
+    /// `permission-options.test.ts` > "preserves the complete representable
+    /// provider bundle for %s".
+    #[test]
+    fn t8c_mcp_complete_provider_bundle_is_preserved() {
+        for tool in ["mcp__example__write_tool", "mcp__computer-use__click"] {
+            let updates = vec![
+                json!({
+                    "type": "addRules",
+                    "rules": [{"toolName": tool}, {"toolName": tool}],
+                    "behavior": "allow",
+                    "destination": "session"
+                }),
+                json!({
+                    "type": "addRules",
+                    "rules": [{"toolName": tool}],
+                    "behavior": "allow",
+                    "destination": "localSettings"
+                }),
+            ];
+            let c = with_changeset(ctx(tool, json!({})), updates.clone());
+            let offered = build_options(&c);
+            assert!(
+                ids(&offered).contains(&OPTION_ALLOW_WITH_UPDATES.to_string()),
+                "{tool}"
+            );
+            let effect = apply_selection(OPTION_ALLOW_WITH_UPDATES, &c).unwrap();
+            assert_eq!(
+                effect,
+                SelectionOutcome::Allow {
+                    updated_permissions: Some(updates),
+                    permanent: true,
+                },
+                "{tool}"
+            );
+        }
+    }
+
+    /// `permission-options.test.ts` > "builds the native session label for %s".
+    #[test]
+    fn t8c_native_session_labels() {
+        let cases: Vec<(&str, Value, Value, &str)> = vec![
+            (
+                "Read",
+                json!({"file_path": "/workspace/a.ts"}),
+                json!([{
+                    "type": "addRules",
+                    "rules": [{"toolName": "Read", "ruleContent": "/workspace/**"}],
+                    "behavior": "allow",
+                    "destination": "session"
+                }]),
+                "Yes, during this session",
+            ),
+            (
+                "Read",
+                json!({"file_path": "/outside/a.ts"}),
+                json!([{
+                    "type": "addRules",
+                    "rules": [{"toolName": "Read", "ruleContent": "/outside/**"}],
+                    "behavior": "allow",
+                    "destination": "session"
+                }]),
+                "Yes, allow reading from outside/ during this session",
+            ),
+            (
+                "Edit",
+                json!({"file_path": "/workspace/a.ts"}),
+                json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]),
+                "Yes, allow all edits during this session",
+            ),
+            (
+                "Write",
+                json!({"file_path": "/outside/a.ts"}),
+                json!([{"type": "addDirectories", "directories": ["/outside"], "destination": "session"}]),
+                "Yes, allow all edits in outside/ during this session",
+            ),
+            (
+                "NotebookEdit",
+                json!({"notebook_path": "/workspace/a.ipynb"}),
+                json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]),
+                "Yes, allow all edits during this session",
+            ),
+            (
+                "Glob",
+                json!({}),
+                json!([{
+                    "type": "addRules",
+                    "rules": [{"toolName": "Read", "ruleContent": "/workspace/**"}],
+                    "behavior": "allow",
+                    "destination": "session"
+                }]),
+                "Yes, during this session",
+            ),
+            (
+                "Grep",
+                json!({}),
+                json!([{
+                    "type": "addRules",
+                    "rules": [{"toolName": "Read", "ruleContent": "/workspace/**"}],
+                    "behavior": "allow",
+                    "destination": "session"
+                }]),
+                "Yes, during this session",
+            ),
+        ];
+        for (tool, input, updates, expected) in cases {
+            let updates = updates.as_array().cloned().unwrap_or_default();
+            let mut c = ctx(tool, input);
+            c.cwd = PathBuf::from("/workspace");
+            let c = with_changeset(c, updates);
+            let options = build_options(&c);
+            let names: Vec<&str> = options.iter().filter_map(|o| o["name"].as_str()).collect();
+            assert_eq!(names, vec!["Yes", expected, "No"], "{tool}");
+        }
+    }
+
+    /// `permission-options.test.ts` > "does not call a persistent filesystem
+    /// update a session grant".
+    #[test]
+    fn t8c_persistent_filesystem_update_is_not_a_session_grant() {
+        let c = with_changeset(
+            ctx("Read", json!({"file_path": "/outside/a.ts"})),
+            vec![json!({
+                "type": "addDirectories",
+                "directories": ["/outside"],
+                "destination": "localSettings"
+            })],
+        );
+        assert_eq!(build_options(&c).len(), 2);
+    }
+
+    /// `permission-options.test.ts` > "does not offer a path-specific
+    /// filesystem effect for a different in-project path".
+    #[test]
+    fn t8c_no_path_specific_effect_for_another_in_project_path() {
+        let read = with_changeset(
+            ctx("Read", json!({"file_path": "/workspace/a.ts"})),
+            vec![json!({
+                "type": "addRules",
+                "rules": [{"toolName": "Read", "ruleContent": "/outside/**"}],
+                "behavior": "allow",
+                "destination": "session"
+            })],
+        );
+        assert_eq!(build_options(&read).len(), 2);
+        let edit = with_changeset(
+            ctx("Edit", json!({"file_path": "/workspace/a.ts"})),
+            vec![json!({
+                "type": "addDirectories",
+                "directories": ["/outside"],
+                "destination": "session"
+            })],
+        );
+        assert_eq!(build_options(&edit).len(), 2);
+    }
+
+    /// `permission-options.test.ts` > "suppresses generated Skill rules when a
+    /// configured ask rule forced the prompt".
+    #[test]
+    fn t8c_skill_rules_are_suppressed_by_a_forced_ask() {
+        let mut c = ctx("Skill", json!({"skill": "deploy prod"}));
+        c.no_persistent_rule = true;
+        assert_eq!(
+            json!(build_options(&c)),
+            json!([
+                {"optionId": "allow-once", "name": "Yes", "kind": "allow_once"},
+                {"optionId": "reject", "name": "No", "kind": "reject_once"}
+            ])
+        );
+    }
+
+    /// `permission-options.test.ts` > "keeps EnterPlanMode at its two reachable
+    /// one-time choices".
+    #[test]
+    fn t8c_enter_plan_mode_has_two_one_time_choices() {
+        assert_eq!(
+            json!(build_options(&ctx("EnterPlanMode", json!({})))),
+            json!([
+                {"optionId": "allow-once", "name": "Yes, enter plan mode", "kind": "allow_once"},
+                {"optionId": "reject", "name": "No, start implementing now", "kind": "reject_once"}
+            ])
+        );
+    }
+
+    /// `permission-options.test.ts` > "ignores a pre-plan bypass mode the
+    /// session no longer advertises".
+    #[test]
+    fn t8c_pre_plan_bypass_is_ignored_when_not_advertised() {
+        let mut c = exit_ctx(
+            json!({"plan": "Implement it"}),
+            &["auto", "acceptEdits"],
+            Some("bypassPermissions"),
+        );
+        c.context_used_percent = Some(73);
+        assert_eq!(
+            ids(&build_options(&c)),
+            vec![
+                "exit-plan-default",
+                "exit-plan-clear-auto",
+                "exit-plan-auto",
+                "reject"
+            ]
+        );
+    }
+
+    /// `permission-options.test.ts` > "falls back through the native
+    /// ExitPlanMode priority".
+    #[test]
+    fn t8c_exit_plan_priority_fallbacks() {
+        let cases: [(&[&str], &str, &str); 3] = [
+            (
+                &["bypassPermissions", "acceptEdits"],
+                "exit-plan-bypass",
+                "Yes, and bypass permissions",
+            ),
+            (
+                &["acceptEdits"],
+                "exit-plan-accept-edits",
+                "Yes, auto-accept edits",
+            ),
+            (&[], "exit-plan-accept-edits", "Yes, auto-accept edits"),
+        ];
+        for (modes, option_id, name) in cases {
+            let options = build_options(&exit_ctx(json!({}), modes, None));
+            assert_eq!(ids(&options)[0], "exit-plan-default");
+            assert_eq!(ids(&options)[1], option_id);
+            assert_eq!(options[1]["name"], name);
+            assert_eq!(ids(&options)[2], "reject");
+        }
+    }
+
+    /// `permission-options.test.ts` > "offers one clear-context ExitPlanMode
+    /// choice using native priority".
+    #[test]
+    fn t8c_exit_plan_clear_context_priority() {
+        let cases: [(&[&str], &str, &str); 3] = [
+            (
+                &["auto", "bypassPermissions", "acceptEdits"],
+                "exit-plan-clear-auto",
+                "Yes, clear context (73% used) and use auto mode",
+            ),
+            (
+                &["bypassPermissions", "acceptEdits"],
+                "exit-plan-clear-bypass",
+                "Yes, clear context (73% used) and bypass permissions",
+            ),
+            (
+                &["acceptEdits"],
+                "exit-plan-clear-accept-edits",
+                "Yes, clear context (73% used) and auto-accept edits",
+            ),
+        ];
+        for (modes, option_id, name) in cases {
+            let mut c = exit_ctx(json!({"plan": "Implement it"}), modes, None);
+            c.context_used_percent = Some(73);
+            let options = build_options(&c);
+            let found = options
+                .iter()
+                .find(|o| o["optionId"].as_str() == Some(option_id))
+                .unwrap_or_else(|| panic!("{option_id} in {options:?}"));
+            assert_eq!(found["name"], name);
+        }
+    }
+
+    /// `permission-options.test.ts` > "recognizes real Computer Use MCP tools
+    /// and preserves their exact durable suggestion".
+    #[test]
+    fn t8c_computer_use_tool_preserves_its_suggestion() {
+        let tool = "mcp__computer-use__click";
+        let updates = vec![json!({
+            "type": "addRules",
+            "rules": [{"toolName": tool}],
+            "behavior": "allow",
+            "destination": "localSettings"
+        })];
+        let mut c = ctx(tool, json!({}));
+        c.display_name = Some("Click".into());
+        let c = with_changeset(c, updates.clone());
+        let offered = build_options(&c);
+        assert_eq!(
+            offered
+                .iter()
+                .filter_map(|o| o["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["Yes", "Yes, and don't ask again for Click", "No"]
+        );
+        let effect = apply_selection(OPTION_ALLOW_WITH_UPDATES, &c).unwrap();
+        assert_eq!(
+            effect,
+            SelectionOutcome::Allow {
+                updated_permissions: Some(updates),
+                permanent: true,
+            }
+        );
+    }
+
+    /// `permission-options.test.ts` > "reuses the Computer Use MCP tool-call
+    /// title": the AIR presentation falls back to the tool-call title, which
+    /// is the programmatic tool name.
+    #[test]
+    fn t8c_computer_use_presentation_reuses_the_tool_call_title() {
+        let meta = crate::tools::air_permission_meta(
+            "mcp__computer-use__screenshot",
+            &json!({}),
+            None,
+            "mcp__computer-use__screenshot",
+            None,
+            false,
+        );
+        assert_eq!(
+            meta,
+            json!({
+                "jetbrains": {"air": {"version": 1, "permission": {
+                    "version": 1, "title": "mcp__computer-use__screenshot"
+                }}}
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod t8c_ask_user_question {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// `permission-options.test.ts` > "refuses to route AskUserQuestion through
+    /// permission options": the builder panics with the elicitation message.
+    #[test]
+    fn t8c_ask_user_question_is_refused() {
+        let context = OptionsContext {
+            tool_name: "AskUserQuestion".into(),
+            display_name: None,
+            input: serde_json::json!({}),
+            cwd: PathBuf::from("/repo"),
+            change_set: None,
+            no_persistent_rule: false,
+            default_to_no: false,
+            available_modes: Vec::new(),
+            auto_unavailable: false,
+            pre_plan_mode: None,
+            context_used_percent: None,
+            home_dir: None,
+        };
+        let panic = std::panic::catch_unwind(|| build_options(&context));
+        let payload = panic.expect_err("AskUserQuestion must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        assert_eq!(
+            message,
+            "AskUserQuestion must be handled by ACP elicitation, not permission options"
+        );
+    }
 }

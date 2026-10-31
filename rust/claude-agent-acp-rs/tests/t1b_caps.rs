@@ -295,3 +295,30 @@ fn terminal_exit_for_a_command_that_got_no_result() {
     assert_eq!(c.terminal_exit_meta(false, "t"), None);
     assert_eq!(caps(json!({})).terminal_exit_meta(true, "t"), None);
 }
+
+/// `tools.test.ts` > "keys the terminal metas off the tool_use id, which is
+/// what was announced": a result that names another id cannot retarget them.
+#[test]
+fn t8c_terminal_metas_follow_the_announced_id() {
+    let c = caps(json!({"_meta": {"terminal_output": true}}));
+    let r = c
+        .terminal_result(
+            Some("toolu_bash"),
+            Some("toolu_something_else"),
+            &outcome("out", Some(0), false),
+            false,
+        )
+        .expect("terminal result");
+    assert_eq!(
+        r.content,
+        Some(json!({"type": "terminal", "terminalId": "toolu_bash"}))
+    );
+    assert_eq!(
+        r.output_meta,
+        json!({"terminal_output": {"terminal_id": "toolu_bash", "data": "out"}})
+    );
+    assert_eq!(
+        r.exit_meta,
+        json!({"terminal_exit": {"terminal_id": "toolu_bash", "exit_code": 0, "signal": null}})
+    );
+}

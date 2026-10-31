@@ -61,3 +61,40 @@ async fn t3b_the_same_gateway_reuses_its_listing() {
     assert!(list_provider_models(None, &mut vertex, &None).await.is_ok());
     assert_eq!(vertex.listed_models, None);
 }
+
+/// `providers.test.ts` > "providers/set takes precedence over gateway auth":
+/// `resolveProviderConfig` reads the client override first and the legacy
+/// gateway only when no override is set; setting the single slot again replaces
+/// the active api type.
+#[tokio::test]
+async fn t9b_provider_set_precedes_gateway_auth_and_replaces_the_slot() {
+    use super::providers::ProviderConfig;
+
+    let mut rig = super::tests_t3fb::rig();
+    rig.registry.gateway_auth = Some(json!({
+        "methodId": "gateway",
+        "_meta": {"gateway": {"baseUrl": "https://gateway.example", "headers": {}}}
+    }));
+    assert_eq!(
+        rig.registry.resolve_provider().expect("gateway").base_url,
+        "https://gateway.example"
+    );
+    rig.registry.provider = Some(ProviderConfig::new(
+        "anthropic",
+        "https://provider.example",
+        Vec::new(),
+    ));
+    let current = rig.registry.resolve_provider().expect("override");
+    assert_eq!(current.base_url, "https://provider.example");
+    assert_eq!(current.api_type, "anthropic");
+
+    // The one slot is replaced wholesale by the next set.
+    rig.registry.provider = Some(ProviderConfig::new(
+        "bedrock",
+        "https://bedrock.example",
+        Vec::new(),
+    ));
+    let current = rig.registry.resolve_provider().expect("replaced");
+    assert_eq!(current.api_type, "bedrock");
+    assert_eq!(current.base_url, "https://bedrock.example");
+}

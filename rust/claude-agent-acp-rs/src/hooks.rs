@@ -90,40 +90,69 @@ impl HookRole {
 
 /// The payload sent in the `initialize` control_request's `hooks` field.
 pub fn init_hooks_payload() -> Value {
-    init_hooks_payload_with_v2(false)
+    init_hooks_payload_with_user(false, None)
 }
 
 /// The payload sent in the `initialize` control_request's `hooks` field,
 /// optionally adding the v2 PreToolUse preview hook for Edit/Write (T-105;
 /// `acp-agent.ts:11285-11292`).
 pub fn init_hooks_payload_with_v2(v2: bool) -> Value {
+    init_hooks_payload_with_user(v2, None)
+}
+
+/// [`init_hooks_payload_with_v2`] merged with the client's own hook tables
+/// (O-169; `acp-agent.ts:11280-11390`):
+///
+/// ```js
+/// hooks: {
+///   ...userProvidedOptions?.hooks,
+///   ...(v2 ? { PreToolUse: [...user.PreToolUse, preview] } : {}),
+///   PostToolUse: [...user.PostToolUse, post],
+///   PostModelSwitch: [...], PostCompact: [...],
+///   TaskCreated: [...], TaskCompleted: [...],
+/// }
+/// ```
+///
+/// The user's keys keep their insertion order; a key the adapter also owns
+/// keeps its position when the user declared it (JavaScript object semantics)
+/// and is appended otherwise. The user's entries stay verbatim: Node's SDK
+/// registers one callback id per entry, which is an SDK-internal detail the
+/// adapter does not control.
+pub fn init_hooks_payload_with_user(v2: bool, user_hooks: Option<&Value>) -> Value {
+    let user = user_hooks.and_then(Value::as_object);
+    let entries = |key: &str| -> Vec<Value> {
+        user.and_then(|hooks| hooks.get(key))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
     let mut map = serde_json::Map::new();
-    if v2 {
-        map.insert(
-            "PreToolUse".to_string(),
-            json!([{"matcher": "Edit|Write", "hookCallbackIds": [HookRole::PreToolUse.id_for(v2)]}]),
-        );
+    if let Some(user) = user {
+        for (key, value) in user {
+            map.insert(key.clone(), value.clone());
+        }
     }
-    map.insert(
-        "PostToolUse".to_string(),
-        json!([{"hookCallbackIds": [HookRole::PostToolUse.id_for(v2)]}]),
-    );
-    map.insert(
-        "PostModelSwitch".to_string(),
-        json!([{"hookCallbackIds": [HookRole::PostModelSwitch.id_for(v2)]}]),
-    );
-    map.insert(
-        "PostCompact".to_string(),
-        json!([{"hookCallbackIds": [HookRole::PostCompact.id_for(v2)]}]),
-    );
-    map.insert(
-        "TaskCreated".to_string(),
-        json!([{"hookCallbackIds": [HookRole::TaskCreated.id_for(v2)]}]),
-    );
-    map.insert(
-        "TaskCompleted".to_string(),
-        json!([{"hookCallbackIds": [HookRole::TaskCompleted.id_for(v2)]}]),
-    );
+    if v2 {
+        let mut pre = entries("PreToolUse");
+        pre.push(json!({"matcher": "Edit|Write",
+            "hookCallbackIds": [HookRole::PreToolUse.id_for(v2)]}));
+        map.insert("PreToolUse".to_string(), Value::Array(pre));
+    }
+    let mut post = entries("PostToolUse");
+    post.push(json!({"hookCallbackIds": [HookRole::PostToolUse.id_for(v2)]}));
+    map.insert("PostToolUse".to_string(), Value::Array(post));
+    let mut model_switch = entries("PostModelSwitch");
+    model_switch.push(json!({"hookCallbackIds": [HookRole::PostModelSwitch.id_for(v2)]}));
+    map.insert("PostModelSwitch".to_string(), Value::Array(model_switch));
+    let mut compact = entries("PostCompact");
+    compact.push(json!({"hookCallbackIds": [HookRole::PostCompact.id_for(v2)]}));
+    map.insert("PostCompact".to_string(), Value::Array(compact));
+    let mut created = entries("TaskCreated");
+    created.push(json!({"hookCallbackIds": [HookRole::TaskCreated.id_for(v2)]}));
+    map.insert("TaskCreated".to_string(), Value::Array(created));
+    let mut completed = entries("TaskCompleted");
+    completed.push(json!({"hookCallbackIds": [HookRole::TaskCompleted.id_for(v2)]}));
+    map.insert("TaskCompleted".to_string(), Value::Array(completed));
     Value::Object(map)
 }
 
@@ -1924,5 +1953,246 @@ mod tests {
         assert_eq!(entries[0]["content"], "Building");
         assert_eq!(entries[1]["content"], "Empty form");
         assert_eq!(entries[2]["content"], "Pending");
+    }
+
+    /// `tools.test.ts` > "applyTaskCreate / applyTaskUpdate": a TaskCreate
+    /// entry keeps the input's activeForm and description; a TaskUpdate for an
+    /// unseen task creates a placeholder only when it carries a subject.
+    #[test]
+    fn t8c_task_create_entry_and_update_placeholder() {
+        let mut state = Vec::new();
+        apply_task_create(
+            &mut state,
+            &json!({
+                "subject": "Write tests",
+                "description": "Cover Task* flow",
+                "activeForm": "Writing tests"
+            }),
+            Some("1"),
+        );
+        assert_eq!(state.len(), 1);
+        assert_eq!(
+            state[0].1,
+            TaskStateEntry {
+                subject: "Write tests".into(),
+                status: "pending".into(),
+                active_form: Some("Writing tests".into()),
+                description: Some("Cover Task* flow".into()),
+            }
+        );
+
+        let mut state = Vec::new();
+        apply_task_update(
+            &mut state,
+            &json!({"taskId": "5", "subject": "Late arrival", "status": "in_progress"}),
+        );
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].0, "5");
+        assert_eq!(state[0].1.subject, "Late arrival");
+        assert_eq!(state[0].1.status, "in_progress");
+        assert!(state[0].1.active_form.is_none());
+        assert!(state[0].1.description.is_none());
+
+        let mut state = Vec::new();
+        apply_task_update(&mut state, &json!({"taskId": "5", "status": "in_progress"}));
+        assert!(state.is_empty(), "no subject: no blank placeholder");
+    }
+
+    /// `tools.test.ts` > "applyTaskCreate / applyTaskUpdate": insertion order
+    /// survives an update, and a deleted status removes the entry.
+    #[test]
+    fn t8c_task_update_keeps_insertion_order_and_deletes() {
+        let mut state = Vec::new();
+        apply_task_create(
+            &mut state,
+            &json!({"subject": "A", "description": "", "activeForm": "Working on A"}),
+            Some("1"),
+        );
+        apply_task_create(
+            &mut state,
+            &json!({"subject": "B", "description": ""}),
+            Some("2"),
+        );
+        apply_task_update(&mut state, &json!({"taskId": "1", "status": "in_progress"}));
+        assert_eq!(
+            task_state_to_plan_entries(&state),
+            vec![
+                json!({"content": "Working on A", "status": "in_progress", "priority": "medium"}),
+                json!({"content": "B", "status": "pending", "priority": "medium"}),
+            ]
+        );
+        apply_task_update(&mut state, &json!({"taskId": "1", "status": "deleted"}));
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].0, "2");
+    }
+
+    /// `tools.test.ts` > "applyTaskCreate / applyTaskUpdate": a TaskList
+    /// snapshot after an unrelated JSON block, the human-readable format, and
+    /// adversarial subject text are all parsed without treating the middle of a
+    /// subject as a blocked-by suffix.
+    #[test]
+    fn t8c_task_list_parsing_edges() {
+        assert_eq!(
+            parse_task_list_output(&json!([
+                {"type": "text", "text": r#"{"metadata":"unrelated"}"#},
+                {"type": "text", "text": r#"{"tasks":[{"id":"1","subject":"Recovered","status":"pending","blockedBy":[]}]}"#}
+            ])),
+            vec![(
+                "1".to_string(),
+                "Recovered".to_string(),
+                "pending".to_string()
+            )]
+        );
+
+        assert_eq!(
+            parse_task_list_output(&json!(
+                "#1 [in_progress] Run tests (runner)\n#2 [pending] Write release notes [blocked by #1, #3]"
+            )),
+            vec![
+                (
+                    "1".to_string(),
+                    "Run tests".to_string(),
+                    "in_progress".to_string()
+                ),
+                (
+                    "2".to_string(),
+                    "Write release notes".to_string(),
+                    "pending".to_string()
+                ),
+            ]
+        );
+        assert_eq!(parse_task_list_output(&json!("No tasks found")), vec![]);
+
+        let subject = format!("{}work", "work [blocked by #1, ".repeat(20_000));
+        let parsed = parse_task_list_output(&json!(format!("#1 [pending] {subject}")));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].1, subject);
+        assert_eq!(parsed[0].2, "pending");
+    }
+
+    /// `tools.test.ts` > "post-tool-use hook sends diff content for Edit tool":
+    /// multiple hunks produce one diff block and location each.
+    #[test]
+    fn t8c_post_tool_use_multiple_hunks() {
+        let response = json!({
+            "filePath": "/src/a.rs",
+            "structuredPatch": [
+                {"newStart": 3, "lines": ["-old1", "+new1"]},
+                {"newStart": 8, "lines": ["-old2", "+new2"]}
+            ]
+        });
+        let update = post_tool_use_update("t", "Edit", None, &response, false, false)
+            .expect("the change is reported");
+        assert_eq!(
+            update["content"],
+            json!([
+                {"type": "diff", "path": "/src/a.rs", "oldText": "old1", "newText": "new1"},
+                {"type": "diff", "path": "/src/a.rs", "oldText": "old2", "newText": "new2"}
+            ])
+        );
+        assert_eq!(
+            update["locations"],
+            json!([{"path": "/src/a.rs", "line": 3}, {"path": "/src/a.rs", "line": 8}])
+        );
+    }
+
+    /// `tools.test.ts` > "post-tool-use hook sends diff content for Write
+    /// tool": an update emits the real diff and a create emits a creation diff.
+    #[test]
+    fn t8c_post_tool_use_write_update_and_create() {
+        let update = post_tool_use_update(
+            "t",
+            "Write",
+            None,
+            &json!({
+                "type": "update",
+                "filePath": "/src/file.ts",
+                "content": "line1\nNEW line2\nline3",
+                "originalFile": "line1\nold line2\nline3",
+                "structuredPatch": [{
+                    "newStart": 1,
+                    "lines": [" line1", "-old line2", "+NEW line2", " line3"]
+                }]
+            }),
+            false,
+            false,
+        )
+        .expect("the update is reported");
+        assert_eq!(
+            update["content"],
+            json!([{
+                "type": "diff",
+                "path": "/src/file.ts",
+                "oldText": "line1\nold line2\nline3",
+                "newText": "line1\nNEW line2\nline3"
+            }])
+        );
+        assert_eq!(
+            update["locations"],
+            json!([{"path": "/src/file.ts", "line": 1}])
+        );
+
+        let update = post_tool_use_update(
+            "t",
+            "Write",
+            None,
+            &json!({
+                "type": "create",
+                "filePath": "/src/new.ts",
+                "content": "first\nsecond",
+                "originalFile": null,
+                "structuredPatch": [{
+                    "newStart": 1,
+                    "lines": ["+first", "+second"]
+                }]
+            }),
+            false,
+            false,
+        )
+        .expect("the creation is reported");
+        let mut update = update;
+        crate::map::materialize_diff_old_text(&mut update);
+        assert_eq!(
+            update["content"],
+            json!([{
+                "type": "diff",
+                "path": "/src/new.ts",
+                "oldText": null,
+                "newText": "first\nsecond"
+            }])
+        );
+    }
+
+    /// `tools.test.ts` > "post-tool-use hook sends diff content for Edit tool"
+    /// and "post-tool-use hook preserves terminal _meta": a non-Edit tool has
+    /// no content/locations; an AIR client (which keeps its `_meta`) gets no
+    /// update without a marker, and every other client gets only `claudeCode`.
+    #[test]
+    fn t8c_post_tool_use_non_edit_and_terminal_meta() {
+        let air = post_tool_use_update("t", "Bash", None, &json!("hi"), false, true);
+        assert!(air.is_none(), "no marker and no change: nothing to add");
+
+        let plain = post_tool_use_update("t", "Bash", None, &json!("hi"), false, false)
+            .expect("the response is reported");
+        assert!(plain.get("content").is_none());
+        assert!(plain.get("locations").is_none());
+        assert_eq!(plain["_meta"]["claudeCode"]["toolName"], "Bash");
+        assert_eq!(plain["_meta"]["claudeCode"]["toolResponse"], "hi");
+        assert!(plain["_meta"].get("terminal_output").is_none());
+        assert!(plain["_meta"].get("terminal_exit").is_none());
+
+        let markers = post_tool_use_update(
+            "t",
+            "Agent",
+            None,
+            &json!({"status": "async_launched", "isAsync": true, "agentId": "a"}),
+            false,
+            true,
+        )
+        .expect("the markers are reported");
+        assert_eq!(
+            markers["_meta"]["claudeCode"]["toolResponse"],
+            json!({"status": "async_launched", "isAsync": true})
+        );
     }
 }

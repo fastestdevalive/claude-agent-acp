@@ -183,6 +183,7 @@ pub fn permission_denied_update(
     frame: &Value,
     state: &mut MapState,
     live_background: &HashMap<String, String>,
+    eager_session: Option<&str>,
     air: bool,
     supports_subagents: bool,
 ) -> Option<SessionUpdate> {
@@ -196,7 +197,10 @@ pub fn permission_denied_update(
     // canUseTool does), never by the Agent/Task call that spawned it.
     let agent_id = str_of(frame, "agent_id").filter(|id| !id.is_empty());
     let parent = agent_id.and_then(|id| live_background.get(id).map(String::as_str));
-    if agent_id.is_some() && parent.is_none() && supports_subagents {
+    // P-01 (`acp-agent.ts:6326-6340`): a denial whose agent id has no live
+    // lineage is still presentable when the eager tool-call session map knows
+    // the child (the permission surfaced the call before `task_started`).
+    if agent_id.is_some() && parent.is_none() && eager_session.is_none() && supports_subagents {
         // An agent-scoped denial with missing lineage cannot safely be presented
         // in the root transcript.
         return None;
@@ -565,6 +569,34 @@ mod tests {
         assert!(two.get("content").is_none());
     }
 
+    /// `tool-call-contract.test.ts` > "reports a memory recall as a completed
+    /// read": the whole update, in Node's shape.
+    #[test]
+    fn t9a_memory_recall_is_a_completed_read_tool_call() {
+        assert_eq!(
+            memory_recall_update(&json!({
+                "uuid": "m", "mode": "select", "memories": [{"path": "/mem/a.md"}]
+            })),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "m",
+                "title": "Recalled 1 memory",
+                "kind": "read",
+                "status": "completed",
+                "locations": [{"path": "/mem/a.md"}],
+                "_meta": {"claudeCode": {"toolName": "memory_recall",
+                    "toolResponse": {"mode": "select"}}}
+            })
+        );
+        assert_eq!(
+            memory_recall_update(&json!({
+                "uuid": "m", "mode": "synthesize",
+                "memories": [{"path": "/mem/a.md", "content": "Use pnpm"}]
+            }))["content"],
+            json!([{"type": "content", "content": {"type": "text", "text": "Use pnpm"}}])
+        );
+    }
+
     /// T-82 — a synthesis shows the recalled text and no files.
     #[test]
     fn t2a_memory_recall_synthesis_shows_the_text() {
@@ -697,7 +729,7 @@ mod tests {
         let mut state = MapState::default();
         emitted(&mut state, "toolu_D", "Bash");
         let update = wire(
-            &permission_denied_update(&denial(), &mut state, &HashMap::new(), false, false)
+            &permission_denied_update(&denial(), &mut state, &HashMap::new(), None, false, false)
                 .expect("denial"),
         );
         assert_eq!(update["toolCallId"], "toolu_D");
@@ -718,7 +750,8 @@ mod tests {
         let mut air = MapState::default();
         emitted(&mut air, "toolu_D", "Bash");
         let update = wire(
-            &permission_denied_update(&denial(), &mut air, &HashMap::new(), true, false).unwrap(),
+            &permission_denied_update(&denial(), &mut air, &HashMap::new(), None, true, false)
+                .unwrap(),
         );
         assert_eq!(
             update["_meta"]["claudeCode"]["toolResponse"],
@@ -729,11 +762,39 @@ mod tests {
         let mut equal = denial();
         equal["message"] = equal["decision_reason"].clone();
         let update = wire(
-            &permission_denied_update(&equal, &mut same, &HashMap::new(), true, false).unwrap(),
+            &permission_denied_update(&equal, &mut same, &HashMap::new(), None, true, false)
+                .unwrap(),
         );
         assert_eq!(
             update["_meta"]["claudeCode"]["toolResponse"],
             json!({"decisionReasonType": "rule"})
+        );
+    }
+
+    /// T8B — a denial is final, so it replaces the approval patch pinned on the
+    /// call (`acp-agent.ts` `pinContent` / `replacePinnedContent`).
+    #[test]
+    fn t8b_permission_denied_replaces_a_pinned_approval_patch() {
+        let mut state = MapState::default();
+        emitted(&mut state, "toolu_D", "Bash");
+        let preview = json!([{"type": "content",
+            "content": {"type": "text", "text": "the pinned approval patch"}}]);
+        state.pin_approval_preview("toolu_D", None, preview.as_array().expect("preview array"));
+        let update = wire(
+            &permission_denied_update(&denial(), &mut state, &HashMap::new(), None, false, false)
+                .expect("denial"),
+        );
+        assert_eq!(update["status"], "failed");
+        assert_eq!(
+            update["content"],
+            json!([{"type": "content", "content": {"type": "text",
+                "text": "Permission denied: Denied by rule Bash(rm:*)"}}]),
+            "the denial reason replaces the pinned patch: {update}"
+        );
+        assert_ne!(
+            update["content"],
+            json!([{"type": "content", "content": {"type": "text",
+                "text": "the pinned approval patch"}}])
         );
     }
 
@@ -745,7 +806,8 @@ mod tests {
         let mut frame = denial();
         frame.as_object_mut().unwrap().remove("decision_reason");
         let update = wire(
-            &permission_denied_update(&frame, &mut state, &HashMap::new(), false, false).unwrap(),
+            &permission_denied_update(&frame, &mut state, &HashMap::new(), None, false, false)
+                .unwrap(),
         );
         assert_eq!(
             update["content"][0]["content"]["text"],
@@ -759,10 +821,15 @@ mod tests {
     fn t2a_permission_denied_for_an_unknown_call_is_dropped() {
         let mut state = MapState::default();
         state.pending_hooks.insert("toolu_D".to_string());
-        assert!(
-            permission_denied_update(&denial(), &mut state, &HashMap::new(), false, false)
-                .is_none()
-        );
+        assert!(permission_denied_update(
+            &denial(),
+            &mut state,
+            &HashMap::new(),
+            None,
+            false,
+            false
+        )
+        .is_none());
         assert!(!state.pending_hooks.contains("toolu_D"));
     }
 
@@ -778,7 +845,7 @@ mod tests {
         let mut state = MapState::default();
         emitted(&mut state, "toolu_D", "Bash");
         let update =
-            wire(&permission_denied_update(&frame, &mut state, &live, false, true).unwrap());
+            wire(&permission_denied_update(&frame, &mut state, &live, None, false, true).unwrap());
         assert_eq!(
             update["_meta"]["claudeCode"]["parentToolUseId"],
             "toolu_AGENT"
@@ -787,11 +854,13 @@ mod tests {
         let mut lost = MapState::default();
         emitted(&mut lost, "toolu_D", "Bash");
         assert!(
-            permission_denied_update(&frame, &mut lost, &HashMap::new(), false, true).is_none()
+            permission_denied_update(&frame, &mut lost, &HashMap::new(), None, false, true)
+                .is_none()
         );
         // A client without subagent support still gets the report in the root.
         let root = wire(
-            &permission_denied_update(&frame, &mut lost, &HashMap::new(), false, false).unwrap(),
+            &permission_denied_update(&frame, &mut lost, &HashMap::new(), None, false, false)
+                .unwrap(),
         );
         assert!(root["_meta"]["claudeCode"].get("parentToolUseId").is_none());
     }

@@ -77,6 +77,9 @@ mod tests_t6a2;
 #[cfg(test)]
 mod tests_t7c;
 
+#[cfg(test)]
+mod tests_t8c;
+
 // Public library surface mirroring upstream `src/lib.ts` (FX-4 / O-83, Q-19).
 pub use agent::serve as run_acp;
 pub use agent::{serve, serve_handle, ClaudeAcpAgent, ServeHandle, ServeOptions};

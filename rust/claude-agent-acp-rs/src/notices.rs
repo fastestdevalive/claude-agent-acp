@@ -377,6 +377,35 @@ mod tests {
         );
     }
 
+    /// `async-tasks.test.ts` > "acknowledges a stop as a live notice for a client
+    /// on the notice contract": the acknowledgement is a live `notice` with the
+    /// task's name; without the capability it is the bold-label transcript line.
+    #[test]
+    fn t9a_task_stopped_notice_wire_shape() {
+        let stopped = notice(
+            "info",
+            "Task stopped by user",
+            Some("Build generated assets."),
+        );
+        assert_eq!(
+            notice_or_transcript_update(&stopped, true, None, None),
+            json!({
+                "sessionUpdate": "notice",
+                "severity": "info",
+                "title": "Task stopped by user",
+                "description": "Build generated assets."
+            })
+        );
+        assert_eq!(
+            notice_or_transcript_update(&stopped, false, None, None),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text",
+                    "text": "**Task stopped by user:** Build generated assets."}
+            })
+        );
+    }
+
     #[test]
     fn strips_inline_markdown_that_a_plain_text_notice_would_show_literally() {
         assert_eq!(

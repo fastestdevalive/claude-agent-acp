@@ -680,6 +680,25 @@ fn air_finish_delivers_buffered_output_before_the_terminal_state() {
     );
 }
 
+/// T8A — a tool-call update of a child that a cancel ended gets no report: the
+/// AIR form drops it and logs the late update.
+#[test]
+fn t8a_late_update_for_a_terminal_air_child_is_dropped() {
+    let mut h = air_with_launch("launch-1");
+    h.started(task("worker-1", "launch-1", Some("Explore"), Some("run")));
+    h.finish("worker-1", "cancelled", None);
+    let late = json!({"sessionId": "root", "update": {
+        "sessionUpdate": "tool_call_update", "toolCallId": "bash-1",
+        "status": "completed",
+        "_meta": {"claudeCode": {"parentToolUseId": "launch-1"}}}});
+    assert_eq!(h.route(&late), None);
+    assert!(h
+        .rt
+        .take_logs()
+        .iter()
+        .any(|l| l.contains("ignoring late update for terminal subagent")));
+}
+
 #[test]
 fn air_parent_cancel_ends_every_child_as_cancelled() {
     let mut h = air_with_launch("launch-1");
@@ -1355,4 +1374,538 @@ fn a_tool_call_route_of_another_runtime_applies_to_nothing() {
         .rt
         .apply_route(route, &output("launch-1", "late"))
         .is_none());
+}
+
+// ----- T9A: RFD/AIR restore rows ---------------------------------------------
+
+/// `native-subagents.test.ts` > lifecycle > "discards unknown pending child
+/// updates during finishAll": the sweep drops the buffer, and a child that the
+/// SDK starts afterwards gets none of it.
+#[test]
+fn t9a_finish_all_discards_unknown_pending_child_updates() {
+    let mut h = H::new(Some(SubagentForm::Air));
+    let pending = output("agent-tool", "stale");
+    assert_eq!(h.route(&pending), None);
+    assert_eq!(h.rt.pending_count(), 1);
+    let outs = h.rt.finish_all(SubagentState::Cancelled);
+    h.apply(outs);
+    assert_eq!(h.rt.pending_count(), 0);
+    h.started(task(
+        "child-1",
+        "agent-tool",
+        Some("Explore"),
+        Some("New child"),
+    ));
+    assert_eq!(
+        h.route(&control("tool_call", "pending", "agent-tool", None)),
+        None
+    );
+    assert!(h.delivered.is_empty());
+}
+
+/// `native-subagents.test.ts` > lifecycle > "announces a resumed nested subagent
+/// under a live ancestor when its parent has finished": the resumed generation
+/// of a nested child is announced under the root once its parent is gone.
+#[test]
+fn t9a_air_resumed_nested_child_is_announced_under_the_root() {
+    let mut h = H::new(Some(SubagentForm::Air));
+    h.route(&control("tool_call", "pending", "launch-a", None));
+    h.started(task("agent-a", "launch-a", Some("Explore"), None));
+    h.route(&control(
+        "tool_call",
+        "pending",
+        "launch-b",
+        Some("launch-a"),
+    ));
+    h.started(task("agent-b", "launch-b", Some("Explore"), None));
+    h.finish("agent-b", "completed", Some("launch-b"));
+    h.finish("agent-a", "completed", Some("launch-a"));
+    h.started(task("agent-b", "launch-b", Some("Explore"), None));
+    let last = h.published.last().unwrap();
+    assert_eq!(last["sessionId"], "root");
+    assert_eq!(last["update"]["sessionUpdate"], "subagent_spawned");
+    assert_eq!(last["update"]["subagentSessionId"], "agent-b:generation:2");
+}
+
+/// `native-subagents.test.ts` > RFD "an agent from before a load or resume" >
+/// "restores the agent that a SendMessage call resumes under its id, and routes
+/// its run to it": the restore announces once, sends the prompt, and the resumed
+/// run's output under the launch id reaches the child.
+#[test]
+fn t9a_rfd_restores_under_a_send_message_and_routes_its_run() {
+    let lineage: LineageFn = Box::new(|id| {
+        if id == "echoer-1" {
+            vec![HistoricalSubagent {
+                agent_id: "echoer-1".into(),
+                launch_id: "launch-1".into(),
+                parent_agent_id: None,
+                name: Some("echoer".into()),
+                agent_type: Some("Explore".into()),
+                description: Some("Echo a word".into()),
+            }]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Rfd, lineage, None);
+    h.route(&send_message("send-1", None));
+    h.started(TaskStarted {
+        task_id: "echoer-1".into(),
+        tool_use_id: Some("send-1".into()),
+        subagent_type: Some("Explore".into()),
+        prompt: Some("Say PING".into()),
+        ..TaskStarted::default()
+    });
+    assert_eq!(
+        h.published,
+        vec![
+            json!({"sessionId": "root", "update": {
+                "sessionUpdate": "subagent_update", "sessionId": "echoer-1",
+                "title": "echoer (Explore)", "description": "Echo a word",
+                "capabilities": {"cancel": {}}, "state": {"state": "running"}}}),
+            json!({"sessionId": "echoer-1", "update": {
+                "sessionUpdate": "session_message", "messageId": "send-1",
+                "senderSessionId": "root", "recipientSessionId": "echoer-1",
+                "content": [{"type": "text", "text": "Say PING"}]}}),
+        ]
+    );
+    // Claude Code sends the resumed run's messages under the call that launched
+    // the agent.
+    assert_eq!(
+        session_of(&h.route(&output("launch-1", "working"))).as_deref(),
+        Some("echoer-1")
+    );
+    h.finish("echoer-1", "completed", Some("send-1"));
+    assert_eq!(
+        h.published.last().unwrap()["update"]["state"],
+        json!({"state": "idle", "stopReason": "end_turn"})
+    );
+}
+
+/// `native-subagents.test.ts` > RFD restore > "announces an ancestor once, for
+/// each agent under it that resumes".
+#[test]
+fn t9a_rfd_announces_an_ancestor_once_for_each_child() {
+    let lineage: LineageFn = Box::new(|id| {
+        let coordinator = HistoricalSubagent {
+            agent_id: "coordinator-1".into(),
+            launch_id: "launch-c".into(),
+            parent_agent_id: None,
+            name: Some("coordinator".into()),
+            agent_type: Some("general-purpose".into()),
+            description: Some("Coordinate".into()),
+        };
+        match id {
+            "echoer-1" => vec![
+                coordinator,
+                HistoricalSubagent {
+                    agent_id: "echoer-1".into(),
+                    launch_id: "launch-e".into(),
+                    parent_agent_id: Some("coordinator-1".into()),
+                    name: None,
+                    agent_type: Some("Explore".into()),
+                    description: None,
+                },
+            ],
+            "sibling-1" => vec![
+                coordinator,
+                HistoricalSubagent {
+                    agent_id: "sibling-1".into(),
+                    launch_id: "launch-s".into(),
+                    parent_agent_id: Some("coordinator-1".into()),
+                    name: None,
+                    agent_type: Some("Explore".into()),
+                    description: None,
+                },
+            ],
+            _ => Vec::new(),
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Rfd, lineage, None);
+    h.route(&send_message("send-1", None));
+    h.started(TaskStarted {
+        task_id: "echoer-1".into(),
+        tool_use_id: Some("send-1".into()),
+        ..TaskStarted::default()
+    });
+    h.route(&send_message("send-2", None));
+    h.started(TaskStarted {
+        task_id: "sibling-1".into(),
+        tool_use_id: Some("send-2".into()),
+        ..TaskStarted::default()
+    });
+    let announcements: Vec<String> = h
+        .published
+        .iter()
+        .filter(|n| n["update"]["sessionUpdate"] == "subagent_update")
+        .map(|n| {
+            format!(
+                "{} -> {}",
+                n["sessionId"].as_str().unwrap(),
+                n["update"]["sessionId"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        announcements,
+        [
+            "root -> coordinator-1",
+            "coordinator-1 -> echoer-1",
+            "coordinator-1 -> sibling-1",
+        ]
+    );
+}
+
+/// `native-subagents.test.ts` > RFD restore > "restores the agent at the
+/// SendMessage result when no task_started came".
+#[test]
+fn t9a_rfd_restores_at_the_send_message_result() {
+    let lineage: LineageFn = Box::new(|id| {
+        if id == "echoer-1" {
+            vec![entry("echoer-1", "launch-1", None)]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Rfd, lineage, None);
+    h.route(&send_message("send-1", None));
+    h.send_resumed("echoer-1", Some("Say PING"), Some("send-1"));
+    let kinds: Vec<String> = h
+        .published
+        .iter()
+        .map(|n| {
+            format!(
+                "{} {}",
+                n["sessionId"].as_str().unwrap(),
+                n["update"]["sessionUpdate"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(kinds, ["root subagent_update", "echoer-1 session_message"]);
+}
+
+/// `native-subagents.test.ts` > RFD restore > "reads no history for a new launch,
+/// or for a child it knows".
+#[test]
+fn t9a_rfd_reads_no_history_for_a_new_launch_or_a_known_child() {
+    let lineage: LineageFn = Box::new(|_| panic!("history must not be read"));
+    let mut h = H::with_history(SubagentForm::Rfd, lineage, None);
+    h.route(&rfd_launch(
+        "launch-1",
+        json!({"description": "Fix the build"}),
+        None,
+    ));
+    h.started(task("worker-1", "launch-1", Some("Explore"), None));
+    h.finish("worker-1", "completed", Some("launch-1"));
+    h.route(&send_message("send-1", None));
+    h.started(TaskStarted {
+        task_id: "worker-1".into(),
+        tool_use_id: Some("send-1".into()),
+        ..TaskStarted::default()
+    });
+}
+
+/// `native-subagents.test.ts` > RFD "keeps the role in the title when a late
+/// frame names the child": the task_started announces by role, the later frame
+/// adds the name and keeps the role in parentheses.
+#[test]
+fn t9a_rfd_late_frame_keeps_the_role_in_the_title() {
+    let mut h = H::new(Some(SubagentForm::Rfd));
+    h.started(task("worker-1", "launch-1", Some("Explore"), None));
+    h.route(&rfd_launch("launch-1", json!({"name": "builder"}), None));
+    assert_eq!(h.published[0]["update"]["title"], "builder (Explore)");
+}
+
+/// `native-subagents.test.ts` > RFD "ends the children that still run with the
+/// stream as idle, with no reason it did not see": a cancelled or failed stream
+/// end reports idle with no stop reason, and a later error event does not turn
+/// that end into a failure.
+#[test]
+fn t9a_rfd_finish_all_reports_idle_and_a_late_error_changes_nothing() {
+    for state in [SubagentState::Cancelled, SubagentState::Failed] {
+        let (mut h, _) = running_worker(json!({}));
+        let outs = h.rt.finish_all(state);
+        h.apply(outs);
+        assert_eq!(h.states().last().unwrap(), &json!({"state": "idle"}));
+        let end = TaskEnd {
+            error: Some("boom".into()),
+            ..TaskEnd::default()
+        };
+        let o = h.rt.finish_task("worker-1", "failed", None, Some(&end));
+        h.apply(o);
+        assert_eq!(h.states().len(), 2);
+    }
+}
+
+/// `native-subagents.test.ts` > RFD "lets the last of two requests decide":
+/// `$first` then `$last` — only the request that ends last reports, and it
+/// reports running only when that request was answered, not withdrawn.
+#[test]
+fn t9a_rfd_two_requests_let_the_last_decide() {
+    for (first_aborted, last_aborted, running) in [
+        (true, false, true),
+        (false, true, false),
+        (true, true, false),
+    ] {
+        let (mut h, _) = running_worker(json!({}));
+        let (first, outs) = h.rt.awaiting_user_begin("worker-1");
+        h.apply(outs);
+        let (last, outs) = h.rt.awaiting_user_begin("worker-1");
+        h.apply(outs);
+        let outs = h.rt.parent_cancelled();
+        h.apply(outs);
+        let outs = h.rt.awaiting_user_end(first.unwrap(), first_aborted);
+        h.apply(outs);
+        assert_eq!(h.states().len(), 2, "only the last request reports");
+        let outs = h.rt.awaiting_user_end(last.unwrap(), last_aborted);
+        h.apply(outs);
+        assert_eq!(
+            h.states().last().unwrap(),
+            &json!({"state": if running { "running" } else { "requires_action" }})
+        );
+    }
+}
+
+/// `native-subagents.test.ts` > AIR restore > "restores the agent on a resume
+/// signal, delivers its buffered output, and numbers later generations from it".
+#[test]
+fn t9a_air_restore_numbers_later_generations_from_the_first() {
+    let lineage: LineageFn = Box::new(|id| {
+        if id == "worker-1" {
+            vec![HistoricalSubagent {
+                agent_id: "worker-1".into(),
+                launch_id: "launch-1".into(),
+                parent_agent_id: None,
+                name: Some("worker".into()),
+                agent_type: Some("Explore".into()),
+                description: Some("Inspect".into()),
+            }]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Air, lineage, None);
+    assert_eq!(h.route(&output("launch-1", "early")), None);
+    h.resumed("worker-1", Some("Say PING"));
+    let first = h.published[0]["update"]["subagentSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(first.starts_with("worker-1:generation:"), "{first}");
+    assert_eq!(h.published[0]["update"]["name"], "worker");
+    assert_eq!(h.published[0]["update"]["task"], "Inspect");
+    assert_eq!(h.published[0]["update"]["prompt"], "Say PING");
+    assert_eq!(h.delivered.len(), 1);
+    assert_eq!(
+        session_of(&h.route(&output("launch-1", "later"))).as_deref(),
+        Some(first.as_str())
+    );
+    h.finish("worker-1", "completed", None);
+    h.resumed("worker-1", None);
+    let second = h.published.last().unwrap()["update"]["subagentSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(second.starts_with("worker-1:generation:"), "{second}");
+    assert_ne!(
+        first, second,
+        "the next generation numbers on from the first"
+    );
+}
+
+/// `native-subagents.test.ts` > AIR restore > "restores the agent from a message
+/// under an unknown parent_tool_use_id alone, and routes it".
+#[test]
+fn t9a_air_restores_from_an_unknown_parent_tool_use_id() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let launched: LaunchedAgentFn = Box::new(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Some("worker-1".into())
+    });
+    let lineage: LineageFn = Box::new(|id| {
+        if id == "worker-1" {
+            vec![entry("worker-1", "launch-1", None)]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Air, lineage, Some(launched));
+    assert_eq!(h.route(&output("launch-1", "early")), None);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(h.published.len(), 1);
+    assert_eq!(h.delivered.len(), 1);
+    let sid = h.published[0]["update"]["subagentSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        session_of(&h.route(&output("launch-1", "later"))).as_deref(),
+        Some(sid.as_str())
+    );
+}
+
+/// `native-subagents.test.ts` > AIR restore > "buffers a new Agent call of this
+/// process until its task_started, with no history lookup".
+#[test]
+fn t9a_air_buffers_a_new_agent_call_with_no_history_lookup() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let launched: LaunchedAgentFn = Box::new(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        None
+    });
+    let mut h = H::with_history(SubagentForm::Air, Box::new(|_| Vec::new()), Some(launched));
+    h.route(&control("tool_call", "pending", "launch-2", None));
+    assert_eq!(h.route(&output("launch-2", "early")), None);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(h.published.is_empty());
+    h.started(task("fresh-1", "launch-2", Some("Explore"), None));
+    assert_eq!(h.published.len(), 1);
+    assert_eq!(h.published[0]["update"]["subagentSessionId"], "fresh-1");
+    assert_eq!(h.delivered.len(), 1);
+}
+
+/// `native-subagents.test.ts` > AIR restore > "opens a nested agent under the
+/// root when its parent is not live".
+#[test]
+fn t9a_air_nested_agent_opens_under_the_root_when_its_parent_is_not_live() {
+    let lineage: LineageFn = Box::new(|id| {
+        if id == "worker-1" {
+            vec![
+                entry("coordinator-1", "launch-c", None),
+                entry("worker-1", "launch-1", Some("coordinator-1")),
+            ]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Air, lineage, None);
+    h.resumed("worker-1", None);
+    assert_eq!(h.published[0]["sessionId"], "root");
+}
+
+/// `native-subagents.test.ts` > AIR restore > "restores the agent again after
+/// the runtime was cleared".
+#[test]
+fn t9a_air_restores_the_agent_again_after_a_clear() {
+    let lineage: LineageFn = Box::new(|id| {
+        if id == "worker-1" {
+            vec![entry("worker-1", "launch-1", None)]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Air, lineage, None);
+    h.resumed("worker-1", None);
+    h.rt.clear();
+    h.resumed("worker-1", None);
+    let ids: Vec<String> = h
+        .published
+        .iter()
+        .map(|n| {
+            n["update"]["subagentSessionId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+}
+
+/// `native-subagents.test.ts` > AIR restore > "looks up an unknown launch again
+/// after the runtime ended every child".
+#[test]
+fn t9a_air_looks_up_an_unknown_launch_again_after_finish_all() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let launched: LaunchedAgentFn = Box::new(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        None
+    });
+    let mut h = H::with_history(SubagentForm::Air, Box::new(|_| Vec::new()), Some(launched));
+    assert_eq!(h.route(&output("launch-9", "a")), None);
+    let outs = h.rt.finish_all(SubagentState::Cancelled);
+    h.apply(outs);
+    assert_eq!(h.route(&output("launch-9", "b")), None);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// `native-subagents.test.ts` > AIR restore > "reads the history once for a
+/// launch whose agent cannot be placed".
+#[test]
+fn t9a_air_reads_the_history_once_for_an_unplaceable_launch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let lineage_calls = Arc::new(AtomicUsize::new(0));
+    let seen = lineage_calls.clone();
+    let lineage: LineageFn = Box::new(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    });
+    let launched: LaunchedAgentFn = Box::new(|_| Some("worker-1".into()));
+    let mut h = H::with_history(SubagentForm::Air, lineage, Some(launched));
+    for _ in 0..5 {
+        assert_eq!(h.route(&output("launch-1", "x")), None);
+    }
+    assert_eq!(lineage_calls.load(Ordering::SeqCst), 1);
+    assert!(h.published.is_empty());
+}
+
+/// `native-subagents.test.ts` > AIR restore > "restores the agent from a
+/// task_started under a SendMessage id".
+#[test]
+fn t9a_air_restores_from_a_task_started_under_a_send_message_id() {
+    let lineage: LineageFn = Box::new(|id| {
+        if id == "worker-1" {
+            vec![entry("worker-1", "launch-1", None)]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut h = H::with_history(SubagentForm::Air, lineage, None);
+    h.route(&send_message("send-1", None));
+    h.started(TaskStarted {
+        task_id: "worker-1".into(),
+        tool_use_id: Some("send-1".into()),
+        subagent_type: Some("Explore".into()),
+        prompt: Some("Say PING".into()),
+        ..TaskStarted::default()
+    });
+    assert_eq!(h.published.len(), 1);
+    assert_eq!(h.published[0]["update"]["prompt"], "Say PING");
+    let sid = h.published[0]["update"]["subagentSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        session_of(&h.route(&output("launch-1", "x"))).as_deref(),
+        Some(sid.as_str())
+    );
+    h.finish("worker-1", "completed", Some("send-1"));
+    assert_eq!(
+        h.published.last().unwrap()["update"]["sessionUpdate"],
+        "subagent_state_update"
+    );
+}
+
+/// `native-subagents.test.ts` > AIR restore > "does not read the history for a
+/// task_started without a subagent type".
+#[test]
+fn t9a_air_reads_no_history_without_a_subagent_type() {
+    let lineage: LineageFn = Box::new(|_| panic!("history must not be read"));
+    let mut h = H::with_history(SubagentForm::Air, lineage, None);
+    h.route(&send_message("send-1", None));
+    h.started(TaskStarted {
+        task_id: "shell-1".into(),
+        tool_use_id: Some("send-1".into()),
+        ..TaskStarted::default()
+    });
 }

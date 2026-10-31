@@ -878,7 +878,7 @@ async fn t2b_air_client_without_the_index_archives_on_delete() {
     let plain_air = AirClient::from_client_capabilities(
         &json!({"_meta": {"jetbrains": {"air": {"version": 1, "capabilities": []}}}}),
     );
-    connection.negotiate(plain_air.as_ref());
+    connection.negotiate(plain_air.as_ref(), false);
     assert!(!connection.has_service());
     let operation = connection
         .delete_session(session.clone(), false, true)
@@ -911,7 +911,7 @@ async fn t2b_capabilities_are_advertised_only_after_negotiation() {
     let env = Env::new("caps");
     let mut connection = env.connection();
     assert!(connection.capabilities().is_empty());
-    connection.negotiate(Some(&air_client()));
+    connection.negotiate(Some(&air_client()), false);
     assert_eq!(
         connection.capabilities(),
         vec![
@@ -923,7 +923,7 @@ async fn t2b_capabilities_are_advertised_only_after_negotiation() {
         ]
     );
     // A later initialize without the capability drops the index.
-    connection.negotiate(None);
+    connection.negotiate(None, false);
     assert!(connection.capabilities().is_empty());
     // Without the capability the new methods answer method-not-found.
     let publish: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(|_| {});
@@ -950,7 +950,7 @@ async fn t2b_capabilities_are_advertised_only_after_negotiation() {
 async fn t2b_archive_checks_its_params() {
     let env = Env::new("params");
     let mut connection = env.connection();
-    connection.negotiate(Some(&air_client()));
+    connection.negotiate(Some(&air_client()), false);
     let publish: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(|_| {});
     for params in [
         json!({}),
@@ -989,7 +989,7 @@ async fn t2b_connection_archive_of_an_unloaded_session_reports_nothing() {
     let cwd = env.cwd("app");
     let session = simple_session(&env, &cwd, 1, T0);
     let mut connection = env.connection();
-    connection.negotiate(Some(&air_client()));
+    connection.negotiate(Some(&air_client()), false);
     let updates = Arc::new(AtomicUsize::new(0));
     let counter = updates.clone();
     let publish: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(move |_| {

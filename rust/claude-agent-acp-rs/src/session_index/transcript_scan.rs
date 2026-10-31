@@ -1295,4 +1295,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(with.parent().expect("dir"));
         let _ = std::fs::remove_dir_all(without.parent().expect("dir"));
     }
+
+    /// titles by the SDK's rule > finds a custom title whose record starts before
+    /// the tail window: the SDK searches the raw 64 KB tail, including the cut
+    /// line.
+    #[test]
+    fn t8d_finds_a_custom_title_across_the_tail_boundary() {
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut text = String::new();
+        // About 70 KB before the title, past the head window.
+        for _ in 0..40 {
+            text.push_str(&assistant("2026-01-01T00:00:00.000Z", "end_turn"));
+            text.push('\n');
+            text.push_str(&json!({"type": "progress", "data": "x".repeat(4_000)}).to_string());
+            text.push('\n');
+        }
+        // The title record starts before the last 64 KB; its `customTitle` is
+        // inside it.
+        let title = json!({
+            "type": "custom-title",
+            "padding": "p".repeat(10_000),
+            "customTitle": "Across the boundary",
+            "sessionId": id,
+        })
+        .to_string();
+        text.push_str(&title);
+        text.push('\n');
+        for _ in 0..20 {
+            text.push_str(&assistant("2026-01-01T00:00:00.000Z", "end_turn"));
+            text.push('\n');
+            text.push_str(&json!({"type": "progress", "data": "y".repeat(3_000)}).to_string());
+            text.push('\n');
+        }
+        let path = temp_file("boundary", text.as_bytes());
+        let size = std::fs::metadata(&path).expect("meta").len();
+        assert!(size > 128 * 1024, "the transcript spans several windows");
+        let head_tail = read_head_tail(&path, size).expect("read");
+        assert_eq!(
+            sdk_titles(&head_tail, None).custom_title.as_deref(),
+            Some("Across the boundary")
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
 }

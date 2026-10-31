@@ -387,6 +387,163 @@ mod tests {
         assert_eq!(resumed_model_from_transcript(&[]), None);
     }
 
+    /// Write `lines` to a fresh transcript file and read its tail.
+    fn tail_of(tag: &str, lines: &[String], with_model: bool) -> ResumedTail {
+        let path = std::env::temp_dir().join(format!(
+            "t9a_tail_{tag}_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let tail = read_tail_from_file(&path, with_model).unwrap();
+        let _ = std::fs::remove_file(&path);
+        tail
+    }
+
+    fn assistant_record(model: &str, extra: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","parent_tool_use_id":null,"message":{{"role":"assistant","model":"{model}","content":[{{"type":"text","text":"ok"}}]}}{extra}}}"#
+        )
+    }
+
+    fn user_record(text: &str, extra: &str) -> String {
+        format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}{extra}}}"#)
+    }
+
+    /// `resumed-session.test.ts` > readResumedTail > "reads a record that is
+    /// longer than one backward read": a record above the 64 KiB chunk is joined
+    /// across chunks.
+    #[test]
+    fn t9a_tail_reads_a_record_longer_than_one_chunk() {
+        let padding = "y".repeat(200 * 1024);
+        let lines = vec![
+            assistant_record("claude-opus-5", &format!(r#","padding":"{padding}""#)),
+            user_record("after", ""),
+        ];
+        assert_eq!(
+            tail_of("wide", &lines, true).model.as_deref(),
+            Some("claude-opus-5")
+        );
+    }
+
+    /// "reads the first line of the file": a single record is the pending
+    /// remainder after the only chunk.
+    #[test]
+    fn t9a_tail_reads_the_first_line() {
+        let lines = vec![assistant_record("claude-opus-5", "")];
+        assert_eq!(
+            tail_of("single", &lines, true).model.as_deref(),
+            Some("claude-opus-5")
+        );
+    }
+
+    /// "returns undefined when no real model is recorded": only a user record
+    /// and a synthetic assistant record.
+    #[test]
+    fn t9a_tail_no_real_model_is_none() {
+        let lines = vec![
+            user_record("hello", ""),
+            assistant_record("<synthetic>", ""),
+        ];
+        let tail = tail_of("none", &lines, true);
+        assert_eq!(tail.model, None);
+        assert_eq!(tail.permission_mode, None);
+    }
+
+    /// "reads a permission mode that is before the last model": the backward
+    /// read passes 200 records to find the mode.
+    #[test]
+    fn t9a_tail_mode_before_the_model() {
+        let mut lines = vec![user_record(
+            "first",
+            r#","permissionMode":"acceptEdits","origin":{"kind":"human"}"#,
+        )];
+        lines.extend((0..200).map(|_| user_record(&"x".repeat(1000), "")));
+        lines.push(assistant_record("claude-opus-5", ""));
+        let tail = tail_of("early-mode", &lines, true);
+        assert_eq!(tail.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(tail.permission_mode.as_deref(), Some("acceptEdits"));
+    }
+
+    /// "ignores the permission-mode records of the CLI metadata block": the
+    /// `type: "permission-mode"` metadata record is not a user prompt.
+    #[test]
+    fn t9a_tail_ignores_the_cli_metadata_mode_block() {
+        let lines = vec![
+            user_record(
+                "first",
+                r#","permissionMode":"bypassPermissions","origin":{"kind":"human"}"#,
+            ),
+            assistant_record("claude-opus-5", ""),
+            r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"metadata-mode"}"#
+                .to_string(),
+        ];
+        assert_eq!(
+            tail_of("metadata-mode", &lines, true)
+                .permission_mode
+                .as_deref(),
+            Some("bypassPermissions")
+        );
+    }
+
+    /// "stops the mode search at the last human prompt without a mode": an older
+    /// prompt's mode is not resurrected.
+    #[test]
+    fn t9a_tail_stops_at_a_human_prompt_without_a_mode() {
+        let lines = vec![
+            user_record(
+                "old",
+                r#","permissionMode":"bypassPermissions","origin":{"kind":"human"}"#,
+            ),
+            user_record("new", r#","origin":{"kind":"human"}"#),
+            assistant_record("claude-opus-5", ""),
+        ];
+        let tail = tail_of("bounded", &lines, true);
+        assert_eq!(tail.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(tail.permission_mode, None);
+    }
+
+    /// "reads the mode of the prompt before a compaction": the compact summary
+    /// is not a prompt, so the mode before the boundary is the session's.
+    #[test]
+    fn t9a_tail_reads_the_mode_before_a_compaction() {
+        let lines = vec![
+            user_record(
+                "old",
+                r#","permissionMode":"plan","origin":{"kind":"human"}"#,
+            ),
+            r#"{"type":"system","subtype":"compact_boundary"}"#.to_string(),
+            user_record("summary", r#","isCompactSummary":true"#),
+            assistant_record("claude-opus-5", ""),
+        ];
+        assert_eq!(
+            tail_of("compacted", &lines, true)
+                .permission_mode
+                .as_deref(),
+            Some("plan")
+        );
+    }
+
+    /// "returns no permission mode when the transcript records none".
+    #[test]
+    fn t9a_tail_without_a_mode_is_none() {
+        let lines = vec![
+            user_record("hello", ""),
+            assistant_record("claude-opus-5", ""),
+        ];
+        let tail = tail_of("no-mode", &lines, true);
+        assert_eq!(tail.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(tail.permission_mode, None);
+    }
+
     #[test]
     fn scan_tail_plan_mode_exit_clears_plan_mode() {
         let path =

@@ -268,4 +268,28 @@ mod tests {
         assert!(!is_in_linked_worktree(&base.to_string_lossy()));
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// worktrees after git worktree move > follows a moved linked worktree: the
+    /// gitdir file is rewritten, the directory keeps its mtime.
+    #[test]
+    fn t8d_follows_a_moved_linked_worktree() {
+        let (base, main, wt1) = repo("moved");
+        let from_main = main.to_string_lossy().into_owned();
+        assert_eq!(
+            repository_worktrees(&from_main, P),
+            vec![from_main.clone(), wt1.to_string_lossy().into_owned()]
+        );
+        let moved = base.join("wt2");
+        std::fs::rename(&wt1, &moved).expect("move");
+        std::fs::write(
+            main.join(".git/worktrees/wt1/gitdir"),
+            format!("{}\n", moved.join(".git").display()),
+        )
+        .expect("gitdir");
+        assert_eq!(
+            repository_worktrees(&from_main, P),
+            vec![from_main, moved.to_string_lossy().into_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

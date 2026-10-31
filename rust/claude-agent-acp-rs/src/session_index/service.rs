@@ -330,12 +330,31 @@ pub fn sidecar_path(transcript_path: &Path) -> PathBuf {
         .join("custom-title.json")
 }
 
+/// A 16-hex-character temporary suffix, like Node's
+/// `randomBytes(8).toString("hex")`: `RandomState` is seeded from the OS per
+/// instance, and the process counter and clock keep two calls unique even when
+/// two seeds collide. (The old `uuid_v4` low bytes depended only on the
+/// nanosecond clock, so concurrent writes could pick the same temporary name and
+/// the second `create_new` failed with `AlreadyExists` — M-133.)
+/// A 16-hex-character temporary suffix, like Node's
+/// `randomBytes(8).toString("hex")`: `RandomState` is seeded from the OS per
+/// instance, and the process counter and clock keep two calls unique even when
+/// two seeds collide. (The old `uuid_v4` low bytes depended only on the
+/// nanosecond clock, so concurrent writes could pick the same temporary name and
+/// the second `create_new` failed with `AlreadyExists` — M-133.)
 fn random_hex() -> String {
-    crate::agent::uuid_v4()
-        .replace('-', "")
-        .chars()
-        .take(16)
-        .collect()
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::AtomicU64;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(nanos);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Writes `<projectDir>/<sessionId>/custom-title.json` the way the CLI's

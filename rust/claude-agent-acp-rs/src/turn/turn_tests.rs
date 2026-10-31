@@ -1920,3 +1920,79 @@ async fn inv_48_machine_swept_cancel_has_no_rows() {
     let events = machine.cancel();
     assert_eq!(settled_rows(&events, "p2"), Some(vec![]));
 }
+
+/// `folded-prompt-scenario.test.ts` > "answers the folded prompt with the
+/// background cycle's result": the folded prompt settles with the stamped
+/// autonomous result's own usage.
+#[tokio::test(flavor = "multi_thread")]
+async fn t9b_folded_prompt_uses_the_cycle_results_usage() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p2".into(), false));
+    let mut result = stamped_autonomous_result(&["p2"]);
+    result["usage"] = serde_json::json!({
+        "input_tokens": 20, "output_tokens": 7,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+    });
+    let events = machine.on_result(&result, false);
+    let settled = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Settled {
+                prompt_uuid,
+                stop_reason,
+                usage,
+                ..
+            } => Some((prompt_uuid.as_str(), *stop_reason, *usage)),
+            _ => None,
+        })
+        .expect("the folded prompt settles");
+    assert_eq!(settled.0, "p2");
+    assert_eq!(settled.1, StopReason::EndTurn);
+    assert_eq!(
+        settled.2,
+        Usage {
+            input_tokens: 20,
+            output_tokens: 7,
+            cached_read_tokens: 0,
+            cached_write_tokens: 0,
+        }
+    );
+}
+
+/// `folded-prompt-scenario.test.ts` > "keeps the background answer's tokens out
+/// of the next prompt": a later prompt's settle reports only its own result.
+#[tokio::test(flavor = "multi_thread")]
+async fn t9b_next_prompt_keeps_its_own_usage() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    let mut first = autonomous_result("success");
+    first["origin"] = serde_json::json!(null);
+    first["usage"] = serde_json::json!({"input_tokens": 10, "output_tokens": 5});
+    machine.on_result(&first, false);
+
+    machine.enqueue(Turn::new("p2".into(), false));
+    machine.on_echo("p2");
+    let mut second = autonomous_result("success");
+    second["origin"] = serde_json::json!(null);
+    second["usage"] = serde_json::json!({"input_tokens": 40, "output_tokens": 11});
+    let events = machine.on_result(&second, false);
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Settled {
+                prompt_uuid, usage, ..
+            } if prompt_uuid == "p2" => Some(*usage),
+            _ => None,
+        })
+        .expect("the next prompt settles");
+    assert_eq!(
+        usage,
+        Usage {
+            input_tokens: 40,
+            output_tokens: 11,
+            cached_read_tokens: 0,
+            cached_write_tokens: 0,
+        }
+    );
+}

@@ -925,6 +925,101 @@ impl Rig {
     }
 }
 
+/// T8A — `task_started` records the child → launching-call mapping, a terminal
+/// `task_updated` patch prunes it, and a non-terminal patch keeps it; a
+/// `task_notification` prunes the rest.
+#[test]
+fn t8a_task_started_mapping_is_pruned_on_settle() {
+    let mut rig = Rig::new();
+    rig.echo("p1");
+    rig.tool_use(
+        "toolu_p",
+        "Agent",
+        json!({"description": "A", "prompt": "a"}),
+    );
+    rig.tool_use(
+        "toolu_p2",
+        "Agent",
+        json!({"description": "B", "prompt": "b"}),
+    );
+    rig.feed(
+        json!({"type":"system","subtype":"task_started","task_id":"agent-42",
+        "tool_use_id":"toolu_p","description":"A","subagent_type":"Explore",
+        "task_type":"local_agent"}),
+    );
+    rig.feed(
+        json!({"type":"system","subtype":"task_started","task_id":"agent-43",
+        "tool_use_id":"toolu_p2","description":"B","subagent_type":"Explore",
+        "task_type":"local_agent"}),
+    );
+    assert_eq!(
+        rig.live_background.get("agent-42").map(String::as_str),
+        Some("toolu_p")
+    );
+    assert_eq!(
+        rig.live_background.get("agent-43").map(String::as_str),
+        Some("toolu_p2")
+    );
+
+    rig.feed(
+        json!({"type":"system","subtype":"task_updated","task_id":"agent-42",
+        "patch":{"status":"completed"}}),
+    );
+    assert_eq!(rig.live_background.get("agent-42"), None);
+    assert_eq!(
+        rig.live_background.get("agent-43").map(String::as_str),
+        Some("toolu_p2"),
+        "a non-terminal patch keeps the attribution"
+    );
+
+    rig.feed(
+        json!({"type":"system","subtype":"task_notification","task_id":"agent-43",
+        "tool_use_id":"toolu_p2","status":"completed","summary":"done"}),
+    );
+    assert!(rig.live_background.is_empty());
+}
+
+/// T8A — a client without native subagent sessions keeps the legacy Agent
+/// lifecycle and the flattened child text.
+#[test]
+fn t8a_legacy_agent_lifecycle_without_capabilities() {
+    let mut rig = Rig::new();
+    rig.echo("p1");
+    rig.tool_use(
+        "toolu_parent",
+        "Agent",
+        json!({"description": "Investigate", "subagent_type": "Explore"}),
+    );
+    rig.feed(
+        json!({"type":"system","subtype":"task_started","task_id":"agent-42",
+        "tool_use_id":"toolu_parent","description":"Investigate",
+        "subagent_type":"Explore","task_type":"local_agent"}),
+    );
+    rig.feed(
+        json!({"type":"stream_event","parent_tool_use_id":"toolu_parent",
+        "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"hidden child output"}}}),
+    );
+    let updates = rig.updates();
+    assert!(
+        updates
+            .iter()
+            .all(|u| u["sessionUpdate"] != "subagent_spawned"
+                && u["sessionUpdate"] != "subagent_state_update"),
+        "no native lifecycle: {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|u| serde_json::to_string(u)
+            .unwrap()
+            .contains("hidden child output")),
+        "a plain client gets the flattened child text: {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|u| u["toolCallId"] == "toolu_parent"),
+        "the Agent call stays: {updates:?}"
+    );
+}
+
 /// N-18 / N-36 — a terminal status in a `task_updated` PATCH settles the live
 /// subagent, so the held turn drains at the next idle (the status is not a
 /// top-level field of the frame).
@@ -2316,4 +2411,26 @@ fn t2a_synthetic_login_message_matching() {
         [{"type":"text","text":"Please run /login"},{"type":"text","text":"more"}]})
     ));
     assert!(!frames::is_synthetic_login_message(&Value::Null));
+}
+
+/// acp-v2.test.ts: "ends a tool call that finished as the cancel landed as
+/// completed, not cancelled" — a result that arrives before the settle keeps its
+/// own status, and the settle does not close the call again.
+#[test]
+fn t9a_a_tool_result_before_the_cancel_settles_stays_completed() {
+    let mut rig = Rig::new();
+    rig.echo("p1");
+    rig.tool_use("toolu_A", "Bash", json!({"command": "make"}));
+    rig.updates();
+    rig.cancel();
+    rig.feed(json!({"type":"user","parent_tool_use_id":null,
+        "message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_A","content":"done"}]}}));
+    let updates = rig.updates();
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(updates[0]["toolCallId"], "toolu_A");
+    assert_eq!(updates[0]["status"], "completed");
+    rig.interrupt_result();
+    assert!(rig.updates().is_empty(), "the settle closes nothing again");
+    assert!(rig.answered("p1"));
 }

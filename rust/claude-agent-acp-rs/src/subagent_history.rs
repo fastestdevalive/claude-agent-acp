@@ -1228,6 +1228,39 @@ mod tests {
         assert!(read_subagent_messages(SESSION, "gone", &history, None).is_empty());
     }
 
+    /// `native-subagents.test.ts` > RFD restore > "keeps an agent that the
+    /// history cannot place, or not read, unexposed": a transcript that cannot
+    /// be read logs the miss and yields no lineage, so the runtime exposes
+    /// nothing for it (the runtime half is `rfd_reads_no_history_for_an_unknown_call_or_a_known_child`).
+    #[test]
+    fn t9a_unreadable_subagent_history_logs_and_yields_no_lineage() {
+        let fx = fixture("unreadable");
+        write_session(
+            &fx,
+            vec![user("u1", "Go"), launch("a1", "launch-echoer")],
+            vec![(
+                "echoer1",
+                meta("launch-echoer", "echoer"),
+                vec![user("e1", "Work")],
+            )],
+        );
+        let log = fx.dir.join("agent.log");
+        let logger = crate::logger::Logger::to_file(&log);
+        let history = subagent_history(SESSION, &fx.env);
+        assert!(
+            read_subagent_messages(SESSION, "unreadable-1", &history, Some(&logger)).is_empty()
+        );
+        assert_eq!(
+            subagent_lineage(SESSION, "lost-1", &fx.env, Some(&logger)),
+            vec![]
+        );
+        let content = std::fs::read_to_string(&log).expect("log");
+        assert!(
+            content.contains("Failed to read the history of subagent unreadable-1"),
+            "{content}"
+        );
+    }
+
     /// T6FB2 LOW 11: an empty `name`/`agentType`/`description` is dropped, so
     /// the display name falls back (`subagent-history.ts:139-141`).
     #[test]

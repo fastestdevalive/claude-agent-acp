@@ -165,6 +165,12 @@ pub struct SessionConfigState {
     /// The latest explainable `fast_mode_disabled_reason`
     /// (`session.fastModeDisabledReason`).
     pub fast_mode_disabled_reason: Option<String>,
+    /// The programmatic settings tier (`_meta.claudeCode.options.settings`
+    /// merged over `CLAUDE_MODEL_CONFIG`), retained as
+    /// `session.effortSettingsOverride`: it shadows the file-backed settings on
+    /// the creation and every model-switch effort seed
+    /// (`acp-agent.ts:11642`, `10570`).
+    pub effort_settings_override: Option<Value>,
     /// The initial auto-mode clamp's fallback warning is deferred to the first
     /// prompt (`session.autoModeFallbackWarningPending`, `acp-agent.ts:3863-3864`).
     pub pending_auto_fallback_warning: bool,
@@ -555,6 +561,30 @@ pub fn merge_effort_settings(base: &Value, override_settings: Option<&Value>) ->
     }
     merged.insert("modelSettings".into(), Value::Object(model_settings));
     Value::Object(merged)
+}
+
+/// The effort seed for session creation and a model switch
+/// (`settingsEffortForModel`): an explicit value (the spawn `--effort`, or a
+/// user pin the new model supports) wins, else the merged settings — the
+/// programmatic tier over the file-backed one (`mergeEffortSettings`) — resolve
+/// the new model's per-model entry, then the legacy top-level effort.
+pub fn seeded_effort(
+    explicit: Option<&str>,
+    file_settings: &Value,
+    override_settings: Option<&Value>,
+    model_info: Option<&ModelInfo>,
+    model_id: &str,
+) -> Option<String> {
+    if let Some(explicit) = explicit {
+        return Some(explicit.to_string());
+    }
+    let merged = merge_effort_settings(file_settings, override_settings);
+    settings_effort_for_model(
+        merged.get("modelSettings"),
+        merged.get("effortLevel").and_then(Value::as_str),
+        model_info,
+        model_id,
+    )
 }
 
 /// The `appliedEffortLevel` after a direct effort pick
@@ -1230,6 +1260,86 @@ mod tests {
         assert_eq!(
             applied_effort_before_switch(None, false, Some("medium"), None),
             None
+        );
+    }
+
+    // ---------------------------------------------------------- G4 / F11
+
+    fn model_info(value: &str, resolved: Option<&str>) -> ModelInfo {
+        ModelInfo {
+            value: value.into(),
+            resolved_model: resolved.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    /// `acp-agent-settings.test.ts` > "seeds effort from higher-priority
+    /// programmatic model settings": the programmatic tier shadows the
+    /// file-backed one; its `claude-sonnet-5-1m` key canonicalises onto the
+    /// resolved `claude-sonnet-5[1m]` row.
+    #[test]
+    fn g4_f11_seeded_effort_prefers_programmatic_model_settings() {
+        let file = json!({
+            "effortLevel": "high",
+            "modelSettings": {"claude-sonnet-5[1m]": {"effortLevel": "high"}}
+        });
+        let programmatic = json!({
+            "effortLevel": "medium",
+            "modelSettings": {"claude-sonnet-5-1m": {"effortLevel": "low"}}
+        });
+        let info = model_info("sonnet[1m]", Some("claude-sonnet-5[1m]"));
+        assert_eq!(
+            seeded_effort(None, &file, Some(&programmatic), Some(&info), "sonnet[1m]"),
+            Some("low".to_string())
+        );
+    }
+
+    /// `session-config-options.test.ts` > "re-seeds switches from retained
+    /// programmatic settings before file settings".
+    #[test]
+    fn g4_f11_seeded_effort_re_seeds_from_retained_programmatic_settings() {
+        let file = json!({"effortLevel": "high"});
+        let programmatic = json!({
+            "effortLevel": "medium",
+            "modelSettings": {"claude-sonnet-4-6": {"effortLevel": "low"}}
+        });
+        let info = model_info("claude-sonnet-4-6", None);
+        assert_eq!(
+            seeded_effort(
+                None,
+                &file,
+                Some(&programmatic),
+                Some(&info),
+                "claude-sonnet-4-6"
+            ),
+            Some("low".to_string())
+        );
+    }
+
+    /// `session-config-options.test.ts` > "seeds effort from the new model's
+    /// persisted modelSettings entry on an unpinned switch".
+    #[test]
+    fn g4_f11_seeded_effort_uses_the_new_models_model_settings() {
+        let file = json!({
+            "effortLevel": "high",
+            "modelSettings": {"claude-sonnet-4-6": {"effortLevel": "low"}}
+        });
+        let info = model_info("claude-sonnet-4-6", None);
+        assert_eq!(
+            seeded_effort(None, &file, None, Some(&info), "claude-sonnet-4-6"),
+            Some("low".to_string())
+        );
+    }
+
+    /// `session-config-options.test.ts` > "falls back to the top-level settings
+    /// effort when the new model has no per-model entry".
+    #[test]
+    fn g4_f11_seeded_effort_falls_back_to_the_top_level_effort() {
+        let file = json!({"effortLevel": "medium"});
+        let info = model_info("claude-sonnet-4-6", None);
+        assert_eq!(
+            seeded_effort(None, &file, None, Some(&info), "claude-sonnet-4-6"),
+            Some("medium".to_string())
         );
     }
 }

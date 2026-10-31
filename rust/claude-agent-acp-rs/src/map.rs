@@ -140,6 +140,18 @@ pub struct MapState {
     /// The Agent/Task calls of the live background subagents (see
     /// [`MapState::set_background_subagents`]).
     background_subagents: HashSet<String>,
+    /// Tool-call ids whose closing report (`unfinished::closing_report`) closed
+    /// a call that the turn end or a cancel stopped. Node's renderer reports
+    /// such a call `cancelled` to a v2 client and `failed` to every other one
+    /// (`AcpToolCallRenderer.unfinished`, `renderer.ts:650-668`); the typed v1
+    /// status has no `cancelled`, so the session rewrites it on the v2 send.
+    stopped_closing: Vec<String>,
+    /// Tool-call ids whose result Node reports `cancelled` to a v2 client:
+    /// a command result whose structured output says `interrupted`, or an
+    /// error result of the work a cancel stopped (`resultStatus`,
+    /// `renderer.ts:193-204`). The typed v1 status has no `cancelled`, so the
+    /// session rewrites it on the v2 send.
+    aborted_results: Vec<String>,
     /// The ACP session that a permission request created a tool call in
     /// (`session.eagerToolCallSessions`, `acp-agent.ts:1266`): the child
     /// session of an announced subagent, else the root. `sendUpdate` passes it
@@ -579,6 +591,11 @@ impl MapState {
     }
 
     /// True if the session was cancelled (stopped work window is open).
+    /// Whether this session reports ACP v2 state (an ACP v2 connection).
+    pub(crate) fn v2_reporting(&self) -> bool {
+        self.v2.reporting()
+    }
+
     pub(crate) fn is_stopped_work(&self) -> bool {
         self.stopped_work
     }
@@ -852,6 +869,52 @@ impl MapState {
         self.tool_tracker.clear();
         self.progress_meta.clear();
         self.pending_hooks.clear();
+        self.stopped_closing.clear();
+        self.aborted_results.clear();
+    }
+
+    /// Remember that `id`'s result is one Node calls `aborted`
+    /// (`resultStatus`): a v2 client gets `cancelled` for it.
+    pub(crate) fn note_aborted_result(&mut self, id: &str) {
+        if !self.aborted_results.iter().any(|existing| existing == id) {
+            self.aborted_results.push(id.to_string());
+        }
+    }
+
+    /// Take the aborted mark of `id` (the report that carries it is being sent
+    /// now).
+    pub(crate) fn take_aborted_result(&mut self, id: &str) -> bool {
+        let Some(position) = self
+            .aborted_results
+            .iter()
+            .position(|existing| existing == id)
+        else {
+            return false;
+        };
+        self.aborted_results.remove(position);
+        true
+    }
+
+    /// Remember that `id`'s closing report is one Node would call `stopped`
+    /// (`AcpToolCallRenderer.unfinished`): a v2 client gets `cancelled` for it.
+    pub(crate) fn note_stopped_closing(&mut self, id: &str) {
+        if !self.stopped_closing.iter().any(|existing| existing == id) {
+            self.stopped_closing.push(id.to_string());
+        }
+    }
+
+    /// Take the stopped-closing mark of `id` (the report that carries it is
+    /// being sent now).
+    pub(crate) fn take_stopped_closing(&mut self, id: &str) -> bool {
+        let Some(position) = self
+            .stopped_closing
+            .iter()
+            .position(|existing| existing == id)
+        else {
+            return false;
+        };
+        self.stopped_closing.remove(position);
+        true
     }
 }
 
@@ -1094,6 +1157,10 @@ struct FrameCtx {
     parent: Option<String>,
     structured: Option<Value>,
     non_exec: HashMap<String, crate::tool_meta::NonExecution>,
+    /// The frame is a result of the work a cancel stopped
+    /// (`options.cancelled`, `acp-agent.ts:12984-12990`): an error result then
+    /// ends a run the cancel aborted, whatever kind the SDK stamped on it.
+    cancelled: bool,
 }
 
 impl FrameCtx {
@@ -1110,8 +1177,9 @@ impl FrameCtx {
 
     /// The attribution of a `user` frame: parent, the single-result structured
     /// `tool_use_result` and the `tool_result_meta` sidecar.
-    fn of_user_frame(frame: &Value, content: &Value) -> Self {
+    fn of_user_frame(frame: &Value, content: &Value, cancelled: bool) -> Self {
         let mut ctx = Self::of_frame(frame);
+        ctx.cancelled = cancelled;
         let tool_result_count = match content {
             Value::Array(blocks) => blocks
                 .iter()
@@ -1127,6 +1195,28 @@ impl FrameCtx {
         );
         ctx
     }
+}
+
+/// [`map_consolidated`] with only the frame's parent attribution
+/// (`parentToolUseId`): replay maps a nested message's blocks with its parent so
+/// every update carries `_meta.claudeCode.parentToolUseId`
+/// (`stampParentToolUseId`, `acp-agent.ts:13356`). Replay has no structured
+/// `tool_use_result` or `tool_result_meta` sidecar.
+pub fn map_consolidated_with_parent(
+    content: &Value,
+    role: MsgRole,
+    state: &mut MapState,
+    parent: Option<&str>,
+) -> Vec<SessionUpdate> {
+    map_consolidated_ctx(
+        content,
+        role,
+        state,
+        &FrameCtx {
+            parent: parent.map(str::to_string),
+            ..FrameCtx::default()
+        },
+    )
 }
 
 /// Map a consolidated Claude message's `content` into ACP `SessionUpdate`s
@@ -1172,12 +1262,24 @@ fn map_consolidated_ctx(
 /// the single-result `tool_use_result` and the `tool_result_meta` sidecar ride
 /// along to the tool updates. The echo-skip itself stays in the session actor.
 pub fn map_user_frame(frame: &Value, state: &mut MapState) -> Vec<SessionUpdate> {
+    map_user_frame_cancelled(frame, state, false)
+}
+
+/// [`map_user_frame`] for a result of the work a cancel stopped
+/// (`toAcpNotifications` with `options.cancelled`, `acp-agent.ts:12984-12990`,
+/// sent by `sendInterruptedToolResults`): an error result then ends a run the
+/// cancel aborted, which a v2 client gets as `cancelled`.
+pub fn map_user_frame_cancelled(
+    frame: &Value,
+    state: &mut MapState,
+    cancelled: bool,
+) -> Vec<SessionUpdate> {
     remember_user_frame_tool_names(frame, state);
     let content = frame
         .pointer("/message/content")
         .cloned()
         .unwrap_or(Value::Null);
-    let ctx = FrameCtx::of_user_frame(frame, &content);
+    let ctx = FrameCtx::of_user_frame(frame, &content, cancelled);
     let updates = match &content {
         // Map one block at a time so a caller that owns extra updates (the
         // actor's plan/suppressed resolution, session.rs) can interleave them
@@ -1236,7 +1338,7 @@ pub fn map_user_frame_block(
         .pointer("/message/content")
         .cloned()
         .unwrap_or(Value::Null);
-    let ctx = FrameCtx::of_user_frame(frame, &content);
+    let ctx = FrameCtx::of_user_frame(frame, &content, false);
     let updates = map_user_block(block, state, &ctx);
     let message_id = crate::mcp_command::message_id_of(frame).unwrap_or_default();
     apply_stream_message_id(updates, &message_id)
@@ -1438,6 +1540,11 @@ fn map_block(
                 // is unknown here). Without a surfaced call there is nothing
                 // pending: Node logs and drops it (`acp-agent.ts:13193-13215`).
                 if was_emitted {
+                    note_aborted_result(
+                        state,
+                        &id,
+                        result_aborted(is_error, false, ctx.cancelled, ctx.non_exec.get(&id)),
+                    );
                     let mut fields = ToolCallUpdateFields::new().status(status);
                     if let Some(content) = block.get("content") {
                         fields = fields.raw_output(content.clone());
@@ -1566,6 +1673,27 @@ fn tool_call_from_use(
     ))
 }
 
+/// Whether Node's `resultStatus` calls a finished result aborted
+/// (`renderer.ts:193-204`): a command whose structured result says
+/// `interrupted`, or an error result of the work a cancel stopped / one the SDK
+/// stamped `interrupted`/`cancelled`. Only a v2 client maps that to
+/// `cancelled`; the typed v1 status keeps `failed`/`completed`.
+fn result_aborted(
+    is_error: bool,
+    interrupted: bool,
+    cancelled: bool,
+    non_exec: Option<&crate::tool_meta::NonExecution>,
+) -> bool {
+    interrupted || (is_error && (cancelled || crate::tool_meta::is_aborted(non_exec)))
+}
+
+/// Mark `id`'s result for the v2 `cancelled` rewrite (`send_updates`).
+fn note_aborted_result(state: &mut MapState, id: &str, aborted: bool) {
+    if aborted && state.v2_reporting() {
+        state.note_aborted_result(id);
+    }
+}
+
 /// 7.3 — a `tool_result` block becomes a completing `ToolCallUpdate`. The
 /// caller already took the cached tool_use and cleared the emitted marker (Node
 /// does both at the top of its `tool_result` case).
@@ -1638,6 +1766,16 @@ fn terminal_command_updates(
     } else {
         ToolCallStatus::Completed
     };
+    note_aborted_result(
+        state,
+        &id,
+        result_aborted(
+            is_error,
+            command.interrupted,
+            ctx.cancelled,
+            ctx.non_exec.get(&id),
+        ),
+    );
     let mut fields = ToolCallUpdateFields::new().status(status);
     if let Some(content) = terminal
         .content
@@ -1683,6 +1821,14 @@ fn tool_update_from_result_single(
         ctx.non_exec.get(&id),
         ctx.parent.as_deref(),
     );
+    // Node's `resultStatus` reads the command facts: a structured result that
+    // says `interrupted` is an aborted run even without an error.
+    let interrupted = is_command_tool(&name)
+        && matches!(
+            tools::reporters::bash_facts(ctx.structured.as_ref(), &result_input, is_error),
+            tools::reporters::BashFacts::Command(command) if command.interrupted
+        );
+    let aborted = result_aborted(is_error, interrupted, ctx.cancelled, ctx.non_exec.get(&id));
     if name == "ExitPlanMode" {
         // The reporter (`reporters/interaction.ts:51-72`) owns the title, the
         // display copy and the raw output; an accepted plan's title replaces
@@ -1714,6 +1860,7 @@ fn tool_update_from_result_single(
         }
         let mut updates = Vec::new();
         if let Some(fields) = state.track_final_tool_call_update(&id, &fields) {
+            note_aborted_result(state, &id, aborted);
             updates.push(SessionUpdate::ToolCallUpdate(
                 ToolCallUpdate::new(id.clone(), fields).meta(result_meta),
             ));
@@ -1784,6 +1931,7 @@ fn tool_update_from_result_single(
         state.finish_result_tool_tracker(&id, state.pending_hooks.contains(&id));
         return Vec::new();
     };
+    note_aborted_result(state, &id, aborted);
     // Entry ends after the tool_result (or kept if hook is pending, M3/Decision 12).
     let hook_pending = state.pending_hooks.contains(&id);
     state.finish_result_tool_tracker(&id, hook_pending);
@@ -3486,6 +3634,55 @@ mod tests {
         assert_eq!(meta["claudeCode"]["parentToolUseId"], "toolu_TASK");
     }
 
+    /// T8A — `Agent` and the legacy `Task` are subagent launches for an AIR
+    /// client (`toolUseMeta` adds `jetbrains.air.subagent`), and a nested launch
+    /// carries its parent tool call.
+    #[test]
+    fn t8a_agent_and_legacy_task_are_subagent_launches() {
+        for name in ["Agent", "Task"] {
+            let mut state = MapState::default();
+            state.configure_air(std::env::temp_dir());
+            let frame = json!({
+                "type": "assistant",
+                "parent_tool_use_id": null,
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": format!("toolu_{name}"),
+                    "name": name,
+                    "input": {"description": "Explore", "prompt": "Inspect the project"},
+                }]},
+            });
+            let updates = map_consolidated_assistant(&frame, &mut state);
+            assert_eq!(updates.len(), 1, "{name}: {updates:?}");
+            let value = serde_json::to_value(&updates[0]).unwrap();
+            assert_eq!(value["sessionUpdate"], "tool_call");
+            assert_eq!(value["_meta"]["claudeCode"]["toolName"], name);
+            assert_eq!(value["_meta"]["jetbrains"]["air"]["subagent"], true);
+        }
+
+        let mut state = MapState::default();
+        state.configure_air(std::env::temp_dir());
+        let frame = json!({
+            "type": "assistant",
+            "parent_tool_use_id": "outer-agent",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "nested-agent",
+                "name": "Agent",
+                "input": {"description": "Review tests", "prompt": "Inspect tests"},
+            }]},
+        });
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        let value = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(value["sessionUpdate"], "tool_call");
+        assert_eq!(value["_meta"]["claudeCode"]["toolName"], "Agent");
+        assert_eq!(
+            value["_meta"]["claudeCode"]["parentToolUseId"],
+            "outer-agent"
+        );
+        assert_eq!(value["_meta"]["jetbrains"]["air"]["subagent"], true);
+    }
+
     /// D15 (inv_77) — the `tool_result_meta` sidecar stamps
     /// `nonExecutionKind` / `userFeedback` on the completing update, in Node's
     /// key order, and an unknown kind is preserved (`acp-agent.js:10124,10162`).
@@ -3835,6 +4032,35 @@ mod tests {
         let updates = map_consolidated_assistant(&frame, &mut state);
         assert_eq!(updates.len(), 1, "{updates:?}");
         assert!(matches!(updates[0], SessionUpdate::ToolCallUpdate(_)));
+    }
+
+    /// T8A — the streamed refinement of a call the eager permission path
+    /// surfaced restores its parent attribution (`parentToolUseId`) when the
+    /// eager emission raced `task_started`.
+    #[test]
+    fn t8a_refinement_restores_the_raced_parent_attribution() {
+        let mut state = MapState::default();
+        state.mark_emitted(
+            "toolu_sub".to_string(),
+            json!({"type": "tool_use", "id": "toolu_sub", "name": "Bash",
+                   "input": {"command": "ls"}}),
+        );
+        let frame = json!({
+            "type": "assistant", "parent_tool_use_id": "toolu_parent",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_sub", "name": "Bash",
+                 "input": {"command": "ls"}}
+            ]}
+        });
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        let value = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(value["sessionUpdate"], "tool_call_update");
+        assert_eq!(value["toolCallId"], "toolu_sub");
+        assert_eq!(
+            value["_meta"]["claudeCode"]["parentToolUseId"],
+            "toolu_parent"
+        );
     }
 
     /// F6b / T-15: a nested subagent tool call remembers its Agent/Task parent
@@ -4515,3 +4741,6 @@ mod diff_patch_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests_t8b;

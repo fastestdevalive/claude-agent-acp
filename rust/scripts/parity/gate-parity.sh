@@ -9,15 +9,17 @@
 # The gate never touches the network: fetch-upstream.sh is ALWAYS called with
 # --offline. PARITY_FORCE_OFFLINE=1 (tests only) forces the SKIP path.
 #
-# Decision 7: FORBID is empty in Phase 1/2; the Phase 3 final flip changes it to
-# --forbid-unclassified.
+# Decision 7: the Phase 3 final flip landed in the T9 closeout — every TEST-MAP
+# row is classified, so an `missing:T-UNCLASSIFIED` row is now a hard failure.
+# (The checker has no `--forbid-missing` mode; `missing:` rows only warn, and
+# MISSING.md is empty because TEST-MAP/MODULE-MAP carry zero `missing:` rows.)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PARITY="$ROOT/rust/scripts/parity"
 PIN="$(cat "$ROOT/porting/UPSTREAM_VERSION")"
 TAG="v$PIN"
-FORBID=""
+FORBID="--forbid-unclassified"
 
 fail=0
 

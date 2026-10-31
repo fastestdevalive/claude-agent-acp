@@ -3459,6 +3459,19 @@ mod tests {
         ));
     }
 
+    /// T8A — the exact upstream `markdownEscape` cases.
+    #[test]
+    fn t8a_markdown_escape_exact() {
+        assert_eq!(
+            markdown_escape("Hello *world*!"),
+            "```\nHello *world*!\n```"
+        );
+        assert_eq!(
+            markdown_escape("for example:\n```markdown\nHello *world*!\n```\n"),
+            "````\nfor example:\n```markdown\nHello *world*!\n```\n````"
+        );
+    }
+
     /// F6a / T-74 — the fence run counts only backticks at the start of a line
     /// (`/^```+/gm`); an indented run does not widen the fence.
     #[test]

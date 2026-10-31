@@ -90,7 +90,7 @@ impl Env {
         let air = AirClient::from_client_capabilities(&json!({"_meta": {"jetbrains": {"air": {
             "version": 1, "capabilities": ["sessionIndex"]
         }}}}));
-        connection.negotiate(air.as_ref());
+        connection.negotiate(air.as_ref(), false);
         Self {
             root: base.join("projects"),
             registry: base.join("sessions"),

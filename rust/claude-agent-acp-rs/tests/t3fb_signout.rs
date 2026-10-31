@@ -304,3 +304,72 @@ async fn t3fb_a_goal_after_a_sign_out_runs_on_the_new_query() {
     .await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// G4 / F34 — `acp-agent-settings.test.ts` > "keeps the live mode when a
+/// sign-out respawn starts a fresh conversation": the recreated child's argv
+/// carries the session's live mode, not the default.
+#[tokio::test]
+async fn g4_f34_a_sign_out_respawn_keeps_the_live_mode() {
+    let tmp = temp_dir("live-mode");
+    let argv_out = tmp.join("argv.json");
+    let set_mode_step = json!({
+        "expect": {"type": "control_request", "request": {"subtype": "set_permission_mode"}},
+        "emit": [{"type": "control_response", "response": {
+            "subtype": "success", "request_id": "$REQ", "response": {}
+        }}]
+    })
+    .to_string();
+    let script = tmp.join("signout-mode.transcript.jsonl");
+    std::fs::write(
+        &script,
+        format!(
+            "{}\n{}\n{}\n{{\"segment\":1}}\n{}\n{}\n{}\n",
+            init_step(&json!({"apiKeySource": "ANTHROPIC_API_KEY"})),
+            set_mode_step,
+            auth_fail_turn(),
+            init_step(&json!({"subscriptionType": "pro"})),
+            answering_turn("x"),
+            json!({"auth_status_stdout": {"loggedIn": true, "apiProvider": "firstParty",
+                "apiKeySource": "ANTHROPIC_API_KEY"}})
+        ),
+    )
+    .expect("write transcript");
+    let mut opts = options(&tmp, script);
+    opts.extra_env.push((
+        "FAKE_CLAUDE_ARGV_OUT".to_string(),
+        argv_out.to_string_lossy().into_owned(),
+    ));
+    with_agent(opts, move |connection, _updates| async move {
+        call(&connection, "initialize", json!({"protocolVersion": 1})).await?;
+        let cwd = repo_root().to_string_lossy().into_owned();
+        let created = call(&connection, "session/new", new_session(&cwd)).await?;
+        let session_id = created["sessionId"].as_str().unwrap_or("").to_string();
+        call(
+            &connection,
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": "plan"}),
+        )
+        .await?;
+        sign_out(&connection, &session_id).await?;
+        // The steer recreates the query (the live mode must follow) and then the
+        // creation guard refuses the subscription account.
+        let _ = call(
+            &connection,
+            "_session/steering",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "x"}]}),
+        )
+        .await;
+        Ok::<(), Error>(())
+    })
+    .await;
+    let recorded: Value =
+        serde_json::from_str(&std::fs::read_to_string(&argv_out).expect("the argv record"))
+            .expect("valid argv json");
+    let argv = recorded["argv"].as_array().expect("an argv array");
+    assert!(
+        argv.iter()
+            .any(|arg| arg.as_str() == Some("--permission-mode=plan")),
+        "the recreated child keeps the live mode: {argv:?}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}

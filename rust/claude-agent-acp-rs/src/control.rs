@@ -181,6 +181,9 @@ pub struct InitializeOptions {
     /// `appendSystemPrompt` (client `systemPrompt` append mode and AIR
     /// `customInstructions`, rust-air-gaps Decision 10).
     pub append_system_prompt: Option<String>,
+    /// `excludeDynamicSections` of the `claude_code` preset (O-168): forwarded
+    /// verbatim when the client's `_meta.systemPrompt` object carries it.
+    pub exclude_dynamic_sections: Option<Value>,
     /// `agents`.
     pub agents: Option<Value>,
     /// `hooks` (the `initHooksPayload`).
@@ -255,6 +258,11 @@ impl InitializeOptions {
         }
         if let Some(tool_aliases) = &self.tool_aliases {
             request.insert("toolAliases".to_string(), tool_aliases.clone());
+        }
+        // O-168: the SDK sends the preset's `excludeDynamicSections` right after
+        // `toolAliases` (`sdk.mjs` `buildInitializeRequest`).
+        if let Some(exclude) = &self.exclude_dynamic_sections {
+            request.insert("excludeDynamicSections".to_string(), exclude.clone());
         }
         if let Some(tool_config) = &self.tool_config {
             request.insert("toolConfig".to_string(), tool_config.clone());

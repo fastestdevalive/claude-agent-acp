@@ -1607,4 +1607,93 @@ mod tests {
             );
         }
     }
+
+    /// session/list > stops reading once the page is full and older transcripts
+    /// cannot rank higher, and a second list reads nothing again.
+    #[test]
+    fn t8d_stops_reading_once_the_page_is_full() {
+        let fx = Fixture::new("early-stop");
+        for n in 1..=60 {
+            let session = id(n);
+            let at = T0 - n as i64 * 60_000;
+            fx.write(
+                &session,
+                &[fx.prompt(&session, "p", at), fx.answer(&session, at + 1000)],
+                at + 2000,
+            );
+        }
+        let mut index = SessionIndex::new(fx.root.clone());
+        let (rows, _) = index.list(&fx.query(5, None));
+        assert_eq!(rows.len(), 5);
+        let read = index.transcripts_read();
+        assert!(
+            read <= 16,
+            "a full page reads at most one batch: {read} transcripts"
+        );
+        // The metadata cache holds: the same list reads nothing again.
+        index.list(&fx.query(5, None));
+        assert_eq!(index.transcripts_read(), read);
+    }
+
+    /// cwd recovery in a directory without any cwd > reads a bounded number of
+    /// transcripts, and not again until the directory changes.
+    #[test]
+    fn t8d_cwd_recovery_reads_a_bounded_number_and_not_again() {
+        let fx = Fixture::new("cwd-bounded");
+        let other = fx.base.join("work/other");
+        std::fs::create_dir_all(&other).expect("other");
+        let other_dir = fx.root.join(encode_project_path(
+            &other.to_string_lossy(),
+            Platform::host(),
+        ));
+        std::fs::create_dir_all(&other_dir).expect("other project dir");
+        let write_no_cwd = |session: &str, at: i64| {
+            let lines = [
+                json!({"type": "user", "sessionId": session,
+                    "timestamp": js_text::to_iso_string(at),
+                    "message": {"role": "user", "content": "no cwd"}}),
+                fx.answer(session, at + 1000),
+            ];
+            let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            let path = other_dir.join(format!("{session}.jsonl"));
+            std::fs::write(&path, text).expect("write");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open");
+            file.set_modified(
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_millis((at + 2000) as u64),
+            )
+            .expect("mtime");
+        };
+        write_no_cwd(&id(1), T0);
+        for n in 2..=21 {
+            let session = id(n);
+            let at = T0 - n as i64 * 1000;
+            fx.write(
+                &session,
+                &[fx.prompt(&session, "p", at), fx.answer(&session, at + 1000)],
+                at + 2000,
+            );
+        }
+        for n in 22..=121 {
+            write_no_cwd(&id(n), T0 - 3_600_000 - n as i64);
+        }
+        let mut index = SessionIndex::new(fx.root.clone());
+        let mut query = fx.query(2, None);
+        query.cwd = None;
+        index.list(&query);
+        let read = index.transcripts_read();
+        assert!(
+            read <= 16 + 64,
+            "the cwd probes are bounded per directory: {read} transcripts"
+        );
+        index.list(&query);
+        assert_eq!(
+            index.transcripts_read(),
+            read,
+            "an unchanged directory is not probed again"
+        );
+    }
 }

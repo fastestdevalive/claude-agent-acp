@@ -902,6 +902,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// T8A — the local project helper wins over an unused user Central helper,
+    /// and the label follows the resolved helper.
+    #[test]
+    fn t8a_local_project_helper_wins_over_a_user_central_helper() {
+        let root = temp_root("t8a-central-helper");
+        let cwd = root.join("cwd");
+        let config = root.join("config");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        write(
+            &config.join("settings.json"),
+            json!({"apiKeyHelper": "central proxy start"}),
+        );
+        write(
+            &cwd.join(".claude/settings.json"),
+            json!({"apiKeyHelper": "central proxy start"}),
+        );
+        write(
+            &cwd.join(".claude/settings.local.json"),
+            json!({"apiKeyHelper": "ordinary-helper"}),
+        );
+        let settings = resolve(&cwd, Some(&config), None, None);
+        let helper = settings.get_api_key_helper(None);
+        assert_eq!(helper.as_deref(), Some("ordinary-helper"));
+        let status = crate::auth_status::from_account_info(
+            &json!({"apiKeySource": "apiKeyHelper"}),
+            helper.as_deref(),
+        )
+        .expect("a status");
+        assert_eq!(status.kind, "api_key");
+        assert_eq!(status.label, "Anthropic API key");
+        assert_eq!(status.detail.as_deref(), Some("API key helper"));
+        // A Central helper alone is the AIR gateway.
+        let central = crate::auth_status::from_account_info(
+            &json!({"apiKeySource": "apiKeyHelper"}),
+            Some("central proxy start"),
+        )
+        .expect("a status");
+        assert_eq!(central.kind, "gateway");
+        assert_eq!(central.label, "JetBrains Air Gateway");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T8A — a programmatic `settings.apiKeyHelper` override wins for every
+    /// value, and an empty override stays a plain API key.
+    #[test]
+    fn t8a_programmatic_helper_override_wins() {
+        let root = temp_root("t8a-helper-override");
+        let cwd = root.join("cwd");
+        let config = root.join("config");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        write(
+            &cwd.join(".claude/settings.json"),
+            json!({"apiKeyHelper": "decentralized proxy start"}),
+        );
+        let settings = resolve(&cwd, Some(&config), None, None);
+        for helper in ["central proxy start", "", "ordinary-helper"] {
+            let override_val = json!({"apiKeyHelper": helper});
+            let resolved = settings.get_api_key_helper(Some(&override_val));
+            assert_eq!(resolved.as_deref(), Some(helper), "override {helper:?}");
+            let status = crate::auth_status::from_account_info(
+                &json!({"apiKeySource": "apiKeyHelper"}),
+                resolved.as_deref(),
+            )
+            .expect("a status");
+            if helper == "central proxy start" {
+                assert_eq!(status.kind, "gateway");
+                assert_eq!(status.label, "JetBrains Air Gateway");
+            } else {
+                assert_eq!(status.kind, "api_key");
+                assert_eq!(status.label, "Anthropic API key");
+                assert_eq!(status.detail.as_deref(), Some("API key helper"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Finding 1: An unreadable/unparseable MDM plist (or a `reg.exe` timeout)
     /// drops only the MDM tier; the managed FILE tier is still enforced
     /// (deniedModels, disableBypassPermissionsMode, apiKeyHelper, managed env).

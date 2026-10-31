@@ -374,3 +374,41 @@ fn t3b_a_listing_narrows_the_picker() {
         Some((vec!["claude-sonnet-5".to_string()], Some("eu".to_string())))
     );
 }
+
+/// `authorization.test.ts` > "uses gateway env after anthropic gateway auth"
+/// and "uses gateway env after gateway auth": `authenticate` stores the
+/// gateway as the routing config, and a later session spawn carries its env
+/// after every other source (the user's env included).
+#[test]
+fn t8c_gateway_auth_env_reaches_the_spawn() {
+    let mut spawn = crate::process::SpawnOptions {
+        extra_env: vec![("userEnv".into(), "userEnv".into())],
+        ..Default::default()
+    };
+    let config = gateway_request_to_provider_config(Some(&json!({
+        "methodId": "gateway",
+        "_meta": {"gateway": {"baseUrl": "https://gateway.example",
+            "headers": {"x-api-key": "test"}}}
+    })))
+    .expect("anthropic gateway");
+    apply_provider_to_spawn(&mut spawn, Some(&config));
+    let env: std::collections::HashMap<String, String> = spawn.extra_env.into_iter().collect();
+    assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "acp-proxy");
+    assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gateway.example");
+    assert_eq!(env["ANTHROPIC_CUSTOM_HEADERS"], "x-api-key: test");
+    assert_eq!(env["userEnv"], "userEnv");
+
+    let mut spawn = crate::process::SpawnOptions::default();
+    let config = gateway_request_to_provider_config(Some(&json!({
+        "methodId": "gateway-bedrock",
+        "_meta": {"gateway": {"baseUrl": "https://gateway.example",
+            "headers": {"custom-header": "test"}}}
+    })))
+    .expect("bedrock gateway");
+    apply_provider_to_spawn(&mut spawn, Some(&config));
+    let env: std::collections::HashMap<String, String> = spawn.extra_env.into_iter().collect();
+    assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"], "1");
+    assert_eq!(env["AWS_BEARER_TOKEN_BEDROCK"], "acp-proxy");
+    assert_eq!(env["ANTHROPIC_BEDROCK_BASE_URL"], "https://gateway.example");
+    assert_eq!(env["ANTHROPIC_CUSTOM_HEADERS"], "custom-header: test");
+}

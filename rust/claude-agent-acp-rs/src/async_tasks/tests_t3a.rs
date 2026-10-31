@@ -556,3 +556,187 @@ fn t3a_monitor_tool_tasks_are_never_announced() {
         "description": "other", "tool_use_id": "other-call"}));
     assert_eq!(kinds(&published), ["async_task_spawned"]);
 }
+
+// ----- T9A: stop acknowledgements, held tasks, Monitor rows --------------------
+
+/// `async-tasks.test.ts` > "publishes a stopped terminal after a task-specific
+/// stop": the claim is one-shot, the task ends `stopped` without a summary, and
+/// the stop names the one acknowledgement.
+#[test]
+fn t9a_task_stop_publishes_one_stopped_terminal_and_one_notice() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    let mut published = runtime.task_started(&json!({"taskId": "task-1",
+        "taskType": "local_workflow", "description": "Build generated assets",
+        "toolCallId": "workflow-tool"}));
+    assert!(runtime.can_stop("task-1"));
+    assert!(runtime.claim_stop("task-1"));
+    assert!(!runtime.claim_stop("task-1"));
+    let first = runtime.task_stopped("task-1");
+    published.extend(first.updates.clone());
+    let second = runtime.task_stopped("task-1");
+    published.extend(second.updates);
+    assert!(!runtime.can_stop("task-1"));
+    assert_eq!(
+        kinds(&published),
+        ["async_task_spawned", "async_task_state_update"]
+    );
+    assert_eq!(published[1]["state"], "stopped");
+    assert!(published[1].get("summary").is_none());
+    assert_eq!(first.notice_name.as_deref(), Some("Build generated assets"));
+    assert_eq!(second.notice_name, None, "one acknowledgement per task");
+}
+
+/// `async-tasks.test.ts` > "still announces a stop whose SDK notification landed
+/// first": the SDK's terminal edge does not swallow the acknowledgement.
+#[test]
+fn t9a_task_stop_after_the_sdk_notification_still_acknowledges() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    let mut published = runtime.task_started(&json!({"taskId": "task-1",
+        "taskType": "local_bash", "description": "npm run build",
+        "isBackgrounded": true, "toolCallId": "bash-tool"}));
+    assert!(runtime.claim_stop("task-1"));
+    published.extend(runtime.task_notification(&json!({"taskId": "task-1", "status": "killed"})));
+    let stopped = runtime.task_stopped("task-1");
+    published.extend(stopped.updates);
+    assert_eq!(
+        kinds(&published),
+        ["async_task_spawned", "async_task_state_update"]
+    );
+    assert_eq!(stopped.notice_name.as_deref(), Some("npm run build"));
+}
+
+/// `async-tasks.test.ts` > "announces a stop for a panel-only task too": a task
+/// whose spawn is hidden from the transcript still acknowledges the click.
+#[test]
+fn t9a_task_stop_acknowledges_a_panel_only_task() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    let published = runtime.task_started(&json!({"taskId": "task-1",
+        "taskType": "local_bash", "description": "npm run build",
+        "isBackgrounded": true, "skipTranscript": true, "toolCallId": "bash-tool"}));
+    assert_eq!(published[0]["showInTranscript"], false);
+    assert!(runtime.claim_stop("task-1"));
+    let stopped = runtime.task_stopped("task-1");
+    assert_eq!(stopped.notice_name.as_deref(), Some("npm run build"));
+}
+
+/// `async-tasks.test.ts` > "publishes a mutable output path after an already
+/// announced task": both the snake and the camel spelling are progress beats.
+#[test]
+fn t9a_task_updated_publishes_a_mutable_output_path() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    runtime.task_started(&json!({"taskId": "shell", "taskType": "local_bash",
+        "description": "Build", "isBackgrounded": true, "toolCallId": "bash-tool"}));
+    let mut published =
+        runtime.task_updated("shell", &json!({"output_file": "/tmp/tasks/one.output"}));
+    published
+        .extend(runtime.task_updated("shell", &json!({"outputFilePath": "/tmp/tasks/two.output"})));
+    assert_eq!(
+        published,
+        [
+            json!({"sessionUpdate": "async_task_progress", "asyncTaskId": "shell",
+                "outputFilePath": "/tmp/tasks/one.output"}),
+            json!({"sessionUpdate": "async_task_progress", "asyncTaskId": "shell",
+                "outputFilePath": "/tmp/tasks/two.output"}),
+        ]
+    );
+}
+
+/// `async-tasks.test.ts` > "publishes a tool id that arrives after the turn
+/// released the spawn": the spawn goes out without it, the late id is a
+/// progress beat.
+#[test]
+fn t9a_tool_id_after_the_released_spawn_is_a_progress_beat() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    let mut published = runtime.task_started(&json!({"task_id": "shell",
+        "task_type": "local_bash", "description": "Build", "is_backgrounded": true}));
+    published.extend(runtime.release_held());
+    published.extend(runtime.task_backgrounded(&json!({"task_id": "shell",
+        "task_type": "local_bash", "description": "Build", "is_backgrounded": true,
+        "tool_use_id": "bash-tool"})));
+    assert!(published[0].get("toolCallId").is_none());
+    assert_eq!(
+        published[1],
+        json!({"sessionUpdate": "async_task_progress", "asyncTaskId": "shell",
+            "toolCallId": "bash-tool"})
+    );
+}
+
+/// `async-tasks.test.ts` > "takes the tool id of the terminal notification of a
+/// held task": the spawn takes the id from the terminal edge.
+#[test]
+fn t9a_held_task_takes_the_tool_id_of_its_terminal_notification() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    runtime.task_started(
+        &json!({"task_id": "workflow", "task_type": "local_workflow",
+        "description": "Build assets"}),
+    );
+    let published = runtime.task_notification(&json!({"task_id": "workflow",
+        "status": "failed", "tool_use_id": "workflow-tool"}));
+    assert_eq!(
+        kinds(&published),
+        ["async_task_spawned", "async_task_state_update"]
+    );
+    assert_eq!(published[0]["toolCallId"], "workflow-tool");
+}
+
+/// `async-tasks.test.ts` > "finishes a held task at shutdown": the held spawn
+/// goes out with the shutdown terminal.
+#[test]
+fn t9a_finish_all_finishes_a_held_task() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    runtime.task_started(
+        &json!({"task_id": "workflow", "task_type": "local_workflow",
+        "description": "Build assets"}),
+    );
+    let published = runtime.finish_all("stopped");
+    assert_eq!(
+        kinds(&published),
+        ["async_task_spawned", "async_task_state_update"]
+    );
+    assert_eq!(published[1]["state"], "stopped");
+}
+
+/// `async-tasks.test.ts` > Monitor tasks > "never announces a task that a Monitor
+/// tool call started": the task is ignored before its spawn, so no stop or
+/// shutdown report exists for it.
+#[test]
+fn t9a_monitor_task_started_by_the_tool_call_is_never_announced() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    runtime.hide_tool_call("monitor-tool");
+    let mut published = runtime.task_started(&json!({"task_id": "monitor",
+        "task_type": "local_bash", "description": "Watch the logs",
+        "is_backgrounded": true, "tool_use_id": "monitor-tool"}));
+    published
+        .extend(runtime.task_progress(&json!({"task_id": "monitor", "summary": "First line"})));
+    published.extend(runtime.task_updated("monitor", &json!({"status": "paused"})));
+    published.extend(runtime.background_tasks_changed(&json!([
+        {"task_id": "monitor", "task_type": "local_bash"}
+    ])));
+    assert!(!runtime.can_stop("monitor"));
+    assert!(!runtime.claim_stop("monitor"));
+    published.extend(runtime.task_stopped("monitor").updates);
+    published.extend(runtime.task_notification(&json!({"task_id": "monitor",
+        "status": "completed", "tool_use_id": "monitor-tool"})));
+    published.extend(runtime.finish_all("stopped"));
+    assert!(published.is_empty(), "{published:?}");
+}
+
+/// `async-tasks.test.ts` > Monitor tasks > "ignores a local_monitor task without
+/// a tool call": the level and the task_started frames publish nothing.
+#[test]
+fn t9a_local_monitor_task_without_a_tool_call_is_ignored() {
+    let mut runtime = AsyncTaskRuntime::new(true);
+    let mut published = runtime.background_tasks_changed(&json!([
+        {"task_id": "level", "task_type": "local_monitor"}
+    ]));
+    published
+        .extend(runtime.task_started(&json!({"task_id": "level", "task_type": "local_monitor"})));
+    published
+        .extend(runtime.task_started(&json!({"task_id": "started", "task_type": "local_monitor"})));
+    published.extend(runtime.task_progress(&json!({"task_id": "started", "summary": "line"})));
+    published.extend(runtime.release_held());
+    published
+        .extend(runtime.task_notification(&json!({"task_id": "started", "status": "completed"})));
+    assert!(published.is_empty(), "{published:?}");
+    assert!(!runtime.can_stop("started"));
+}

@@ -266,6 +266,27 @@ impl SessionFailures {
     pub fn active(&self) -> &[Prepared] {
         &self.active
     }
+
+    /// The revision the client holds of the failure `id`, if any.
+    pub fn revision_of(&self, id: &str) -> Option<u64> {
+        self.revisions.get(id).copied()
+    }
+
+    /// Undo a replay's [`Self::restore`] when the restored failure could not be
+    /// published (`SessionFailureController.restore`: it records only after
+    /// `emit` succeeded, so a failed publish leaves no active record and no
+    /// revision). The revision goes back to what it was before the restore.
+    pub fn rollback_restored(&mut self, id: &str) {
+        self.active.retain(|active| active.failure.id != id);
+        match self.revisions.get(id).copied() {
+            Some(revision) if revision > 1 => {
+                self.revisions.insert(id.to_string(), revision - 1);
+            }
+            _ => {
+                self.revisions.remove(id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

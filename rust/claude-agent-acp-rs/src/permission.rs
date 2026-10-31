@@ -1029,6 +1029,53 @@ mod tests {
         );
     }
 
+    /// T8A — a permission request's `toolCall` carries the title, kind and
+    /// content of the tool shape for Write, Bash and Read.
+    #[test]
+    fn t8a_permission_tool_call_has_title_kind_and_content() {
+        let cases = [
+            (
+                "Write",
+                json!({"file_path": "/test/file.txt", "content": "test"}),
+                "/test/file.txt",
+            ),
+            (
+                "Bash",
+                json!({"command": "ls -la", "description": "List files"}),
+                "ls -la",
+            ),
+            (
+                "Read",
+                json!({"file_path": "/test/data.json"}),
+                "/test/data.json",
+            ),
+        ];
+        for (name, input, expected_title_part) in cases {
+            let tc = build_permission_tool_call(&PermissionToolCall {
+                tool_name: name.to_string(),
+                tool_input: input,
+                tool_use_id: format!("test-{}", name.to_lowercase()),
+                parent_tool_use_id: None,
+                cwd: None,
+                air: false,
+                plan_file: false,
+                terminal_output: false,
+                title: None,
+                preview_content: None,
+                blocked_path: None,
+                fallback_content: None,
+                mcp_server: None,
+            });
+            let title = tc["title"].as_str().expect("a title");
+            assert!(
+                title.contains(expected_title_part),
+                "{name}: {title} does not contain {expected_title_part}"
+            );
+            assert!(tc["kind"].is_string(), "{name}: kind is a string");
+            assert!(tc["content"].is_array(), "{name}: content is an array");
+        }
+    }
+
     /// 10.T2 (INV-21) — a deny maps to the exact R28 payload (with the 2.11
     /// `toolUseID` / `decisionClassification:"user_reject"` additions; the deny
     /// message is unchanged).

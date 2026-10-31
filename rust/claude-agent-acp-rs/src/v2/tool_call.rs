@@ -41,13 +41,31 @@ pub fn v2_tool_call_content(item: &Value) -> Result<Value, Error> {
 /// Upstream: `v2ToolCallPatch(toolCall: ToolCall | ToolCallUpdate): v2.ToolCallUpdate`.
 /// Drops null fields, drops `sessionUpdate`, translates `content`, and keeps
 /// all other fields. Content is placed last after non-null patch fields.
+///
+/// C-24: a v1 `failed` result that the CLI stamped as aborted
+/// (`nonExecutionKind` `interrupted`/`cancelled`) is `cancelled` on v2
+/// (`AcpToolCallRenderer.resultStatus`, `renderer.ts:196-204`). The v1 status
+/// has no `cancelled`, so the translation rewrites it here; every other field
+/// keeps its v1 order.
 pub fn v2_tool_call_patch(tool_call: &Value) -> Result<Value, Error> {
     let Some(obj) = tool_call.as_object() else {
         return Ok(tool_call.clone());
     };
+    let aborted = obj.get("status").and_then(Value::as_str) == Some("failed")
+        && tool_call
+            .pointer("/_meta/claudeCode/nonExecutionKind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "interrupted" | "cancelled"));
     let mut map = Map::new();
     for (key, value) in obj {
         if key == "sessionUpdate" || key == "content" || value.is_null() {
+            continue;
+        }
+        if key == "status" && aborted {
+            map.insert(
+                key.clone(),
+                Value::String(super::session::tool_call_status_for_aborted(true).to_string()),
+            );
             continue;
         }
         map.insert(key.clone(), value.clone());

@@ -158,6 +158,59 @@ fn t3a_worker_shutting_down_only_arms_the_signal() {
     assert!(rig.machine.has_active());
 }
 
+/// T8A — a restored quota failure (as `session/load` replay leaves it) is
+/// cleared after a follow-up whose real model answer proves recovery.
+#[test]
+fn t8a_replayed_failure_clears_after_a_successful_follow_up() {
+    let mut rig = air_rig(&["sessionFailure"]);
+    let restored = rig.ext.t2a.failures.restore(
+        "s",
+        "p1:error",
+        ClaudeFailureKind::QuotaExhausted,
+        "You've hit your limit",
+        true,
+    );
+    assert_eq!(
+        restored["update"]["_meta"]["jetbrains"]["air"]["sessionFailure"]["id"],
+        "p1:error"
+    );
+    assert_eq!(active_kinds(&rig), vec![ClaudeFailureKind::QuotaExhausted]);
+    rig.echo("p2");
+    model_answer(&mut rig);
+    rig.feed(success_result());
+    assert!(
+        active_kinds(&rig).is_empty(),
+        "the recovered failure is no longer active"
+    );
+}
+
+/// T8A — a synthetic local-command frame does not prove recovery: a restored
+/// quota failure stays active, and its zero usage is not published.
+#[test]
+fn t8a_a_local_command_does_not_clear_restored_quota() {
+    let mut rig = air_rig(&["sessionFailure"]);
+    rig.ext.t2a.failures.restore(
+        "s",
+        "p1:error",
+        ClaudeFailureKind::QuotaExhausted,
+        "You've hit your limit",
+        true,
+    );
+    rig.echo("p2");
+    rig.feed(json!({"type":"assistant","parent_tool_use_id":null,
+        "message":{"id":"api-local-command-result","model":"<synthetic>",
+            "role":"assistant","content":[{"type":"text","text":"No response requested."}],
+            "usage":{"input_tokens":0,"output_tokens":0,
+                "cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}));
+    rig.feed(success_result());
+    let updates = rig.updates();
+    assert!(
+        updates.iter().all(|u| u["sessionUpdate"] != "usage_update"),
+        "the synthetic zero usage is not published: {updates:?}"
+    );
+    assert_eq!(active_kinds(&rig), vec![ClaudeFailureKind::QuotaExhausted]);
+}
+
 // ---------------------------------------------------------------- F21
 
 fn exit_plan_use(rig: &mut Rig, plan: &str) {

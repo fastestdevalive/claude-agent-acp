@@ -120,6 +120,10 @@ pub(crate) struct RestartedChild {
     pub buffered: Vec<Value>,
     /// Owns the relay and, through it, the process.
     pub guard: AbortOnDrop,
+    /// The fresh session's Fast mode after `restartSession` and the restore
+    /// (`applyFastMode`, `clear-context-coordinator.ts:143-152`).
+    pub fast_mode_enabled: bool,
+    pub fast_mode_disabled_reason: Option<String>,
 }
 
 /// Why a restart ended, from the actor's point of view.
@@ -143,6 +147,16 @@ pub(crate) struct BringUp {
     pub control_in_tx: mpsc::UnboundedSender<Value>,
     /// How long the whole bring-up may take before it fails.
     pub deadline: Duration,
+    /// The old session's Fast mode, restored on the fresh session when its own
+    /// initialize reports another state (`applyFastMode`,
+    /// `clear-context-coordinator.ts:143-152`).
+    pub fast_mode_desired: bool,
+    /// Whether the session's model supports Fast mode (the toggle is only
+    /// surfaced, and a reported state only meaningful, while it does).
+    pub fast_mode_supported: bool,
+    /// Where the restore's failure is logged, like upstream's
+    /// `logError("Failed to restore Fast mode after clearing context:", error)`.
+    pub logger: Option<std::sync::Arc<crate::logger::Logger>>,
 }
 
 /// Start a fresh child (the live model, agent and effort travel as its flags,
@@ -158,6 +172,9 @@ pub(crate) async fn bring_up(bring: BringUp, old: OldChild) -> RestartResult {
         control,
         control_in_tx,
         deadline,
+        fast_mode_desired,
+        fast_mode_supported,
+        logger,
     } = bring;
     let mut process = process::spawn(&spawn)
         .await
@@ -172,21 +189,55 @@ pub(crate) async fn bring_up(bring: BringUp, old: OldChild) -> RestartResult {
     old.stop();
 
     let handshake = async {
-        control
+        let info = control
             .initialize(&initialize)
             .await
             .map_err(|error| format!("initialize handshake: {error}"))?;
-        Ok::<(), String>(())
+        // B-74: `restartSession` seeds the fresh session's Fast mode from its
+        // own initialize; `continuePlanInFreshContext` then restores the old
+        // session's toggle when the two differ (`applyFastMode`).
+        let fresh = crate::session_config::fast_mode_option_state_from_initialize(
+            &json!({
+                "fast_mode_state": info.fast_mode_state,
+                "fast_mode_disabled_reason": info.fast_mode_disabled_reason,
+            }),
+            fast_mode_supported,
+            true,
+        );
+        let mut enabled = fresh.enabled;
+        let mut disabled_reason = fresh.disabled_reason;
+        if enabled != fast_mode_desired {
+            match control
+                .send_request(json!({
+                    "subtype": "apply_flag_settings",
+                    "settings": {"fastMode": fast_mode_desired},
+                }))
+                .await
+            {
+                Ok(_) => {
+                    enabled = fast_mode_desired;
+                    disabled_reason = None;
+                }
+                Err(error) => {
+                    // Upstream logs and carries on with the fresh state.
+                    if let Some(logger) = &logger {
+                        logger.error(&format!(
+                            "Failed to restore Fast mode after clearing context: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok::<(bool, Option<String>), String>((enabled, disabled_reason))
     };
     tokio::pin!(handshake);
     let mut buffered = Vec::new();
     let timeout = tokio::time::sleep(deadline);
     tokio::pin!(timeout);
-    loop {
+    let fast_mode = loop {
         tokio::select! {
             outcome = &mut handshake => {
-                outcome?;
-                break;
+                break outcome?;
             }
             line = lines.recv() => match line {
                 Some(line) => {
@@ -204,7 +255,7 @@ pub(crate) async fn bring_up(bring: BringUp, old: OldChild) -> RestartResult {
                 return Err("the fresh Claude context did not start in time".to_string());
             }
         }
-    }
+    };
 
     let (relay_tx, stream) = mpsc::unbounded_channel::<Value>();
     let relay = tokio::spawn(relay_stream(
@@ -212,10 +263,13 @@ pub(crate) async fn bring_up(bring: BringUp, old: OldChild) -> RestartResult {
         relay_tx,
         child_exit_verdict(process, timings),
     ));
+    let (fast_mode_enabled, fast_mode_disabled_reason) = fast_mode;
     Ok(RestartedChild {
         stream,
         buffered,
         guard: AbortOnDrop(relay),
+        fast_mode_enabled,
+        fast_mode_disabled_reason,
     })
 }
 

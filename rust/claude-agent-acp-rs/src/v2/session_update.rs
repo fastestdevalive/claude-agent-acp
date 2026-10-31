@@ -109,6 +109,25 @@ pub fn v2_child_state_update(update: &Value) -> Result<Option<Value>, Error> {
     Ok(Some(Value::Object(notif_map)))
 }
 
+/// A v1 `failed` tool result the CLI stamped as aborted becomes v2 `cancelled`
+/// (`resultStatus`, `renderer.ts:195-203`: `isError && isAbortedToolResult`).
+/// v1 has no `cancelled` status, so only the v2 form is rewritten; the
+/// `nonExecutionKind` stays in `_meta` (upstream keeps it on v2 too).
+fn rewrite_aborted_status(report: Value) -> Value {
+    let aborted = report
+        .pointer("/_meta/claudeCode/nonExecutionKind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "interrupted" || kind == "cancelled");
+    if !aborted || report.get("status").and_then(Value::as_str) != Some("failed") {
+        return report;
+    }
+    let Value::Object(mut map) = report else {
+        return report;
+    };
+    map.insert("status".to_string(), Value::String("cancelled".to_string()));
+    Value::Object(map)
+}
+
 /// The v2 form of a v1 session update, or `None` when v2 has no counterpart.
 ///
 /// Throws an error on untranslated update kinds.
@@ -170,7 +189,7 @@ pub fn v2_session_update(update: &Value) -> Result<Option<Value>, Error> {
         }
         "tool_call" | "tool_call_update" => {
             let tc = v2_tool_call_update(update)?;
-            Ok(Some(tc))
+            Ok(Some(rewrite_aborted_status(tc)))
         }
         "plan" => {
             let mut map = Map::new();

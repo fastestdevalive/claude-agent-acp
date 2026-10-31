@@ -2096,3 +2096,97 @@ mod tests {
         assert_eq!(respawn[0]["sessionUpdate"], "async_task_spawned");
     }
 }
+
+#[cfg(test)]
+mod t9a_tests {
+    use super::*;
+
+    fn rt() -> AsyncTaskRuntime {
+        AsyncTaskRuntime::new(true)
+    }
+
+    fn kinds(updates: &[Value]) -> Vec<&str> {
+        updates
+            .iter()
+            .map(|u| u["sessionUpdate"].as_str().unwrap_or(""))
+            .collect()
+    }
+
+    /// `async-tasks.test.ts` > "publishes one durable lifecycle with progress and
+    /// a terminal state": one spawn, the progress beat with its usage, the
+    /// paused/running states, and one terminal; late beats and a duplicate
+    /// terminal publish nothing.
+    #[test]
+    fn t9a_one_durable_lifecycle_with_progress_and_a_terminal() {
+        let mut r = rt();
+        let mut published = r.task_started(&json!({
+            "taskId": "task-1", "taskType": "local_workflow",
+            "description": "Build generated assets", "workflowName": "assets"
+        }));
+        published.extend(r.task_progress(&json!({
+            "taskId": "task-1", "summary": "Generated 3 files", "lastToolName": "Write",
+            "usage": {"total_tokens": 12, "tool_uses": 3, "duration_ms": 500}
+        })));
+        published.extend(r.task_updated("task-1", &json!({"status": "paused"})));
+        published.extend(r.task_updated("task-1", &json!({"status": "running"})));
+        published.extend(r.task_notification(&json!({
+            "taskId": "task-1", "status": "completed", "summary": "Done"
+        })));
+        published.extend(r.task_progress(&json!({"taskId": "task-1", "summary": "late"})));
+        published.extend(r.task_notification(&json!({
+            "taskId": "task-1", "status": "failed", "summary": "duplicate terminal"
+        })));
+        assert_eq!(
+            kinds(&published),
+            [
+                "async_task_spawned",
+                "async_task_progress",
+                "async_task_state_update",
+                "async_task_state_update",
+                "async_task_state_update",
+            ]
+        );
+        assert_eq!(published[0]["name"], "assets");
+        assert_eq!(published[0]["taskType"], "workflow");
+        assert_eq!(published[0]["showInTranscript"], true);
+        assert_eq!(published[1]["summary"], "Generated 3 files");
+        assert_eq!(
+            published[1]["usage"],
+            json!({"totalTokens": 12, "toolUses": 3, "durationMs": 500})
+        );
+        assert_eq!(published[2]["state"], "paused");
+        assert_eq!(published[3]["state"], "running");
+        assert_eq!(published[4]["state"], "completed");
+        assert_eq!(published[4]["summary"], "Done");
+    }
+
+    /// `async-tasks.test.ts` > "normalizes snake_case SDK task events and
+    /// propagates a late output file".
+    #[test]
+    fn t9a_snake_case_task_events_normalize_and_a_late_output_file_rides_the_terminal() {
+        let mut r = rt();
+        let mut published = r.task_started(&json!({
+            "task_id": "shell", "task_type": "local_bash", "description": "Run build",
+            "is_backgrounded": true, "tool_use_id": "bash-tool"
+        }));
+        published.extend(r.task_progress(&json!({
+            "task_id": "shell", "last_tool_name": "Bash",
+            "usage": {"totalTokens": 2, "toolUses": 1, "durationMs": 50}
+        })));
+        published.extend(r.task_notification(&json!({
+            "task_id": "shell", "status": "completed", "summary": "Done",
+            "output_file": "/tmp/tasks/shell.output"
+        })));
+        assert_eq!(published[0]["asyncTaskId"], "shell");
+        assert_eq!(published[0]["taskType"], "shell");
+        assert_eq!(published[0]["toolCallId"], "bash-tool");
+        assert_eq!(published[1]["lastToolName"], "Bash");
+        assert_eq!(
+            published[1]["usage"],
+            json!({"totalTokens": 2, "toolUses": 1, "durationMs": 50})
+        );
+        assert_eq!(published[2]["state"], "completed");
+        assert_eq!(published[2]["summary"], "Done");
+        assert_eq!(published[2]["outputFilePath"], "/tmp/tasks/shell.output");
+    }
+}

@@ -1198,3 +1198,222 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod t9a_tests {
+    use super::*;
+
+    /// A reporting session with the turn `p1` already inserted.
+    fn rig() -> V2State {
+        let mut state = V2State::new();
+        state.set_reporting(true);
+        state.register("p1", json!([]), oneshot::channel().0);
+        state.note_inserted("p1");
+        // The insertion's `running` is not part of the case under test.
+        let _ = emissions(&mut state);
+        state
+    }
+
+    fn emissions(state: &mut V2State) -> Vec<String> {
+        state
+            .take_out()
+            .into_iter()
+            .filter_map(|emission| match emission {
+                V2Emission::Foreground(ForegroundEvent::Running) => Some("running".into()),
+                V2Emission::Foreground(ForegroundEvent::AwaitingUser) => {
+                    Some("requires_action".into())
+                }
+                V2Emission::Foreground(ForegroundEvent::Ended(outcome)) => {
+                    Some(format!("idle {}", outcome.stop_reason.as_str()))
+                }
+                V2Emission::Ended { outcome, .. } => {
+                    Some(format!("idle {}", outcome.stop_reason.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `acp-v2.test.ts` > "reports a cycle that waits on a question as
+    /// requires_action": a cycle Claude Code starts on its own waits for a
+    /// foreground subagent's question.
+    #[test]
+    fn t9a_a_cycle_that_waits_on_a_question_reports_requires_action() {
+        let mut state = V2State::new();
+        state.set_reporting(true);
+        state.note_task("agent-1", false, None);
+        state.open_input("r1", Some("agent-1".into()));
+        state.start_cycle();
+        assert_eq!(emissions(&mut state), ["running", "requires_action"]);
+    }
+
+    /// `acp-v2.test.ts` > "keeps the turn running for a foreground subagent that
+    /// a background subagent launched": the foreground child of a background
+    /// parent does not hold the turn.
+    #[test]
+    fn t9a_a_foreground_subagent_under_a_background_parent_does_not_block() {
+        let mut state = rig();
+        state.note_task("agent-1", true, None);
+        state.note_task("agent-2", false, Some("agent-1"));
+        state.open_input("r1", Some("agent-2".into()));
+        assert!(emissions(&mut state).is_empty());
+    }
+
+    /// `acp-v2.test.ts` > "waits for a request once its subagent, which asked
+    /// before its task_started, turns out to run in the foreground".
+    #[test]
+    fn t9a_a_request_waits_when_its_subagent_turns_out_foreground() {
+        let mut state = rig();
+        state.open_input("r1", Some("agent-1".into()));
+        assert!(emissions(&mut state).is_empty(), "no task record yet");
+        state.note_task("agent-1", false, None);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+    }
+
+    /// `acp-v2.test.ts` > "stops waiting for a request once its foreground
+    /// subagent settles", and once Claude Code moves it to the background.
+    #[test]
+    fn t9a_a_foreground_subagent_settling_or_backgrounding_reports_running() {
+        for settle in [true, false] {
+            let mut state = rig();
+            state.note_task("agent-1", false, None);
+            state.open_input("r1", Some("agent-1".into()));
+            assert_eq!(emissions(&mut state), ["requires_action"]);
+            if settle {
+                state.remove_task("agent-1");
+            } else {
+                state.set_task_backgrounded("agent-1", true);
+            }
+            assert_eq!(emissions(&mut state), ["running"]);
+        }
+    }
+
+    /// `acp-v2.test.ts` > "reports nothing for a background subagent's request
+    /// that a cancel withdraws".
+    #[test]
+    fn t9a_a_background_subagents_withdrawn_request_reports_nothing() {
+        let mut state = rig();
+        state.note_task("agent-1", true, None);
+        state.open_input("r1", Some("agent-1".into()));
+        state.cancel_inputs();
+        state.close_input("r1", true);
+        assert!(emissions(&mut state).is_empty());
+    }
+
+    /// `acp-v2.test.ts` > "reports no running for a turn's request that a cancel
+    /// withdraws along with a background subagent's".
+    #[test]
+    fn t9a_a_turn_request_withdrawn_with_a_background_one_reports_no_running() {
+        let mut state = rig();
+        state.note_task("agent-1", true, None);
+        state.open_input("r1", None);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+        state.open_input("r2", Some("agent-1".into()));
+        state.cancel_inputs();
+        state.close_input("r1", true);
+        state.close_input("r2", true);
+        assert_eq!(emissions(&mut state), Vec::<String>::new());
+    }
+
+    /// `acp-v2.test.ts` > "reports running when Claude Code withdraws %s without
+    /// a cancel, since the work goes on".
+    #[test]
+    fn t9a_a_withdrawn_request_without_a_cancel_reports_running() {
+        let mut state = rig();
+        state.open_input("r1", None);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+        state.close_input("r1", true);
+        assert_eq!(emissions(&mut state), ["running"]);
+    }
+
+    /// `acp-v2.test.ts` > "reports running when Claude Code withdraws a request
+    /// that opened after the cancel".
+    #[test]
+    fn t9a_a_request_opened_after_the_cancel_reports_running() {
+        let mut state = rig();
+        state.cancel_inputs();
+        state.open_input("r1", None);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+        state.close_input("r1", true);
+        assert_eq!(emissions(&mut state), ["running"]);
+    }
+
+    /// `acp-v2.test.ts` > "two requests that are open together": the last one to
+    /// end decides whether the work runs again.
+    #[test]
+    fn t9a_two_open_requests_let_the_last_decide() {
+        // Both withdrawn: no running.
+        let mut state = rig();
+        state.open_input("r1", None);
+        state.open_input("r2", None);
+        state.cancel_inputs();
+        state.close_input("r1", true);
+        state.close_input("r2", true);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+
+        // The user answers the one the cancel did not withdraw, last: running.
+        let mut state = rig();
+        state.open_input("r1", None);
+        state.open_input("r2", None);
+        state.cancel_inputs();
+        state.close_input("r1", true);
+        state.close_input("r2", false);
+        assert_eq!(emissions(&mut state), ["requires_action", "running"]);
+
+        // The cancel withdraws the one that ends last: no running.
+        let mut state = rig();
+        state.open_input("r1", None);
+        state.open_input("r2", None);
+        state.cancel_inputs();
+        state.close_input("r1", false);
+        state.close_input("r2", true);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+    }
+
+    /// `acp-v2.test.ts` > "reports no running before idle cancelled for a request
+    /// of a cycle that Claude Code started, which a cancel withdraws".
+    #[test]
+    fn t9a_a_cancelled_cycle_request_reports_no_running_before_idle_cancelled() {
+        let mut state = V2State::new();
+        state.set_reporting(true);
+        state.start_cycle();
+        assert_eq!(emissions(&mut state), ["running"]);
+        state.open_input("r1", None);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+        state.cancel_inputs();
+        state.close_input("r1", true);
+        assert!(emissions(&mut state).is_empty());
+        state.set_cycle_end(ForegroundEnd::Ended(TurnOutcome {
+            stop_reason: StopReason::Cancelled,
+            usage: None,
+            meta: None,
+        }));
+        state.after_events(&[TurnEvent::CycleEnded], false);
+        assert_eq!(emissions(&mut state), ["idle cancelled"]);
+    }
+
+    /// `acp-v2.test.ts` > "does not report the next turn as waiting for a
+    /// question that its client never settled": the withdrawn request does not
+    /// survive into the next turn.
+    #[test]
+    fn t9a_a_withdrawn_question_does_not_wait_into_the_next_turn() {
+        let mut state = rig();
+        state.open_input("r1", None);
+        assert_eq!(emissions(&mut state), ["requires_action"]);
+        state.cancel_inputs();
+        state.close_input("r1", true);
+        state.note_held(
+            "p1",
+            ForegroundEnd::Ended(TurnOutcome {
+                stop_reason: StopReason::Cancelled,
+                usage: None,
+                meta: None,
+            }),
+        );
+        assert_eq!(emissions(&mut state), ["idle cancelled"]);
+        // The next turn reports no requires_action.
+        state.register("p2", json!([]), oneshot::channel().0);
+        state.note_inserted("p2");
+        assert_eq!(emissions(&mut state), ["running"]);
+    }
+}

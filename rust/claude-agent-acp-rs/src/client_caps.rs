@@ -597,3 +597,37 @@ mod tests {
         assert!(caps.auth_gateway);
     }
 }
+
+#[cfg(test)]
+mod tests_t9b {
+    use super::*;
+
+    /// `acp-scenarios.test.ts` > AIR > "sends the Bash output as terminal
+    /// deltas": a delta client gets `terminal_output_delta` and never the
+    /// `terminal_output` snapshot; a client without the capability renders no
+    /// terminal result at all.
+    #[test]
+    fn t9b_terminal_output_is_a_delta_for_a_delta_client() {
+        let caps = ClientCapabilities::from_value(Some(&json!({
+            "_meta": {"terminal_output_delta": true}
+        })));
+        let command = CommandOutcome {
+            output: "a.ts\nb.ts".into(),
+            exit_code: Some(0),
+            interrupted: false,
+        };
+        let result = caps
+            .terminal_result(Some("toolu_bash"), None, &command, false)
+            .expect("a terminal result");
+        assert_eq!(
+            result.output_meta,
+            json!({"terminal_output_delta": {"terminal_id": "toolu_bash", "data": "a.ts\nb.ts"}})
+        );
+        assert!(!result.output_meta.to_string().contains("terminal_output\""));
+
+        let plain = ClientCapabilities::from_value(Some(&json!({})));
+        assert!(plain
+            .terminal_result(Some("toolu_bash"), None, &command, false)
+            .is_none());
+    }
+}

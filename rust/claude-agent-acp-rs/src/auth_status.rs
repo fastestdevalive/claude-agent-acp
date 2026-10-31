@@ -536,6 +536,13 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    const CLI_SUBSCRIPTION: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"user@example.com","orgId":"org-1","orgName":"ACME","subscriptionType":"max"}"#;
+    const CLI_API_KEY: &str = r#"{"loggedIn":true,"authMethod":"none","apiProvider":"firstParty","apiKeySource":"apiKeyHelper"}"#;
+    const CLI_KEY_HELPER_AND_SUBSCRIPTION: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","apiKeySource":"apiKeyHelper","email":"user@example.com","orgName":"ACME","subscriptionType":"max"}"#;
+    const CLI_LOGGED_OUT: &str =
+        r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#;
+    const CLI_BEDROCK: &str = r#"{"loggedIn":false,"authMethod":"none","apiProvider":"bedrock"}"#;
+
     fn acct(plan: &str, email: Option<&str>, org: Option<&str>) -> AuthStatus {
         AuthStatus {
             kind: "account".into(),
@@ -926,6 +933,271 @@ mod tests {
             next_push(&mut push_rx).await,
             Some(acct("pro", Some("a@b.c"), Some("Org")).to_json())
         );
+    }
+
+    // ---- T8C: the `auth-status.test.ts` "auth status mappers" table --------
+    //
+    // The inputs and expected values are the upstream test's; every helper
+    // case is exercised against both mappings (`fromCliStatus` and
+    // `fromAccountInfo`).
+
+    /// `auth-status.test.ts` > "names the active Central helper %j without
+    /// exposing its command": the AIR gateway's helper maps to the gateway
+    /// status, whatever its argv looks like; the command never reaches the
+    /// payload.
+    #[test]
+    fn t8c_central_helper_is_named_without_its_command() {
+        let expected = st("gateway", "JetBrains Air Gateway", None);
+        for helper in [
+            "central proxy start",
+            "/opt/tools/central proxy start --arbitrary-flag",
+            "CeNtRaL ProXy   StArT --return-key",
+            "central.exe proxy\tstart",
+        ] {
+            assert_eq!(
+                from_cli_status(CLI_KEY_HELPER_AND_SUBSCRIPTION, Some(helper)),
+                Some(expected.clone()),
+                "{helper}"
+            );
+            assert_eq!(
+                from_account_info(
+                    &json!({"apiProvider": "firstParty", "apiKeySource": "apiKeyHelper",
+                        "subscriptionType": "max"}),
+                    Some(helper),
+                ),
+                Some(expected.clone()),
+                "{helper}"
+            );
+        }
+    }
+
+    /// `auth-status.test.ts` > "keeps a non-Central helper %j human readable":
+    /// an absent, empty or look-alike helper stays an `api_key` payload.
+    #[test]
+    fn t8c_non_central_helper_stays_human_readable() {
+        let expected = st("api_key", "Anthropic API key", Some("API key helper"));
+        for helper in [
+            None,
+            Some(""),
+            Some("decentralized proxy start"),
+            Some("centralized proxy start"),
+            Some("central proxy stop"),
+            Some("another proxy start"),
+            Some("central proxy starter"),
+        ] {
+            assert_eq!(
+                from_cli_status(CLI_API_KEY, helper),
+                Some(expected.clone()),
+                "{helper:?}"
+            );
+        }
+    }
+
+    /// `auth-status.test.ts` > "does not use an inactive helper or override an
+    /// external backend": an external backend and a logged-out CLI win over the
+    /// helper, and a helper with an unknown source keeps no detail.
+    #[test]
+    fn t8c_inactive_helper_and_external_backend() {
+        let helper = "central proxy start";
+        assert_eq!(
+            from_cli_status(CLI_BEDROCK, Some(helper)),
+            Some(st("external", "AWS Bedrock", None))
+        );
+        assert_eq!(
+            from_cli_status(CLI_LOGGED_OUT, Some(helper)),
+            Some(not_logged_in())
+        );
+        assert_eq!(
+            from_account_info(
+                &json!({"apiProvider": "firstParty", "apiKeySource": "env"}),
+                Some(helper),
+            ),
+            Some(st("api_key", "Anthropic API key", Some("env")))
+        );
+        assert_eq!(
+            from_account_info(
+                &json!({"apiKeySource": "futureInternalIdentifier"}),
+                Some(helper),
+            ),
+            Some(st("api_key", "Anthropic API key", None))
+        );
+    }
+
+    /// `auth-status.test.ts` > "maps a first-party subscription account".
+    #[test]
+    fn t8c_first_party_subscription_account() {
+        assert_eq!(
+            from_account_info(
+                &json!({"apiProvider": "firstParty", "subscriptionType": "max",
+                    "email": "user@example.com", "organization": "ACME"}),
+                None,
+            ),
+            Some(acct("max", Some("user@example.com"), Some("ACME")))
+        );
+        assert_eq!(
+            acct("max", Some("user@example.com"), Some("ACME")).to_json(),
+            json!({"kind": "account", "label": "Claude Max",
+                "account": {"plan": "max", "email": "user@example.com",
+                    "organization": "ACME"}})
+        );
+    }
+
+    /// `auth-status.test.ts` > "names the plan %j once, as %j": a plan the CLI
+    /// already prefixed is not prefixed twice; the plan itself stays raw.
+    #[test]
+    fn t8c_plan_is_named_once() {
+        for (plan, label) in [
+            ("max", "Claude Max"),
+            ("Claude Max", "Claude Max"),
+            ("claude max", "Claude Max"),
+            ("Team Premium", "Claude Team Premium"),
+        ] {
+            let status = from_account_info(
+                &json!({"apiProvider": "firstParty", "subscriptionType": plan}),
+                None,
+            )
+            .expect("a subscription account");
+            assert_eq!(status.label, label, "{plan}");
+            assert_eq!(
+                status.account.as_ref().and_then(|a| a.plan.as_deref()),
+                Some(plan),
+                "{plan}: the raw vendor string stays"
+            );
+        }
+    }
+
+    /// `auth-status.test.ts` > "maps an API key source".
+    #[test]
+    fn t8c_api_key_source() {
+        assert_eq!(
+            from_account_info(
+                &json!({"apiProvider": "firstParty", "apiKeySource": "ANTHROPIC_API_KEY"}),
+                None,
+            ),
+            Some(st(
+                "api_key",
+                "Anthropic API key",
+                Some("ANTHROPIC_API_KEY")
+            ))
+        );
+    }
+
+    /// `auth-status.test.ts` > "prefers the API key over a stored subscription
+    /// when both are reported": the helper key is what bills.
+    #[test]
+    fn t8c_api_key_outranks_subscription() {
+        assert_eq!(
+            from_cli_status(CLI_KEY_HELPER_AND_SUBSCRIPTION, None),
+            Some(st("api_key", "Anthropic API key", Some("API key helper")))
+        );
+        assert_eq!(
+            from_account_info(
+                &json!({"apiProvider": "firstParty", "apiKeySource": "apiKeyHelper",
+                    "subscriptionType": "max", "email": "user@example.com",
+                    "organization": "ACME"}),
+                None,
+            ),
+            Some(st("api_key", "Anthropic API key", Some("API key helper")))
+        );
+    }
+
+    /// `auth-status.test.ts` > "maps third-party backends to external auth".
+    #[test]
+    fn t8c_third_party_backends_are_external() {
+        assert_eq!(
+            from_account_info(&json!({"apiProvider": "bedrock"}), None),
+            Some(st("external", "AWS Bedrock", None))
+        );
+        assert_eq!(
+            from_account_info(&json!({"apiProvider": "vertex"}), None),
+            Some(st("external", "Google Vertex AI", None))
+        );
+    }
+
+    /// `auth-status.test.ts` > "maps the gateway backend".
+    #[test]
+    fn t8c_gateway_backend() {
+        assert_eq!(
+            from_account_info(&json!({"apiProvider": "gateway"}), None),
+            Some(st("gateway", "Custom model gateway", None))
+        );
+    }
+
+    /// `auth-status.test.ts` > "reports an account with no identity signal as
+    /// no information": `apiProvider` alone (or `tokenSource`) is not an
+    /// identity; mapping it to `none` would claim "logged out".
+    #[test]
+    fn t8c_account_without_identity_signal_is_no_information() {
+        assert_eq!(
+            from_account_info(&json!({"apiProvider": "firstParty"}), None),
+            None
+        );
+        assert_eq!(from_account_info(&json!({}), None), None);
+        assert_eq!(from_account_info(&Value::Null, None), None);
+        assert_eq!(
+            from_account_info(
+                &json!({"apiProvider": "firstParty", "tokenSource": "CLAUDE_CODE_OAUTH_TOKEN"}),
+                None,
+            ),
+            None
+        );
+    }
+
+    /// `auth-status.test.ts` > "maps CLI probe output".
+    #[test]
+    fn t8c_cli_probe_output() {
+        assert_eq!(
+            from_cli_status(CLI_SUBSCRIPTION, None),
+            Some(acct("max", Some("user@example.com"), Some("ACME")))
+        );
+        assert_eq!(
+            from_cli_status(CLI_API_KEY, None),
+            Some(st("api_key", "Anthropic API key", Some("API key helper")))
+        );
+        assert_eq!(from_cli_status(CLI_LOGGED_OUT, None), Some(not_logged_in()));
+    }
+
+    /// `auth-status.test.ts` > "lets a third-party backend outrank the
+    /// logged-out flag": `loggedIn` tracks the claude.ai login only.
+    #[test]
+    fn t8c_third_party_backend_outranks_logged_out() {
+        assert_eq!(
+            from_cli_status(CLI_BEDROCK, None),
+            Some(st("external", "AWS Bedrock", None))
+        );
+    }
+
+    /// `auth-status.test.ts` > "reports unparseable CLI output as not known".
+    #[test]
+    fn t8c_unparseable_cli_output_is_not_known() {
+        for stdout in ["", "Usage: claude auth status", "[]", r#"{"foo": 1}"#] {
+            assert_eq!(from_cli_status(stdout, None), None, "{stdout:?}");
+        }
+    }
+
+    /// `auth-status.test.ts` > "merges a poorer read into the same identity and
+    /// replaces a different one".
+    #[test]
+    fn t8c_merge_poorer_read_and_different_identity() {
+        let stored = acct("max", Some("user@example.com"), Some("ACME"));
+        // Same login without the organization: the organization survives.
+        let poorer = acct("max", Some("user@example.com"), None);
+        assert_eq!(merge(Some(&stored), &poorer), stored);
+        // A different login replaces everything, organization included.
+        let other = acct("pro", Some("other@example.com"), None);
+        assert_eq!(
+            merge(Some(&stored), &other),
+            acct("pro", Some("other@example.com"), None)
+        );
+        // A different kind never merges, even when it looks adjacent.
+        let key = st("api_key", "Anthropic API key", Some("env"));
+        assert_eq!(merge(Some(&stored), &key), key);
+        // Key sources identify api_key payloads.
+        assert!(!same_identity(
+            &st("api_key", "Anthropic API key", Some("API key helper")),
+            &key
+        ));
+        assert!(same_identity(&stored, &poorer));
     }
 
     /// D10 (Decision 12) — the `useAuthStatusSettings` change rule: cwd, the

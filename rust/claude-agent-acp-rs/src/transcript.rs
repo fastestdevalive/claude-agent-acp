@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
 
 use crate::env_snapshot::EnvSnapshot;
-use crate::map::{map_consolidated, MapState, MsgRole};
+use crate::map::{MapState, MsgRole};
 use crate::session_store;
 
 /// Origin kinds whose meta user messages replay must hide
@@ -423,12 +423,12 @@ fn read_records_capped(
     root: &std::path::Path,
     session_id: &str,
     cap: u64,
-) -> (Vec<Record>, HashMap<String, usize>) {
+) -> std::io::Result<(Vec<Record>, HashMap<String, usize>)> {
     let Some(path) = session_store::find_transcripts(root, session_id)
         .into_iter()
         .next()
     else {
-        return (Vec::new(), HashMap::new());
+        return Ok((Vec::new(), HashMap::new()));
     };
     read_records_from_file(&path, cap)
 }
@@ -438,19 +438,17 @@ fn read_records_capped(
 fn read_records_from_file(
     path: &std::path::Path,
     cap: u64,
-) -> (Vec<Record>, HashMap<String, usize>) {
+) -> std::io::Result<(Vec<Record>, HashMap<String, usize>)> {
     let mut out = Vec::new();
     let mut ledger = QueueLedger::default();
     let skip_precompact = std::fs::metadata(path)
         .map(|metadata| metadata.len() > cap)
         .unwrap_or(false);
-    let Ok(file) = std::fs::File::open(path) else {
-        return (out, ledger.finish());
-    };
+    let file = std::fs::File::open(path)?;
     for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
-        let Ok(line) = line else {
-            continue;
-        };
+        // A malformed byte stream is an unreadable history, not an empty one
+        // (the load path reports it; see `session_messages_async`).
+        let line = line?;
         let Ok(entry) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -484,7 +482,7 @@ fn read_records_from_file(
             entry,
         });
     }
-    (out, ledger.finish())
+    Ok((out, ledger.finish()))
 }
 
 /// Apply the compaction re-linking from every `compact_boundary` system record
@@ -752,13 +750,21 @@ pub fn full_history(env: &EnvSnapshot, session_id: &str) -> Vec<Value> {
 }
 
 /// Async wrapper so a `session/load` replay never blocks the runtime on the
-/// transcript read.
-pub async fn session_messages_async(env: &EnvSnapshot, session_id: &str) -> Vec<Value> {
+/// transcript read. The error travels: a load whose history cannot be read
+/// rejects instead of replaying an empty one (M-132).
+pub async fn session_messages_async(
+    env: &EnvSnapshot,
+    session_id: &str,
+) -> Result<Vec<Value>, String> {
     let env = env.clone();
+    let id = session_id.to_string();
     let session_id = session_id.to_string();
-    tokio::task::spawn_blocking(move || session_messages(&env, &session_id))
-        .await
-        .unwrap_or_default()
+    match tokio::task::spawn_blocking(move || session_messages_checked(&env, &id)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!(
+            "failed to read the history of session {session_id}: {error}"
+        )),
+    }
 }
 
 /// The SDK's `getSubagentMessages` core for a subagent's own transcript file
@@ -768,7 +774,8 @@ pub async fn session_messages_async(env: &EnvSnapshot, session_id: &str) -> Vec<
 /// out, as it does for the session's history.
 #[must_use]
 pub fn messages_of_transcript(path: &std::path::Path, session_id: &str) -> Vec<Value> {
-    let (raw, _delivered) = read_records_from_file(path, LOAD_PRECOMPACT_SKIP_BYTES);
+    let (raw, _delivered) =
+        read_records_from_file(path, LOAD_PRECOMPACT_SKIP_BYTES).unwrap_or_default();
     let mut records: HashMap<String, Record> =
         raw.iter().map(|r| (r.uuid.clone(), r.clone())).collect();
     let order: HashMap<&str, usize> = raw
@@ -814,11 +821,27 @@ pub fn messages_of_transcript(path: &std::path::Path, session_id: &str) -> Vec<V
 }
 
 fn session_messages_capped(env: &EnvSnapshot, session_id: &str, cap: u64) -> Vec<Value> {
+    session_messages_capped_result(env, session_id, cap).unwrap_or_default()
+}
+
+/// The history read that keeps its I/O error: a `session/load` replay fails when
+/// the transcript cannot be read instead of replaying nothing (M-132,
+/// `getSessionMessages` rejecting).
+pub fn session_messages_checked(env: &EnvSnapshot, session_id: &str) -> Result<Vec<Value>, String> {
+    session_messages_capped_result(env, session_id, LOAD_PRECOMPACT_SKIP_BYTES)
+        .map_err(|error| format!("failed to read the history of session {session_id}: {error}"))
+}
+
+fn session_messages_capped_result(
+    env: &EnvSnapshot,
+    session_id: &str,
+    cap: u64,
+) -> std::io::Result<Vec<Value>> {
     if !session_store::is_session_id(session_id) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let root = session_store::projects_root_with_env(env);
-    let (raw, delivered) = read_records_capped(&root, session_id, cap);
+    let (raw, delivered) = read_records_capped(&root, session_id, cap)?;
     let mut records: HashMap<String, Record> =
         raw.iter().map(|r| (r.uuid.clone(), r.clone())).collect();
     let order: HashMap<&str, usize> = raw
@@ -886,7 +909,7 @@ fn session_messages_capped(env: &EnvSnapshot, session_id: &str, cap: u64) -> Vec
         }
         out.push(to_sdk_message(&mapped, None, None));
     }
-    out
+    Ok(out)
 }
 
 /// `isQueuedCommandAttachment` (`Lwe`): an attachment of type `queued_command`.
@@ -1443,10 +1466,11 @@ fn replay_content(
     task_state: &mut Vec<(String, crate::hooks::TaskStateEntry)>,
     flags: ReplayFlags,
     last_published: &mut Option<String>,
+    parent: Option<&str>,
 ) -> Vec<Value> {
     let air = flags.air;
     let Value::Array(blocks) = content else {
-        return map_consolidated(content, role, state)
+        return crate::map::map_consolidated_with_parent(content, role, state, parent)
             .into_iter()
             .filter_map(|update| serde_json::to_value(update).ok())
             .map(|mut val| {
@@ -1470,7 +1494,12 @@ fn replay_content(
                     let input = tool_use.get("input").cloned().unwrap_or(Value::Null);
                     // Let the shared mapper do its Task* bookkeeping (drop the
                     // cache entry, finish the tracker); it emits no update.
-                    let _ = map_consolidated(&Value::Array(vec![block.clone()]), role, state);
+                    let _ = crate::map::map_consolidated_with_parent(
+                        &Value::Array(vec![block.clone()]),
+                        role,
+                        state,
+                        parent,
+                    );
                     let is_error = block
                         .get("is_error")
                         .and_then(Value::as_bool)
@@ -1524,7 +1553,12 @@ fn replay_content(
                     &Value::Null,
                 )
             });
-        for update in map_consolidated(&Value::Array(vec![block.clone()]), role, state) {
+        for update in crate::map::map_consolidated_with_parent(
+            &Value::Array(vec![block.clone()]),
+            role,
+            state,
+            parent,
+        ) {
             if let Ok(mut value) = serde_json::to_value(update) {
                 crate::map::materialize_tool_call_defaults(&mut value);
                 crate::map::materialize_diff_old_text(&mut value);
@@ -1572,6 +1606,17 @@ pub struct ReplaySinks<'a> {
     /// so a persisted compact summary replays as one completed
     /// `compaction_update` instead of chat text (B-50).
     pub compaction: bool,
+    /// The client is on AIR's native subagent draft (`subagentForm === "air"`):
+    /// the replay announces every Agent/Task launch and replays inline
+    /// sidechain messages into synthetic child sessions
+    /// (`acp-agent.ts:9083-9210`). Off for RFD clients, which replay each
+    /// child from its own transcript instead.
+    pub native_air_replay: bool,
+    /// The client gets a subagent's text on the root (`forwardSubagentText`,
+    /// `acp-agent.ts:9068-9073`): the legacy `subagent-transcript` opt-in or
+    /// the `forwardSubagentText` session option, for a client without native
+    /// subagent sessions.
+    pub forward_subagent_text: bool,
 }
 
 /// The one `session_info_update` after a complete history replay
@@ -1660,6 +1705,148 @@ fn task_notifications_of(content: &Value) -> Vec<PersistedTaskNotification> {
 struct ReplayToolUse {
     name: String,
     input: Value,
+    /// The ACP session the call belongs to (`replayToolUses.set(..., {sessionId})`):
+    /// the replay target of its message, so a later task notification routes
+    /// there (`AsyncTaskRuntime`'s `routeOf`, `acp-agent.ts:9246-9252`).
+    session_id: String,
+}
+
+/// One child the AIR replay shows (`replayChildren`, `acp-agent.ts:9083-9135`).
+#[derive(Debug, Clone)]
+struct AirReplayChild {
+    /// `<session>:replay-subagent:<launch id>` (AIR's draft), or the SDK agent id
+    /// when the child was read from its own persisted transcript.
+    session_id: String,
+    /// The Agent/Task call of the child that launched this one.
+    parent_tool_use_id: Option<String>,
+    name: String,
+    task: String,
+    /// False for a launch without persisted metadata, or one whose lineage is
+    /// malformed: its end is `disconnected`.
+    reconstructable: bool,
+    announced: bool,
+    /// The state of the launch's tool_result (`replayTerminalStates`).
+    terminal_state: Option<crate::acp_subagents::SubagentState>,
+    /// The state of the child's last persisted task notification, which comes
+    /// after the launch result and wins.
+    notified_state: Option<crate::acp_subagents::SubagentState>,
+}
+
+/// AIR's native-subagent replay state (`acp-agent.ts:9083-9135`): the launches
+/// of the history and the children synthesized from inline sidechain messages.
+#[derive(Debug, Default)]
+struct AirReplay {
+    /// The children in registration order (`replayChildren` insertion order).
+    children: Vec<(String, AirReplayChild)>,
+    /// The terminal state of every launch tool_result, by tool-use id.
+    terminal_states: HashMap<String, crate::acp_subagents::SubagentState>,
+}
+
+impl AirReplay {
+    fn child(&self, launch_id: &str) -> Option<&AirReplayChild> {
+        self.children
+            .iter()
+            .find(|(id, _)| id == launch_id)
+            .map(|(_, child)| child)
+    }
+
+    fn child_mut(&mut self, launch_id: &str) -> Option<&mut AirReplayChild> {
+        self.children
+            .iter_mut()
+            .find(|(id, _)| id == launch_id)
+            .map(|(_, child)| child)
+    }
+
+    /// `registerLaunches`: the Agent/Task launches of `messages`, with the
+    /// terminal state of each launch's tool_result and the launching message's
+    /// `parent_tool_use_id`.
+    fn register(&mut self, messages: &[Value], root_session_id: &str) {
+        for message in messages {
+            let Some(content) = message
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let owner = parent_tool_use_id_of(message).map(str::to_string);
+            for block in content {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_result") | Some("mcp_tool_result") => {
+                        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                            self.terminal_states.insert(
+                                id.to_string(),
+                                crate::subagent_replay::replay_subagent_terminal_state(block),
+                            );
+                        }
+                    }
+                    Some("tool_use") | Some("server_tool_use") | Some("mcp_tool_use") => {
+                        let (Some(id), Some(name)) = (
+                            block.get("id").and_then(Value::as_str),
+                            block.get("name").and_then(Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        if !crate::native_subagents::is_native_subagent_control_tool(Some(name)) {
+                            continue;
+                        }
+                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+                        let task = ["prompt", "description"]
+                            .iter()
+                            .find_map(|key| {
+                                input
+                                    .get(*key)
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                            })
+                            .unwrap_or("Delegated task restored from session history")
+                            .to_string();
+                        let name = ["name", "description", "subagent_type"]
+                            .iter()
+                            .find_map(|key| {
+                                input
+                                    .get(*key)
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                            })
+                            .unwrap_or("Restored agent")
+                            .to_string();
+                        let terminal_state = self.terminal_states.get(id).copied();
+                        if self.child(id).is_some() {
+                            continue;
+                        }
+                        self.children.push((
+                            id.to_string(),
+                            AirReplayChild {
+                                session_id: format!("{root_session_id}:replay-subagent:{id}"),
+                                parent_tool_use_id: owner.clone(),
+                                name,
+                                task,
+                                reconstructable: true,
+                                announced: false,
+                                terminal_state,
+                                notified_state: None,
+                            },
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // A result that came after its launch in the same pass still wins.
+        let terminal_states: Vec<(String, crate::acp_subagents::SubagentState)> = self
+            .terminal_states
+            .iter()
+            .map(|(id, state)| (id.clone(), *state))
+            .collect();
+        for (id, state) in terminal_states {
+            if let Some(child) = self.child_mut(&id) {
+                child.terminal_state = Some(state);
+            }
+        }
+    }
 }
 
 /// One child transcript the RFD replay is walking (B-52). The stack keeps the
@@ -1710,6 +1897,12 @@ struct ReplayRun<'a> {
     /// The children whose history is being replayed, depth-first (see
     /// [`ChildTask`]).
     child_tasks: Vec<ChildTask>,
+    /// AIR's native-subagent replay (`acp-agent.ts:9083-9135`): launches are
+    /// announced and inline sidechain messages replay into synthetic children.
+    /// `None` for every other client.
+    air_replay: Option<AirReplay>,
+    /// The client gets a subagent's text on the root (`forwardSubagentText`).
+    forward_subagent_text: bool,
 }
 
 /// The RFD subagent replay and the history it reads (B-52).
@@ -1731,6 +1924,10 @@ impl<'a> ReplayRun<'a> {
             .as_ref()
             .and_then(|_| crate::session_failure::active_usage_limit_message(messages))
             .map(|(uuid, _)| uuid);
+        let mut air_replay = sinks.native_air_replay.then(AirReplay::default);
+        if let Some(replay) = air_replay.as_mut() {
+            replay.register(messages, session_id);
+        }
         Self {
             session_id,
             air,
@@ -1749,12 +1946,111 @@ impl<'a> ReplayRun<'a> {
             replay_tool_uses: HashMap::new(),
             subagents: None,
             child_tasks: Vec::new(),
+            air_replay,
+            forward_subagent_text: sinks.forward_subagent_text,
         }
     }
 
     fn push(&mut self, update: Value) {
+        self.push_to(self.session_id, update);
+    }
+
+    fn push_to(&mut self, session_id: &str, update: Value) {
         self.out
-            .push(json!({ "sessionId": self.session_id, "update": update }));
+            .push(json!({ "sessionId": session_id, "update": update }));
+    }
+
+    /// `announceReplayChild` (`acp-agent.ts:9137-9185`): announce the child of
+    /// `parent_tool_use_id` on its parent (the root, or the child that launched
+    /// it), after announcing that ancestor first. A launch the history does not
+    /// describe, or one whose lineage is malformed, becomes a deterministic
+    /// `Disconnected agent`. Returns the child's session id.
+    fn announce_air_child(&mut self, parent_tool_use_id: &str) -> String {
+        self.announce_air_child_with(parent_tool_use_id, &mut Vec::new())
+    }
+
+    fn announce_air_child_with(
+        &mut self,
+        parent_tool_use_id: &str,
+        ancestors: &mut Vec<String>,
+    ) -> String {
+        let Some(replay) = self.air_replay.as_mut() else {
+            return self.session_id.to_string();
+        };
+        if replay.child(parent_tool_use_id).is_none() {
+            replay.children.push((
+                parent_tool_use_id.to_string(),
+                AirReplayChild {
+                    session_id: format!("{}:replay-subagent:{parent_tool_use_id}", self.session_id),
+                    parent_tool_use_id: None,
+                    name: "Disconnected agent".to_string(),
+                    task: "Subagent restored without persisted launch metadata".to_string(),
+                    reconstructable: false,
+                    announced: false,
+                    terminal_state: None,
+                    notified_state: None,
+                },
+            ));
+        }
+        // A lineage cycle: the child cannot be placed under itself, so its end
+        // is `disconnected`.
+        if ancestors.iter().any(|id| id == parent_tool_use_id) {
+            if let Some(child) = replay.child_mut(parent_tool_use_id) {
+                child.reconstructable = false;
+                child.terminal_state = None;
+                child.parent_tool_use_id = None;
+            }
+        }
+        let parent_of_child = replay
+            .child(parent_tool_use_id)
+            .and_then(|child| child.parent_tool_use_id.clone());
+        if let Some(ancestor) = parent_of_child {
+            ancestors.push(parent_tool_use_id.to_string());
+            self.announce_air_child_with(&ancestor, ancestors);
+            ancestors.pop();
+        }
+        let Some(replay) = self.air_replay.as_mut() else {
+            return self.session_id.to_string();
+        };
+        let Some(child) = replay.child(parent_tool_use_id) else {
+            return self.session_id.to_string();
+        };
+        let session_id = child.session_id.clone();
+        if child.announced {
+            return session_id;
+        }
+        let parent_session_id = child
+            .parent_tool_use_id
+            .as_deref()
+            .and_then(|parent| replay.child(parent))
+            .map(|parent| parent.session_id.clone())
+            .unwrap_or_else(|| self.session_id.to_string());
+        let (name, task) = (child.name.clone(), child.task.clone());
+        if let Some(child) = replay.child_mut(parent_tool_use_id) {
+            child.announced = true;
+        }
+        let spawned = crate::acp_subagents::subagent_spawned(
+            &parent_session_id,
+            &session_id,
+            &name,
+            &task,
+            None,
+        );
+        self.out.push(spawned);
+        session_id
+    }
+
+    /// The session a replayed message's updates go to
+    /// (`replayTargetSessionId`, `acp-agent.ts:9352-9356`): the child of its
+    /// `parent_tool_use_id` on AIR, else the root.
+    fn air_target_session(&mut self, message: &Value) -> String {
+        match (
+            self.air_replay.is_some(),
+            parent_tool_use_id_of(message).map(str::to_string),
+        ) {
+            (true, Some(parent)) => self.announce_air_child(&parent),
+            _ => self.session_id.to_string(),
+        }
     }
 
     /// `restoreTaskNotification` (`acp-agent.ts:9258-9284`): a persisted
@@ -1776,6 +2072,19 @@ impl<'a> ReplayRun<'a> {
         let Some(tool_use_id) = notification.tool_use_id.clone() else {
             return;
         };
+        // AIR (`acp-agent.ts:9263-9271`): a notification of a child launch is
+        // the child's persisted state, which wins over its launch result.
+        if self.air_replay.is_some() {
+            let state = crate::native_subagents::native_subagent_state(&notification.status);
+            if let Some(replay) = self.air_replay.as_mut() {
+                if let Some(child) = replay.child_mut(&tool_use_id) {
+                    if let Some(state) = state {
+                        child.notified_state = Some(state);
+                    }
+                    return;
+                }
+            }
+        }
         let Some(tool_use) = self.replay_tool_uses.get(&tool_use_id).cloned() else {
             return;
         };
@@ -1817,8 +2126,15 @@ impl<'a> ReplayRun<'a> {
             updates.extend(runtime.task_notification(&frame));
             updates
         };
+        // `AsyncTaskRuntime.send` routes through `routeOf(toolCallId)`: the
+        // session recorded for the launching tool use (`acp-agent.ts:9246-9252`).
+        let target = tool_use.session_id;
         for update in updates {
-            self.push(update);
+            if target == self.session_id {
+                self.push(update);
+            } else {
+                self.push_to(&target, update);
+            }
         }
     }
 
@@ -1907,14 +2223,30 @@ impl<'a> ReplayRun<'a> {
             }
         }
         let mut content = payload.get("content").cloned().unwrap_or(Value::Null);
+        // `replayTargetSessionId` (`acp-agent.ts:9352-9356`): AIR announces the
+        // child of an inline sidechain message before mapping it, and every
+        // update of the message goes to that child's session.
+        let air_target = self.air_target_session(message);
+        let nested_parent = parent_tool_use_id_of(message).map(str::to_string);
         if role == "user" {
             // B-45: like live, a tool result gives the output path of a known
             // task, and a persisted task notification restores the task card
             // (`acp-agent.ts:9363-9375`).
-            if let Some(runtime) = self.async_tasks.as_deref_mut() {
-                for update in runtime.tool_results(&content) {
-                    self.push(update);
-                }
+            let task_updates = self
+                .async_tasks
+                .as_deref_mut()
+                .map(|runtime| runtime.tool_results(&content))
+                .unwrap_or_default();
+            for update in task_updates {
+                // `AsyncTaskRuntime.send` routes through `routeOf`: the session
+                // recorded for the task's tool call.
+                let target = update
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.replay_tool_uses.get(id))
+                    .map(|tool_use| tool_use.session_id.clone())
+                    .unwrap_or_else(|| air_target.clone());
+                self.push_to(&target, update);
             }
             let notifications = task_notifications_of(&content);
             for notification in &notifications {
@@ -1944,13 +2276,18 @@ impl<'a> ReplayRun<'a> {
                                     .unwrap_or("")
                                     .to_string(),
                                 input: block.get("input").cloned().unwrap_or(Value::Null),
+                                session_id: air_target.clone(),
                             },
                         );
                     }
                 }
             }
         }
-        if role == "assistant" && parent_tool_use_id_of(message).is_some() {
+        if role == "assistant"
+            && nested_parent.is_some()
+            && self.air_replay.is_none()
+            && !self.forward_subagent_text
+        {
             // Plain client without native subagent sessions: the nested
             // assistant's text/thinking is dropped (not forwarded to the root),
             // but its tool blocks still replay (`stripSubagentTextAndThinking`,
@@ -1983,6 +2320,7 @@ impl<'a> ReplayRun<'a> {
                 top_level,
             },
             &mut self.last_published,
+            nested_parent.as_deref(),
         );
         let message_id = if self.message_id.is_empty() {
             None
@@ -1990,7 +2328,7 @@ impl<'a> ReplayRun<'a> {
             Some(self.message_id.clone())
         };
         for update in updates {
-            let update = match update {
+            let mut update = match update {
                 // Group chunk updates under the API message id
                 // (`apply_stream_message_id`); plan updates stay untouched.
                 Value::Object(mut map)
@@ -2013,7 +2351,40 @@ impl<'a> ReplayRun<'a> {
                 }
                 other => other,
             };
-            self.push(update);
+            // `stampParentToolUseId(update, options.parentToolUseId)`
+            // (`acp-agent.ts:13356`): every update of a nested message carries
+            // the Agent/Task call that launched the subagent.
+            if let Some(parent) = &nested_parent {
+                Self::stamp_child_parent_tool_use_id(&mut update, parent);
+            }
+            // AIR (`acp-agent.ts:9447-9452`): a native Agent/Task control call is
+            // not a transcript tool; its child announcement replaces it.
+            if self.air_replay.is_some()
+                && matches!(
+                    update.get("sessionUpdate").and_then(Value::as_str),
+                    Some("tool_call" | "tool_call_update")
+                )
+                && update
+                    .pointer("/_meta/claudeCode/toolName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| {
+                        crate::native_subagents::is_native_subagent_control_tool(Some(name))
+                    })
+            {
+                continue;
+            }
+            if air_target == self.session_id {
+                self.push(update);
+            } else {
+                self.push_to(&air_target, update);
+            }
+        }
+        // AIR (`acp-agent.ts:9461-9470`): announce each launch of the message,
+        // after its own updates.
+        if self.air_replay.is_some() && role == "assistant" {
+            for launch_id in crate::native_subagents::subagent_launch_ids(&content) {
+                self.announce_air_child(&launch_id);
+            }
         }
         self.seed_child_launches(&content, role);
     }
@@ -2301,6 +2672,7 @@ impl<'a> ReplayRun<'a> {
                     top_level: false,
                 },
                 &mut task.last_published,
+                None,
             );
             (updates, task.session_id.clone())
         };
@@ -2353,6 +2725,38 @@ impl<'a> ReplayRun<'a> {
             let notices = state.context.notices;
             self.out
                 .extend(state.replay.finish(notices, self.session_id));
+        }
+        // AIR (`acp-agent.ts:9500-9524`): every announced child ends before the
+        // replay does, in reverse registration order. The end is the child's
+        // last task notification, else its launch result, else `disconnected`
+        // for a child the history cannot place.
+        if let Some(replay) = self.air_replay.take() {
+            let mut states = Vec::new();
+            for (_, child) in replay.children.iter().rev() {
+                if !child.announced {
+                    continue;
+                }
+                let parent_session_id = child
+                    .parent_tool_use_id
+                    .as_deref()
+                    .and_then(|parent| replay.child(parent))
+                    .map(|parent| parent.session_id.clone())
+                    .unwrap_or_else(|| self.session_id.to_string());
+                let state = if child.reconstructable {
+                    child
+                        .notified_state
+                        .or(child.terminal_state)
+                        .unwrap_or(crate::acp_subagents::SubagentState::Disconnected)
+                } else {
+                    crate::acp_subagents::SubagentState::Disconnected
+                };
+                states.push(crate::acp_subagents::subagent_state_update(
+                    &parent_session_id,
+                    &child.session_id,
+                    state,
+                ));
+            }
+            self.out.extend(states);
         }
         (self.out, self.task_state, self.last_published)
     }
@@ -2485,26 +2889,14 @@ pub fn replay_with_failures_rfd(
     session_id: &str,
     air: bool,
     plan_ops: bool,
-    compaction: bool,
-    failures: Option<&mut crate::session::failures::SessionFailures>,
+    sinks: ReplaySinks<'_>,
     subagents: Option<crate::subagent_replay::SubagentReplayContext>,
 ) -> (
     Vec<Value>,
     Vec<(String, crate::hooks::TaskStateEntry)>,
     Option<String>,
 ) {
-    replay_session_with_subagents(
-        messages,
-        session_id,
-        air,
-        plan_ops,
-        ReplaySinks {
-            failures,
-            compaction,
-            ..ReplaySinks::default()
-        },
-        subagents,
-    )
+    replay_session_with_subagents(messages, session_id, air, plan_ops, sinks, subagents)
 }
 
 /// [`replay_session_async`] with the RFD subagent replay (B-52).
@@ -2813,7 +3205,7 @@ mod tests {
         let (_tmp, env) = TempProjects::new(&body);
         let root = session_store::projects_root_with_env(&env);
         // A zero cap forces the skip on this small fixture.
-        let (records, _) = read_records_capped(&root, ID, 0);
+        let (records, _) = read_records_capped(&root, ID, 0).unwrap();
         let uuids: Vec<&str> = records.iter().map(|r| r.uuid.as_str()).collect();
         assert_eq!(uuids, vec!["b1", "u2", "a2"]);
         // The chain from the post-boundary leaf stops at the missing parent.
@@ -2824,7 +3216,7 @@ mod tests {
             .collect();
         assert_eq!(uuids, vec!["u2", "a2"]);
         // Without the cap the whole transcript is read.
-        let (records, _) = read_records_capped(&root, ID, u64::MAX);
+        let (records, _) = read_records_capped(&root, ID, u64::MAX).unwrap();
         assert_eq!(records.len(), 5);
     }
 
@@ -3252,6 +3644,509 @@ mod tests {
                 .any(|n| n["update"]["sessionUpdate"] == "async_task_spawned"),
             "{out:?}"
         );
+    }
+
+    /// T8A — every `stripLocalCommandMetadata` case of the upstream suite:
+    /// marker-only strings, reconstructed model-bound skill prompts, hidden
+    /// local-command output, real prose, injected reminders, persisted task
+    /// notifications, mixed arrays and non-container shapes.
+    #[test]
+    fn t8a_strip_local_command_metadata_cases() {
+        let strip = |content: Value| strip_local_command_metadata(content);
+        let text = |s: &str| strip(Value::String(s.to_string()));
+
+        // Pure marker metadata -> null.
+        assert!(text("<command-name>/model</command-name>").is_none());
+        assert!(text("<local-command-stdout>out</local-command-stdout>").is_none());
+        assert!(text("<local-command-stderr>err</local-command-stderr>").is_none());
+        assert!(text(
+            "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>"
+        )
+        .is_none());
+
+        // A marker-only model-bound slash skill prompt is reconstructed.
+        let skill = "<command-message>example-skill</command-message>\n<command-name>/example-skill</command-name>\n<command-args>explain the startup decision</command-args>";
+        assert_eq!(
+            text(skill),
+            Some(json!("/example-skill explain the startup decision"))
+        );
+        assert_eq!(
+            strip(json!([{"type": "text", "text": skill}])),
+            Some(json!([{"type": "text", "text": "/example-skill explain the startup decision"}]))
+        );
+
+        // A local-command stdout payload keeps the message hidden.
+        assert!(text(
+            "<command-name>/example-skill</command-name><command-args>explain</command-args><local-command-stdout>handled locally</local-command-stdout>"
+        )
+        .is_none());
+
+        // Real content is unchanged.
+        assert_eq!(text("hi"), Some(json!("hi")));
+        assert_eq!(
+            text("please run /model with args"),
+            Some(json!("please run /model with args"))
+        );
+
+        // Mixed marker tags keep the real prose.
+        let mixed = "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args><local-command-stdout>Set model to opus (claude-opus-4-7)</local-command-stdout><command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus[1m]</command-args><local-command-stdout>Set model to opus[1m] (claude-opus-4-7[1m])</local-command-stdout>hi";
+        let stripped = text(mixed).expect("the prose survives");
+        let stripped = stripped.as_str().unwrap_or("");
+        assert!(!stripped.contains("<command-name>"));
+        assert!(!stripped.contains("<command-message>"));
+        assert!(!stripped.contains("<command-args>"));
+        assert!(!stripped.contains("<local-command-stdout>"));
+        assert!(stripped.trim_end().ends_with("hi"));
+
+        // An injected reminder is stripped, keeping the user's prose.
+        assert_eq!(
+            text("is that right?<system-reminder>be nice</system-reminder>"),
+            Some(json!("is that right?"))
+        );
+        assert!(text("<system-reminder>do not mention this</system-reminder>").is_none());
+
+        // A persisted task notification is stripped, keeping the prose.
+        assert_eq!(
+            text("<task-notification>\n<task-id>bg1</task-id>\n</task-notification>\nwhat now?"),
+            Some(json!("\nwhat now?"))
+        );
+        assert!(text("<task-notification><task-id>bg1</task-id></task-notification>").is_none());
+
+        // Arrays keep only the real blocks.
+        assert_eq!(
+            strip(json!([
+                {"type": "text", "text": "is that right?"},
+                {"type": "text", "text": "<system-reminder>be nice</system-reminder>"}
+            ])),
+            Some(json!([{"type": "text", "text": "is that right?"}]))
+        );
+        assert_eq!(
+            strip(json!([
+                {"type": "text", "text": "<command-name>/model</command-name>"},
+                {"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"},
+                {"type": "text", "text": "hi"}
+            ])),
+            Some(json!([{"type": "text", "text": "hi"}]))
+        );
+        assert!(strip(json!([
+            {"type": "text", "text": "<command-name>/model</command-name>"},
+            {"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"}
+        ]))
+        .is_none());
+        assert_eq!(
+            strip(json!([{
+                "type": "text",
+                "text": "<command-name>/model</command-name><local-command-stdout>ok</local-command-stdout>hi"
+            }])),
+            Some(json!([{"type": "text", "text": "hi"}]))
+        );
+
+        // A non-text block is left alone.
+        let image = json!({"type": "image", "source": {"type": "base64", "data": "", "media_type": "image/png"}});
+        assert_eq!(
+            strip(json!([
+                {"type": "text", "text": "<command-name>/model</command-name>"},
+                image
+            ])),
+            Some(json!([image]))
+        );
+
+        // Null, non-container shapes.
+        assert_eq!(strip(Value::Null), Some(Value::Null));
+        let object = json!({"arbitrary": "object"});
+        assert_eq!(strip(object.clone()), Some(object));
+    }
+
+    /// T8A — `isLocalCommandMetadata` is `stripLocalCommandMetadata === null`.
+    #[test]
+    fn t8a_is_local_command_metadata() {
+        let is_marker = |content: Value| strip_local_command_metadata(content).is_none();
+        assert!(is_marker(json!("<command-name>/model</command-name>")));
+        assert!(is_marker(json!([
+            {"type": "text", "text": "<command-name>/model</command-name>"}
+        ])));
+        assert!(!is_marker(json!("hi")));
+        assert!(!is_marker(json!("<command-name>/model</command-name>hi")));
+        assert!(!is_marker(json!([
+            {"type": "text", "text": "<command-name>/model</command-name>"},
+            {"type": "text", "text": "hi"}
+        ])));
+    }
+
+    /// T8A — a replay hands the client what the user typed, without the
+    /// `<system-reminder>` the CLI appended.
+    #[test]
+    fn t8a_replay_strips_the_appended_reminder() {
+        let message = json!({
+            "type": "user", "uuid": "u1", "parentUuid": null,
+            "parent_tool_use_id": null, "sessionId": ID,
+            "message": {"role": "user", "content":
+                "is that right?<system-reminder>Do not mention this reminder to the user.</system-reminder>"}
+        });
+        let updates = replay_notifications(&[message], ID);
+        let chunks: Vec<&str> = updates
+            .iter()
+            .filter(|n| n["update"]["sessionUpdate"] == "user_message_chunk")
+            .filter_map(|n| n["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["is that right?"]);
+        assert!(!serde_json::to_string(&updates)
+            .unwrap()
+            .contains("system-reminder"));
+    }
+
+    /// T8A — replay skips the CLI's synthetic login reply but keeps the prompt.
+    #[test]
+    fn t8a_replay_skips_the_synthetic_login_message() {
+        let messages = vec![
+            user(
+                "u1",
+                None,
+                json!([{"type": "text", "text": "hi, say one word"}]),
+                "/p",
+            ),
+            json!({
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "parent_tool_use_id": null, "sessionId": ID,
+                "message": {"model": "<synthetic>", "content": [
+                    {"type": "text", "text": "Please run /login"}
+                ]}
+            }),
+        ];
+        let updates = replay_notifications(&messages, ID);
+        let chunks: Vec<&str> = updates
+            .iter()
+            .filter(|n| n["update"]["sessionUpdate"] == "user_message_chunk")
+            .filter_map(|n| n["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["hi, say one word"]);
+        let serialized = serde_json::to_string(&updates).unwrap();
+        assert!(!serialized.contains("Please run /login"));
+        assert!(!serialized.contains("/login"));
+    }
+
+    // ----- the task-notification replay fixture of the upstream suite -------
+
+    fn t8a_notification_text(status: &str, tool_use_id: &str) -> String {
+        format!(
+            "<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>{tool_use_id}</tool-use-id>\n<output-file>/tmp/tasks/bg1.output</output-file>\n<status>{status}</status>\n<summary>Background command \"npm test\" finished</summary>\n<note>A task-notification fires each time the task stops.</note>\n<result><status>failed</status></result>\n</task-notification>"
+        )
+    }
+
+    fn t8a_notification(status: &str, extra: Value) -> Value {
+        let mut record = json!({
+            "type": "user", "uuid": format!("notification-{status}"),
+            "parentUuid": "u2", "parent_tool_use_id": null, "sessionId": ID,
+            "message": {"role": "user", "content": t8a_notification_text(status, "toolu_bash")},
+            "origin": {"kind": "task-notification"},
+        });
+        if let Value::Object(extra) = extra {
+            for (key, value) in extra {
+                record[key] = value;
+            }
+        }
+        record
+    }
+
+    fn t8a_bash_launch(tool: &str) -> Vec<Value> {
+        vec![
+            json!({"type": "user", "uuid": "u1", "parentUuid": null,
+                "parent_tool_use_id": null, "sessionId": ID,
+                "message": {"role": "user", "content": "run the tests"}}),
+            json!({"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "parent_tool_use_id": null, "sessionId": ID,
+                "message": {"id": "m1", "role": "assistant", "model": "claude-opus-5",
+                    "content": [{"type": tool, "id": "toolu_bash", "name": "Bash",
+                        "input": {"command": "npm test", "run_in_background": true}}]}}),
+            json!({"type": "user", "uuid": "u2", "parentUuid": "a1",
+                "parent_tool_use_id": null, "sessionId": ID,
+                "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "toolu_bash",
+                    "content": "Command running in background with ID: bg1."}]}}),
+        ]
+    }
+
+    fn t8a_replay_with_async(messages: &[Value]) -> Vec<Value> {
+        let mut tasks = crate::async_tasks::AsyncTaskRuntime::new(true);
+        let (out, _, _) = replay_session(
+            messages,
+            ID,
+            true,
+            false,
+            ReplaySinks {
+                async_tasks: Some(&mut tasks),
+                ..ReplaySinks::default()
+            },
+        );
+        out
+    }
+
+    fn t8a_async_updates(out: &[Value]) -> Vec<Value> {
+        out.iter()
+            .filter(|n| {
+                n["update"]["sessionUpdate"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("async_task_"))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// T8A — an origin-less notification is detected by its text, and `killed`
+    /// maps to `stopped`.
+    #[test]
+    fn t8a_replay_detects_an_originless_notification_and_maps_killed_to_stopped() {
+        let mut messages = t8a_bash_launch("tool_use");
+        let mut notification = t8a_notification("killed", json!({}));
+        notification.as_object_mut().unwrap().remove("origin");
+        messages.push(notification);
+        let out = t8a_replay_with_async(&messages);
+        let tasks = t8a_async_updates(&out);
+        assert_eq!(
+            tasks.last().unwrap()["update"]["state"],
+            "stopped",
+            "{tasks:?}"
+        );
+        let chunks: Vec<&str> = out
+            .iter()
+            .filter(|n| n["update"]["sessionUpdate"] == "user_message_chunk")
+            .filter_map(|n| n["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["run the tests"]);
+    }
+
+    /// T8A — a background task launched by a `server_tool_use` or
+    /// `mcp_tool_use` block is restored like a `tool_use` launch.
+    #[test]
+    fn t8a_replay_restores_server_and_mcp_tool_use_launches() {
+        for block_type in ["server_tool_use", "mcp_tool_use"] {
+            let mut messages = t8a_bash_launch(block_type);
+            messages.push(t8a_notification("completed", json!({})));
+            let out = t8a_replay_with_async(&messages);
+            let tasks = t8a_async_updates(&out);
+            let kinds: Vec<&str> = tasks
+                .iter()
+                .map(|n| n["update"]["sessionUpdate"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec!["async_task_spawned", "async_task_state_update"],
+                "{block_type}"
+            );
+            assert_eq!(tasks.last().unwrap()["update"]["state"], "completed");
+        }
+    }
+
+    /// T8A — the user's text next to an embedded notification replays, and the
+    /// notification is hidden.
+    #[test]
+    fn t8a_replay_keeps_user_text_next_to_an_embedded_notification() {
+        let mut messages = t8a_bash_launch("tool_use");
+        messages.push(json!({
+            "type": "user", "uuid": "u3", "parentUuid": "u2",
+            "parent_tool_use_id": null, "sessionId": ID,
+            "message": {"role": "user", "content": [
+                {"type": "text", "text": t8a_notification_text("failed", "toolu_bash")},
+                {"type": "text", "text": "why did it fail?"}
+            ]}
+        }));
+        let out = t8a_replay_with_async(&messages);
+        let chunks: Vec<&str> = out
+            .iter()
+            .filter(|n| n["update"]["sessionUpdate"] == "user_message_chunk")
+            .filter_map(|n| n["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["run the tests", "why did it fail?"]);
+        assert!(!serde_json::to_string(&out)
+            .unwrap()
+            .contains("task-notification"));
+        assert_eq!(
+            t8a_async_updates(&out).last().unwrap()["update"]["state"],
+            "failed"
+        );
+    }
+
+    /// T8A — a notification of a task no tool call started restores nothing.
+    #[test]
+    fn t8a_replay_ignores_a_notification_no_tool_started() {
+        let messages = vec![
+            json!({"type": "user", "uuid": "u1", "parentUuid": null,
+                "parent_tool_use_id": null, "sessionId": ID,
+                "message": {"role": "user", "content": "hi"}}),
+            t8a_notification("completed", json!({})),
+        ];
+        let out = t8a_replay_with_async(&messages);
+        assert!(t8a_async_updates(&out).is_empty());
+        let chunks: Vec<&str> = out
+            .iter()
+            .filter(|n| n["update"]["sessionUpdate"] == "user_message_chunk")
+            .filter_map(|n| n["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["hi"]);
+    }
+
+    /// T8A — the output path of a notification without one comes from the tool
+    /// result that moved the command to the background.
+    #[test]
+    fn t8a_replay_takes_the_output_path_from_the_tool_result() {
+        let timeout_result = json!({
+            "type": "user", "uuid": "u2b", "parentUuid": "a1",
+            "parent_tool_use_id": null, "sessionId": ID,
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_bash",
+                "content": "Command did not complete within its 120s timeout and was moved to the background (ID: bg1). Output is being written to: /tmp/claude/tasks/bg1.output."
+            }]}
+        });
+        let bare = json!({
+            "type": "user", "uuid": "notification-bare", "parentUuid": "u2b",
+            "parent_tool_use_id": null, "sessionId": ID,
+            "message": {"role": "user", "content":
+                "<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>toolu_bash</tool-use-id>\n<status>completed</status>\n</task-notification>"},
+            "origin": {"kind": "task-notification"},
+        });
+        let launch = t8a_bash_launch("tool_use");
+        let messages = vec![launch[0].clone(), launch[1].clone(), timeout_result, bare];
+        let out = t8a_replay_with_async(&messages);
+        let spawned = t8a_async_updates(&out)
+            .into_iter()
+            .find(|n| n["update"]["sessionUpdate"] == "async_task_spawned")
+            .expect("the task is announced");
+        assert_eq!(spawned["update"]["asyncTaskId"], "bg1");
+        assert_eq!(
+            spawned["update"]["outputFilePath"],
+            "/tmp/claude/tasks/bg1.output"
+        );
+    }
+
+    /// T8A — a repeated notification sends one terminal state.
+    #[test]
+    fn t8a_replay_sends_one_terminal_state_for_a_repeated_notification() {
+        let mut messages = t8a_bash_launch("tool_use");
+        messages.push(t8a_notification("completed", json!({})));
+        messages.push(t8a_notification(
+            "completed",
+            json!({"uuid": "notification-again"}),
+        ));
+        let out = t8a_replay_with_async(&messages);
+        let tasks = t8a_async_updates(&out);
+        let kinds: Vec<&str> = tasks
+            .iter()
+            .map(|n| n["update"]["sessionUpdate"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(kinds, vec!["async_task_spawned", "async_task_state_update"]);
+    }
+
+    /// T8A — a task-notification delivery with a subkind is a prompt, not a
+    /// hidden notification.
+    #[test]
+    fn t8a_replay_keeps_a_subkind_task_notification_as_a_prompt() {
+        let messages = vec![json!({
+            "type": "user", "uuid": "u1", "parentUuid": null,
+            "parent_tool_use_id": null, "sessionId": ID,
+            "message": {"role": "user", "content": "Run the nightly report"},
+            "origin": {"kind": "task-notification", "subkind": "scheduled-trigger"},
+        })];
+        let out = replay_notifications(&messages, ID);
+        let chunks: Vec<&str> = out
+            .iter()
+            .filter(|n| n["update"]["sessionUpdate"] == "user_message_chunk")
+            .filter_map(|n| n["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["Run the nightly report"]);
+    }
+
+    /// T8A — `isReplayHiddenMetaMessage` matches only meta user messages with an
+    /// inter-agent origin.
+    #[test]
+    fn t8a_hidden_meta_predicate_matches_inter_agent_origins() {
+        let peer = json!({
+            "type": "user", "uuid": "peer-1", "session_id": "s1",
+            "is_meta": true, "origin": {"kind": "peer"},
+            "message": {"role": "user", "content": "framed"},
+        });
+        assert!(is_hidden_meta_message(&peer));
+        for kind in ["channel", "observer", "observer-activity", "slack-ping"] {
+            let mut message = peer.clone();
+            message["origin"] = json!({"kind": kind});
+            assert!(is_hidden_meta_message(&message), "{kind}");
+        }
+        let mut not_meta = peer.clone();
+        not_meta.as_object_mut().unwrap().remove("is_meta");
+        assert!(!is_hidden_meta_message(&not_meta));
+        let mut no_origin = peer.clone();
+        no_origin.as_object_mut().unwrap().remove("origin");
+        no_origin["isCompactSummary"] = json!(true);
+        assert!(!is_hidden_meta_message(&no_origin));
+        let mut human = peer.clone();
+        human["origin"] = json!({"kind": "human"});
+        assert!(!is_hidden_meta_message(&human));
+        let mut assistant = peer.clone();
+        assistant["type"] = json!("assistant");
+        assert!(!is_hidden_meta_message(&assistant));
+    }
+
+    /// T8A — replay skips the inter-agent meta messages but keeps the user's own
+    /// prompt.
+    #[test]
+    fn t8a_replay_skips_inter_agent_meta_messages() {
+        let peer = json!({
+            "type": "user", "uuid": "peer-1", "parentUuid": null,
+            "parent_tool_use_id": null, "sessionId": ID, "is_meta": true,
+            "origin": {"kind": "peer", "from": "uds:/tmp/fake.sock", "hostInjected": true},
+            "message": {"role": "user", "content":
+                "Another Claude session sent a message:\n<cross-session-message from=\"uds:/tmp/fake.sock\">enveloped hi</cross-session-message>\n\nThis came from another Claude session — not typed by your user."},
+        });
+        let own = user("u1", Some("peer-1"), json!("my own prompt"), "/p");
+        let out = replay_notifications(&[peer, own], ID);
+        let chunks: Vec<&str> = out
+            .iter()
+            .filter(|n| n["update"]["sessionUpdate"] == "user_message_chunk")
+            .filter_map(|n| n["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(chunks, vec!["my own prompt"]);
+    }
+
+    /// T8A — the SDK's parser sanitizes a raw usage-limit transcript (drops the
+    /// `error` field) and the adapter still recognizes it through the parsed
+    /// shape, replaying the typed failure.
+    #[test]
+    fn t8a_sanitized_raw_transcript_is_recognized_through_the_parser() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../src/tests/fixtures/usage-limit-session.jsonl");
+        let raw = std::fs::read_to_string(&path).expect("the upstream fixture");
+        let entries: Vec<Value> = raw
+            .trim()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("jsonl"))
+            .collect();
+        assert_eq!(entries[1]["error"], json!("rate_limit"));
+        assert_eq!(entries[1]["isApiErrorMessage"], json!(true));
+
+        let (tmp, env) = TempProjects::new(&raw);
+        let messages = session_messages(&env, ID);
+        let parsed = messages
+            .iter()
+            .find(|message| message["uuid"] == entries[1]["uuid"])
+            .expect("the limit message survives the SDK parser");
+        assert!(
+            parsed.get("error").is_none(),
+            "the sanitized shape drops the error field: {parsed}"
+        );
+
+        let mut book = crate::session::failures::SessionFailures::default();
+        let (notifications, _, _) =
+            replay_with_failures(&messages, ID, false, false, Some(&mut book));
+        let failure = notifications
+            .iter()
+            .find_map(|n| n["update"]["_meta"]["jetbrains"]["air"]["sessionFailure"].as_object())
+            .expect("the usage limit replays as a typed failure");
+        assert!(
+            failure["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("individual spend limit")),
+            "{failure:?}"
+        );
+        drop(tmp);
     }
 
     /// B-48 — a marker-only command without `<command-args>` is not dropped:
@@ -3756,8 +4651,14 @@ mod tests {
             user("u1", None, json!("Go"), "/p"),
             launch_message("a1", Some("u1"), "toolu_live", "Work"),
         ];
-        let (out, _, _) =
-            replay_with_failures_rfd(&messages, ID, false, false, false, None, Some(context));
+        let (out, _, _) = replay_with_failures_rfd(
+            &messages,
+            ID,
+            false,
+            false,
+            ReplaySinks::default(),
+            Some(context),
+        );
         assert!(out.iter().any(|value| {
             value["sessionId"] == ID
                 && value["update"]["sessionUpdate"] == "subagent_update"
@@ -4607,5 +5508,388 @@ mod tests {
                 "subagent_update agent-x idle",
             ]
         );
+    }
+
+    // ------------------------------------------------------------ AIR replay (G1)
+
+    /// `replaySessionHistory` for a client on AIR's native subagent draft
+    /// (`acp-agent.ts:9037-9527`).
+    fn air_replay(messages: &[Value]) -> Vec<Value> {
+        replay_session(
+            messages,
+            "s1",
+            true,
+            false,
+            ReplaySinks {
+                native_air_replay: true,
+                ..ReplaySinks::default()
+            },
+        )
+        .0
+    }
+
+    /// `replaySessionHistory` for a client without native subagent sessions
+    /// (`forwardSubagentText` decides whether the nested text replays).
+    fn legacy_replay(messages: &[Value], forward_subagent_text: bool) -> Vec<Value> {
+        replay_session(
+            messages,
+            "s1",
+            false,
+            false,
+            ReplaySinks {
+                forward_subagent_text,
+                ..ReplaySinks::default()
+            },
+        )
+        .0
+    }
+
+    /// The upstream `replayHistory`: an unattributed sidechain assistant message.
+    fn sidechain_assistant() -> Value {
+        json!({
+            "type": "assistant",
+            "uuid": "subagent-message",
+            "session_id": "s1",
+            "parent_tool_use_id": "parent-agent-call",
+            "parent_agent_id": "agent-1",
+            "message": {
+                "id": "api-subagent-message",
+                "model": "claude-sonnet-4-5",
+                "role": "assistant",
+                "type": "message",
+                "stop_reason": "tool_use",
+                "content": [
+                    {"type": "text", "text": "nested report"},
+                    {"type": "tool_use", "id": "child-tool", "name": "Bash",
+                        "input": {"command": "pwd"}}
+                ]
+            }
+        })
+    }
+
+    /// The upstream launch message of a persisted Agent call.
+    fn agent_launch() -> Value {
+        json!({
+            "type": "assistant",
+            "uuid": "launch-message",
+            "session_id": "s1",
+            "parent_tool_use_id": null,
+            "parent_agent_id": null,
+            "message": {
+                "id": "api-launch-message",
+                "model": "claude-sonnet-4-5",
+                "role": "assistant",
+                "type": "message",
+                "stop_reason": "tool_use",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "parent-agent-call",
+                    "name": "Agent",
+                    "input": {"name": "Reviewer", "prompt": "Review the implementation"}
+                }]
+            }
+        })
+    }
+
+    /// The upstream `agentResult(isError, content)`: the launch's tool_result.
+    fn agent_result(is_error: bool, content: &str) -> Value {
+        json!({
+            "type": "user",
+            "uuid": format!("agent-result-{content}"),
+            "session_id": "s1",
+            "parent_tool_use_id": null,
+            "parent_agent_id": null,
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "parent-agent-call",
+                    "is_error": is_error,
+                    "content": content
+                }]
+            }
+        })
+    }
+
+    fn kinds(updates: &[Value]) -> Vec<(String, String)> {
+        updates
+            .iter()
+            .map(|value| {
+                (
+                    value["sessionId"].as_str().unwrap_or("").to_string(),
+                    value["update"]["sessionUpdate"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// T8A gap (U-101): upstream "replays an unattributed sidechain as a
+    /// deterministic disconnected child" — AIR synthesizes the child from the
+    /// inline sidechain, replays its text and tool call into it, and ends it
+    /// `disconnected`.
+    #[test]
+    fn air_replays_an_unattributed_sidechain_as_a_disconnected_child() {
+        let updates = air_replay(&[sidechain_assistant()]);
+        let child = "s1:replay-subagent:parent-agent-call";
+        assert_eq!(
+            kinds(&updates),
+            vec![
+                ("s1".to_string(), "subagent_spawned".to_string()),
+                (child.to_string(), "agent_message_chunk".to_string()),
+                (child.to_string(), "tool_call".to_string()),
+                ("s1".to_string(), "subagent_state_update".to_string()),
+            ]
+        );
+        // The spawn's wire shape and key order (`announceReplayChild`,
+        // `acp-agent.ts:9163-9175`).
+        assert_eq!(
+            serde_json::to_string(&updates[0]).unwrap(),
+            json!({
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "subagent_spawned",
+                    "subagentSessionId": child,
+                    "name": "Disconnected agent",
+                    "task": "Subagent restored without persisted launch metadata",
+                    "capabilities": {}
+                }
+            })
+            .to_string()
+        );
+        assert_eq!(
+            serde_json::to_string(&updates[3]).unwrap(),
+            json!({
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "subagent_state_update",
+                    "subagentSessionId": child,
+                    "state": "disconnected"
+                }
+            })
+            .to_string()
+        );
+        // The child's tool call carries the launch that owns it.
+        assert_eq!(
+            updates[2]["update"]["_meta"]["claudeCode"]["parentToolUseId"],
+            json!("parent-agent-call")
+        );
+    }
+
+    /// T8A gap (U-101): upstream "reconstructs a persisted Agent launch before
+    /// child updates" — the launch announces the child with its name and task,
+    /// the Agent control call never becomes a transcript tool, and the launch
+    /// result ends the child `completed`.
+    #[test]
+    fn air_reconstructs_a_persisted_agent_launch() {
+        let updates = air_replay(&[
+            agent_launch(),
+            sidechain_assistant(),
+            agent_result(false, "done"),
+        ]);
+        assert_eq!(
+            updates[0]["update"]["sessionUpdate"],
+            json!("subagent_spawned")
+        );
+        assert_eq!(updates[0]["update"]["name"], json!("Reviewer"));
+        assert_eq!(
+            updates[0]["update"]["task"],
+            json!("Review the implementation")
+        );
+        assert_eq!(
+            updates.last().unwrap()["update"]["state"],
+            json!("completed")
+        );
+        assert!(
+            !updates.iter().any(|value| {
+                let update = &value["update"];
+                (update["sessionUpdate"] == json!("tool_call")
+                    || update["sessionUpdate"] == json!("tool_call_update"))
+                    && update["toolCallId"] == json!("parent-agent-call")
+            }),
+            "the AIR control call is not a transcript tool: {updates:?}"
+        );
+    }
+
+    /// T8A gap (U-101): upstream "restores a persisted $state Agent result" —
+    /// an error result that names a stop is `cancelled`, any other error
+    /// `failed`.
+    #[test]
+    fn air_restores_the_persisted_agent_result_state() {
+        for (content, state) in [
+            ("subagent failed", "failed"),
+            ("Request interrupted by user", "cancelled"),
+        ] {
+            let updates = air_replay(&[
+                agent_launch(),
+                sidechain_assistant(),
+                agent_result(true, content),
+            ]);
+            assert_eq!(
+                updates.last().unwrap()["update"]["state"],
+                json!(state),
+                "{content}"
+            );
+        }
+    }
+
+    /// T8A gap (U-101): upstream "marks a launched child without a persisted
+    /// result as disconnected".
+    #[test]
+    fn air_marks_a_launch_without_a_result_disconnected() {
+        let updates = air_replay(&[agent_launch(), sidechain_assistant()]);
+        assert_eq!(
+            updates.last().unwrap()["update"]["state"],
+            json!("disconnected")
+        );
+    }
+
+    /// T8A gap (U-101): upstream "breaks malformed replay lineage cycles
+    /// deterministically" — two spawns, and a `disconnected` end.
+    #[test]
+    fn air_breaks_a_replay_lineage_cycle() {
+        let cyclic = |id: &str, parent: &str| {
+            json!({
+                "type": "assistant",
+                "uuid": format!("launch-{id}"),
+                "session_id": "s1",
+                "parent_tool_use_id": parent,
+                "parent_agent_id": "malformed",
+                "message": {
+                    "id": format!("api-launch-{id}"),
+                    "model": "claude-sonnet-4-5",
+                    "role": "assistant",
+                    "type": "message",
+                    "stop_reason": "tool_use",
+                    "content": [{
+                        "type": "tool_use", "id": id, "name": "Agent",
+                        "input": {"prompt": format!("Run {id}")}
+                    }]
+                }
+            })
+        };
+        let mut sidechain = sidechain_assistant();
+        sidechain["parent_tool_use_id"] = json!("agent-a");
+        let updates = air_replay(&[
+            cyclic("agent-a", "agent-b"),
+            cyclic("agent-b", "agent-a"),
+            sidechain,
+        ]);
+        let spawned = updates
+            .iter()
+            .filter(|value| value["update"]["sessionUpdate"] == json!("subagent_spawned"))
+            .count();
+        assert_eq!(spawned, 2, "{updates:?}");
+        assert!(
+            updates.iter().any(|value| {
+                value["update"]["sessionUpdate"] == json!("subagent_state_update")
+                    && value["update"]["state"] == json!("disconnected")
+            }),
+            "{updates:?}"
+        );
+    }
+
+    /// T8A gap (U-101): upstream "keeps legacy text filtering without losing
+    /// child tool attribution" — a client without native subagent sessions
+    /// loses the nested text but keeps the child tool call with its parent.
+    #[test]
+    fn legacy_replay_keeps_the_child_tool_attribution() {
+        let updates = legacy_replay(&[sidechain_assistant()], false);
+        assert!(
+            !updates
+                .iter()
+                .any(|value| value["update"]["sessionUpdate"] == json!("agent_message_chunk")),
+            "{updates:?}"
+        );
+        let tool_call = updates
+            .iter()
+            .find(|value| value["update"]["sessionUpdate"] == json!("tool_call"))
+            .expect("the child tool call replays");
+        assert_eq!(tool_call["sessionId"], json!("s1"));
+        assert_eq!(tool_call["update"]["toolCallId"], json!("child-tool"));
+        assert_eq!(
+            tool_call["update"]["_meta"]["claudeCode"]["parentToolUseId"],
+            json!("parent-agent-call")
+        );
+    }
+
+    /// T8A gap (U-101): upstream "replays the flattened transcript for the
+    /// legacy opt-in" (`_meta["subagent-transcript"]`).
+    #[test]
+    fn legacy_replay_forwards_the_flattened_transcript() {
+        let updates = legacy_replay(&[sidechain_assistant()], true);
+        let chunk = updates
+            .iter()
+            .find(|value| value["update"]["sessionUpdate"] == json!("agent_message_chunk"))
+            .expect("the nested text replays on the root");
+        assert_eq!(chunk["sessionId"], json!("s1"));
+        assert_eq!(chunk["update"]["content"]["text"], json!("nested report"));
+        assert!(
+            updates
+                .iter()
+                .any(|value| value["update"]["toolCallId"] == json!("child-tool")),
+            "{updates:?}"
+        );
+    }
+
+    /// T8A gap (125): upstream "routes a task to the session of its launching
+    /// tool even when the root receives the stop" — the async-task updates go
+    /// to the AIR child of the tool call that started the task.
+    #[test]
+    fn air_routes_a_restored_task_to_its_launching_child() {
+        let child = "s1:replay-subagent:toolu_agent";
+        let with_parent = |value: Value| {
+            let mut value = value;
+            value["parent_tool_use_id"] = json!("toolu_agent");
+            value
+        };
+        let launch = with_parent(json!({
+            "type": "assistant", "uuid": "a1", "session_id": "s1",
+            "message": {"id": "m1", "role": "assistant", "model": "claude-opus-5",
+                "content": [{"type": "tool_use", "id": "toolu_bash", "name": "Bash",
+                    "input": {"command": "npm test", "run_in_background": true}}]}
+        }));
+        let result = with_parent(json!({
+            "type": "user", "uuid": "u2", "session_id": "s1",
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "toolu_bash", "content": "Command running in background with ID: bg1."}]}
+        }));
+        let notification = json!({
+            "type": "user", "uuid": "notification-completed", "session_id": "s1",
+            "parent_tool_use_id": null,
+            "origin": {"kind": "task-notification"},
+            "message": {"role": "user", "content":
+                "<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>toolu_bash</tool-use-id>\n<output-file>/tmp/tasks/bg1.output</output-file>\n<status>completed</status>\n<summary>Background command \"npm test\" finished</summary>\n<note>A task-notification fires each time the task stops.</note>\n<result><status>failed</status></result>\n</task-notification>"}
+        });
+        let user = json!({
+            "type": "user", "uuid": "u1", "session_id": "s1",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": "run the tests"}
+        });
+        let updates = replay_session(
+            &[user, launch, result, notification],
+            "s1",
+            true,
+            false,
+            ReplaySinks {
+                native_air_replay: true,
+                async_tasks: Some(&mut crate::async_tasks::AsyncTaskRuntime::new(true)),
+                ..ReplaySinks::default()
+            },
+        )
+        .0;
+        let tasks: Vec<&Value> = updates
+            .iter()
+            .filter(|value| {
+                value["update"]["sessionUpdate"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("async_task_"))
+            })
+            .collect();
+        assert_eq!(tasks.len(), 2, "{updates:?}");
+        assert_eq!(tasks[0]["sessionId"], json!(child));
+        assert_eq!(tasks[1]["sessionId"], json!(child));
     }
 }
