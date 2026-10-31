@@ -766,6 +766,11 @@ fn replay_content(
         return map_consolidated(content, role, state)
             .into_iter()
             .filter_map(|update| serde_json::to_value(update).ok())
+            .map(|mut val| {
+                crate::map::materialize_tool_call_defaults(&mut val);
+                crate::map::materialize_diff_old_text(&mut val);
+                val
+            })
             .collect();
     };
     let mut out = Vec::new();
@@ -822,7 +827,9 @@ fn replay_content(
             }
         }
         for update in map_consolidated(&Value::Array(vec![block.clone()]), role, state) {
-            if let Ok(value) = serde_json::to_value(update) {
+            if let Ok(mut value) = serde_json::to_value(update) {
+                crate::map::materialize_tool_call_defaults(&mut value);
+                crate::map::materialize_diff_old_text(&mut value);
                 out.push(value);
             }
         }

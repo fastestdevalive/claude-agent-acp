@@ -133,13 +133,11 @@ fn inv_24_ignore_paths() {
     );
 }
 
-/// 9b.T1 — the normalizer materialises a `tool_call`'s omitted `status`/
-/// `content` defaults, so an explicit `"pending"`/`[]` on one side equals an
-/// omitted one on the other. Only on `tool_call` frames.
+/// 9b.T1 — a `tool_call` frame's `status` and `content` are materialised on the
+/// wire by the adapter, so matching frames compare equal.
 #[test]
 fn inv_24_tool_call_default_status_content() {
-    // Node: explicit `status: "pending"` and `content: []`.
-    let node = Frame::recv(json!({
+    let a = Frame::recv(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
@@ -154,8 +152,7 @@ fn inv_24_tool_call_default_status_content() {
             }
         }
     }));
-    // Rust: the crate omits `status` (pending default) and empty `content`.
-    let rust = Frame::recv(json!({
+    let b = Frame::recv(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
@@ -164,13 +161,15 @@ fn inv_24_tool_call_default_status_content() {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "toolu_01ABC",
                 "title": "echo hi",
-                "kind": "execute"
+                "kind": "execute",
+                "status": "pending",
+                "content": []
             }
         }
     }));
     assert!(
-        diff_frames(&[node], &[rust], &[]).is_ok(),
-        "an omitted tool_call default must equal an explicit default"
+        diff_frames(&[a], &[b], &[]).is_ok(),
+        "matching tool_call frames must compare equal"
     );
 }
 
@@ -250,13 +249,11 @@ fn differential_ignore() -> Vec<JsonPath> {
 /// The ignores common to every differential: the fields the Rust side
 /// intentionally diverges on regardless of phase.
 ///
-/// Tool frames are NOT ignored — `kind`/`title`/`status`/`content`/
-/// `locations`/`rawInput`/`_meta` are compared against the fixture. The only
-/// crate-inherent serialization difference — the pinned `agent-client-protocol`
-/// crate omits `status` (the `pending` default) and empty `content` on a
-/// `tool_call`, which the Node adapter always emits — is reconciled by the
-/// frame normalizer materialising those defaults on both sides (see
-/// `normalize_tool_call_defaults` in `common/mod.rs`), not by an ignore path.
+/// Both adapters emit byte-identical frames on the supported scenarios:
+/// `locations`/`rawInput`/`_meta` are compared against the fixture. The
+/// adapter's wire layer materialises defaults (`status:"pending"`, `locations:[]`,
+/// `content:[]`, `kind:"other"`, `oldText:null`) and numeric request IDs
+/// directly, matching Node on the wire without test-side normalisers.
 fn base_ignore() -> Vec<JsonPath> {
     vec![]
 }
@@ -286,9 +283,6 @@ fn inv_24_tools() {
 /// (13.T1) requires ALL of them to diff clean against the committed Node
 /// fixtures, not just the subset each earlier phase exercised.
 fn all_corpus_names() -> Vec<String> {
-    // HAZARD-IMPL T-21-todowrite: `todo-perm-settle` has its own ignored test
-    // (`inv_24_todo_perm_settle`); it is left out of the whole-corpus check until the fix lands.
-    const HAZARD_PENDING: &[&str] = &["todo-perm-settle"];
     let mut names: Vec<String> = std::fs::read_dir(repo_root().join("porting/corpus"))
         .expect("read corpus dir")
         .filter_map(|e| e.ok())
@@ -296,7 +290,6 @@ fn all_corpus_names() -> Vec<String> {
             let name = e.file_name().to_string_lossy().into_owned();
             name.strip_suffix(".acp.json").map(|s| s.to_string())
         })
-        .filter(|n| !HAZARD_PENDING.contains(&n.as_str()))
         .collect();
     names.sort();
     assert!(
@@ -622,37 +615,36 @@ fn inv_24_permissions() {
     run_and_diff("permission-deny");
 }
 
-/// Phase-10 — the `session/request_permission` request id (a volatile
-/// correlation id: `0` from the Node, a uuid from the pinned crate) and its
-/// echoed response id are normalised to the same fixed token, so a uuid-bearing
-/// Rust frame equals the Node's fixed `0` frame.
+/// Phase-10 / LD-3 — the `session/request_permission` request id and its echoed
+/// response id are sequential numbers allocated on the wire (starting at 0),
+/// matching Node without test-side normalisers.
 #[test]
-fn request_permission_id_is_normalised_to_fixed_token() {
+fn request_permission_id_is_numeric() {
     let node_request = Frame::recv(json!({
         "jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
         "params": {"sessionId": "s", "options": [], "toolCall": {"toolCallId": "t", "title": "x"}}
     }));
     let rust_request = Frame::recv(json!({
-        "jsonrpc": "2.0", "id": "11111111-1111-1111-1111-111111111111",
+        "jsonrpc": "2.0", "id": 0,
         "method": "session/request_permission",
         "params": {"sessionId": "s", "options": [], "toolCall": {"toolCallId": "t", "title": "x"}}
     }));
     assert!(
         diff_frames(&[node_request], &[rust_request], &[]).is_ok(),
-        "the request_permission request id must be normalised to a fixed token"
+        "the request_permission request id must match between frames"
     );
 
-    // The client's echoed response id is normalised the same way.
+    // The client's echoed response id matches the same way.
     let node_response = Frame::send(json!({
         "jsonrpc": "2.0", "id": 0, "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
     }));
     let rust_response = Frame::send(json!({
-        "jsonrpc": "2.0", "id": "22222222-2222-2222-2222-222222222222",
+        "jsonrpc": "2.0", "id": 0,
         "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
     }));
     assert!(
         diff_frames(&[node_response], &[rust_response], &[]).is_ok(),
-        "the request_permission response id must be normalised to the fixed token"
+        "the request_permission response id must match between frames"
     );
 }
 
@@ -1008,14 +1000,29 @@ fn inv_24_task_perm_settle() {
     run_and_diff("task-perm-settle");
 }
 
-/// claude-master PC-1 review (b), HAZARD-IMPL T-21-todowrite: the TodoWrite twin of the blocker.
-/// A permission-surfaced TodoWrite is not cleared by the tool_result branch (map.rs TodoWrite arm),
-/// so end_turn fails with -32603 where Node completes the turn. Node's order is plan, completed,
-/// end_turn. Ignored until the settle-path fix lands; the reproduction is `todo-perm-settle`.
+/// claude-master PC-1 review (b), T-21-todowrite: the TodoWrite twin of the blocker.
+/// A permission-surfaced TodoWrite is resolved at its tool_result (map.rs TodoWrite arm,
+/// session.rs `handle_user_frame_blocks`), so end_turn completes like Node. Node's order is
+/// plan, completed, end_turn. The reproduction is `todo-perm-settle`.
 #[test]
-#[ignore = "HAZARD-IMPL T-21-todowrite: settle path (map.rs TodoWrite arm, session.rs permission-surfaced check)"]
 fn inv_24_todo_perm_settle() {
     run_and_diff("todo-perm-settle");
+}
+
+/// G10c review (1): a user frame with several tool_results resolves them in
+/// block order — the Bash completion before the permission-surfaced TodoWrite
+/// resolution (Node walks the blocks in one pass, acp-agent.ts:13232-13253).
+#[test]
+fn inv_24_todo_perm_multi_result() {
+    run_and_diff("todo-perm-multi-result");
+}
+
+/// G10c review (3): a subagent's TodoWrite plan and Task* plan carry
+/// `_meta.claudeCode.parentToolUseId` like every other update of that frame
+/// (`stampParentToolUseId`, acp-agent.ts:13356).
+#[test]
+fn inv_24_subagent_nested_plan() {
+    run_and_diff("subagent-nested-plan");
 }
 
 /// rust-parity-fixes Phase 3 (item 3.4, X12/Decision 12): the Task* plan. Both
@@ -1194,4 +1201,164 @@ fn inv_24_local_command_message_id() {
 #[test]
 fn inv_24_terminal_commands() {
     run_and_diff("terminal-commands");
+}
+
+/// claude-master F6b (T-09 / T-19 / T-20 / U-27) — a TodoWrite tool_use is
+/// cached like every other tool_use, its tool_result stays silent, an untracked
+/// result is dropped, and the plan shows `activeForm` for an in_progress entry
+/// (an empty one falls back to the content).
+#[test]
+fn inv_24_todo_write_result() {
+    run_and_diff("todo-write-result");
+}
+
+/// claude-master F6b (T-14 / N-47 / T-07 / U-27) — streamed TodoWrite/Task*
+/// input never refines a tool_call, Task* tool results publish the plan, and an
+/// empty activeForm falls back to the subject.
+#[test]
+fn inv_24_task_tools_stream() {
+    run_and_diff("task-tools-stream");
+}
+
+/// claude-master F6b (T-15 / T-76 / N-47) — a nested subagent tool call and its
+/// streamed partial refinement / result carry
+/// `_meta.claudeCode.parentToolUseId`, and the parent memory records the
+/// Agent/Task call.
+#[test]
+fn inv_24_subagent_nested_tool() {
+    run_and_diff("subagent-nested-tool");
+}
+
+/// claude-master F6b (T-107 reconciliation) — an error result of Edit, Write or
+/// Skill completes with the fenced error text as content and status `failed`.
+#[test]
+fn inv_24_edit_error_result() {
+    run_and_diff("edit-error-result");
+}
+
+/// claude-master F6b (C-42) — a client that advertised
+/// `_meta["subagent-transcript"]` gets the nested assistant text/thinking
+/// (streamed and consolidated), each stamped with the parent.
+#[test]
+fn inv_24_subagent_text_transcript() {
+    run_and_diff("subagent-text-transcript");
+}
+
+/// claude-master F6a — one tool_use per reporter: the Bash description
+/// fallback and empty-command title, PowerShell, the Read range/start-line
+/// titles and relative display paths, Glob/Grep truthiness and aliases,
+/// WebFetch's offset, WebSearch's `Search "q"`, Agent effort, ReportFindings
+/// line truthiness, the AskUserQuestion title, the "Other" JSON fence, the
+/// agent-control titles and error, Write/Edit aliases, and ExitPlanMode.
+#[test]
+fn inv_24_tool_shapes() {
+    run_and_diff("tool-shapes");
+}
+
+/// claude-master F4b/FX-1 (O-84/O-85/O-108/O-119/O-120/O-121/O-126/O-127/
+/// O-132) — the remaining SDK argv flags are emitted in Node's order
+/// (`inv_57_argv_matches_node` compares the argv fixtures), and the frames of
+/// a session created with them diff clean. `spawn-channels` also pins that a
+/// `channels` option emits NO flag: the pinned SDK never forwards
+/// `Options.channels` into the process transport.
+#[test]
+fn inv_24_f4b_spawn_flags() {
+    for name in [
+        "spawn-continue",
+        "spawn-task-budget",
+        "spawn-json-schema",
+        "spawn-debug",
+        "spawn-session-mirror",
+        "spawn-channels",
+        "spawn-permission-prompts",
+        "initialize-fields",
+    ] {
+        run_and_diff(name);
+    }
+}
+
+/// claude-master F4b (U-10) — with `_meta.claudeCode.emitRawSDKMessages:true`
+/// every message the SDK query yields is forwarded as the `_claude/sdkMessage`
+/// ext notification BEFORE the `session/update` it maps to, exactly like
+/// `acp-agent.ts:5820-5826`.
+#[test]
+fn inv_24_raw_sdk_messages() {
+    run_and_diff("raw-sdk-messages");
+}
+
+/// rust-air-gaps G12 (S-02/S-14/S-15/S-17/S-18/S-20, A-23) — a `/mcp` prompt
+/// replaces the Claude Code text with the server list read through the
+/// `mcp_status` control request (summary, groups, disabled line, hint).
+#[test]
+fn inv_24_mcp_command_status() {
+    run_and_diff("mcp-command-status");
+}
+
+/// rust-air-gaps G12 (A-24, S-20) — `/mcp reconnect db` runs through
+/// `mcp_reconnect` and drops the CLI's "aren't available in this session"
+/// refusal, keeping only the result line and the refreshed server list.
+#[test]
+fn inv_24_mcp_command_reconnect() {
+    run_and_diff("mcp-command-reconnect");
+}
+
+/// rust-air-gaps G12 (S-08, S-15) — `promptToClaude` rewrites
+/// `/mcp:server:command args` to `/server:command (MCP) args`, while a
+/// non-exact `/mcp` prompt (`/mcp help`) passes through unchanged and is not
+/// intercepted.
+#[test]
+fn inv_24_mcp_prompt_rewrite() {
+    run_and_diff("mcp-prompt-rewrite");
+}
+
+/// rust-air-gaps G8 (M-93, U-07, S-21, N-15, N-52; Contract C) — `_session/goal
+/// set` publishes the AIR goal optimistically (`objective/status/
+/// controlMethod`) and again from the CLI's `active_goal` frame
+/// (`iterations/lastReason/createdAt`), then answers `{}` once the turn
+/// settles; `clear` publishes `goal: null` twice and answers `{}`.
+#[test]
+fn inv_24_goal() {
+    run_and_diff("goal-set-clear");
+}
+
+/// FX-3 (M-51, N-48) — user chunks carry messageId grouped by frame uuid.
+#[test]
+fn inv_24_stream_user_chunks() {
+    run_and_diff("stream-user-chunks");
+}
+
+/// rust-live-divergences 3.3 (LD-3) — streamed tool_use with empty input:
+/// Read, Edit, Write, Glob gain locations:[], while Bash and MCP do not.
+#[test]
+fn inv_24_tool_call_empty_locations() {
+    run_and_diff("tool-call-empty-locations");
+}
+
+/// rust-live-divergences 3.3 (LD-3 / D8) — Write to a new file: permission
+/// request and diff update carry `oldText: null`.
+#[test]
+fn inv_24_write_new_file_diff() {
+    run_and_diff("write-new-file-diff");
+}
+
+/// Review G14 finding 1 — a `{"type":"diff"}` object inside a tool's own data
+/// (`rawInput`, `_meta.claudeCode.toolResponse`) is Node's to send verbatim;
+/// only the `content[*]` diff blocks gain `oldText: null`.
+#[test]
+fn inv_24_mcp_diff_raw_verbatim() {
+    run_and_diff("mcp-diff-raw-verbatim");
+}
+
+/// rust-live-divergences 3.3 (LD-3 / D7) — two sequential permission requests:
+/// sequential numeric IDs 0 and 1 on both sides.
+#[test]
+fn inv_24_permission_two_requests() {
+    run_and_diff("permission-two-requests");
+}
+
+/// rust-live-divergences 3.5 (LD-3 / D6) — background session title generation
+/// and publication via `session_info_update`.
+#[test]
+fn inv_24_session_title() {
+    run_and_diff("session-title");
 }

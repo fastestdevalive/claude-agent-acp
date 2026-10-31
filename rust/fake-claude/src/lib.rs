@@ -606,24 +606,42 @@ pub fn replay_segment(
             matched_init = true;
         }
 
+        // Write every non-marker frame of this step in ONE `write_all` (F42).
+        //
+        // The host reads the child's stdout line-by-line. Two frames written
+        // separately can be read in two different wake-ups, so a host that
+        // processes one line per read can finish a whole round-trip (e.g. the
+        // first `can_use_tool` permission) before it ever reads the second
+        // line. A single <= PIPE_BUF write keeps the step's frames in one pipe
+        // buffer, so the host reads them all before dispatching the first one —
+        // the duplicate-`request_id` scenario (`sdkctl-duplicate-request`)
+        // then deterministically routes both duplicates before the first one
+        // can complete, instead of flaking under load.
+        let mut batch: Vec<u8> = Vec::new();
         for emit in &step.emit {
             // A transcript may insert a pacing marker to separate two emits that
             // otherwise race in the host (e.g. hold the `can_use_tool`
             // control_request until the `assistant` tool_use has been processed,
             // making a permission capture deterministic — phase 10). The marker
-            // is not a real frame: fake-claude sleeps instead of writing it.
+            // is not a real frame: fake-claude flushes the frames emitted before
+            // it, sleeps, and continues. Only transcripts whose Node capture
+            // needs the pause keep it (F42).
             if let Some(ms) = emit.get("sleep_ms").and_then(Value::as_u64) {
+                stdout.write_all(&batch)?;
+                stdout.flush()?;
+                batch.clear();
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 continue;
             }
             let resolved = substitute_with(emit, &frame, &history);
             let mut text = serde_json::to_string(&resolved)?;
             text.push('\n');
-            stdout.write_all(text.as_bytes())?;
+            batch.extend_from_slice(text.as_bytes());
         }
         if step.keep_alive {
-            stdout.write_all(b"{\"type\":\"keep_alive\"}\n")?;
+            batch.extend_from_slice(b"{\"type\":\"keep_alive\"}\n");
         }
+        stdout.write_all(&batch)?;
         stdout.flush()?;
         step_index += 1;
         history.push(frame);
@@ -675,9 +693,60 @@ mod tests {
         assert!(!subset_match(&expect, &frame));
     }
 
-    /// A `{"sleep_ms": N}` emit marker is consumed (never written as a frame)
-    /// and pauses replay, so a transcript can pace two otherwise-racing emits
-    /// (phase 10 deterministic-capture fix).
+    /// A writer that records the size of every `write`/`flush` call, so a test
+    /// can assert how many pipe writes one transcript step produced (F42).
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    /// F42: every frame of one step is emitted in a SINGLE write. The host then
+    /// reads the whole step before dispatching its first line, which keeps the
+    /// duplicate-`request_id` scenario deterministic without a sleep.
+    #[test]
+    fn emits_of_one_step_are_written_in_one_write() {
+        let text = "{\"expect\":{\"type\":\"user\"},\"emit\":[{\"type\":\"assistant\",\"n\":1},{\"type\":\"control_request\",\"request_id\":\"dup\"},{\"type\":\"control_request\",\"request_id\":\"dup\"}]}\n";
+        let transcript = Transcript::parse(text).unwrap();
+        let mut writer = CountingWriter::default();
+        let steps = replay(
+            &transcript,
+            &[],
+            None,
+            None,
+            br#"{"type":"user","uuid":"u","message":{}}"#.as_slice(),
+            &mut writer,
+        )
+        .unwrap();
+        assert_eq!(steps, 1);
+        assert_eq!(
+            writer.writes.len(),
+            1,
+            "all frames of one step must travel in one write"
+        );
+        let frames: Vec<Value> = writer.writes[0]
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 3);
+    }
+
+    /// A `{"sleep_ms": N}` emit marker is consumed (never written as a frame),
+    /// flushes what came before it, and pauses replay, so a transcript can pace
+    /// two otherwise-racing emits (phase 10 deterministic-capture fix; F42 keeps
+    /// it only where the Node capture needs the pause).
     #[test]
     fn sleep_marker_pauses_without_writing_a_frame() {
         let text = "{\"expect\":{\"type\":\"user\"},\"emit\":[{\"type\":\"assistant\",\"n\":1},{\"sleep_ms\":1},{\"type\":\"result\",\"n\":2}]}\n";
@@ -710,6 +779,31 @@ mod tests {
             start.elapsed() >= std::time::Duration::from_millis(1),
             "sleep marker must pause replay"
         );
+    }
+
+    /// F42: a sleep marker flushes the frames emitted before it, so the pause
+    /// really happens after they reached the host.
+    #[test]
+    fn sleep_marker_splits_the_write() {
+        let text = "{\"expect\":{\"type\":\"user\"},\"emit\":[{\"type\":\"assistant\",\"n\":1},{\"sleep_ms\":1},{\"type\":\"control_request\",\"n\":2}]}\n";
+        let transcript = Transcript::parse(text).unwrap();
+        let mut writer = CountingWriter::default();
+        let steps = replay(
+            &transcript,
+            &[],
+            None,
+            None,
+            br#"{"type":"user","uuid":"u","message":{}}"#.as_slice(),
+            &mut writer,
+        )
+        .unwrap();
+        assert_eq!(steps, 1);
+        assert_eq!(
+            writer.writes.len(),
+            2,
+            "the sleep marker must flush before pausing"
+        );
+        assert_eq!(writer.flushes, 2);
     }
 
     #[test]

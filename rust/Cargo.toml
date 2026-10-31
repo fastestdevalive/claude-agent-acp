@@ -15,3 +15,7 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 pedantic = "warn"
+
+[profile.release]
+panic = "unwind"
+

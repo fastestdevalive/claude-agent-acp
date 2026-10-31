@@ -762,7 +762,7 @@ Test files not covered by a "matching module" rule (each is ALSO read by the nam
 
 ### Acceptance (unchanged, binding)
 
-- [ ] T1 done (`CHECKPOINT: TURN-1`) — session ids: ____
+- [x] T1 done (`CHECKPOINT: TURN-1`, branch head e426b22) — sessions: see porting/parity/STATUS.md model log
 - [ ] T2 done — session ids: ____
 - [ ] T3 done — session ids: ____
 - [ ] T4 done — session ids: ____

@@ -26,6 +26,15 @@ const PASSTHROUGH_ENV: &[&str] = &[
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Hard recursion guard (Turn 1, Group G7a-fix6): an example or embedding host
+    // must never be re-executed as a reaper supervisor or probe.
+    if std::env::args().any(|arg| arg == "--reaper")
+        || std::env::var_os("CLAUDE_ACP_REAPER_GUARD").is_some()
+    {
+        eprintln!("examples/in_process: error: cannot be used as a reaper binary");
+        std::process::exit(1);
+    }
+
     let extra_env = PASSTHROUGH_ENV
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))

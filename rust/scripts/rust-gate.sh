@@ -38,7 +38,7 @@ echo "==> prewarm upstream cache"
 run_timeout 300 bash "$ROOT/porting/capture.sh" --install-only
 
 echo "==> test"
-run_timeout 180 cargo test --manifest-path "$MANIFEST" --workspace
+run_timeout 300 cargo test --manifest-path "$MANIFEST" --workspace -- --test-threads=4
 
 echo "==> cross-target check: x86_64-pc-windows-gnu"
 cargo check --manifest-path "$MANIFEST" --workspace --target x86_64-pc-windows-gnu
@@ -52,6 +52,9 @@ if grep -rEn 'cfg!?\(.*(unix|windows|target_)' "$RUST/claude-agent-acp-rs/src/" 
     exit 1
 fi
 
+echo "==> D8: unsafe confined to process.rs windows_job"
+bash "$RUST/scripts/d8-check.sh" "$RUST/claude-agent-acp-rs/src"
+
 echo "==> G10: dependency pin (agent-client-protocol 2.1.0)"
 if ! cargo tree --manifest-path "$MANIFEST" -i agent-client-protocol@2.1.0 -e normal >/dev/null 2>&1; then
     echo "G10 FAIL: agent-client-protocol@2.1.0 not in the tree"
@@ -63,7 +66,7 @@ if [ "$(cargo tree --manifest-path "$MANIFEST" -d | grep -c '^agent-client-proto
 fi
 
 echo "==> parity maps (TEST-MAP + MODULE-MAP)"
-run_timeout 180 bash "$RUST/scripts/parity/gate-parity.sh"
+run_timeout 900 bash "$RUST/scripts/parity/gate-parity.sh"
 
 echo "==> upstream ahead (non-failing)"
 run_timeout 20 bash "$RUST/scripts/upstream-ahead.sh" || true

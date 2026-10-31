@@ -179,6 +179,7 @@ async fn wire_parse_error_shapes_match_node() {
 /// outgoing request is `0`), and the client's numeric reply reaches the crate.
 #[tokio::test]
 async fn wire_permission_request_id_is_numeric() {
+    let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
     let mut harness = Harness::start(Some("permission-allow"));
     harness.initialize().await;
     let session_id = harness.new_session().await;
@@ -226,6 +227,7 @@ async fn wire_permission_request_id_is_numeric() {
 /// cancel a later turn (Node removes the abort listener in `finally`).
 #[tokio::test]
 async fn wire_late_cancel_request_is_ignored() {
+    let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
     let mut harness = Harness::start(Some("tool-then-text"));
     harness.initialize().await;
     let session_id = harness.new_session().await;
@@ -279,6 +281,7 @@ async fn wire_late_cancel_request_is_ignored() {
 /// resolves `cancelled`.
 #[tokio::test]
 async fn wire_cancel_request_cancels_the_prompt() {
+    let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
     let mut harness = Harness::start(Some("cancel-mid-turn"));
     harness.initialize().await;
     let session_id = harness.new_session().await;

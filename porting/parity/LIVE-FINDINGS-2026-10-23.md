@@ -29,3 +29,10 @@ permission option sets.
 Coverage gaps of the driver (to be closed by corpus scenarios): Bash was auto-allowed in both runs so the
 permission-deny path was not exercised live; `sleep` was blocked by the CLI before the cancel arrived so
 cancel-during-tool was not truly exercised.
+
+## Resolutions in LD-3 (Group G14)
+
+- **D2 (resolved):** Wire-level typed-update materialiser `map::materialize_tool_call_defaults` ensures initial `tool_call` carries `status:"pending"`, `content:[]`, and file-tool `locations:[]`. Differential test normaliser `normalize_tool_call_defaults` deleted. Corpus: `tool-call-empty-locations`. Units: `inv_79_materialize_tool_call_defaults_*`.
+- **D6 (resolved, first cut):** `session_titles.rs` + session loop wiring port `SessionTitles`. Collects rolling context up to 1000 characters, sends `generate_session_title` control request to CLI at `session_state_changed: idle`, adopts stored titles, publishes `session_info_update`. Corpus: `session-title`. Units: `inv_80_*`.
+- **D7 (resolved):** Sequential numeric request IDs (`0`, `1`, ...) assigned to agent-initiated outbound JSON-RPC requests via `codec::RequestIds` in `codec.rs`. Differential test normaliser `normalize_request_permission_id` deleted. Corpus: `permission-two-requests`. Units: `inv_79_request_ids_*`.
+- **D8 (resolved):** `oldText: null` materialized on typed file Diff updates (`map::materialize_diff_old_text`) for Write new files and Edit with empty `old_string`. Corpus: `write-new-file-diff`. Units: `inv_79_materialize_diff_old_text_*`.

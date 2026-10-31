@@ -168,6 +168,23 @@ pub fn find_transcripts(root: &Path, session_id: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The transcript of `session_id` in `dir`'s project directory, without
+/// scanning every project (`getSessionInfo(id, {dir})` reads only the cwd's
+/// project: `sdk.mjs` `As(…, dir, …)`). The directory is canonicalized first,
+/// like `list`.
+pub fn find_transcript_for_dir(root: &Path, dir: &str, session_id: &str) -> Option<PathBuf> {
+    if !is_session_id(session_id) {
+        return None;
+    }
+    let real = std::fs::canonicalize(dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| dir.to_string());
+    project_dirs_for(root, &real)
+        .into_iter()
+        .map(|d| d.join(format!("{session_id}.jsonl")))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0))
+}
+
 // ---- JSON-ish text scanning (the SDK's `Kt` / `ll` / `am` / `cm`) -----------
 
 fn unescape(raw: &str) -> String {
@@ -453,6 +470,42 @@ fn row_of(candidate: &Candidate) -> Option<SessionRow> {
         cwd,
         title: sanitize_title(&summary),
         last_modified_ms,
+    })
+}
+
+/// Summary and custom title read from stored transcript files.
+#[derive(Debug, Clone)]
+pub struct StoredSessionInfo {
+    pub custom_title: Option<String>,
+    pub summary: Option<String>,
+    pub mtime_ms: u64,
+}
+
+/// Read the stored session info (custom title / summary) for a session ID,
+/// searching every project directory.
+pub fn read_stored_session_info(root: &Path, session_id: &str) -> Option<StoredSessionInfo> {
+    find_transcripts(root, session_id)
+        .into_iter()
+        .find_map(|path| read_stored_session_info_at(&path))
+}
+
+/// Read the stored session info from one already-resolved transcript path.
+pub fn read_stored_session_info_at(path: &Path) -> Option<StoredSessionInfo> {
+    let (head, tail, mtime) = read_window(path)?;
+    let custom_title = last_string_field(&tail, "customTitle")
+        .filter(|s| !s.is_empty())
+        .or_else(|| last_string_field(&head, "customTitle").filter(|s| !s.is_empty()))
+        .or_else(|| last_string_field(&tail, "aiTitle").filter(|s| !s.is_empty()))
+        .or_else(|| last_string_field(&head, "aiTitle").filter(|s| !s.is_empty()));
+    let summary = custom_title
+        .clone()
+        .or_else(|| last_string_field(&tail, "lastPrompt").filter(|s| !s.is_empty()))
+        .or_else(|| last_string_field(&tail, "summary").filter(|s| !s.is_empty()))
+        .or_else(|| first_prompt(&head).filter(|s| !s.is_empty()));
+    Some(StoredSessionInfo {
+        custom_title,
+        summary,
+        mtime_ms: mtime,
     })
 }
 

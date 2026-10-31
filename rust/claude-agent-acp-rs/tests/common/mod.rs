@@ -317,27 +317,11 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
     let mut norm_b = Norm::default();
     let a: Vec<(Direction, Value)> = filtered_a
         .into_iter()
-        .map(|f| {
-            (
-                f.0,
-                normalize(
-                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
-                    &mut norm_a,
-                ),
-            )
-        })
+        .map(|f| (f.0, normalize(f.1, &mut norm_a)))
         .collect();
     let b: Vec<(Direction, Value)> = filtered_b
         .into_iter()
-        .map(|f| {
-            (
-                f.0,
-                normalize(
-                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
-                    &mut norm_b,
-                ),
-            )
-        })
+        .map(|f| (f.0, normalize(f.1, &mut norm_b)))
         .collect();
 
     for (i, (left, right)) in a.iter().zip(b.iter()).enumerate() {
@@ -395,78 +379,6 @@ fn filter_frames(frames: &[Frame], ignore: &[JsonPath]) -> Vec<(Direction, Value
         out.push((frame.direction, json));
     }
     out
-}
-
-/// Materialise ACP defaults the pinned crate omits, so an omitted default
-/// equals an explicit default on BOTH sides of a differential (Decision D13).
-///
-/// The `agent-client-protocol` crate marks `ToolCall.status` and `ToolCall.content`
-/// with `skip_serializing_if = is_default` / `Vec::is_empty`, so a `tool_call`
-/// frame with `Pending` status and empty content serialises without them, while
-/// the Node adapter always emits `"pending"` / `[]`. We re-insert those defaults
-/// on any `params.update` whose `sessionUpdate == "tool_call"`. This is done for
-/// `tool_call` frames ONLY — never for `tool_call_update` or any other kind,
-/// where `status`/`content` must match exactly.
-fn normalize_tool_call_defaults(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            for (_, v) in map.iter_mut() {
-                *v = normalize_tool_call_defaults(std::mem::take(v));
-            }
-            if map.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call") {
-                map.entry("status")
-                    .or_insert_with(|| Value::String("pending".to_string()));
-                map.entry("content")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                // Same crate limitation for `kind`: `ToolKind::Other` is the
-                // default and is omitted from the wire, while the Node always
-                // emits `"kind":"other"` (an MCP / Skill tool call).
-                map.entry("kind")
-                    .or_insert_with(|| Value::String("other".to_string()));
-            }
-            if map.get("type").and_then(Value::as_str) == Some("diff")
-                && map.get("oldText") == Some(&Value::Null)
-            {
-                map.remove("oldText");
-            }
-            Value::Object(map)
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(normalize_tool_call_defaults)
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-/// Normalise the JSON-RPC `id` of a `session/request_permission` request (and
-/// its response) to a fixed token. The Node adapter sends these with a fixed
-/// `id:0` while the pinned crate assigns a fresh uuid to every outgoing
-/// request; the `id` is a volatile correlation id (like a uuid/timestamp), so
-/// it is mapped to a fixed `$PERM_REQ` on both sides. The response is detected
-/// by its `result.outcome` shape (the permission decision). A fixed token (not
-/// a `Norm` placeholder) is used because the committed fixtures are already
-/// pre-normalised by `capture.sh` (their other ids are `$0..$k` strings that do
-/// not consume `Norm` slots), while the live Rust side produces real uuids that
-/// do.
-fn normalize_request_permission_id(value: Value) -> Value {
-    let is_request =
-        value.get("method").and_then(Value::as_str) == Some("session/request_permission");
-    let is_response = value.get("result").and_then(|r| r.get("outcome")).is_some();
-    if !is_request && !is_response {
-        return value;
-    }
-    match value {
-        Value::Object(mut map) => {
-            if map.contains_key("id") {
-                map.insert("id".into(), Value::String("$PERM_REQ".into()));
-            }
-            Value::Object(map)
-        }
-        other => other,
-    }
 }
 
 /// Replace ids/uuids/timestamps with first-appearance placeholders.
@@ -717,9 +629,38 @@ pub fn rust_agent_binary() -> PathBuf {
     repo_root().join("rust/target/debug/claude-agent-acp-rs")
 }
 
+static BUILD_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct BuildLockGuard;
+impl Drop for BuildLockGuard {
+    fn drop(&mut self) {
+        BUILD_LOCK.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn acquire_build_lock() -> BuildLockGuard {
+    while BUILD_LOCK
+        .compare_exchange_weak(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    BuildLockGuard
+}
+
 /// Build and return the path to a crate example binary.
 pub fn build_example(name: &str) -> PathBuf {
     let root = repo_root();
+    let bin = root.join("rust/target/debug/examples").join(name);
+    let _guard = acquire_build_lock();
+    if bin.exists() {
+        return bin;
+    }
     let status = std::process::Command::new("cargo")
         .args([
             "build",
@@ -735,7 +676,7 @@ pub fn build_example(name: &str) -> PathBuf {
         status.success(),
         "cargo build --example {name} must succeed"
     );
-    root.join("rust/target/debug/examples").join(name)
+    bin
 }
 
 /// Read a JSON file into a `serde_json::Value`.
@@ -1085,11 +1026,21 @@ pub fn wait_pid_gone(pid: u32, timeout: Duration) -> bool {
     }
 }
 
-/// Whether `kill(pid, 0)` reports the process does not exist (ESRCH).
+/// Whether the process is gone or has exited.
+/// For child processes of the current process, `waitpid(WNOHANG)` reaps the zombie
+/// and detects exit; for non-children, `kill(pid, 0) == ESRCH` is used.
 #[cfg(unix)]
 pub fn pid_is_gone(pid: u32) -> bool {
     use nix::sys::signal::kill;
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
+
+    match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => return true,
+        Ok(WaitStatus::StillAlive) => return false,
+        _ => {}
+    }
+
     matches!(
         kill(Pid::from_raw(pid as i32), None),
         Err(nix::errno::Errno::ESRCH)

@@ -1,0 +1,9 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"jetbrains": {"air": {"version": 1, "capabilities": []}}}},
+    {"call": "session/new"},
+    {"call": "request", "method": "_session/goal", "params": {"sessionId": "$SESSION", "action": "set", "objective": "ship it"}},
+    {"call": "request", "method": "_session/goal", "params": {"sessionId": "$SESSION", "action": "clear"}}
+  ]
+}

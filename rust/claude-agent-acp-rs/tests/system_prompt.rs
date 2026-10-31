@@ -45,3 +45,32 @@ fn inv_39_initialize_matches_node() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
+
+/// claude-master F4b (O-84/O-85) — `promptSuggestions`,
+/// `forwardSubagentText` and `perTaskStopAffordance` reach the `initialize`
+/// control_request from the client's `_meta.claudeCode.options`, exactly like
+/// the Node adapter (`initialize-fields.init.json`).
+#[test]
+fn inv_39_initialize_fields_matches_node() {
+    let root = repo_root();
+    let name = "initialize-fields";
+    let script = root.join(format!("porting/corpus/{name}.acp.json"));
+    let transcript = root.join(format!("porting/corpus/{name}.transcript.jsonl"));
+    let fixture = root.join(format!("porting/fixtures/{name}.init.json"));
+    assert!(fixture.exists(), "missing {fixture:?}");
+    let tmp = std::env::temp_dir().join(format!("acp-init-fields-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let (_frames, init) = run_recorder_with_init(
+        &rust_agent_binary().to_string_lossy(),
+        &script,
+        &transcript,
+        &tmp.join("out.jsonl"),
+    );
+    assert_eq!(
+        init,
+        read_json(&fixture),
+        "{name}: Rust initialize request differs from the Node fixture"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -317,39 +317,24 @@ pub fn same_status(a: Option<&AuthStatus>, b: &AuthStatus) -> bool {
     a.is_some_and(|a| a == b)
 }
 
-/// `apiKeyHelper` from the user / project / local `settings.json` files (last
-/// one wins), the `SettingsManager.getApiKeyHelper` sources.
-pub async fn read_api_key_helper(cwd: &Path) -> Option<String> {
-    read_api_key_helper_with_env(cwd, &crate::env_snapshot::EnvSnapshot::from_process()).await
+/// `apiKeyHelper` read using an explicit environment snapshot and optional session-level
+/// settings override (managed > --settings override > user/project/local, O-61, O-67).
+pub async fn read_api_key_helper_with_override(
+    cwd: &Path,
+    env: &crate::env_snapshot::EnvSnapshot,
+    settings_override: Option<&serde_json::Value>,
+) -> Option<String> {
+    let settings = crate::settings::load(cwd, env);
+    settings.get_api_key_helper(settings_override)
 }
 
-/// `apiKeyHelper` read using an explicit environment snapshot.
+/// `apiKeyHelper` read using an explicit environment snapshot with full precedence
+/// (managed > --settings override > user/project/local, O-61, O-67).
 pub async fn read_api_key_helper_with_env(
     cwd: &Path,
     env: &crate::env_snapshot::EnvSnapshot,
 ) -> Option<String> {
-    let user_dir = env
-        .get_path("CLAUDE_CONFIG_DIR")
-        .or_else(|| env.get_path("HOME").map(|h| h.join(".claude")));
-    let mut files = Vec::new();
-    if let Some(dir) = user_dir {
-        files.push(dir.join("settings.json"));
-    }
-    files.push(cwd.join(".claude").join("settings.json"));
-    files.push(cwd.join(".claude").join("settings.local.json"));
-    let mut helper = None;
-    for file in files {
-        let Ok(raw) = tokio::fs::read_to_string(&file).await else {
-            continue;
-        };
-        let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        if let Some(h) = parsed.get("apiKeyHelper").and_then(Value::as_str) {
-            helper = Some(h.to_string());
-        }
-    }
-    helper
+    read_api_key_helper_with_override(cwd, env, None).await
 }
 
 /// The outcome of one CLI auth status probe.
@@ -367,6 +352,7 @@ pub async fn probe_cli(
     claude_path: Option<&Path>,
     cwd: &Path,
     extra_env: &[(String, String)],
+    env: &crate::env_snapshot::EnvSnapshot,
 ) -> ProbeOutcome {
     let Ok(binary) = crate::process::resolve_claude(claude_path) else {
         return ProbeOutcome::LoggedOut;
@@ -389,7 +375,7 @@ pub async fn probe_cli(
     if run.stdout.trim().is_empty() {
         return ProbeOutcome::LoggedOut;
     }
-    let helper = read_api_key_helper(cwd).await;
+    let helper = read_api_key_helper_with_env(cwd, env).await;
     match from_cli_status(&run.stdout, helper.as_deref()) {
         Some(st) => ProbeOutcome::Status(st),
         None => ProbeOutcome::LoggedOut,
@@ -544,12 +530,16 @@ pub enum AuthPush {
 }
 
 /// Spawn the actor. `push` receives every changed status (and barriers) for
-/// the forwarder; `probe` reads the CLI. State (`current`, in-flight count,
-/// last probe cwd) lives only inside the task — no lock.
+/// the forwarder; `probe` reads the CLI; `env` is the SAME injected managed
+/// source the sessions use, so the `apiKeyHelper` precedence (managed > user >
+/// project > local) never falls back to the host process environment. State
+/// (`current`, in-flight count, last probe cwd) lives only inside the task —
+/// no lock.
 pub fn spawn_auth_actor(
     push: mpsc::UnboundedSender<AuthPush>,
     probe: ProbeFn,
     initial_cwd: PathBuf,
+    env: crate::env_snapshot::EnvSnapshot,
 ) -> AuthHandle {
     let (tx, mut rx) = mpsc::unbounded_channel::<AuthCmd>();
     let self_tx = tx.clone();
@@ -638,7 +628,7 @@ pub fn spawn_auth_actor(
                 }
                 AuthCmd::SessionCreated { cwd, account } => {
                     if let Some(account) = account {
-                        let helper = read_api_key_helper(&cwd).await;
+                        let helper = read_api_key_helper_with_env(&cwd, &env).await;
                         if let Some(status) = from_account_info(&account, helper.as_deref()) {
                             set(&mut current, status);
                         }
@@ -868,7 +858,15 @@ mod tests {
                 }
             }
         });
-        (spawn_auth_actor(push_tx, probe, PathBuf::from(cwd)), out_rx)
+        (
+            spawn_auth_actor(
+                push_tx,
+                probe,
+                PathBuf::from(cwd),
+                crate::env_snapshot::EnvSnapshot::empty(),
+            ),
+            out_rx,
+        )
     }
 
     async fn next_push(rx: &mut mpsc::UnboundedReceiver<Value>) -> Option<Value> {
@@ -1004,6 +1002,10 @@ mod tests {
 
     #[tokio::test]
     async fn inv_50_actor_session_account_and_cwd_reprobe() {
+        // The actor resolves `apiKeyHelper` through the injected managed source
+        // (the same `EnvSnapshot` the sessions use). Arming the guard proves
+        // this test never reads the host managed-policy paths.
+        let _guard = crate::process::ManagedSourceGuard::arm();
         let probed = acct("pro", Some("a@b.c"), None);
         let (handle, mut push_rx) = actor(fixed_probe(Some(probed.clone())), "/a");
         // An uninformative account pushes nothing; the cwd change re-probes.

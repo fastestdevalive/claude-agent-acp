@@ -5,6 +5,8 @@
 //! session down with no orphan `claude` child and exit 0 within a bounded
 //! deadline (INV-6, 12.2). 12.T4 runs the `in_process` example.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;

@@ -1894,4 +1894,160 @@ mod tests {
         };
         assert_eq!(versioned_model_display_name(&custom), "My Custom Model");
     }
+
+    /// FX-5 (O-37) — versioned model display name goldens from `model-presentation.test.ts`.
+    #[test]
+    fn model_presentation_goldens() {
+        // Case 1: standard-family versions and preserves model identity and recommendation
+        let opus = ModelInfo {
+            value: "opus[1m]".into(),
+            resolved_model: Some("claude-opus-5[1m]".into()),
+            display_name: "Opus (1M context)".into(),
+            description: "Opus 5 with 1M context · Best for everyday, complex tasks".into(),
+            ..Default::default()
+        };
+        assert_eq!(versioned_model_display_name(&opus), "Opus 5");
+
+        let sonnet_with_context = ModelInfo {
+            value: "sonnet[1m]".into(),
+            display_name: "Sonnet 5 (1M context)".into(),
+            description: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            versioned_model_display_name(&sonnet_with_context),
+            "Sonnet 5 (1M context)"
+        );
+
+        let custom_opus = ModelInfo {
+            value: "custom".into(),
+            display_name: "Custom Opus (1M context)".into(),
+            description: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            versioned_model_display_name(&custom_opus),
+            "Custom Opus (1M context)"
+        );
+
+        // Case 2: adds major and minor versions without changing custom or already-versioned names
+        let models = [
+            ModelInfo {
+                value: "sonnet".into(),
+                resolved_model: Some("claude-sonnet-5".into()),
+                display_name: "Sonnet".into(),
+                description: "Sonnet 5 · Efficient for routine tasks".into(),
+                ..Default::default()
+            },
+            ModelInfo {
+                value: "haiku".into(),
+                resolved_model: Some("claude-haiku-4-5-20251001".into()),
+                display_name: "Claude Haiku".into(),
+                description: "Fast".into(),
+                ..Default::default()
+            },
+            ModelInfo {
+                value: "fable".into(),
+                resolved_model: Some("claude-fable-5-1".into()),
+                display_name: "Fable".into(),
+                description: "Fable 5.1 · Creative model".into(),
+                ..Default::default()
+            },
+            ModelInfo {
+                value: "opus[1m]".into(),
+                resolved_model: Some("claude-opus-5[1m]".into()),
+                display_name: "Opus 5 (1M context)".into(),
+                description: String::new(),
+                ..Default::default()
+            },
+            ModelInfo {
+                value: "custom".into(),
+                display_name: "My Sonnet".into(),
+                description: String::new(),
+                ..Default::default()
+            },
+            ModelInfo {
+                value: "future".into(),
+                display_name: "Haiku (1M context)".into(),
+                description: String::new(),
+                ..Default::default()
+            },
+            ModelInfo {
+                value: "custom-versioned".into(),
+                display_name: "Fable 5.1 (1M context)".into(),
+                description: String::new(),
+                ..Default::default()
+            },
+        ];
+        let names: Vec<String> = models.iter().map(versioned_model_display_name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Sonnet 5",
+                "Claude Haiku 4.5",
+                "Fable 5.1",
+                "Opus 5 (1M context)",
+                "My Sonnet",
+                "Haiku (1M context)",
+                "Fable 5.1 (1M context)",
+            ]
+        );
+
+        // Case 3: only moves the context hint out of the name when the description retains it
+        let described = ModelInfo {
+            value: "opus-described[1m]".into(),
+            resolved_model: Some("claude-opus-5[1m]".into()),
+            display_name: "Opus 5 (1M context)".into(),
+            description: "Opus 5 with 1M context".into(),
+            ..Default::default()
+        };
+        assert_eq!(versioned_model_display_name(&described), "Opus 5");
+
+        let undescribed = ModelInfo {
+            value: "opus-undescribed[1m]".into(),
+            resolved_model: Some("claude-opus-5[1m]".into()),
+            display_name: "Opus 5 (1M context)".into(),
+            description: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            versioned_model_display_name(&undescribed),
+            "Opus 5 (1M context)"
+        );
+
+        let fable_undescribed = ModelInfo {
+            value: "fable-undescribed[1m]".into(),
+            resolved_model: Some("claude-fable-5-1[1m]".into()),
+            display_name: "Fable (1M context)".into(),
+            description: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            versioned_model_display_name(&fable_undescribed),
+            "Fable 5.1 (1M context)"
+        );
+
+        // Case 4: collision fallback in get_available_models
+        let collision_models = vec![
+            opus.clone(),
+            ModelInfo {
+                value: "opus".into(),
+                resolved_model: Some("claude-opus-5".into()),
+                display_name: "Opus".into(),
+                description: String::new(),
+                ..Default::default()
+            },
+        ];
+        let state = get_available_models(
+            &collision_models,
+            &collision_models,
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        let names: Vec<String> = state.available_models.into_iter().map(|m| m.name).collect();
+        assert_eq!(names, vec!["Opus (1M context)", "Opus"]);
+    }
 }

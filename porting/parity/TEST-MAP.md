@@ -188,13 +188,13 @@ src/tests/acp-agent.test.ts | tool_call emitted before permission request > carr
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > does not re-emit the tool_call when the stream already surfaced it | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > refines the eagerly-emitted tool_call with a tool_call_update when the chunk streams | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > emits a tool_call for plan-rendered tools (TodoWrite) so the permission request references a known id (issue #851) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_call emitted before permission request > resolves a permission-surfaced TodoWrite tool_call at tool_result time | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_call emitted before permission request > marks a permission-surfaced TodoWrite tool_call failed on an is_error tool_result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_call emitted before permission request > resolves permission-surfaced Task* tool_calls too | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_call emitted before permission request > stays silent on a TodoWrite tool_result when no tool_call was surfaced | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | tool_call emitted before permission request > resolves a permission-surfaced TodoWrite tool_call at tool_result time | covered:todo-perm-settle | completed status + rawOutput, end-to-end through the actor (inv_24_todo_perm_settle, un-ignored); G10c F6b | 
+src/tests/acp-agent.test.ts | tool_call emitted before permission request > marks a permission-surfaced TodoWrite tool_call failed on an is_error tool_result | ported:src/session.rs::denied_todo_resolution_at_the_tool_result_call_site | failed status + nonExecutionKind at the tool_result call site; G10c F6b | 
+src/tests/acp-agent.test.ts | tool_call emitted before permission request > resolves permission-surfaced Task* tool_calls too | covered:task-perm-settle | Node-captured resolution; G10a F6b | 
+src/tests/acp-agent.test.ts | tool_call emitted before permission request > stays silent on a TodoWrite tool_result when no tool_call was surfaced | covered:todo-write-result | plan only, no tool_call_update; G10a F6b | 
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > includes Bash terminal_info _meta in the eager tool_call so terminal output can attach | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_call emitted before permission request > prunes the emission marker and resolves the call on a tool_result even when the tool_use was never cached | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool_call emitted before permission request > does not resolve an uncached tool_result that was never surfaced | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | tool_call emitted before permission request > prunes the emission marker and resolves the call on a tool_result even when the tool_use was never cached | ported:src/map.rs::f6b_untracked_result_resolves_only_a_surfaced_call | {status,rawOutput} without meta; G10a F6b | 
+src/tests/acp-agent.test.ts | tool_call emitted before permission request > does not resolve an uncached tool_result that was never surfaced | ported:src/map.rs::f6b_untracked_result_resolves_only_a_surfaced_call | dropped when never emitted; G10a F6b | 
 src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > prompts for asks that survive Claude Code's bypass evaluation | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > prompts the client when the ask was forced by a permissions.ask rule | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > does not promise an ineffective always-allow fallback for a forced ask rule | missing:T-UNCLASSIFIED | 
@@ -276,11 +276,11 @@ src/tests/acp-agent.test.ts | stop reason propagation > only reconciles Fast mod
 src/tests/acp-agent.test.ts | stop reason propagation > does not fold a task-notification result's tokens into an already-active turn's usage | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stop reason propagation > ignores command_lifecycle frames without logging an unexpected-case error | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stop reason propagation > treats the command_lifecycle 'refused' state (2.1.238+) as terminal, not unknown | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > publishes active_goal as provider-neutral session state without changing turn settlement | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > publishes a submitted goal before a long-running command returns without active_goal | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > rolls back an optimistic goal update when the goal command fails | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > derives only state-changing goal slash commands | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > maps the SDK goal shape without exposing provider fields | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | stop reason propagation > publishes active_goal as provider-neutral session state without changing turn settlement | covered:goal-set-clear | runtime snapshot then `goal:null` after the result; unit inv_53_to_goal_snapshot 
+src/tests/acp-agent.test.ts | stop reason propagation > publishes a submitted goal before a long-running command returns without active_goal | covered:goal-set-clear | optimistic update before the result; unit inv_53_optimistic_publish_and_pending 
+src/tests/acp-agent.test.ts | stop reason propagation > rolls back an optimistic goal update when the goal command fails | ported:src/goal.rs::inv_53_rollback_on_failed_result | started + failed result publishes `previous`; actor result hook session.rs:2940 
+src/tests/acp-agent.test.ts | stop reason propagation > derives only state-changing goal slash commands | ported:src/goal.rs::inv_53_goal_update_from_prompt | exact upstream table (clear/bare/mention/leading space) 
+src/tests/acp-agent.test.ts | stop reason propagation > maps the SDK goal shape without exposing provider fields | ported:src/goal.rs::inv_53_to_goal_snapshot | provider fields dropped; `lastReason:null`, `createdAt` 
 src/tests/acp-agent.test.ts | stop reason propagation > settles a no-echo command result (e.g. /compact) by promoting the head turn | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stop reason propagation > resolves at the terminal result without waiting for a lagging idle (issue #773) | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stop reason propagation > forwards background output that arrives after the turn resolves (issue #679) | missing:T-UNCLASSIFIED | 
@@ -445,13 +445,13 @@ src/tests/acp-agent.test.ts | assembled assistant text fallback > still forwards
 src/tests/acp-agent.test.ts | assembled assistant text fallback > does not let a refusal explanation suppress the next turn's fallback | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > forwards the result text when the backend omits output_tokens | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | assembled assistant text fallback > forwards the result text when only subagent content preceded it | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | emitRawSDKMessages > emits all raw messages when set to true | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | emitRawSDKMessages > does not emit when set to false | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | emitRawSDKMessages > emits only messages matching a filter array | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | emitRawSDKMessages > filter without subtype matches all messages of that type | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | emitRawSDKMessages > supports multiple filters | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | emitRawSDKMessages > filter by origin kind only emits matching results | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | emitRawSDKMessages > filter without origin matches results regardless of origin | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | emitRawSDKMessages > emits all raw messages when set to true | covered:raw-sdk-messages | `_claude/sdkMessage` before each mapped update, Node-captured |
+src/tests/acp-agent.test.ts | emitRawSDKMessages > does not emit when set to false | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
+src/tests/acp-agent.test.ts | emitRawSDKMessages > emits only messages matching a filter array | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
+src/tests/acp-agent.test.ts | emitRawSDKMessages > filter without subtype matches all messages of that type | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
+src/tests/acp-agent.test.ts | emitRawSDKMessages > supports multiple filters | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
+src/tests/acp-agent.test.ts | emitRawSDKMessages > filter by origin kind only emits matching results | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
+src/tests/acp-agent.test.ts | emitRawSDKMessages > filter without origin matches results regardless of origin | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
 src/tests/acp-agent.test.ts | result origin handling > forwards origin in usage_update _meta | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | result origin handling > carries only the model in _meta when origin is absent | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | result origin handling > task-notification result with max_tokens does not override the user-turn stopReason | missing:T-UNCLASSIFIED | 
@@ -557,11 +557,11 @@ src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects when t
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects when the query stream has already closed | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > preserves the existing steering capability declaration | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > submits set and clear through the session prompt queue when the session is idle | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > injects clear into a running goal at priority 'now' and publishes removal | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > replaces a running goal through the goal extension and publishes it immediately | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not let a stale runtime update overwrite an optimistic goal replacement | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > cancels the running turn without clearing the persistent goal | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > validates goal control requests | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > injects clear into a running goal at priority 'now' and publishes removal | ported:src/goal.rs::inv_53_clear_pending_only_matches_clear | actor Steer publish (session.rs:1542); cancel path never clears (structural) 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > replaces a running goal through the goal extension and publishes it immediately | ported:src/goal.rs::inv_53_optimistic_publish_and_pending | actor Steer publish (session.rs:1542) 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not let a stale runtime update overwrite an optimistic goal replacement | ported:src/goal.rs::inv_53_runtime_goal_suppresses_stale_update | pending expectation suppresses the old goal's late frame 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > cancels the running turn without clearing the persistent goal | different:cancel-path-does-not-touch-goal-state | no goal write on cancel; parity is structural (upstream asserts the absence) 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > validates goal control requests | ported:src/goal.rs::inv_53_parse_goal_request | trim, action table, the four -32602 texts; wire inv_53_goal_params_wire 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > preserves startedNewTurn by default when no turn is in flight | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > returns promptRequired without consuming an opted-in prompt | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > lets the host retry promptRequired content through session/prompt exactly once | missing:T-UNCLASSIFIED | 
@@ -611,8 +611,8 @@ src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > refines a pending Write from the consolidated block after complete streamed input | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > refines $case before the full JSON object completes | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > waits for the consolidated message when $case is the only field | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps streamed TodoWrite input out of the tool feed | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps deliberately suppressed $name calls out of the tool feed | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps streamed TodoWrite input out of the tool feed | ported:src/map.rs::f6b_streamed_todo_and_task_input_never_refine | shouldEmitToolCall gate; G10a F6b | 
+src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps deliberately suppressed $name calls out of the tool feed | ported:src/map.rs::f6b_streamed_todo_and_task_input_never_refine | Task* variants; G10a F6b | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > does not publish an unfinished string | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > does not publish an ambiguous number until its delimiter arrives | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > recovers a completed $label value at a field boundary | missing:T-UNCLASSIFIED | 
@@ -1054,21 +1054,21 @@ src/tests/create-session-options.test.ts | createSession options merging > merge
 src/tests/create-session-options.test.ts | createSession options merging > inherits HOME and PATH from process.env when no env is provided | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > merges user-provided env vars on top of process.env | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > allows user-provided env vars to override process.env entries | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > asks the SDK for a predicted follow-up prompt per turn | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > lets a caller turn the predicted follow-up prompt off | missing:T-UNCLASSIFIED | 
+src/tests/create-session-options.test.ts | createSession options merging > asks the SDK for a predicted follow-up prompt per turn | covered:initialize-fields | Node-captured initialize request |
+src/tests/create-session-options.test.ts | createSession options merging > lets a caller turn the predicted follow-up prompt off | covered:initialize-fields | |
 src/tests/create-session-options.test.ts | createSession options merging > defaults tools to claude_code preset when not provided | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > passes through user-provided tools string array | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > explicit tools array takes precedence over disableBuiltInTools | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > passes through empty tools array to disable all built-in tools | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > recreates a resumed Query with changed skills and the same session ID | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > keeps the legacy default when neither the client nor caller opts in | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > preserves caller-provided legacy transcript forwarding | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > accepts the legacy transcript extension | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > enables SDK forwarding after native ACP negotiation | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > per-task stop affordance > declares it for a client on the subagents RFD form | missing:T-UNCLASSIFIED | 
+src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > keeps the legacy default when neither the client nor caller opts in | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
+src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > preserves caller-provided legacy transcript forwarding | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
+src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > accepts the legacy transcript extension | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
+src/tests/create-session-options.test.ts | createSession options merging > subagent transcript forwarding > enables SDK forwarding after native ACP negotiation | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
+src/tests/create-session-options.test.ts | createSession options merging > per-task stop affordance > declares it for a client on the subagents RFD form | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
 src/tests/create-session-options.test.ts | createSession options merging > per-task stop affordance > stops workflows on a cancel only when declared and the client cannot stop them | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > per-task stop affordance > does not declare it for a client that cannot cancel one subagent | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > per-task stop affordance > lets a caller's perTaskStopAffordance win | missing:T-UNCLASSIFIED | 
+src/tests/create-session-options.test.ts | createSession options merging > per-task stop affordance > does not declare it for a client that cannot cancel one subagent | ported:src/agent.rs::inv_57_initialize_fields_from_client | |
+src/tests/create-session-options.test.ts | createSession options merging > per-task stop affordance > lets a caller's perTaskStopAffordance win | covered:initialize-fields | |
 src/tests/create-session-options.test.ts | createSession options merging > systemPrompt via _meta > defaults to the claude_code preset when not provided | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > systemPrompt via _meta > appends AIR custom instructions to the claude_code preset | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > systemPrompt via _meta > ignores malformed AIR custom instructions | missing:T-UNCLASSIFIED | 
@@ -1390,58 +1390,58 @@ src/tests/live-capability-session-audit.test.ts | live Claude SDK to ACP capabil
 src/tests/managed-policy.test.ts | applyManagedPolicyEnv > copies the managed tier's env vars into the target env | ported:src/settings.rs::inv_managed_policy_env_applied_and_failure_logged | managed-settings.json env table -> spawn env |
 src/tests/managed-policy.test.ts | applyManagedPolicyEnv > resolves without applying anything when the tier has no env table | ported:src/settings.rs::inv_managed_policy_env_from_managed_tier | no env table -> empty |
 src/tests/managed-policy.test.ts | applyManagedPolicyEnv > does not reject when the tier cannot be read, and reports it on stderr | ported:src/settings.rs::inv_managed_policy_env_applied_and_failure_logged | error logged, adapter keeps starting |
-src/tests/managed-policy.test.ts | applyManagedPolicyEnv > asks the SDK for the managed tier only | different:reads managed-settings.json directly; no SDK resolveSettings/MDM/HKLM sources | |
-src/tests/mcp-command.test.ts | parseMcpCommand > parses the action, the server, and all | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | parseMcpCommand > rejects every other prompt | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | parseMcpCommand > reads past any leading whitespace, as before the prefix check | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > renders the summary, the groups, the disabled line, and the hint | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > keeps the SDK order inside a group and omits an empty group | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > uses the singular and the plural for the tool count | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > uses the plural for more than one server that needs authentication | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > shows the hint only when a server can be reconnected | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > drops the scope and the source of a server | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > shows the scope when two servers have the same name | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > shortens a long multi-segment error | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > escapes the Markdown syntax in an error and keeps one line | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > counts a status that the adapter does not know | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > orders the summary counts as the groups, with an unknown status before the disabled ones | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > shows no error detail for an error with only whitespace | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | formatMcpStatus > shows a server name with a backtick unchanged in a longer fence | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > keeps the real error of a wrapped, repeated error | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > keeps a short error as it is | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > drops a type path and a long generic | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > keeps at most two sentences | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > cuts a long error with an ellipsis | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > never keeps an error code alone | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > drops the MCP SDK wrapper | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > cuts a long error at a code point boundary | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | cleanMcpError > gives an empty text for an error with only whitespace | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > sends /mcp to Claude Code and replaces its text with the list | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > says when no MCP server is configured | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > reconnects a server through the control API after the text of Claude Code | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > runs /mcp %s through the control API | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > %s reconnects every server that is not connected and not disabled | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > disables every enabled server and enables every disabled server for all | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > says when a reconnect of all has nothing to reconnect | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > asks for a server name for an enable without a name | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > keeps the unknown-server sentence of Claude Code and drops the terminal sentence | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > isolates a control API error to its server | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > keeps the text of Claude Code for %s when the status read fails | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > runs the action and sends the result once when Claude Code mirrors its text as %j | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > replaces the result text when no other shape carries it | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > leaves the text of other /mcp prompts unchanged | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > publishes nothing when a cancel comes during the status read with %j | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp > stops the actions and publishes nothing when a cancel comes during a reconnect | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow after an explicit reconnect of an ACP server | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow only for the ACP servers of a reconnect of all | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a plain /mcp | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a server that is not from the ACP request | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the turn was cancelled | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not hold the turn while the MCP OAuth flow runs | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow without URL elicitation | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the result fell back to the CLI text | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp in available_commands_update > advertises one mcp entry when Claude Code also has one | missing:T-UNCLASSIFIED | 
-src/tests/mcp-command.test.ts | /mcp replay > hides a persisted /mcp invocation | missing:T-UNCLASSIFIED | 
+src/tests/managed-policy.test.ts | applyManagedPolicyEnv > asks the SDK for the managed tier only | different:reads the managed tiers directly (MDM plist / HKLM / managed file + .d / HKCU) instead of calling resolveSettings({settingSources:[]}); no remote-tier slot | |
+src/tests/mcp-command.test.ts | parseMcpCommand > parses the action, the server, and all | ported:src/mcp_command.rs::inv_56_parse_table | 
+src/tests/mcp-command.test.ts | parseMcpCommand > rejects every other prompt | ported:src/mcp_command.rs::inv_56_parse_rejects_other_prompts | 
+src/tests/mcp-command.test.ts | parseMcpCommand > reads past any leading whitespace, as before the prefix check | ported:src/mcp_command.rs::inv_56_parse_leading_whitespace | JS `\s` incl. U+FEFF
+src/tests/mcp-command.test.ts | formatMcpStatus > renders the summary, the groups, the disabled line, and the hint | ported:src/mcp_command.rs::inv_56_format_summary_groups_disabled_hint | covered:mcp-command-status
+src/tests/mcp-command.test.ts | formatMcpStatus > keeps the SDK order inside a group and omits an empty group | ported:src/mcp_command.rs::inv_56_format_keeps_order_and_omits_empty_groups | 
+src/tests/mcp-command.test.ts | formatMcpStatus > uses the singular and the plural for the tool count | ported:src/mcp_command.rs::inv_56_format_tool_count | 
+src/tests/mcp-command.test.ts | formatMcpStatus > uses the plural for more than one server that needs authentication | ported:src/mcp_command.rs::inv_56_format_needs_auth_plural | 
+src/tests/mcp-command.test.ts | formatMcpStatus > shows the hint only when a server can be reconnected | ported:src/mcp_command.rs::inv_56_format_hint_only_when_reconnectable | 
+src/tests/mcp-command.test.ts | formatMcpStatus > drops the scope and the source of a server | ported:src/mcp_command.rs::inv_56_format_scope_tags | 
+src/tests/mcp-command.test.ts | formatMcpStatus > shows the scope when two servers have the same name | ported:src/mcp_command.rs::inv_56_format_scope_tags | 
+src/tests/mcp-command.test.ts | formatMcpStatus > shortens a long multi-segment error | ported:src/mcp_command.rs::inv_56_format_shortens_long_error | 
+src/tests/mcp-command.test.ts | formatMcpStatus > escapes the Markdown syntax in an error and keeps one line | ported:src/mcp_command.rs::inv_56_format_escapes_error | 
+src/tests/mcp-command.test.ts | formatMcpStatus > counts a status that the adapter does not know | ported:src/mcp_command.rs::inv_56_format_unknown_status | 
+src/tests/mcp-command.test.ts | formatMcpStatus > orders the summary counts as the groups, with an unknown status before the disabled ones | ported:src/mcp_command.rs::inv_56_format_unknown_status | 
+src/tests/mcp-command.test.ts | formatMcpStatus > shows no error detail for an error with only whitespace | ported:src/mcp_command.rs::inv_56_format_whitespace_error | 
+src/tests/mcp-command.test.ts | formatMcpStatus > shows a server name with a backtick unchanged in a longer fence | ported:src/mcp_command.rs::inv_56_format_backtick_name | 
+src/tests/mcp-command.test.ts | cleanMcpError > keeps the real error of a wrapped, repeated error | ported:src/mcp_command.rs::inv_56_clean_wrapped_error | 
+src/tests/mcp-command.test.ts | cleanMcpError > keeps a short error as it is | ported:src/mcp_command.rs::inv_56_clean_short_error | 
+src/tests/mcp-command.test.ts | cleanMcpError > drops a type path and a long generic | ported:src/mcp_command.rs::inv_56_clean_type_paths | 
+src/tests/mcp-command.test.ts | cleanMcpError > keeps at most two sentences | ported:src/mcp_command.rs::inv_56_clean_two_sentences | 
+src/tests/mcp-command.test.ts | cleanMcpError > cuts a long error with an ellipsis | ported:src/mcp_command.rs::inv_56_clean_truncates | 
+src/tests/mcp-command.test.ts | cleanMcpError > never keeps an error code alone | ported:src/mcp_command.rs::inv_56_clean_error_codes | 
+src/tests/mcp-command.test.ts | cleanMcpError > drops the MCP SDK wrapper | ported:src/mcp_command.rs::inv_56_clean_mcp_wrapper | 
+src/tests/mcp-command.test.ts | cleanMcpError > cuts a long error at a code point boundary | ported:src/mcp_command.rs::inv_56_clean_code_point_boundary | 
+src/tests/mcp-command.test.ts | cleanMcpError > gives an empty text for an error with only whitespace | ported:src/mcp_command.rs::inv_56_clean_whitespace_only | 
+src/tests/mcp-command.test.ts | /mcp > sends /mcp to Claude Code and replaces its text with the list | covered:mcp-command-status | 
+src/tests/mcp-command.test.ts | /mcp > says when no MCP server is configured | ported:src/mcp_command.rs::inv_56_format_empty | 
+src/tests/mcp-command.test.ts | /mcp > reconnects a server through the control API after the text of Claude Code | covered:mcp-command-reconnect | 
+src/tests/mcp-command.test.ts | /mcp > runs /mcp %s through the control API | ported:src/mcp_command.rs::inv_56_action_targets | targets unit; the enable/disable toggle wire is not corpus-captured
+src/tests/mcp-command.test.ts | /mcp > %s reconnects every server that is not connected and not disabled | ported:src/mcp_command.rs::inv_56_action_targets | reconnect-all targets unit; corpus mcp-command-reconnect covers the named case
+src/tests/mcp-command.test.ts | /mcp > disables every enabled server and enables every disabled server for all | ported:src/mcp_command.rs::inv_56_action_targets | 
+src/tests/mcp-command.test.ts | /mcp > says when a reconnect of all has nothing to reconnect | ported:src/mcp_command.rs::inv_56_render_action_cases | 
+src/tests/mcp-command.test.ts | /mcp > asks for a server name for an enable without a name | ported:src/mcp_command.rs::inv_56_render_action_cases | 
+src/tests/mcp-command.test.ts | /mcp > keeps the unknown-server sentence of Claude Code and drops the terminal sentence | ported:src/mcp_command.rs::inv_56_render_action_sentences | 
+src/tests/mcp-command.test.ts | /mcp > isolates a control API error to its server | ported:src/mcp_command.rs::inv_56_render_action_cases | 
+src/tests/mcp-command.test.ts | /mcp > keeps the text of Claude Code for %s when the status read fails | ported:src/mcp_command.rs::inv_56_render_status_failure_keeps_cli_text | both /mcp and /mcp reconnect db share the None-render fallback
+src/tests/mcp-command.test.ts | /mcp > runs the action and sends the result once when Claude Code mirrors its text as %j | covered:mcp-command-status+mcp-command-reconnect | system+result and assistant+result shapes captured
+src/tests/mcp-command.test.ts | /mcp > replaces the result text when no other shape carries it | different:result-only shape publishes at the result frame; a result that beats the control run keeps the CLI text (no settle hold, no corpus) | 
+src/tests/mcp-command.test.ts | /mcp > leaves the text of other /mcp prompts unchanged | covered:mcp-prompt-rewrite | plus inv_56_prompt_mcp_command_single_text_block
+src/tests/mcp-command.test.ts | /mcp > publishes nothing when a cancel comes during the status read with %j | different:cancel clears the /mcp state so nothing is published; not corpus-captured | 
+src/tests/mcp-command.test.ts | /mcp > stops the actions and publishes nothing when a cancel comes during a reconnect | different:same cancel path; not corpus-captured | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow after an explicit reconnect of an ACP server | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > starts the MCP OAuth flow only for the ACP servers of a reconnect of all | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a plain /mcp | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow for a server that is not from the ACP request | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the turn was cancelled | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not hold the turn while the MCP OAuth flow runs | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow without URL elicitation | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the result fell back to the CLI text | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
+src/tests/mcp-command.test.ts | /mcp in available_commands_update > advertises one mcp entry when Claude Code also has one | covered:commands-proactive | the adapter's entry replaces a CLI `mcp` entry (map.rs)
+src/tests/mcp-command.test.ts | /mcp replay > hides a persisted /mcp invocation | ported:src/transcript.rs::inv_67_local_command_metadata_stripped | REPLAY_HIDDEN_COMMANDS includes /mcp; marker-only stripping covers both upstream cases
 src/tests/model-presentation.test.ts | versioned model display names > adds standard-family versions and preserves model identity and recommendation | missing:T-UNCLASSIFIED | 
 src/tests/model-presentation.test.ts | versioned model display names > adds major and minor versions without changing custom or already-versioned names | missing:T-UNCLASSIFIED | 
 src/tests/model-presentation.test.ts | versioned model display names > only moves the context hint out of the name when the description retains it | missing:T-UNCLASSIFIED | 
@@ -2038,15 +2038,15 @@ src/tests/session-titles.test.ts | session titles at turn-end > generates once p
 src/tests/session-titles.test.ts | session titles at turn-end > releases the latch when generation yields no title | missing:T-UNCLASSIFIED | 
 src/tests/session-titles.test.ts | session titles at turn-end > skips argument-less slash commands and bash openers when building the title context | missing:T-UNCLASSIFIED | 
 src/tests/session-titles.test.ts | session titles at turn-end > includes slash-command arguments in the title context | missing:T-UNCLASSIFIED | 
-src/tests/settings-api-key-helper.test.ts | SettingsManager.getApiKeyHelper > prefers a managed helper over the --settings override | missing:T-UNCLASSIFIED | 
-src/tests/settings-api-key-helper.test.ts | SettingsManager.getApiKeyHelper > prefers the --settings override over a user helper | missing:T-UNCLASSIFIED | 
-src/tests/settings.test.ts | SettingsManager > settings merging > should merge model setting with later sources taking precedence | missing:T-UNCLASSIFIED | 
+src/tests/settings-api-key-helper.test.ts | SettingsManager.getApiKeyHelper > prefers a managed helper over the --settings override | ported:src/settings.rs::o61_api_key_helper_precedence | managed > override > user/project/local | 
+src/tests/settings-api-key-helper.test.ts | SettingsManager.getApiKeyHelper > prefers the --settings override over a user helper | ported:src/settings.rs::o61_api_key_helper_precedence | override > user/project/local | 
+src/tests/settings.test.ts | SettingsManager > settings merging > should merge model setting with later sources taking precedence | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | later tier overrides earlier | 
 src/tests/settings.test.ts | SettingsManager > settings merging > should expose availableModels from settings | ported:src/settings.rs::f5b_available_models_union_across_tiers | field extracted from the merged document | 
 src/tests/settings.test.ts | SettingsManager > settings merging > should union and dedupe availableModels across sources | ported:src/settings.rs::f5b_available_models_union_across_tiers | source-order union+dedupe | 
-src/tests/settings.test.ts | SettingsManager > settings merging > should merge permissions.defaultMode with later sources taking precedence | missing:T-UNCLASSIFIED | 
-src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > drops %s when set in project-tier settings | missing:T-UNCLASSIFIED | 
-src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > preserves non-escalating %s from project-tier settings | missing:T-UNCLASSIFIED | 
-src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > preserves escalating defaultMode when it comes from local-tier settings | missing:T-UNCLASSIFIED | 
+src/tests/settings.test.ts | SettingsManager > settings merging > should merge permissions.defaultMode with later sources taking precedence | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | defaultMode merges across tiers | 
+src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > drops %s when set in project-tier settings | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | project-tier escalating defaultMode dropped | 
+src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > preserves non-escalating %s from project-tier settings | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | non-escalating project mode preserved | 
+src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > preserves escalating defaultMode when it comes from local-tier settings | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | local-tier escalating mode dropped for auto, preserved for acceptEdits | 
 src/tests/subagent-history.test.ts | subagentLineage > places an agent that the session launched under the root | missing:T-UNCLASSIFIED | 
 src/tests/subagent-history.test.ts | subagentLineage > places a nested agent under the agent whose transcript has its launch, root first | missing:T-UNCLASSIFIED | 
 src/tests/subagent-history.test.ts | subagentLineage > places an agent whose launch the root made before a compaction | missing:T-UNCLASSIFIED | 
@@ -2080,7 +2080,7 @@ src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports WebS
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > marks an Agent as a subagent and shows its prompt only to Zed | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows a requested Agent effort in the title | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > does not show an effort for a fork, which runs at the parent's effort | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports TodoWrite as a plan, not as a tool call | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports TodoWrite as a plan, not as a tool call | covered:todo-write-result | plan only; G10a F6b | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > agent control tools > sends the ListAgents result to AIR as plain text | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > agent control tools > sends the exact SendMessage and TaskStop JSON to AIR | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > agent control tools > sends an error result to AIR without a fence | missing:T-UNCLASSIFIED | 
@@ -2127,11 +2127,13 @@ src/tests/tools.test.ts | tool output in tool call updates > should include rawO
 src/tests/tools.test.ts | tool output in tool call updates > should include rawOutput for mcp_tool_result with array content | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | tool output in tool call updates > should include rawOutput for web_search_tool_result | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | tool output in tool call updates > should include rawOutput for bash_code_execution_tool_result | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | tool output in tool call updates > should set status to failed when is_error is true | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | tool output in tool call updates > should set status to failed when is_error is true | covered:tool-shapes | SendMessage error result completes failed
+
 src/tests/tools.test.ts | tool output in tool call updates > keeps rawOutput for a result without content | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | tool output in tool call updates > should not emit tool_call_update for TodoWrite (emits plan instead) | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | tool output in tool call updates > should convert Read tool base64 image content to ACP image format | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | tool output in tool call updates > should handle Read tool with mixed text and image content | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | tool output in tool call updates > should not emit tool_call_update for TodoWrite (emits plan instead) | covered:todo-write-result | silent tool_result; G10a F6b | 
+src/tests/tools.test.ts | tool output in tool call updates > should convert Read tool base64 image content to ACP image format | ported:src/tools.rs::f6a_content_block_types | base64 image becomes an ACP image block
+src/tests/tools.test.ts | tool output in tool call updates > should handle Read tool with mixed text and image content | ported:src/tools.rs::f6a_read_result_document_and_image_blocks | text escaped, document/image via toAcpContentBlock
+
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return formatted content without _meta when supportsTerminalOutput is false | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > should return no content with _meta when supportsTerminalOutput is true | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > toolUpdateFromToolResult > keys the terminal metas off the tool_use id, which is what was announced | missing:T-UNCLASSIFIED | 
@@ -2176,19 +2178,21 @@ src/tests/tools.test.ts | Bash terminal output > post-tool-use hook preserves te
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook preserves terminal _meta > sends no hook update when client lacks terminal_output support | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook preserves terminal _meta > should not include terminal _meta in hook update when client lacks terminal_output support | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | PowerShell terminal output > emits output and exit for the terminal announced by the tool call | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - ExitPlanMode > should include plan text in content when input.plan is provided | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | toolInfoFromToolUse - ExitPlanMode > should include plan text in content when input.plan is provided | covered:tool-shapes | "Approve Plan" + plan display copy
+
 src/tests/tools.test.ts | toolInfoFromToolUse - ExitPlanMode > should return empty content when input.plan is not provided | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toolInfoFromToolUse - Write input aliases > renders %s like file_path + content | ported:src/tools.rs::inv_75_write_input_aliases | path/file_text/file_content aliases; corpus tool-display-paths
 src/tests/tools.test.ts | toolInfoFromToolUse - Write input aliases > prefers the canonical fields when both spellings are present | ported:src/tools.rs::inv_75_write_input_aliases | canonical key wins
 src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > Read with undefined input should not throw | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > Grep with undefined input should not throw | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > Glob with undefined input should not throw | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > WebSearch with undefined input should not throw | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > shows a WebSearch query in the tool title | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > TodoWrite with undefined input should not throw | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > ReportFindings with undefined input should not throw | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - ReportFindings > should summarize findings count and list each in content | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toolInfoFromToolUse - ReportFindings > should report a singular title and empty findings array | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > Grep with undefined input should not throw | ported:src/tools.rs::f6a_grep_command_line | empty input gives bare "grep"
+src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > Glob with undefined input should not throw | ported:src/tools.rs::f6a_glob_truthiness | empty input gives bare "Find"
+src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > WebSearch with undefined input should not throw | ported:src/tools.rs::f6a_websearch_title | empty input gives "Web search"
+src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > shows a WebSearch query in the tool title | ported:src/tools.rs::f6a_websearch_title | `Search "<query>"`
+src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > TodoWrite with undefined input should not throw | ported:src/tools.rs::f6a_todowrite_empty_array | missing todos gives "Update TODOs"
+src/tests/tools.test.ts | toolInfoFromToolUse - undefined input regression > ReportFindings with undefined input should not throw | ported:src/tools.rs::f6a_report_findings_line_truthiness | empty findings gives "Report findings: none found"
+src/tests/tools.test.ts | toolInfoFromToolUse - ReportFindings > should summarize findings count and list each in content | ported:src/tools.rs::f6a_report_findings_line_truthiness | count title + one display line per finding
+src/tests/tools.test.ts | toolInfoFromToolUse - ReportFindings > should report a singular title and empty findings array | ported:src/tools.rs::f6a_report_findings_line_truthiness | empty array title asserted
+
 src/tests/tools.test.ts | planEntries - undefined input regression > should return empty array when input is undefined | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | planEntries - undefined input regression > should return empty array when input has no todos | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | planEntries - undefined input regression > should still map valid todos correctly | missing:T-UNCLASSIFIED | 
@@ -2211,9 +2215,9 @@ src/tests/tools.test.ts | applyTaskCreate / applyTaskUpdate > rebuilds task stat
 src/tests/tools.test.ts | applyTaskCreate / applyTaskUpdate > finds a TaskList snapshot after an unrelated JSON block | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | applyTaskCreate / applyTaskUpdate > parses the human-readable TaskList format used in session history | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | applyTaskCreate / applyTaskUpdate > handles adversarial TaskList output in linear time | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toAcpNotifications - Task* tools > suppresses tool_call for TaskCreate/TaskUpdate/TaskList/TaskGet on tool_use | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toAcpNotifications - Task* tools > emits a plan snapshot after a TaskCreate tool_result and accumulates state | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | toAcpNotifications - Task* tools > emits a plan snapshot reflecting status changes after a TaskUpdate tool_result | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | toAcpNotifications - Task* tools > suppresses tool_call for TaskCreate/TaskUpdate/TaskList/TaskGet on tool_use | covered:task-tools-stream | streamed + consolidated suppressed; G10a F6b | 
+src/tests/tools.test.ts | toAcpNotifications - Task* tools > emits a plan snapshot after a TaskCreate tool_result and accumulates state | covered:task-tools-stream | pending snapshot; G10a F6b | 
+src/tests/tools.test.ts | toAcpNotifications - Task* tools > emits a plan snapshot reflecting status changes after a TaskUpdate tool_result | covered:task-tools-stream | activeForm + empty fallback; G10a F6b | 
 src/tests/tools.test.ts | toAcpNotifications - Task* tools > uses the structured TaskList result as an authoritative plan snapshot | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - Task* tools > does not apply a logically failed TaskUpdate | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - Task* tools > does not apply a replayed TaskUpdate failure without structured output | missing:T-UNCLASSIFIED | 
@@ -2395,13 +2399,13 @@ src/tests/acp-scenarios/scenarios.ts | scenario > skill | missing:T-UNCLASSIFIED
 src/tests/acp-scenarios/scenarios.ts | scenario > subagent-agent-async | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios/scenarios.ts | scenario > subagent-late-child-update | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios/scenarios.ts | scenario > subagent-native-sessions | missing:T-UNCLASSIFIED | 
-src/tests/acp-scenarios/scenarios.ts | scenario > subagent-nested | missing:T-UNCLASSIFIED | 
+src/tests/acp-scenarios/scenarios.ts | scenario > subagent-nested | covered:subagent-nested-tool | streamed/consolidated nested tool; G10a F6b | 
 src/tests/acp-scenarios/scenarios.ts | scenario > subagent-task-legacy | missing:T-UNCLASSIFIED | 
-src/tests/acp-scenarios/scenarios.ts | scenario > subagent-transcript-extension | missing:T-UNCLASSIFIED | 
-src/tests/acp-scenarios/scenarios.ts | scenario > task-create-update | missing:T-UNCLASSIFIED | 
+src/tests/acp-scenarios/scenarios.ts | scenario > subagent-transcript-extension | covered:subagent-text-transcript | nested text/thinking forwarded stamped; G10a F6b | 
+src/tests/acp-scenarios/scenarios.ts | scenario > task-create-update | covered:task-tools-stream | plan snapshots; G10a F6b | 
 src/tests/acp-scenarios/scenarios.ts | scenario > task-output-and-stop | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios/scenarios.ts | scenario > text-and-thinking | missing:T-UNCLASSIFIED | 
-src/tests/acp-scenarios/scenarios.ts | scenario > todo-write | missing:T-UNCLASSIFIED | 
+src/tests/acp-scenarios/scenarios.ts | scenario > todo-write | covered:todo-write-result | activeForm/empty fallback; G10a F6b | 
 src/tests/acp-scenarios/scenarios.ts | scenario > tool-progress | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios/scenarios.ts | scenario > web-fetch-and-search | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios/scenarios.ts | scenario > write-existing | missing:T-UNCLASSIFIED | 

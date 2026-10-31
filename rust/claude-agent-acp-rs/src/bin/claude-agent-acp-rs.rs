@@ -19,6 +19,10 @@
 //!   outlives the host (INV-6). The signal handlers live in `process.rs`
 //!   (guard G9).
 
+// Decision D8: the bin target is a separate crate root, so it needs its own
+// unsafe lint. It never uses FFI; the gate also greps the whole crate.
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use claude_agent_acp_rs::agent::{serve_handle, ServeOptions};
@@ -30,9 +34,49 @@ use claude_agent_acp_rs::process::{
 };
 use claude_agent_acp_rs::settings;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let raw_args: Vec<String> = std::env::args().collect();
+
+    // Check for supervisor re-exec entry (--reaper <parent_pid> <target_pgid>, F41)
+    // or probe check (--reaper --probe, Finding 6).
+    // Matched ONLY as argv[1] (finding 8) and executed synchronously without starting
+    // a multi-threaded tokio runtime (finding 5).
+    if raw_args.get(1).map(String::as_str) == Some("--reaper") {
+        if raw_args.get(2).map(String::as_str) == Some("--probe") {
+            println!("claude-agent-acp-rs-reaper-v1");
+            return Ok(());
+        }
+        if raw_args.len() >= 4 {
+            if let (Ok(parent_pid), Ok(target_pgid)) =
+                (raw_args[2].parse::<u32>(), raw_args[3].parse::<u32>())
+            {
+                claude_agent_acp_rs::process::run_reaper(parent_pid, target_pgid);
+                return Ok(());
+            }
+        }
+        std::process::exit(1);
+    }
+
+    // Hard recursion guard (Turn 1, Group G7a-fix6): if CLAUDE_ACP_REAPER_GUARD is set,
+    // this process was invoked under a reaper/probe context. It must NEVER start an adapter session
+    // or spawn any further reaper or probe.
+    if std::env::var_os(claude_agent_acp_rs::process::REAPER_GUARD_ENV).is_some() {
+        eprintln!("claude-agent-acp-rs: error: CLAUDE_ACP_REAPER_GUARD is set but process was not invoked with --reaper");
+        std::process::exit(1);
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        claude_agent_acp_rs::process::set_reaper_binary(exe);
+    }
+
+    run_tokio_main(raw_args.into_iter().skip(1).collect())
+}
+
+// Runtime decision (F43 / CONC-1, porting/parity/CONCURRENCY.md):
+// Explicitly configured as `multi_thread`. Benchmarks measure >2x chunk throughput,
+// 2.7x lower cancel latency, and 5.5x lower steering latency compared to `current_thread`.
+#[tokio::main(flavor = "multi_thread")]
+async fn run_tokio_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let env = EnvSnapshot::from_process();
 
     // `--cli` is checked first (`index.ts:11-13`) so that `--version`/`-v` and

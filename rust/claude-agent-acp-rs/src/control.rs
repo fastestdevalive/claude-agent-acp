@@ -160,8 +160,17 @@ pub struct InitializeOptions {
     pub skills: Option<Value>,
     /// `toolAliases`.
     pub tool_aliases: Option<Value>,
+    /// `toolConfig`.
+    pub tool_config: Option<Value>,
     /// `forwardSubagentText`.
     pub forward_subagent_text: bool,
+    /// `perTaskStopAffordance` (O-84): emitted only when `Some`.
+    pub per_task_stop_affordance: Option<bool>,
+    /// `enableFileCheckpointing` (O-136). It is NOT part of the initialize
+    /// request — the SDK turns it into the
+    /// `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` env var — so it rides here
+    /// only to reach `agent.rs`'s spawn options.
+    pub enable_file_checkpointing: bool,
 }
 
 impl InitializeOptions {
@@ -200,12 +209,21 @@ impl InitializeOptions {
         if let Some(tool_aliases) = &self.tool_aliases {
             request.insert("toolAliases".to_string(), tool_aliases.clone());
         }
+        if let Some(tool_config) = &self.tool_config {
+            request.insert("toolConfig".to_string(), tool_config.clone());
+        }
         // `forwardSubagentText` is always sent (even when false), matching the
         // captured fixture.
         request.insert(
             "forwardSubagentText".to_string(),
             Value::Bool(self.forward_subagent_text),
         );
+        if let Some(per_task_stop) = &self.per_task_stop_affordance {
+            request.insert(
+                "perTaskStopAffordance".to_string(),
+                Value::Bool(*per_task_stop),
+            );
+        }
         Value::Object(request)
     }
 }
@@ -309,6 +327,35 @@ impl Control {
     ) -> Result<InitializeInfo, ControlError> {
         let frame = self.send_request(opts.build_request()).await?;
         Ok(parse_initialize_response(&frame))
+    }
+
+    /// `query.mcpServerStatus()` (rust-air-gaps A-23): `{subtype:"mcp_status"}`,
+    /// whose reply payload carries `mcpServers` (`sdk.mjs` `mcpServerStatus`).
+    pub async fn mcp_status(&self) -> Result<Value, ControlError> {
+        self.send_request(json!({ "subtype": "mcp_status" })).await
+    }
+
+    /// `query.reconnectMcpServer(serverName)` (rust-air-gaps A-24):
+    /// `{subtype:"mcp_reconnect", serverName}`.
+    pub async fn mcp_reconnect(&self, server_name: &str) -> Result<(), ControlError> {
+        self.send_request(json!({
+            "subtype": "mcp_reconnect",
+            "serverName": server_name,
+        }))
+        .await
+        .map(|_| ())
+    }
+
+    /// `query.toggleMcpServer(serverName, enabled)` (rust-air-gaps A-24):
+    /// `{subtype:"mcp_toggle", serverName, enabled}`.
+    pub async fn mcp_toggle(&self, server_name: &str, enabled: bool) -> Result<(), ControlError> {
+        self.send_request(json!({
+            "subtype": "mcp_toggle",
+            "serverName": server_name,
+            "enabled": enabled,
+        }))
+        .await
+        .map(|_| ())
     }
 
     /// Replay `pending_permission_requests` from an initialize response (4.5).
@@ -1362,5 +1409,38 @@ mod tests {
             .join("..")
             .canonicalize()
             .expect("repo root resolves")
+    }
+
+    /// O-84 — `perTaskStopAffordance` is serialized only when the client (or
+    /// the RFD default) defines it; `forwardSubagentText` stays always present.
+    #[test]
+    fn initialize_request_carries_per_task_stop_affordance() {
+        let opts = InitializeOptions {
+            per_task_stop_affordance: Some(false),
+            ..Default::default()
+        };
+        let request = opts.build_request();
+        assert_eq!(request["perTaskStopAffordance"], json!(false));
+        assert_eq!(request["forwardSubagentText"], json!(false));
+
+        let absent = InitializeOptions::default().build_request();
+        assert!(absent.get("perTaskStopAffordance").is_none());
+    }
+
+    /// O-155, O-161 — `toolAliases` and `toolConfig` are serialized into initialize payload when provided.
+    #[test]
+    fn initialize_request_carries_tool_aliases_and_tool_config() {
+        let opts = InitializeOptions {
+            tool_aliases: Some(json!({"Read": "CustomRead"})),
+            tool_config: Some(json!({"Bash": {"timeout": 60}})),
+            ..Default::default()
+        };
+        let request = opts.build_request();
+        assert_eq!(request["toolAliases"], json!({"Read": "CustomRead"}));
+        assert_eq!(request["toolConfig"], json!({"Bash": {"timeout": 60}}));
+
+        let absent = InitializeOptions::default().build_request();
+        assert!(absent.get("toolAliases").is_none());
+        assert!(absent.get("toolConfig").is_none());
     }
 }

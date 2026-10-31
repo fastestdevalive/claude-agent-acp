@@ -4,7 +4,7 @@
     {"call": "initialize"},
     {"call": "session/new"},
     {"call": "session/prompt", "text": "duplicate turn"},
-    {"call": "sleep", "ms": 200},
+    {"call": "wait_recv", "contains": "tool_call_update"},
     {"call": "session/prompt", "text": "after duplicate"}
   ]
 }

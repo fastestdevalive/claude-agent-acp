@@ -700,7 +700,15 @@ pub fn task_state_to_plan_entries(state: &[(String, TaskStateEntry)]) -> Vec<Val
     state
         .iter()
         .map(|(_, task)| {
-            let content = if task.status == "in_progress" && task.active_form.is_some() {
+            // Node uses a truthiness check (`task.activeForm ? … : subject`,
+            // `tools.ts:324`), so an EMPTY activeForm falls back to the subject
+            // (U-27).
+            let content = if task.status == "in_progress"
+                && task
+                    .active_form
+                    .as_deref()
+                    .is_some_and(|form| !form.is_empty())
+            {
                 task.active_form.as_deref().unwrap_or(&task.subject)
             } else {
                 &task.subject
@@ -1500,5 +1508,44 @@ mod tests {
         assert_eq!(state.len(), 1);
         assert_eq!(state[0].1.subject, "Build");
         assert_eq!(state[0].1.status, "in_progress");
+    }
+
+    // U-27 (tools.ts:324): an in_progress task shows its activeForm, but an
+    // EMPTY activeForm falls back to the subject (Node's truthiness check).
+    #[test]
+    fn u27_empty_active_form_falls_back_to_the_subject() {
+        let state = vec![
+            (
+                "1".to_string(),
+                TaskStateEntry {
+                    subject: "Build".into(),
+                    status: "in_progress".into(),
+                    active_form: Some("Building".into()),
+                    description: None,
+                },
+            ),
+            (
+                "2".to_string(),
+                TaskStateEntry {
+                    subject: "Empty form".into(),
+                    status: "in_progress".into(),
+                    active_form: Some(String::new()),
+                    description: None,
+                },
+            ),
+            (
+                "3".to_string(),
+                TaskStateEntry {
+                    subject: "Pending".into(),
+                    status: "pending".into(),
+                    active_form: Some("Pending form".into()),
+                    description: None,
+                },
+            ),
+        ];
+        let entries = task_state_to_plan_entries(&state);
+        assert_eq!(entries[0]["content"], "Building");
+        assert_eq!(entries[1]["content"], "Empty form");
+        assert_eq!(entries[2]["content"], "Pending");
     }
 }

@@ -393,7 +393,8 @@ ported_target_ok() {
     *) return 1 ;;
   esac
   [ -f "$path" ] || return 1
-  awk -v fn="$fn" '
+  local verdict
+  verdict="$(awk -v fn="$fn" '
     { lines[NR]=$0 }
     END {
       found=0
@@ -420,7 +421,11 @@ ported_target_ok() {
       }
       print (found ? "yes" : "no")
     }
-  ' "$path" | grep -qx yes
+  ' "$path")"
+  # Compare the captured verdict instead of piping into `grep -q`: under
+  # `set -o pipefail` an early-exiting grep can SIGPIPE the producer (141),
+  # failing the pipeline at random (KNOWN FLAKE A, G12).
+  [ "$verdict" = "yes" ]
 }
 
 covered_target_ok() {
@@ -878,7 +883,7 @@ EOF
             DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
             CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" \
             bash "$0" --map 2>&1)" && rc2=0 || rc2=$?
-    if [ "$rc2" -ne 0 ] && printf '%s\n' "$outf" | grep -q "$marker"; then
+    if [ "$rc2" -ne 0 ] && grep -q "$marker" <<< "$outf"; then
       echo "  ok: $label"
     else
       echo "SELFTEST: FAIL ($label: rc=$rc2, marker '$marker' not found)"
@@ -981,7 +986,7 @@ EOF
   zout="$(TEST_MAP_FILE="$map" TEST_SNAPSHOT_FILE="$tmp/snap2.tsv" MISSING_FILE="$tmp/missing.md" \
           DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
           CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" bash "$0" --reconcile --upstream "$exp" --tag "$TAG" 2>&1)" && zrc=0 || zrc=$?
-  if [ "$zrc" -ne 0 ] && printf '%s\n' "$zout" | grep -q "RECONCILE-ZERO"; then
+  if [ "$zrc" -ne 0 ] && grep -q "RECONCILE-ZERO" <<< "$zout"; then
     echo "  ok: zero-row file fails reconcile"
   else
     echo "SELFTEST: FAIL (zero-row file: rc=$zrc)"
@@ -996,7 +1001,7 @@ EOF
           DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
           CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" \
           bash "$0" --map --upstream "$exp" --tag "$TAG" 2>&1)" && trc=0 || trc=$?
-  if [ "$trc" -ne 0 ] && printf '%s\n' "$tout" | grep -q ".tag-sha"; then
+  if [ "$trc" -ne 0 ] && grep -q ".tag-sha" <<< "$tout"; then
     echo "  ok: wrong .tag-sha fails"
   else
     echo "SELFTEST: FAIL (wrong .tag-sha: rc=$trc)"

@@ -64,3 +64,34 @@ nothing here blocks work.
 - **Alternatives:** print the bare pin (`0.94.0`) from the binary and
   `agentInfo.version` to match Node byte-for-byte (one-line change in `build.rs`
   and the normaliser in `tests/common/mod.rs`).
+
+## D8 — Unsafe code exemption for Windows Job Object and assignment window limitation
+
+- **What:**
+  1. Amends D12 / R33 **for Windows only**: the crate keeps `#![forbid(unsafe_code)]` on every
+     non-Windows target (`#![cfg_attr(not(windows), forbid(unsafe_code))]`). On Windows the
+     crate-level lint is `#![cfg_attr(windows, deny(unsafe_code))]` with `#[allow(unsafe_code)]`
+     strictly scoped to the private `windows_job` module inside `src/process.rs`
+     (`cfg(windows)`) for Win32 Job Object FFI (`CreateJobObjectW`, `SetInformationJobObject`,
+     `AssignProcessToJobObject`, `TerminateJobObject`, `CloseHandle`).
+  2. Documents the Windows Job Object assignment window: descendants spawned between
+     `Command::spawn()` and `AssignProcessToJobObject` escape `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+     Windows coverage is therefore NOT claimed to be complete; the Unix reaper path is unaffected.
+- **Why:**
+  1. No safe wrapper crate was present in `Cargo.lock` (`win32job` and similar are not locked;
+     adding one would change the dependency set). Windows Job Objects are required on Windows to
+     ensure child process trees are terminated on host death. In Rust, crate-level `forbid` cannot
+     coexist with an inner module `allow` (compiler error E0453). Keeping `forbid` on every
+     non-Windows target and `deny` + one scoped `allow` on Windows is the narrowest exemption that
+     compiles. The exemption is enforced, not just documented: `rust/scripts/rust-gate.sh` fails
+     if any `unsafe` token appears outside `src/process.rs`, if `allow(unsafe_code)` appears more
+     than once or is not the attribute of the private `windows_job` module, or if any `unsafe`
+     token in `process.rs` lies outside that module; the bin target
+     (`src/bin/claude-agent-acp-rs.rs`) is its own crate root and carries
+     `#![forbid(unsafe_code)]`.
+  2. Standard library and `tokio::process::Command` do not support `CREATE_SUSPENDED` or
+     `PROC_THREAD_ATTRIBUTE_JOB_LIST` without replacing `Command::spawn` entirely with raw Win32
+     `CreateProcessW` FFI.
+- **Alternatives:** Add an external safe wrapper crate (e.g. `win32job`) to `Cargo.toml`; or rewrite
+  Windows process spawning using raw `CreateProcessW` FFI with `CREATE_SUSPENDED` (closing the
+  assignment window); or accept the documented window.

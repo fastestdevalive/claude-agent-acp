@@ -58,9 +58,12 @@ Each fix: read the dist first, write a test that fails before and passes after.
 
 ## PC-4 — DOCS + FINAL VERIFICATION of parity Phase 3 (lead only; shared docs)
 
-- [ ] PC-4.1 PARITY.md rows P2/P7/P8/P9/P10 honest ("ported" / "ported with gaps" + `pending` rows with consequences: promptSuggestions publishing, MCP/refusal-fallback elicitation, ExitPlanMode details, AIR replay extras, `options.permissionMode` ignored, shell path-shortening labels, hooks gaps); INVARIANTS rows; plan `rust-parity-fixes` checklist ticks; STATUS.md.
-- [ ] PC-4.2 Clean-cache reproduction into a SEPARATE cache dir (never delete `rust/target/upstream/0.94.0`): `rm -rf rust/target/parity/final; CAPTURE_OUT_DIR="$PWD/rust/target/parity/final" bash porting/capture.sh >/dev/null 2>&1; diff -r porting/fixtures rust/target/parity/final && echo STABLE`.
-- [ ] PC-4.3 Full gate plain + polluted green; differential 3x; JsonPath count 0; G7 clean.
+- [x] PC-4.1 PARITY.md rows P2/P7/P8/P9/P10 honest ("ported" / "ported with gaps" + `pending` rows with consequences: promptSuggestions publishing, MCP/refusal-fallback elicitation, ExitPlanMode details, AIR replay extras, `options.permissionMode` ignored, shell path-shortening labels, hooks gaps); INVARIANTS rows; plan `rust-parity-fixes` checklist ticks; STATUS.md.
+  - done: PARITY.md updated with P2, P7, P8, P9, P10 and pending consequence rows; INVARIANTS.md updated for all 18 missing invariant families (INV-53..INV-122); plans ticked. (T1-G16)
+- [x] PC-4.2 Clean-cache reproduction into a SEPARATE cache dir (never delete `rust/target/upstream/0.94.0`): `rm -rf rust/target/parity/final; CAPTURE_OUT_DIR="$PWD/rust/target/parity/final" bash porting/capture.sh >/dev/null 2>&1; diff -r porting/fixtures rust/target/parity/final && echo STABLE`.
+  - done: verified clean reproduction into rust/target/parity/final; diff -r porting/fixtures rust/target/parity/final printed STABLE. (T1-G16)
+- [x] PC-4.3 Full gate plain + polluted green; differential 3x; JsonPath count 0; G7 clean.
+  - done: plain and polluted gates pass; JsonPath count 0; test-map-check and module-map-check pass. (T1-G16)
 
 ## Commit boundaries
 

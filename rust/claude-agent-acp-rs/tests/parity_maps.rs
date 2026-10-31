@@ -215,3 +215,41 @@ fn inv_74_broken_ported_target_fails() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// FX-4 (O-83, Q-19) — lib.rs exposes the public library surface.
+#[test]
+fn inv_75_lib_rs_export_surface() {
+    use claude_agent_acp_rs::{
+        plan_entries, run_acp, serve, serve_handle, to_acp_notifications, to_display_path,
+        tool_info_from_tool_use, AuthStatus, ClaudeAcpAgent, ClaudePlanEntry, ServeHandle,
+        ServeOptions, SettingsManager, SettingsManagerOptions, AUTH_STATUS_UPDATE_METHOD,
+    };
+
+    assert_eq!(AUTH_STATUS_UPDATE_METHOD, "_auth/status_update");
+    let plan = plan_entries(Some(&[ClaudePlanEntry {
+        content: "c".into(),
+        status: "pending".into(),
+        active_form: "".into(),
+    }]));
+    assert_eq!(plan.len(), 1);
+    let path = to_display_path("/a/b", None);
+    assert_eq!(path, "/a/b");
+
+    let shape = tool_info_from_tool_use("Bash", &serde_json::json!({"command": "ls"}), None);
+    assert_eq!(shape.title, "ls");
+
+    let _opts = ServeOptions::default();
+    let _sm_opts = SettingsManagerOptions::default();
+    let _ = to_acp_notifications
+        as fn(&serde_json::Value, &mut claude_agent_acp_rs::map::MapState) -> _;
+    if false {
+        let (ch, _) = agent_client_protocol::Channel::duplex();
+        drop(serve(ch, _opts.clone()));
+        let (ch2, _) = agent_client_protocol::Channel::duplex();
+        drop(run_acp(ch2, _opts.clone()));
+        let (ch3, _) = agent_client_protocol::Channel::duplex();
+        drop(serve_handle(ch3, _opts));
+    }
+    fn assert_types<T1, T2, T3, T4>() {}
+    assert_types::<ClaudeAcpAgent, ServeHandle, SettingsManager, AuthStatus>();
+}

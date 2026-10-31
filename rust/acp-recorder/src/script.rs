@@ -88,6 +88,11 @@ pub enum Step {
     /// Await the responses of every `no_wait` prompt issued so far.
     #[serde(rename = "session/wait")]
     WaitPrompts,
+    /// Wait (bounded) until the agent has emitted a line containing `contains`.
+    /// An ORDERED barrier: unlike `sleep` it returns as soon as the wire
+    /// condition holds, so a script never paces itself with a timeout (F42).
+    #[serde(rename = "wait_recv")]
+    WaitRecv { contains: String },
     /// Reply to the next agent->client `elicitation/create` request (F1, the
     /// F23a corpus lane). Use after a `no_wait` prompt; the agent's request is
     /// queued by the client handler and answered here. `response` is the JSON
@@ -431,6 +436,21 @@ mod tests {
             }
         ));
         assert_eq!(script.steps[2], Step::Sleep { ms: 10 });
+    }
+
+    /// F42: `wait_recv` is an ordered barrier on an agent wire condition (the
+    /// replacement for a pacing `sleep` in corpus scripts).
+    #[test]
+    fn parses_wait_recv_step() {
+        let script =
+            Script::parse(r#"{"steps": [{"call": "wait_recv", "contains": "tool_call_update"}]}"#)
+                .unwrap();
+        assert_eq!(
+            script.steps[0],
+            Step::WaitRecv {
+                contains: "tool_call_update".to_string()
+            }
+        );
     }
 
     #[test]

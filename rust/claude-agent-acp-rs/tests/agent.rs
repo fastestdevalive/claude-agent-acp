@@ -707,3 +707,75 @@ async fn inv_63_set_mode_and_config_option() {
     let _ = timeout(Duration::from_secs(5), serve_task).await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// rust-air-gaps G8 (M-93, WB-14) — `_session/goal` is served (no longer
+/// -32601): every `parseGoalRequest` rejection is `-32602` with Node's exact
+/// message and NO `data`, and an unknown session is `-32603` with
+/// `data:{details:"Session not found"}` (Node's thrown `Error` mapping).
+#[tokio::test]
+async fn inv_53_goal_params_wire() {
+    let opts = ServeOptions::default();
+    let (agent_channel, client_channel) = Channel::duplex();
+    let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
+    let result = Client
+        .builder()
+        .connect_with(
+            client_channel,
+            move |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                let cases = [
+                    (
+                        json!({ "sessionId": "s", "action": "set" }),
+                        "Invalid params: goal action \"set\" requires a non-empty objective",
+                    ),
+                    (
+                        json!({ "sessionId": "s", "action": "pause" }),
+                        "Invalid params: goal action must be \"set\" or \"clear\"",
+                    ),
+                    (
+                        json!({ "action": "clear" }),
+                        "Invalid params: goal params require a non-empty sessionId",
+                    ),
+                ];
+                for (params, message) in cases {
+                    let err = connection
+                        .send_request(UntypedMessage::new("_session/goal", params.clone())?)
+                        .block_task()
+                        .await
+                        .expect_err("bad goal params must error");
+                    assert_eq!(i32::from(err.code), -32602, "{params}");
+                    assert_eq!(err.message, message, "{params}");
+                    assert!(err.data.is_none(), "no data: {params}");
+                }
+                // A non-object params value (null) is the object-check message.
+                let err = connection
+                    .send_request(UntypedMessage::new("_session/goal", json!(null))?)
+                    .block_task()
+                    .await
+                    .expect_err("null goal params must error");
+                assert_eq!(i32::from(err.code), -32602);
+                assert_eq!(err.message, "Invalid params: goal params must be an object");
+                assert!(err.data.is_none());
+
+                // A well-formed request for an unknown session: the method is
+                // routed (not -32601), and the error is Node's -32603/details.
+                let err = connection
+                    .send_request(UntypedMessage::new(
+                        "_session/goal",
+                        json!({ "sessionId": "missing", "action": "clear" }),
+                    )?)
+                    .block_task()
+                    .await
+                    .expect_err("unknown session must error");
+                assert_eq!(i32::from(err.code), -32603);
+                assert_eq!(
+                    err.data.as_ref().and_then(|d| d.get("details")),
+                    Some(&json!("Session not found"))
+                );
+                Ok::<(), agent_client_protocol::Error>(())
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "goal wire drive resolves: {result:?}");
+    drop(result);
+    let _ = timeout(Duration::from_secs(5), serve_task).await;
+}

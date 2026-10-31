@@ -15,9 +15,13 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
-use agent_client_protocol::schema::v1::StopReason;
+use agent_client_protocol::schema::v1::{
+    ReadTextFileRequest, ReadTextFileResponse, StopReason, WriteTextFileRequest,
+    WriteTextFileResponse,
+};
 use agent_client_protocol::{Agent, ConnectTo, ConnectionTo, Error, Result, UntypedMessage};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -103,6 +107,43 @@ impl ServeOptions {
     pub fn with_logger(mut self, logger: Option<std::sync::Arc<crate::logger::Logger>>) -> Self {
         self.logger = logger;
         self
+    }
+}
+
+/// Public library agent client wrapper (`ClaudeAcpAgent`, `acp-agent.ts:2757`,
+/// `acp-agent.ts:9547-9555`, O-138).
+#[derive(Clone)]
+pub struct ClaudeAcpAgent {
+    connection: ConnectionTo<agent_client_protocol::Client>,
+}
+
+impl ClaudeAcpAgent {
+    /// Create a new library agent wrapper for an active ACP connection.
+    #[must_use]
+    pub fn new(connection: ConnectionTo<agent_client_protocol::Client>) -> Self {
+        Self { connection }
+    }
+
+    /// Access the underlying connection.
+    #[must_use]
+    pub fn connection(&self) -> &ConnectionTo<agent_client_protocol::Client> {
+        &self.connection
+    }
+
+    /// Passthrough helper for client `fs/read_text_file` (O-138, `acp-agent.ts:9547-9550`).
+    pub async fn read_text_file(
+        &self,
+        params: ReadTextFileRequest,
+    ) -> Result<ReadTextFileResponse> {
+        self.connection.send_request(params).block_task().await
+    }
+
+    /// Passthrough helper for client `fs/write_text_file` (O-138, `acp-agent.ts:9552-9555`).
+    pub async fn write_text_file(
+        &self,
+        params: WriteTextFileRequest,
+    ) -> Result<WriteTextFileResponse> {
+        self.connection.send_request(params).block_task().await
     }
 }
 
@@ -402,6 +443,9 @@ pub fn prompt_to_claude(params: &Value, session_id: &str, uuid: &str) -> Value {
             match chunk.get("type").and_then(Value::as_str) {
                 Some("text") => {
                     let text = chunk.get("text").and_then(Value::as_str).unwrap_or("");
+                    // S-08: `/mcp:<server>:<command> [args]` is forwarded as
+                    // `/<server>:<command> (MCP) [args]` (`acp-agent.ts:12678-12684`).
+                    let text = crate::mcp_command::rewrite_mcp_prompt(text);
                     content.push(json!({"type": "text", "text": text}));
                 }
                 Some("resource_link") => {
@@ -456,14 +500,44 @@ pub fn prompt_to_claude(params: &Value, session_id: &str, uuid: &str) -> Value {
     })
 }
 
-/// Format a URI as a markdown-style link (subset of `formatUriAsLink`).
+/// The prompt's plain ACP `type:"text"` chunks joined by `\n`
+/// (`session-titles.ts` `onPrompt`). This is the title context source: the
+/// converted SDK frame also carries embedded `<context ref=…>` file contents
+/// and `[@name](uri)` links, which Node never feeds to the title generator.
+pub fn acp_prompt_text(params: &Value) -> String {
+    params
+        .get("prompt")
+        .and_then(Value::as_array)
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter(|c| c.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|c| c.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Format a URI as a markdown-style link (matches upstream `formatUriAsLink`).
 fn format_uri_as_link(uri: &str) -> String {
-    let name = uri
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(uri);
-    format!("[{name}]({uri})")
+    if let Some(path) = uri.strip_prefix("file://") {
+        let name = path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(path);
+        format!("[@{name}]({uri})")
+    } else if uri.starts_with("zed://") {
+        let name = uri
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(uri);
+        format!("[@{name}]({uri})")
+    } else {
+        uri.to_string()
+    }
 }
 
 /// Build the child [`SpawnOptions`] for a session (8.4, rust-parity-fixes 1.3).
@@ -487,6 +561,17 @@ pub fn session_spawn_options(
         .or_else(|| std::env::current_dir().ok());
     let mut extra_env = claude.env.clone();
     extra_env.extend(serve.extra_env.iter().cloned());
+    // The SDK turns `enableFileCheckpointing` into this env var
+    // (`sdk.mjs`: `if (H) env.CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING = "true"`),
+    // overriding an inherited or user-supplied value (O-136). The callers store
+    // the effective value (client option OR an AIR `agentFileChangeReport`
+    // client) here.
+    if claude.enable_file_checkpointing == Some(true) {
+        extra_env.push((
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".to_string(),
+            "true".to_string(),
+        ));
+    }
     let mut disallowed_tools = claude.disallowed_tools.clone();
     if ask_disallowed {
         // Decision 4: `AskUserQuestion` always follows the user list.
@@ -529,6 +614,21 @@ pub fn session_spawn_options(
         project_config_root: claude.project_config_root,
         extra_args: claude.extra_args,
         settings_arg: claude.settings_arg,
+        continue_conversation: claude.continue_conversation,
+        task_budget: claude.task_budget,
+        json_schema: claude.json_schema,
+        debug: claude.debug,
+        debug_file: claude.debug_file,
+        session_mirror: claude.session_mirror,
+        // The SDK's argv builder has a `--channels` branch, but the pinned SDK
+        // never forwards `Options.channels` into the process transport
+        // (`sdk.mjs` builds the transport options without it), so the Node
+        // adapter emits no such flag. `ClaudeOptions.channels` is therefore
+        // parse-only: the ACP path stays silent, like Node (verified by the
+        // captured `spawn-channels.argv.json`, O-127).
+        channels: Vec::new(),
+        permission_prompts: claude.permission_prompts,
+        managed_settings_arg: claude.managed_settings_arg,
         permission_prompt_tool: true,
         allow_dangerously_skip_permissions: allow_bypass,
         replay_user_messages: true,
@@ -566,6 +666,9 @@ pub fn spawn_inputs(
         .or_else(|| serve.default_cwd.clone())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
+    // ONE injection channel: `EnvSnapshot::managed_docs`. `load` reads the
+    // injected documents when the snapshot carries them (`Some`, hermetic in
+    // tests) and the platform sources otherwise (production).
     let settings = crate::settings::load(&dir, &serve.env);
     let mut claude = crate::sdk_options::claude_options(params);
 
@@ -837,6 +940,24 @@ fn rpc_error(rpc: (String, Option<Value>)) -> Error {
     err
 }
 
+/// A resumed session whose CLI cannot find the stored conversation answers
+/// `resourceNotFound` (-32002), not `Internal error` (`acp-agent.ts:8662-8672`:
+/// `RequestError.resourceNotFound(sessionId)`). Node maps the SDK's
+/// "No conversation found with session ID" / "Query closed before response
+/// received" initialization errors; the Rust initialize handshake surfaces the
+/// CLI's own error text, so the substring check is equivalent for the first.
+fn resumed_start_error(err: &SessionError, resumed: bool, session_id: &str) -> Error {
+    if resumed {
+        if let SessionError::Start(message) = err {
+            if message.contains("No conversation found with session ID") {
+                return Error::new(-32002, format!("Resource not found: {session_id}"))
+                    .data(json!({ "uri": session_id }));
+            }
+        }
+    }
+    rpc_error(session_error_to_rpc(err))
+}
+
 /// Serve ACP over `transport` (D9). Runs until the transport closes.
 pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOptions) -> Result<()> {
     // A `session/cancel` notification must reach the owning session actor. The
@@ -850,6 +971,7 @@ pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOption
         air: None,
         caps: ClientCapabilities::default(),
         auth: None,
+        settings_managers: std::collections::HashMap::new(),
     };
     Agent
         .builder()
@@ -983,6 +1105,31 @@ struct Registry {
     caps: ClientCapabilities,
     /// The auth-status actor, spawned by the first `initialize` (G2).
     auth: Option<AuthHandle>,
+    /// Settings managers per session (F5a / O-60).
+    settings_managers:
+        std::collections::HashMap<String, Arc<crate::settings_manager::SettingsManager>>,
+}
+
+#[allow(dead_code)]
+impl Registry {
+    /// Settings manager for a session, if registered.
+    pub fn settings_manager(
+        &self,
+        session_id: &str,
+    ) -> Option<&Arc<crate::settings_manager::SettingsManager>> {
+        self.settings_managers.get(session_id)
+    }
+
+    /// Effective apiKeyHelper for a session, with precedence (O-61, O-67).
+    pub fn api_key_helper(
+        &self,
+        session_id: &str,
+        settings_override: Option<&Value>,
+    ) -> Option<String> {
+        self.settings_managers
+            .get(session_id)
+            .and_then(|m| m.get_api_key_helper(settings_override))
+    }
 }
 
 /// Spawn the [`crate::auth_status`] actor: it probes `claude auth status` and
@@ -1013,14 +1160,25 @@ fn spawn_auth(
     });
     let claude_path = opts.claude_path.clone();
     let extra_env = opts.extra_env.clone();
+    // The actor must resolve settings through the SAME injected managed source
+    // as the sessions (`EnvSnapshot::managed_docs`); using the host process
+    // environment here would leak a managed `apiKeyHelper` into auth status.
+    let env = opts.env.clone();
+    let probe_env = env.clone();
     let probe: crate::auth_status::ProbeFn = Box::new(move |cwd| {
         let claude_path = claude_path.clone();
         let extra_env = extra_env.clone();
+        let env = probe_env.clone();
         Box::pin(async move {
-            crate::auth_status::probe_cli(claude_path.as_deref(), &cwd, &extra_env).await
+            crate::auth_status::probe_cli(claude_path.as_deref(), &cwd, &extra_env, &env).await
         })
     });
-    spawn_auth_actor(push_tx, probe, std::env::current_dir().unwrap_or_default())
+    spawn_auth_actor(
+        push_tx,
+        probe,
+        std::env::current_dir().unwrap_or_default(),
+        env,
+    )
 }
 
 /// Hand a created session's account and cwd to the auth actor (publish the
@@ -1071,16 +1229,44 @@ fn validate_cwd(cwd: Option<&str>) -> Result<(), Error> {
 /// and fold it, the legacy `_meta.systemPrompt` and AIR `customInstructions`
 /// into the `initialize` options (rust-air-gaps G3/G5, Decision 10; F4a
 /// O-133).
-fn initialize_options_for(params: &Value) -> Result<InitializeOptions, Error> {
+fn initialize_options_for(
+    params: &Value,
+    caps: &ClientCapabilities,
+    air: Option<&AirClient>,
+) -> Result<InitializeOptions, Error> {
     let (system_prompt, append_system_prompt) = system_prompt::initialize_fields(params)?;
     let opts = crate::sdk_options::claude_options(params);
+    // Node defaults `promptSuggestions` on unless the client passes a value
+    // (`acp-agent.ts:11235`).
     let prompt_suggestions = opts.prompt_suggestions.unwrap_or(true);
+    // `forwardsSubagentText` (`acp-agent.ts:10947-10953`): native subagent
+    // sessions, the historical `_meta["subagent-transcript"]` capability, or
+    // the client's `forwardSubagentText` option (O-85).
+    let forward_subagent_text = caps.subagent_form.is_some()
+        || caps.subagent_transcript
+        || opts.forward_subagent_text == Some(true);
+    // `perTaskStopAffordance` defaults on for the subagents RFD form; the
+    // client's own option wins because it is spread after it (O-84). Undefined
+    // for every other client, so the field is omitted from the request.
+    let per_task_stop_affordance = opts
+        .per_task_stop_affordance
+        .or((caps.subagent_form == Some(crate::client_caps::SubagentForm::Rfd)).then_some(true));
+    // The SDK enables checkpointing for a client that negotiated per-turn
+    // file-change reports; otherwise the client's option decides
+    // (`acp-agent.ts:11240`, O-136).
+    let file_change_reporter = air.is_some_and(|client| client.supports("agentFileChangeReport"));
+    let enable_file_checkpointing =
+        file_change_reporter || opts.enable_file_checkpointing == Some(true);
     Ok(InitializeOptions {
         system_prompt,
         append_system_prompt,
         hooks: Some(crate::hooks::init_hooks_payload()),
         prompt_suggestions: Some(prompt_suggestions),
-        forward_subagent_text: false,
+        tool_aliases: opts.tool_aliases,
+        tool_config: opts.tool_config,
+        forward_subagent_text,
+        per_task_stop_affordance,
+        enable_file_checkpointing,
         ..InitializeOptions::default()
     })
 }
@@ -1129,12 +1315,32 @@ fn register_session(
         while let Some(item) = update_rx.recv().await {
             match item {
                 SessionOutbound::Update(notif) => {
-                    let _ = connection.send_notification(notif);
+                    let mut value = serde_json::to_value(&notif).unwrap_or(serde_json::Value::Null);
+                    if let Some(update) = value.get_mut("update") {
+                        crate::map::materialize_tool_call_defaults(update);
+                        crate::map::materialize_diff_old_text(update);
+                    }
+                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                        let _ = connection.send_notification(msg);
+                    }
                 }
                 // Item 3.3: an untyped AIR `session/update` (async-task
                 // spawns/progress/state-updates), value = `{"sessionId",⋯,"update",{⋯}}`.
-                SessionOutbound::RawUpdate(value) => {
+                SessionOutbound::RawUpdate(mut value) => {
+                    // Only the `content[*]` diff blocks of a raw `tool_call` /
+                    // `tool_call_update` are materialised; the raw update's
+                    // tool data is forwarded verbatim.
+                    if let Some(update) = value.get_mut("update") {
+                        crate::map::materialize_diff_old_text(update);
+                    }
                     if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                        let _ = connection.send_notification(msg);
+                    }
+                }
+                // U-10: the raw SDK message ext notification
+                // (`client.extNotification("_claude/sdkMessage", {...})`).
+                SessionOutbound::ExtNotification { method, params } => {
+                    if let Ok(msg) = UntypedMessage::new(&method, params) {
                         let _ = connection.send_notification(msg);
                     }
                 }
@@ -1150,6 +1356,10 @@ fn register_session(
                 // resolves the oneshot with the raw `result` (or an error), so the
                 // forwarding task is never blocked on the client round-trip (D14).
                 SessionOutbound::RequestPermission { params, reply } => {
+                    // The actor's permission path already shaped and
+                    // materialised the `toolCall` (`permission::build_tool_call`
+                    // is client-kind aware); re-materialising here would add a
+                    // non-AIR `locations:[]` to an AIR request.
                     let connection = connection.clone();
                     tokio::spawn(async move {
                         let result = match UntypedMessage::new("session/request_permission", params)
@@ -1216,18 +1426,20 @@ async fn start_resumed(
         return responder.respond_with_error(e);
     }
     timing.phase("validate-cwd", "");
-    let initialize = match initialize_options_for(params) {
+    let initialize = match initialize_options_for(params, &registry.caps, registry.air.as_ref()) {
         Ok(initialize) => initialize,
         Err(e) => return responder.respond_with_error(e),
     };
     let cwd = cwd_str.map(PathBuf::from);
-    let (claude, permission_mode, allow_bypass) =
+    let (mut claude, permission_mode, allow_bypass) =
         match spawn_inputs(params, cwd.as_deref(), opts, Some(&session_id)) {
             Ok(inputs) => inputs,
             Err(e) => return responder.respond_with_error(e),
         };
+    claude.enable_file_checkpointing = Some(initialize.enable_file_checkpointing);
     timing.phase("resume-transcript", "");
     timing.phase("settings", "");
+    let raw_sdk_messages = claude.raw_sdk_messages.clone();
     let mut spawn = session_spawn_options(
         opts,
         cwd,
@@ -1243,6 +1455,7 @@ async fn start_resumed(
     let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
         .with_air(registry.air.clone())
         .with_caps(registry.caps.clone())
+        .with_raw_sdk_messages(raw_sdk_messages)
         .with_env(opts.env.clone())
         .with_logger(opts.logger.clone());
     // PC-2.2 / B-02: the replay runs while the CLI starts (Node
@@ -1254,7 +1467,11 @@ async fn start_resumed(
         let messages = crate::transcript::session_messages_async(&opts.env, &session_id).await;
         let (notifications, task_state, last_published) =
             crate::transcript::replay_with_task_state(&messages, &session_id, air);
-        for value in notifications {
+        for mut value in notifications {
+            if let Some(update) = value.get_mut("update") {
+                crate::map::materialize_tool_call_defaults(update);
+                crate::map::materialize_diff_old_text(update);
+            }
             if let Ok(msg) = UntypedMessage::new("session/update", value) {
                 let _ = connection.send_notification(msg);
             }
@@ -1274,7 +1491,7 @@ async fn start_resumed(
     match start_result {
         Ok((session, update_rx)) => {
             timing.phase("session-ready", "");
-            publish_session_account(registry, auth_cwd, &session);
+            publish_session_account(registry, auth_cwd.clone(), &session);
             // Phase 15 (Item 1): upstream sends a proactive
             // `available_commands_update` with the REAL command list right
             // after session/new / session/load
@@ -1296,6 +1513,18 @@ async fn start_resumed(
                 let _ = session.seed_task_state(task_state, last_published).await;
                 timing.phase("replay", "");
             }
+            let mgr = Arc::new(crate::settings_manager::SettingsManager::new(
+                auth_cwd.clone(),
+                Some(crate::settings_manager::SettingsManagerOptions {
+                    on_change: None,
+                    logger: opts.logger.clone(),
+                    env: Some(opts.env.clone()),
+                    managed_docs: None, // env snapshot carries the injected managed docs
+                    managed_file: None,
+                    poll_interval: None,
+                }),
+            ));
+            registry.settings_managers.insert(session_id.clone(), mgr);
             register_session(registry, &session_id, session, update_rx, connection);
             timing.phase("register", "");
             responder.respond(session_response(&session_id, &modes, &config_options))?;
@@ -1311,7 +1540,7 @@ async fn start_resumed(
             }
             Ok(())
         }
-        Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
+        Err(e) => responder.respond_with_error(resumed_start_error(&e, true, &session_id)),
     }
 }
 
@@ -1368,16 +1597,18 @@ async fn handle_request(
             if let Err(e) = validate_cwd(cwd_str) {
                 return responder.respond_with_error(e);
             }
-            let initialize = match initialize_options_for(&params) {
-                Ok(initialize) => initialize,
-                Err(e) => return responder.respond_with_error(e),
-            };
+            let initialize =
+                match initialize_options_for(&params, &registry.caps, registry.air.as_ref()) {
+                    Ok(initialize) => initialize,
+                    Err(e) => return responder.respond_with_error(e),
+                };
             let cwd = cwd_str.map(PathBuf::from);
-            let (claude, permission_mode, allow_bypass) =
+            let (mut claude, permission_mode, allow_bypass) =
                 match spawn_inputs(&params, cwd.as_deref(), opts, None) {
                     Ok(inputs) => inputs,
                     Err(e) => return responder.respond_with_error(e),
                 };
+            claude.enable_file_checkpointing = Some(initialize.enable_file_checkpointing);
             let session_id = claude.resume.clone().unwrap_or_else(uuid_v4);
             let resumed = claude.resume.is_some();
             let mut timing = SessionTiming::with_started_at(
@@ -1391,6 +1622,7 @@ async fn handle_request(
                 timing.phase("resume-transcript", "");
             }
             timing.phase("settings", "");
+            let raw_sdk_messages = claude.raw_sdk_messages.clone();
             let spawn = session_spawn_options(
                 opts,
                 cwd,
@@ -1404,11 +1636,12 @@ async fn handle_request(
             let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
                 .with_air(registry.air.clone())
                 .with_caps(registry.caps.clone())
+                .with_raw_sdk_messages(raw_sdk_messages)
                 .with_env(opts.env.clone())
                 .with_logger(opts.logger.clone());
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
-                    publish_session_account(registry, auth_cwd, &session);
+                    publish_session_account(registry, auth_cwd.clone(), &session);
                     // Phase 15 (Item 1): upstream sends a proactive
                     // `available_commands_update` with the REAL command list right
                     // after session/new / session/load
@@ -1419,6 +1652,18 @@ async fn handle_request(
                     let commands = session.commands().to_vec();
                     let modes = session.modes().clone();
                     let config_options = session.config_options().to_vec();
+                    let mgr = Arc::new(crate::settings_manager::SettingsManager::new(
+                        auth_cwd.clone(),
+                        Some(crate::settings_manager::SettingsManagerOptions {
+                            on_change: None,
+                            logger: opts.logger.clone(),
+                            env: Some(opts.env.clone()),
+                            managed_docs: None, // env snapshot carries the injected managed docs
+                            managed_file: None,
+                            poll_interval: None,
+                        }),
+                    ));
+                    registry.settings_managers.insert(session_id.clone(), mgr);
                     register_session(registry, &session_id, session, update_rx, &connection);
                     timing.phase("register", "");
                     responder.respond(session_response(&session_id, &modes, &config_options))?;
@@ -1434,7 +1679,9 @@ async fn handle_request(
                     }
                     Ok(())
                 }
-                Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
+                Err(e) => {
+                    responder.respond_with_error(resumed_start_error(&e, resumed, &session_id))
+                }
             }
         }
         // `session/resume` is `session/load` without the history replay, which
@@ -1460,7 +1707,11 @@ async fn handle_request(
                             &session_id,
                             registry.air.is_some(),
                         );
-                    for value in notifications {
+                    for mut value in notifications {
+                        if let Some(update) = value.get_mut("update") {
+                            crate::map::materialize_tool_call_defaults(update);
+                            crate::map::materialize_diff_old_text(update);
+                        }
                         if let Ok(msg) = UntypedMessage::new("session/update", value) {
                             let _ = connection.send_notification(msg);
                         }
@@ -1525,7 +1776,7 @@ async fn handle_request(
         "session/fork" => {
             // Node order: validate the systemPrompt, copy the transcript, then
             // start the new session like a resumed one (`unstable_forkSession`).
-            if let Err(e) = initialize_options_for(&params) {
+            if let Err(e) = initialize_options_for(&params, &registry.caps, registry.air.as_ref()) {
                 return responder.respond_with_error(e);
             }
             let fork_session_id = params
@@ -1572,6 +1823,7 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            registry.settings_managers.remove(&session_id);
             match registry.sessions.remove(&session_id) {
                 Some(session) => {
                     tokio::spawn(async move {
@@ -1681,6 +1933,7 @@ async fn handle_request(
                 .to_string();
             // Tear a loaded session down first so its transcript is not recreated.
             let loaded = registry.sessions.remove(&session_id);
+            registry.settings_managers.remove(&session_id);
             let env = opts.env.clone();
             tokio::spawn(async move {
                 if let Some(session) = loaded {
@@ -1759,15 +2012,24 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let is_local_only = is_local_only_command(first_text);
+            let mcp_command = crate::mcp_command::prompt_mcp_command(&params);
             let uuid = uuid_v4();
             let frame = prompt_to_claude(&params, &session_id, &uuid);
+            // G12 (Decision 21): record the `/mcp` command on the actor BEFORE
+            // the prompt, so the actor knows the turn's replacement is coming.
+            // Both sends are on the same unbounded channel, so the actor sees
+            // the command first.
+            if let Some(command) = mcp_command {
+                session.send_mcp(uuid.clone(), command);
+            }
             // Enqueue the prompt on the actor synchronously so a later
             // `session/cancel` notification (processed on the same single-task
             // connection) is always ordered *after* it — the queued-sweep
             // ordering the cancel relies on. Only the settlement is awaited on
             // a spawned task so the connection is never blocked while a turn is
             // in flight (Node's `prompt()` returns immediately).
-            let mut reply_rx = session.send_prompt(uuid, frame, is_local_only);
+            let prompt_text = acp_prompt_text(&params);
+            let mut reply_rx = session.send_prompt(uuid, frame, is_local_only, prompt_text);
             // F2c / M-52: Node's `runPromptWithCancellation`
             // (`acp-agent.ts:13528-13552`) listens for `$/cancel_request` on
             // this prompt's request signal and routes it to the same
@@ -1904,8 +2166,68 @@ async fn handle_request(
             });
             Ok(())
         }
+        "_session/goal" => {
+            // G8 (rust-air-gaps 3.1, Decision 16): the AIR goal control method.
+            // `goal()` (`acp-agent.ts:4185-4196`) turns the request into a
+            // `/goal …` prompt, steers it with `idleBehavior:"promptRequired"`,
+            // and prompts it when the session is idle; the response is `{}`
+            // once that turn settles (or at once when the steer injected).
+            let request = match crate::goal::parse_goal_request(&params) {
+                Ok(request) => request,
+                Err(e) => return responder.respond_with_error(e),
+            };
+            let Some(session) = registry.sessions.get(&request.session_id).cloned() else {
+                // Node's `steer` throws `new Error("Session not found")`; the
+                // SDK maps it to `internalError` with `data:{details}`.
+                return responder.respond_with_error(
+                    Error::internal_error().data(json!({ "details": "Session not found" })),
+                );
+            };
+            let command = request.command_text();
+            let prompt_params = json!({
+                "sessionId": request.session_id,
+                "prompt": [ { "type": "text", "text": command } ],
+            });
+            let steer_uuid = uuid_v4();
+            let frame = prompt_to_claude(&prompt_params, &request.session_id, &steer_uuid);
+            let is_local_only = is_local_only_command(&command);
+            let steer_rx = session.steer(steer_uuid, frame.clone(), is_local_only, true);
+            // The steer reply and the prompt's settlement are awaited off the
+            // connection loop (INV-27); the response never overtakes the
+            // goal's updates because the actor publishes them before either
+            // reply resolves.
+            tokio::spawn(async move {
+                let outcome = match steer_rx.await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        let _ = responder.respond_with_error(Error::internal_error());
+                        return;
+                    }
+                };
+                if outcome.get("outcome").and_then(Value::as_str) == Some("promptRequired") {
+                    // Node's `prompt()` generates its own prompt uuid.
+                    let prompt_uuid = uuid_v4();
+                    match session
+                        .prompt(prompt_uuid, frame, is_local_only, command)
+                        .await
+                    {
+                        Ok(reply) => {
+                            if let Some(flush_rx) = reply.flush_rx {
+                                let _ = flush_rx.await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ =
+                                responder.respond_with_error(rpc_error(session_error_to_rpc(&e)));
+                            return;
+                        }
+                    }
+                }
+                let _ = responder.respond(json!({}));
+            });
+            Ok(())
+        }
         _ => {
-            // Unhandled method (8.1): -32601. Mirror Node's SDK router
             // (`@agentclientprotocol/sdk/dist/core/jsonrpc.js` `methodNotFound`):
             // `-"Method not found": <method>"` with `data` `{method}`.
             responder.respond_with_error(
@@ -1999,6 +2321,34 @@ mod tests {
         assert!(!is_local_only_command("/clear")); // not local-only upstream
     }
 
+    /// Review G14 finding 3 — the title context is built from the plain ACP
+    /// `type:"text"` chunks (`session-titles.ts` `onPrompt`), never from the
+    /// converted SDK frame, whose blocks also carry embedded file contents
+    /// (`<context ref=…>`) and resource links (`[@name](uri)`).
+    #[test]
+    fn inv_80_title_context_from_acp_text_only() {
+        let params = json!({"sessionId":"s1","prompt":[
+            {"type":"text","text":"explain this file"},
+            {"type":"resource","resource":{"uri":"file:///w/a.rs","text":"fn main() {}"}},
+            {"type":"resource_link","uri":"file:///w/b.rs","name":"b.rs"}
+        ]});
+        let text = acp_prompt_text(&params);
+        assert_eq!(text, "explain this file");
+
+        let mut titles = crate::session_titles::SessionTitles::new();
+        titles.on_prompt(&text);
+        let context = titles.context.as_deref().expect("context collected");
+        assert_eq!(context, "\nexplain this file\n");
+        assert!(!context.contains("<context ref"), "no embedded file text");
+        assert!(!context.contains("[@"), "no resource link");
+
+        // The converted frame is exactly the source that must NOT be used.
+        let frame = prompt_to_claude(&params, "s1", "u");
+        let frame_text = frame["message"]["content"].to_string();
+        assert!(frame_text.contains("<context ref=\\\"file:///w/a.rs\\\">"));
+        assert!(frame_text.contains("[@b.rs](file:///w/b.rs)"));
+    }
+
     #[test]
     fn prompt_to_claude_maps_blocks() {
         // text
@@ -2021,7 +2371,7 @@ mod tests {
         assert!(frame["message"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("[a.txt]"));
+            .contains("[@a.txt]"));
 
         // resource with text -> content + context
         let params = json!({"prompt":[{"type":"resource","resource":{"uri":"file:///b.txt","text":"body"}}]});
@@ -2029,7 +2379,7 @@ mod tests {
         let content = frame["message"]["content"].as_array().unwrap();
         assert!(content
             .iter()
-            .any(|c| c["text"].as_str().unwrap().contains("[b.txt]")));
+            .any(|c| c["text"].as_str().unwrap().contains("[@b.txt]")));
         assert!(content
             .iter()
             .any(|c| c["text"].as_str().unwrap().contains("body")));
@@ -2510,6 +2860,261 @@ mod tests {
                 "gateway",
                 "gateway-bedrock"
             ]
+        );
+    }
+
+    /// O-84/O-85/O-136 — `initialize_options_for` derives the three
+    /// client-tunable fields exactly like `forwardsSubagentText`,
+    /// `perTaskStopAffordance` and `enableFileCheckpointing`
+    /// (`acp-agent.ts:10947-10953, 11222-11240`).
+    #[test]
+    fn inv_57_initialize_fields_from_client() {
+        let plain = ClientCapabilities::default();
+        let init = initialize_options_for(
+            &json!({"_meta": {"claudeCode": {"options": {
+                "promptSuggestions": false,
+                "forwardSubagentText": true,
+                "perTaskStopAffordance": false
+            }}}}),
+            &plain,
+            None,
+        )
+        .unwrap();
+        assert_eq!(init.prompt_suggestions, Some(false));
+        assert!(init.forward_subagent_text);
+        assert_eq!(init.per_task_stop_affordance, Some(false));
+        assert!(!init.enable_file_checkpointing);
+        let request = init.build_request();
+        assert_eq!(request["promptSuggestions"], json!(false));
+        assert_eq!(request["forwardSubagentText"], json!(true));
+        assert_eq!(request["perTaskStopAffordance"], json!(false));
+
+        // A plain client: promptSuggestions defaults on, the other two are
+        // absent/false.
+        let bare = initialize_options_for(&json!({}), &plain, None).unwrap();
+        assert_eq!(bare.prompt_suggestions, Some(true));
+        assert_eq!(bare.per_task_stop_affordance, None);
+        assert!(!bare.forward_subagent_text);
+        assert!(bare.build_request().get("perTaskStopAffordance").is_none());
+
+        // The subagents RFD form defaults `perTaskStopAffordance` on and
+        // forwards nested text.
+        let rfd = ClientCapabilities::from_value(Some(&json!({"subagents": {}})));
+        let rfd_init = initialize_options_for(&json!({}), &rfd, None).unwrap();
+        assert_eq!(rfd_init.per_task_stop_affordance, Some(true));
+        assert!(rfd_init.forward_subagent_text);
+
+        // The client's own option wins over the RFD default.
+        let opt_out = initialize_options_for(
+            &json!({"_meta": {"claudeCode": {"options": {"perTaskStopAffordance": false}}}}),
+            &rfd,
+            None,
+        )
+        .unwrap();
+        assert_eq!(opt_out.per_task_stop_affordance, Some(false));
+
+        // The historical `_meta["subagent-transcript"]` capability also
+        // forwards nested text.
+        let transcript = ClientCapabilities::from_value(Some(&json!({
+            "_meta": {"subagent-transcript": true}
+        })));
+        assert!(
+            initialize_options_for(&json!({}), &transcript, None)
+                .unwrap()
+                .forward_subagent_text
+        );
+
+        // An AIR client that negotiated `agentFileChangeReport` enables
+        // checkpointing; the client option alone also does.
+        let air = AirClient::from_client_capabilities(&json!({
+            "_meta": {"jetbrains": {"air": {
+                "version": 1,
+                "capabilities": ["agentFileChangeReport"]
+            }}}
+        }));
+        let reporter = initialize_options_for(&json!({}), &plain, air.as_ref()).unwrap();
+        assert!(reporter.enable_file_checkpointing);
+        let opted_in = initialize_options_for(
+            &json!({"_meta": {"claudeCode": {"options": {"enableFileCheckpointing": true}}}}),
+            &plain,
+            None,
+        )
+        .unwrap();
+        assert!(opted_in.enable_file_checkpointing);
+    }
+
+    /// O-108/O-119/O-120/O-121/O-126/O-127/O-132/O-136 — the ACP path maps the
+    /// FX-1 options onto the argv, suppresses `--continue` for a session mirror,
+    /// never emits `--channels` (the SDK drops `Options.channels`, and the
+    /// captured `spawn-channels.argv.json` proves Node does too), and turns
+    /// checkpointing into the SDK env var.
+    #[test]
+    fn inv_57_session_spawn_options_fx1_and_channels_parity() {
+        let serve = ServeOptions::default();
+        let claude = crate::sdk_options::ClaudeOptions {
+            continue_conversation: true,
+            task_budget: Some("50000".into()),
+            json_schema: Some(r#"{"type":"object"}"#.into()),
+            debug: true,
+            session_mirror: true,
+            channels: vec!["alpha".into()],
+            permission_prompts: Some("none".into()),
+            enable_file_checkpointing: Some(true),
+            ..Default::default()
+        };
+        let spawn = session_spawn_options(
+            &serve,
+            None,
+            "sess".to_string(),
+            claude,
+            "default".to_string(),
+            false,
+            true,
+        );
+        let argv = crate::process::build_argv(&spawn);
+        for flag in [
+            "--task-budget=50000",
+            "--json-schema={\"type\":\"object\"}",
+            "--debug",
+            "--session-mirror",
+            "--permission-prompts=none",
+        ] {
+            assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
+        }
+        assert!(
+            !argv.iter().any(|a| a == "--continue"),
+            "a session mirror suppresses --continue: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--channels")),
+            "Node never forwards Options.channels, so the port must not either: {argv:?}"
+        );
+        assert!(
+            spawn.extra_env.iter().any(|(key, value)| key
+                == "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"
+                && value == "true"),
+            "checkpointing -> CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: {:?}",
+            spawn.extra_env
+        );
+
+        // Without checkpointing the env var is absent.
+        let spawn = session_spawn_options(
+            &serve,
+            None,
+            "sess".to_string(),
+            crate::sdk_options::ClaudeOptions::default(),
+            "default".to_string(),
+            false,
+            true,
+        );
+        assert!(!spawn
+            .extra_env
+            .iter()
+            .any(|(key, _)| key == "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"));
+    }
+
+    /// M-31 partial (F4b): a resumed session whose CLI reports
+    /// "No conversation found with session ID" answers `resourceNotFound`
+    /// (-32002) with `{uri}`; any other start failure keeps the internal-error
+    /// shape.
+    #[test]
+    fn inv_57_resumed_start_error_maps_resource_not_found() {
+        let missing = SessionError::Start(
+            "initialize handshake: No conversation found with session ID: abc".to_string(),
+        );
+        let err = resumed_start_error(&missing, true, "abc");
+        assert_eq!(i32::from(err.code), -32002);
+        assert_eq!(err.message, "Resource not found: abc");
+        assert_eq!(err.data, Some(json!({"uri": "abc"})));
+
+        // A fresh session keeps the generic error.
+        let err = resumed_start_error(&missing, false, "abc");
+        assert_eq!(i32::from(err.code), -32603);
+
+        // A different resume failure is not a missing resource.
+        let other = SessionError::Start("initialize handshake: boom".to_string());
+        assert_eq!(
+            i32::from(resumed_start_error(&other, true, "abc").code),
+            -32603
+        );
+    }
+
+    /// FX-4 (O-138) — ClaudeAcpAgent read_text_file and write_text_file passthrough.
+    #[tokio::test]
+    async fn inv_o138_claude_acp_agent_passthrough() {
+        use agent_client_protocol::schema::v1::{
+            ReadTextFileRequest, ReadTextFileResponse, WriteTextFileRequest, WriteTextFileResponse,
+        };
+        use agent_client_protocol::{Channel, Client, Responder};
+
+        let (agent_transport, client_transport) = Channel::duplex();
+
+        let client_fut = Client
+            .builder()
+            .on_receive_request(
+                |_req: ReadTextFileRequest, responder: Responder<ReadTextFileResponse>, _cx| async move {
+                    responder.respond(ReadTextFileResponse::new("read-success"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                |_req: WriteTextFileRequest, responder: Responder<WriteTextFileResponse>, _cx| async move {
+                    responder.respond(WriteTextFileResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_to(client_transport);
+
+        let agent_fut =
+            Agent
+                .builder()
+                .name("agent")
+                .connect_with(agent_transport, |connection| async move {
+                    let agent = ClaudeAcpAgent::new(connection);
+                    let read = agent
+                        .read_text_file(ReadTextFileRequest::new("s1", PathBuf::from("/a/b.txt")))
+                        .await
+                        .expect("read_text_file should succeed");
+                    assert_eq!(read.content, "read-success");
+
+                    let write = agent
+                        .write_text_file(WriteTextFileRequest::new(
+                            "s1",
+                            PathBuf::from("/a/b.txt"),
+                            "write-payload",
+                        ))
+                        .await
+                        .expect("write_text_file should succeed");
+                    let _ = write;
+                    Ok::<(), Error>(())
+                });
+
+        let (client_res, agent_res) = tokio::join!(client_fut, agent_fut);
+        assert!(client_res.is_ok());
+        assert!(agent_res.is_ok());
+    }
+
+    #[test]
+    fn test_format_uri_as_link() {
+        assert_eq!(
+            format_uri_as_link("file:///path/to/my_file.rs"),
+            "[@my_file.rs](file:///path/to/my_file.rs)"
+        );
+        assert_eq!(
+            format_uri_as_link("file://single_file"),
+            "[@single_file](file://single_file)"
+        );
+        assert_eq!(
+            format_uri_as_link("zed://workspace/src/lib.rs"),
+            "[@lib.rs](zed://workspace/src/lib.rs)"
+        );
+        assert_eq!(
+            format_uri_as_link("https://example.com/index.html"),
+            "https://example.com/index.html"
+        );
+        assert_eq!(
+            format_uri_as_link("custom-scheme://foo"),
+            "custom-scheme://foo"
         );
     }
 }

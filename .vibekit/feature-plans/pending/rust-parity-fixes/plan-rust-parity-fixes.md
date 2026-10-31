@@ -371,6 +371,8 @@ node -e 'const r=n=>JSON.parse(require("fs").readFileSync(n+"/summary.json","utf
 
 ### Verify phase 1
 
+> T1-G16 re-ran these at HEAD `180ace9`: plain and polluted `rust-gate.sh` -> `gate OK`, differential 3x ok; see `porting/parity/progress-G16.md`.
+
 - [x] 1.T1 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --test differential 2>&1 | grep -E "test result|FAILED"` -> ok; run 3 times
 - [x] 1.T2 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --lib 'inv_57|inv_58|inv_59|inv_68' 2>&1 | grep -E "test result|FAILED"` and `--test agent --test process_transport` -> ok
 - [x] 1.T3 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --lib turn 2>&1 | grep -E "test result|FAILED"` -> ok and `git diff baf3d5a --stat -- rust/claude-agent-acp-rs/src/turn.rs rust/claude-agent-acp-rs/src/turn/turn_tests.rs` shows no change from this phase
@@ -416,6 +418,8 @@ HIGH RISK: `session.rs` arms next to `on_result`. Phase constraints: Hard constr
 
 ### Verify phase 2
 
+> T1-G16 re-ran these at HEAD `180ace9` (same evidence as phase 1; fixture greps and guards hold).
+
 - [x] 2.T1 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --test differential 2>&1 | grep -E "test result|FAILED"` -> ok (50 passed); run 3 times (all ok)
 - [x] 2.T2 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --lib turn 2>&1 | grep -E "test result|FAILED"` -> ok; `git diff baf3d5a -- rust/claude-agent-acp-rs/src/turn/turn_tests.rs` shows only air-gaps' mechanical additions (turn.rs/turn_tests.rs unchanged since 455c146)
 - [x] 2.T3 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --lib 'inv_61|inv_62|inv_63' 2>&1 | grep -E "test result|FAILED"`; `--test agent` -> ok
@@ -436,19 +440,21 @@ Phase constraints: Hard constraints above apply; edit files ONLY with Write/Edit
 - [x] 3.4 Task* plan (X12, Decision 12): `task_state` in `SessionExt`, `applyTaskCreate/List/Update` helpers at Task* tool_result, `createTaskHook` for `hook_3`/`hook_4`, `publishTaskPlan`; units `inv_66_task_plan_*`; scripts `task-plan-hooks` (tool_result in the step that `expect`s the hook `control_response`) and `task-plan-no-hook`; `inv_24_task_plan_*`
 - [x] 3.5 Replay (Decision 14): `transcript.rs` + units on temp transcripts (`inv_67_chain_from_leaf`, `inv_67_hidden_meta_skipped`, `inv_67_local_command_metadata_stripped`, `inv_67_subagent_text_stripped`); `session/load` arm sends replay before the response; also for an already-live session (X8); scripts `session-load-replay` (seed a transcript with user text, assistant text + thinking + tool_use + tool_result, an image user message; the fake's `initialize` reply is paced with `sleep_ms` so replay always finishes first, M6), `session-load-replay-live` (load twice); `inv_24_session_load_replay`
 - [x] 3.6 P7 (Decision 7, moved from Phase 1, low severity): `permission_options.rs` + units `inv_60_options_edit_write_session_changeset`, `inv_60_options_read_glob_grep`, `inv_60_options_webfetch_skill_generic`, `inv_60_options_mcp_changeset_only`, `inv_60_options_default_to_no_order`, `inv_60_selection_effects` (Skill exact/prefix, WebFetch domain rule, generated `localSettings` rule); label goldens via `node -e` importing `dist/permissions/options.js`; scripts `permission-edit-always` (policy `allow_always`, suggestions `[{type:"setMode",mode:"acceptEdits",destination:"session"}]`), `permission-webfetch`, `permission-generic-tool`; `inv_24_permission_*`; PARITY rows 189-190 flipped
-- [ ] 3.7 Docs: PARITY P2 (elicitation `pending`, Decision 13), P7, P8, P9, P10 (+ `pending` rows: promptSuggestions publishing, MCP/refusal-fallback elicitation, ExitPlanMode options, AIR replay extras, X7, `options.permissionMode` ignored); INVARIANTS INV-60, INV-64..INV-67; update header test count; air-gaps follow-up note ("Phase 3 next")
-- [ ] 3.8 Clean-cache reproduction: `rm -rf rust/target/upstream/0.94.0; CAPTURE_OUT_DIR="$PWD/rust/target/upstream/final" bash porting/capture.sh >/dev/null 2>&1; diff -r porting/fixtures rust/target/upstream/final && echo STABLE`
+- [x] 3.7 Docs: PARITY P2 (elicitation `pending`, Decision 13), P7, P8, P9, P10 (+ `pending` rows: promptSuggestions publishing, MCP/refusal-fallback elicitation, ExitPlanMode options, AIR replay extras, X7, `options.permissionMode` ignored); INVARIANTS INV-60, INV-64..INV-67; update header test count; air-gaps follow-up note ("Phase 3 next")
+- [x] 3.8 Clean-cache reproduction: `rm -rf rust/target/upstream/0.94.0; CAPTURE_OUT_DIR="$PWD/rust/target/upstream/final" bash porting/capture.sh >/dev/null 2>&1; diff -r porting/fixtures rust/target/upstream/final && echo STABLE` (reproduced into rust/target/parity/final; STABLE)
 - [ ] 3.9 FINAL LIVE MATRIX — run by the ORCHESTRATOR after Phase 3 verifies, NOT by the implementer turn: `node $DRV` for ALL scenarios (`plain,perm_allow,perm_deny,edit_diff,write_new,cancel,steer,queued,resume,subagent,background,image,commands,model,ask_user,vst_meta_argv`) with `--label rust` and `--label bun094`, model `haiku`, then compare per scenario: `updateShape`, `result.stopReason`, `permissions[].options` kinds, `sessionNew.configOptions` ids, `claudeSpawns` argv + env KEY NAMES, `extra` keys; expected residual diffs (model wording, timing) are listed, anything structural is a defect to fix before closing; `write_new` is complemented by an overwrite scenario (write an existing file twice) run ad hoc through the same client class
 
 ### Verify phase 3
 
-- [ ] 3.T1 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --test differential 2>&1 | grep -E "test result|FAILED"` -> ok; run 3 times
-- [ ] 3.T2 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --lib 'inv_60|inv_64|inv_65|inv_66|inv_67' 2>&1 | grep -E "test result|FAILED"`; `--lib turn`; `--test system_prompt --test agent` -> ok
-- [ ] 3.T3 `grep -c 'toolResponse' porting/fixtures/hook-bash.frames.jsonl` >= 1; `grep -c 'structuredPatch\|"type":"diff"' porting/fixtures/hook-write-existing.frames.jsonl` >= 1; `grep -c 'user_message_chunk' porting/fixtures/session-load-replay.frames.jsonl` >= 1; `grep -c 'allow_always' porting/fixtures/permission-edit-always.frames.jsonl` >= 1; `grep -c 'plan' porting/fixtures/task-plan-hooks.frames.jsonl` >= 1
-- [ ] 3.T4 `grep -c '"hooks"' porting/fixtures/initialize.json` == 1 and `inv_39_initialize_matches_node` no longer drops `hooks`/`promptSuggestions` (`grep -c 'promptSuggestions' rust/claude-agent-acp-rs/tests/system_prompt.rs` shows no drop logic)
-- [ ] 3.T5 `rm`/`capture` STABLE check of 3.8 prints `STABLE`
-- [ ] 3.T6 `bash rust/scripts/rust-gate.sh 2>&1 | tail -4` ends `==> gate OK`; `bash rust/scripts/selftest-gate.sh 2>&1 | tail -3` no FAILED; G7 diff empty; `JsonPath::new` added count `0`; `workspace tests`: `cargo test --manifest-path rust/Cargo.toml --workspace 2>&1 | grep -E "test result|FAILED"` all ok
-- [ ] 3.T7 every item P1-P10 has a PARITY row (`for k in P1 P2 P3 P4 P5 P6 P7 P8 P9 P10; do grep -c "$k" porting/PARITY.md; done` prints no `0`) and the final matrix report is attached to the phase report
+> T1-G16 re-ran these at HEAD `180ace9` (differential 3x, fixture greps, guards); 3.9 stays with the orchestrator.
+
+- [x] 3.T1 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --test differential 2>&1 | grep -E "test result|FAILED"` -> ok; run 3 times
+- [x] 3.T2 `cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs --lib 'inv_60|inv_64|inv_65|inv_66|inv_67' 2>&1 | grep -E "test result|FAILED"`; `--lib turn`; `--test system_prompt --test agent` -> ok
+- [x] 3.T3 `grep -c 'toolResponse' porting/fixtures/hook-bash.frames.jsonl` >= 1; `grep -c 'structuredPatch\|"type":"diff"' porting/fixtures/hook-write-existing.frames.jsonl` >= 1; `grep -c 'user_message_chunk' porting/fixtures/session-load-replay.frames.jsonl` >= 1; `grep -c 'allow_always' porting/fixtures/permission-edit-always.frames.jsonl` >= 1; `grep -c 'plan' porting/fixtures/task-plan-hooks.frames.jsonl` >= 1
+- [x] 3.T4 `grep -c '"hooks"' porting/fixtures/initialize.json` == 1 and `inv_39_initialize_matches_node` no longer drops `hooks`/`promptSuggestions` (`grep -c 'promptSuggestions' rust/claude-agent-acp-rs/tests/system_prompt.rs` shows no drop logic)
+- [x] 3.T5 `rm`/`capture` STABLE check of 3.8 prints `STABLE`
+- [x] 3.T6 `bash rust/scripts/rust-gate.sh 2>&1 | tail -4` ends `==> gate OK`; `bash rust/scripts/selftest-gate.sh 2>&1 | tail -3` no FAILED; G7 diff empty; `JsonPath::new` added count `0`; `workspace tests`: `cargo test --manifest-path rust/Cargo.toml --workspace 2>&1 | grep -E "test result|FAILED"` all ok
+- [x] 3.T7 every item P1-P10 has a PARITY row (`for k in P1 P2 P3 P4 P5 P6 P7 P8 P9 P10; do grep -c "$k" porting/PARITY.md; done` prints no `0`) and the final matrix report is attached to the phase report
 
 ## Files & Phase Impact
 

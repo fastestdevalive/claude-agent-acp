@@ -41,6 +41,84 @@ pub enum PluginDelivery {
     Initialize,
 }
 
+/// One entry of the `emitRawSDKMessages` filter list (`SDKMessageFilter`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSdkMessageFilter {
+    /// `type` — matched exactly against the SDK message's `type`.
+    pub type_: String,
+    /// `subtype` — when present, must equal the message's `subtype`.
+    pub subtype: Option<String>,
+    /// `origin` — when present, must equal the message's `origin.kind`.
+    pub origin: Option<String>,
+}
+
+/// `_meta.claudeCode.emitRawSDKMessages` (`acp-agent.ts:1731-1773`): whether
+/// every raw SDK message is forwarded as the `_claude/sdkMessage` ext
+/// notification, only the filtered ones, or none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RawSdkMessages {
+    /// `false` / absent (the default): emit nothing.
+    #[default]
+    Off,
+    /// `true`: emit every message.
+    All,
+    /// An `SDKMessageFilter[]`: emit a message matching at least one filter.
+    Filters(Vec<RawSdkMessageFilter>),
+}
+
+/// `shouldEmitRawMessage` (`acp-agent.ts:11841-11853`).
+pub fn should_emit_raw_message(config: &RawSdkMessages, message: &Value) -> bool {
+    match config {
+        RawSdkMessages::Off => false,
+        RawSdkMessages::All => true,
+        RawSdkMessages::Filters(filters) => {
+            let type_ = message.get("type").and_then(Value::as_str).unwrap_or("");
+            let subtype = message.get("subtype").and_then(Value::as_str);
+            let origin = message.pointer("/origin/kind").and_then(Value::as_str);
+            filters.iter().any(|filter| {
+                filter.type_ == type_
+                    && filter
+                        .subtype
+                        .as_deref()
+                        .is_none_or(|wanted| Some(wanted) == subtype)
+                    && filter
+                        .origin
+                        .as_deref()
+                        .is_none_or(|wanted| Some(wanted) == origin)
+            })
+        }
+    }
+}
+
+/// Parse `emitRawSDKMessages`; an unusable value (not a boolean or array) is
+/// treated as off (Node would throw from `config.some`, but the option only
+/// reaches a message loop that cannot recover anyway).
+fn parse_raw_sdk_messages(value: Option<&Value>) -> RawSdkMessages {
+    match value {
+        Some(Value::Bool(true)) => RawSdkMessages::All,
+        Some(Value::Array(filters)) => RawSdkMessages::Filters(
+            filters
+                .iter()
+                .filter_map(|filter| {
+                    let object = filter.as_object()?;
+                    Some(RawSdkMessageFilter {
+                        type_: object.get("type").and_then(Value::as_str)?.to_string(),
+                        subtype: object
+                            .get("subtype")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        origin: object
+                            .get("origin")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    })
+                })
+                .collect(),
+        ),
+        _ => RawSdkMessages::Off,
+    }
+}
+
 /// One `_meta.claudeCode.options.plugins` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plugin {
@@ -86,6 +164,10 @@ pub struct ClaudeOptions {
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub tools: Option<Vec<String>>,
+    /// `toolAliases` (O-155).
+    pub tool_aliases: Option<Value>,
+    /// `toolConfig` (O-161).
+    pub tool_config: Option<Value>,
     pub effort: Option<String>,
     pub max_turns: Option<u32>,
     pub max_budget_usd: Option<f64>,
@@ -129,8 +211,51 @@ pub struct ClaudeOptions {
     /// The pre-serialised `--mcp-config` payload (`{"mcpServers":{...}}`), or
     /// `None` when no server was supplied.
     pub mcp_config: Option<String>,
-    /// The `--settings` extra-arg value (JSON), resolved by `spawn_inputs`.
+    /// `settings` extra-arg value (JSON), resolved by `spawn_inputs`.
     pub settings_arg: Option<String>,
+    /// `--managed-settings` extra-arg value (path or JSON), O-122.
+    pub managed_settings_arg: Option<String>,
+    /// `continue` -> `--continue` (O-108). Suppressed by a `sessionStore`
+    /// exactly like the SDK's `continueConversation: sessionStore ? void 0`.
+    pub continue_conversation: bool,
+    /// `taskBudget.total` -> `--task-budget=<n>` (O-119), pre-formatted the
+    /// way `String(number)` prints it.
+    pub task_budget: Option<String>,
+    /// `outputFormat:{type:"json_schema",schema}` -> `--json-schema=<json>`
+    /// (O-120); absent for any other output format.
+    pub json_schema: Option<String>,
+    /// `debug` -> `--debug` (O-121).
+    pub debug: bool,
+    /// `debugFile` -> `--debug-file=<path>`, which wins over `debug` (O-121).
+    pub debug_file: Option<String>,
+    /// A truthy `sessionStore` -> `--session-mirror` (O-126); the SDK maps
+    /// `sessionMirror: !!sessionStore`.
+    pub session_mirror: bool,
+    /// `channels` -> one `--channels=<c>` per entry (O-127).
+    pub channels: Vec<String>,
+    /// `permissionPrompts` -> `--permission-prompts=<v>` (O-132).
+    pub permission_prompts: Option<String>,
+    /// `perTaskStopAffordance` (O-84); `None` lets the RFD default apply.
+    pub per_task_stop_affordance: Option<bool>,
+    /// `enableFileCheckpointing` (O-136); also set for an AIR
+    /// `agentFileChangeReport` client. Reaches the CLI as the
+    /// `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` env var.
+    pub enable_file_checkpointing: Option<bool>,
+    /// `forwardSubagentText` (O-85): flattened child transcript.
+    pub forward_subagent_text: Option<bool>,
+    /// `emitRawSDKMessages` (U-10).
+    pub raw_sdk_messages: RawSdkMessages,
+}
+
+/// JavaScript truthiness for the option values Node tests with `if (value)`.
+fn js_truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(boolean)) => *boolean,
+        Some(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0 && !n.is_nan()),
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Array(_)) | Some(Value::Object(_)) => true,
+    }
 }
 
 fn opt_str(opts: &Value, key: &str) -> Option<String> {
@@ -722,6 +847,32 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         Some(_) => (PluginDelivery::Argv, true),
     };
 
+    // `--task-budget`: `String(taskBudget.total)` (`sdk.mjs` ProcessTransport).
+    let task_budget = opts
+        .get("taskBudget")
+        .filter(|value| js_truthy(Some(value)))
+        .and_then(|value| value.get("total"))
+        .and_then(|total| match total {
+            Value::Number(number) => Some(number.to_string()),
+            Value::String(text) => Some(text.clone()),
+            _ => None,
+        });
+
+    // `--json-schema`: the SDK derives it from `outputFormat` only
+    // (`av = outputFormat?.type === "json_schema" ? outputFormat.schema : undefined`).
+    let json_schema = opts
+        .get("outputFormat")
+        .filter(|output| output.get("type").and_then(Value::as_str) == Some("json_schema"))
+        .and_then(|output| output.get("schema"))
+        .filter(|schema| js_truthy(Some(schema)))
+        .and_then(|schema| serde_json::to_string(schema).ok());
+
+    let debug = js_truthy(opts.get("debug"));
+    let debug_file = opt_str(&opts, "debugFile").filter(|path| !path.is_empty());
+    let session_mirror = js_truthy(opts.get("sessionStore"));
+    let continue_conversation = js_truthy(opts.get("continue"));
+    let permission_prompts = opt_str(&opts, "permissionPrompts").filter(|value| !value.is_empty());
+
     ClaudeOptions {
         model: opt_str(&opts, "model"),
         betas: opt_str_ary(&opts, "betas"),
@@ -730,6 +881,8 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         allowed_tools: opt_str_ary(&opts, "allowedTools"),
         disallowed_tools: opt_str_ary(&opts, "disallowedTools"),
         tools,
+        tool_aliases: opts.get("toolAliases").filter(|v| !v.is_null()).cloned(),
+        tool_config: opts.get("toolConfig").filter(|v| !v.is_null()).cloned(),
         effort: opt_str(&opts, "effort"),
         max_turns: opts
             .get("maxTurns")
@@ -774,6 +927,27 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         sandbox: opts.get("sandbox").cloned(),
         mcp_config: mcp_config_json(&user_mcp_servers, &acp_mcp_servers),
         settings_arg: None,
+        managed_settings_arg: opts
+            .get("managedSettings")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::to_string(v).ok()),
+        continue_conversation,
+        task_budget,
+        json_schema,
+        debug,
+        debug_file,
+        session_mirror,
+        channels: opt_str_ary(&opts, "channels"),
+        permission_prompts,
+        per_task_stop_affordance: opts.get("perTaskStopAffordance").and_then(Value::as_bool),
+        enable_file_checkpointing: opts.get("enableFileCheckpointing").and_then(Value::as_bool),
+        forward_subagent_text: opts.get("forwardSubagentText").and_then(Value::as_bool),
+        raw_sdk_messages: parse_raw_sdk_messages(
+            params
+                .get("_meta")
+                .and_then(|meta| meta.get("claudeCode"))
+                .and_then(|claude| claude.get("emitRawSDKMessages")),
+        ),
     }
 }
 
@@ -1443,5 +1617,262 @@ mod tests {
         assert!(!build_argv(&spawn)
             .iter()
             .any(|a| a == "--no-session-persistence"));
+    }
+
+    /// O-108/O-119/O-120/O-121/O-132 — the FX-1 argv flags in the SDK's exact
+    /// order: `--task-budget` after `--max-budget-usd`; `--json-schema` and
+    /// `--debug` after `--betas` and before `--permission-prompt-tool`;
+    /// `--permission-prompts` then `--continue` then `--resume`.
+    #[test]
+    fn inv_57_argv_fx1_order() {
+        let mut opts = base_spawn();
+        opts.max_budget_usd = Some(1.5);
+        opts.task_budget = Some("50000".into());
+        opts.model = Some("haiku".into());
+        opts.json_schema = Some(r#"{"type":"object"}"#.into());
+        opts.debug = true;
+        opts.permission_prompts = Some("none".into());
+        opts.continue_conversation = true;
+        opts.resume = Some("abc".into());
+
+        let argv = build_argv(&opts);
+        let idx = |needle: &str| {
+            argv.iter()
+                .position(|a| a == needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {argv:?}"))
+        };
+        assert!(idx("--max-budget-usd=1.5") < idx("--task-budget=50000"));
+        assert!(idx("--task-budget=50000") < idx("--model=haiku"));
+        assert!(idx("--model=haiku") < idx("--json-schema={\"type\":\"object\"}"));
+        assert!(idx("--json-schema={\"type\":\"object\"}") < idx("--debug"));
+        assert!(idx("--debug") < idx("--permission-prompt-tool=stdio"));
+        assert!(idx("--permission-prompt-tool=stdio") < idx("--permission-prompts=none"));
+        assert!(idx("--permission-prompts=none") < idx("--continue"));
+        assert!(idx("--continue") < idx("--resume=abc"));
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--continue").count(),
+            1,
+            "one --continue token: {argv:?}"
+        );
+    }
+
+    /// O-121 — `debugFile` wins over `debug` and emits `--debug-file=<path>`.
+    #[test]
+    fn inv_57_argv_debug_file_wins() {
+        let mut opts = base_spawn();
+        opts.debug = true;
+        opts.debug_file = Some("/var/log/claude.txt".into());
+        let argv = build_argv(&opts);
+        assert!(argv.iter().any(|a| a == "--debug-file=/var/log/claude.txt"));
+        assert!(!argv.iter().any(|a| a == "--debug"), "{argv:?}");
+
+        // Only `debug` set -> the bare flag.
+        let mut opts = base_spawn();
+        opts.debug = true;
+        assert!(build_argv(&opts).iter().any(|a| a == "--debug"));
+    }
+
+    /// O-126/O-108 — `--session-mirror` follows `--include-partial-messages`
+    /// and precedes `--project-config-root`; a `sessionStore` suppresses
+    /// `--continue` exactly like the SDK's `continueConversation` ternary.
+    #[test]
+    fn inv_57_argv_session_mirror_order() {
+        let mut opts = base_spawn();
+        opts.session_mirror = true;
+        opts.project_config_root = Some("/proj".into());
+        opts.continue_conversation = true;
+        let argv = build_argv(&opts);
+        let idx = |needle: &str| argv.iter().position(|a| a == needle).unwrap();
+        assert!(idx("--include-partial-messages") < idx("--session-mirror"));
+        assert!(idx("--session-mirror") < idx("--project-config-root=/proj"));
+        assert!(
+            !argv.iter().any(|a| a == "--continue"),
+            "sessionStore suppresses --continue: {argv:?}"
+        );
+    }
+
+    /// O-127 — the SDK's argv builder emits one `--channels` per entry after
+    /// `--resume` and before `--allowedTools`; the adapter never reaches it
+    /// (the SDK does not forward `Options.channels`), so the ACP path stays
+    /// silent (covered by the `spawn-channels` Node fixture).
+    #[test]
+    fn inv_57_argv_channels_sdk_builder() {
+        let mut opts = base_spawn();
+        opts.resume = Some("abc".into());
+        opts.allowed_tools = vec!["Read".into()];
+        opts.channels = vec!["alpha".into(), "beta".into()];
+        let argv = build_argv(&opts);
+        let resume = argv.iter().position(|a| a == "--resume=abc").unwrap();
+        let alpha = argv.iter().position(|a| a == "--channels=alpha").unwrap();
+        let beta = argv.iter().position(|a| a == "--channels=beta").unwrap();
+        let allowed = argv
+            .iter()
+            .position(|a| a == "--allowedTools=Read")
+            .unwrap();
+        assert!(resume < alpha && alpha < beta && beta < allowed);
+    }
+
+    /// The FX-1 / F4b option keys parse from `_meta.claudeCode.options`, and
+    /// `emitRawSDKMessages` from `_meta.claudeCode`.
+    #[test]
+    fn inv_57_fx1_and_f4b_option_parsing() {
+        let params = json!({
+            "_meta": {"claudeCode": {
+                "emitRawSDKMessages": [
+                    {"type": "assistant"},
+                    {"type": "system", "subtype": "init"},
+                    {"type": "result", "origin": "human"}
+                ],
+                "options": {
+                    "continue": true,
+                    "taskBudget": {"total": 50000},
+                    "outputFormat": {"type": "json_schema", "schema": {"type": "object"}},
+                    "debug": true,
+                    "debugFile": "/tmp/d.txt",
+                    "sessionStore": {"kind": "memory"},
+                    "channels": ["alpha"],
+                    "permissionPrompts": "none",
+                    "perTaskStopAffordance": false,
+                    "enableFileCheckpointing": true,
+                    "forwardSubagentText": true
+                }
+            }}
+        });
+        let o = claude_options(&params);
+        assert!(o.continue_conversation);
+        assert_eq!(o.task_budget.as_deref(), Some("50000"));
+        assert_eq!(o.json_schema.as_deref(), Some(r#"{"type":"object"}"#));
+        assert!(o.debug);
+        assert_eq!(o.debug_file.as_deref(), Some("/tmp/d.txt"));
+        assert!(o.session_mirror);
+        assert_eq!(o.channels, vec!["alpha".to_string()]);
+        assert_eq!(o.permission_prompts.as_deref(), Some("none"));
+        assert_eq!(o.per_task_stop_affordance, Some(false));
+        assert_eq!(o.enable_file_checkpointing, Some(true));
+        assert_eq!(o.forward_subagent_text, Some(true));
+        assert_eq!(
+            o.raw_sdk_messages,
+            RawSdkMessages::Filters(vec![
+                RawSdkMessageFilter {
+                    type_: "assistant".into(),
+                    subtype: None,
+                    origin: None
+                },
+                RawSdkMessageFilter {
+                    type_: "system".into(),
+                    subtype: Some("init".into()),
+                    origin: None
+                },
+                RawSdkMessageFilter {
+                    type_: "result".into(),
+                    subtype: None,
+                    origin: Some("human".into())
+                }
+            ])
+        );
+
+        // A non-`json_schema` output format emits no schema.
+        let plain = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "outputFormat": {"type": "text"}
+            }}}
+        }));
+        assert_eq!(plain.json_schema, None);
+
+        // A missing `total`/non-boolean debug is not a flag.
+        let absent = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "taskBudget": {},
+                "continue": false,
+                "sessionStore": null,
+                "debugFile": ""
+            }}}
+        }));
+        assert_eq!(absent.task_budget, None);
+        assert!(!absent.continue_conversation);
+        assert!(!absent.session_mirror);
+        assert_eq!(absent.debug_file, None);
+
+        // `true` / `false` / absent forms.
+        assert_eq!(
+            claude_options(&json!({"_meta": {"claudeCode": {"emitRawSDKMessages": true}}}))
+                .raw_sdk_messages,
+            RawSdkMessages::All
+        );
+        assert_eq!(
+            claude_options(&json!({"_meta": {"claudeCode": {"emitRawSDKMessages": false}}}))
+                .raw_sdk_messages,
+            RawSdkMessages::Off
+        );
+        assert_eq!(
+            claude_options(&json!({})).raw_sdk_messages,
+            RawSdkMessages::Off
+        );
+    }
+
+    /// U-10 — `shouldEmitRawMessage` (`acp-agent.ts:11841-11853`): `true` emits
+    /// everything, `false` nothing, and a filter list matches on type, optional
+    /// subtype and optional `origin.kind`.
+    #[test]
+    fn inv_57_raw_sdk_message_filter() {
+        let assistant = json!({"type": "assistant"});
+        let init = json!({"type": "system", "subtype": "init"});
+        let human = json!({"type": "result", "origin": {"kind": "human"}});
+
+        assert!(should_emit_raw_message(&RawSdkMessages::All, &assistant));
+        assert!(!should_emit_raw_message(&RawSdkMessages::Off, &assistant));
+
+        let filters = RawSdkMessages::Filters(vec![
+            RawSdkMessageFilter {
+                type_: "system".into(),
+                subtype: Some("init".into()),
+                origin: None,
+            },
+            RawSdkMessageFilter {
+                type_: "result".into(),
+                subtype: None,
+                origin: Some("human".into()),
+            },
+        ]);
+        assert!(!should_emit_raw_message(&filters, &assistant));
+        assert!(should_emit_raw_message(&filters, &init));
+        assert!(should_emit_raw_message(&filters, &human));
+        // A subtype filter does not match a message without that subtype.
+        assert!(!should_emit_raw_message(
+            &filters,
+            &json!({"type": "system"})
+        ));
+        // An origin filter does not match a message whose origin differs.
+        assert!(!should_emit_raw_message(
+            &filters,
+            &json!({"type": "result", "origin": {"kind": "model"}})
+        ));
+    }
+
+    #[test]
+    fn inv_o155_o161_tool_aliases_and_tool_config() {
+        let params = json!({
+            "_meta": {
+                "claudeCode": {
+                    "options": {
+                        "toolAliases": {
+                            "Read": "MyReader"
+                        },
+                        "toolConfig": {
+                            "Bash": {
+                                "timeout": 30
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let opts = claude_options(&params);
+        assert_eq!(opts.tool_aliases, Some(json!({ "Read": "MyReader" })));
+        assert_eq!(opts.tool_config, Some(json!({ "Bash": { "timeout": 30 } })));
+
+        let empty = claude_options(&json!({}));
+        assert_eq!(empty.tool_aliases, None);
+        assert_eq!(empty.tool_config, None);
     }
 }

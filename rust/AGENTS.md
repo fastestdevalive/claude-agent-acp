@@ -27,6 +27,6 @@ Every implementer phase follows, in order:
 ## Rules
 
 - Session state lives in a **single session-state owner actor** — no `Arc<Mutex<Session>>` (Decision D4, guard G5).
-- Only `process.rs` may use `cfg(unix)` / `cfg(windows)` (guard G9); `#![forbid(unsafe_code)]` everywhere (D12, `rust-coding` §1).
+- Only `process.rs` may use `cfg(unix)` / `cfg(windows)` (guard G9); `#![forbid(unsafe_code)]` on every non-Windows target, and `#![deny(unsafe_code)]` on Windows with a scoped `#[allow(unsafe_code)]` only in `process.rs`'s private `windows_job` module for Win32 Job Object FFI (Decision D8, amending D12/R33 for Windows only; `forbid` cannot coexist with an inner module `allow`).
 - Every test runs under an explicit `timeout` (guard G3, `rust-coding` §9) — a hang is a failure, same severity as a panic.
 - Dependency pin: `agent-client-protocol` held at `2.1.0` with schema `1.7.0` (guard G10, Decision D9).

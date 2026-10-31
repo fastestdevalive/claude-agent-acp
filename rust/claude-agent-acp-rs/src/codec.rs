@@ -14,7 +14,7 @@
 //! is cancel-safe: a cancel that races the reader task never drops a line that
 //! was already enqueued (INV-32).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use agent_client_protocol::{Agent, ConnectTo, Lines};
@@ -201,6 +201,13 @@ pub fn invalid_request_reply(value: &Value) -> Value {
     })
 }
 
+/// Cap on the correlation entries kept in one direction. The writer only needs
+/// the map to translate a later `$/cancel_request`, and the reader removes an
+/// entry as soon as its response arrives; a never-answered entry is evicted
+/// once this many newer ids exist, so the maps cannot grow without bound over
+/// the process lifetime.
+const MAX_TRACKED_IDS: usize = 4096;
+
 /// Outgoing request-id translation for the stdio transport.
 ///
 /// Node's ACP SDK allocates outgoing request ids as numbers (`nextRequestId++`,
@@ -213,6 +220,8 @@ pub struct RequestIds {
     next: u64,
     by_string: HashMap<String, u64>,
     by_number: HashMap<u64, String>,
+    /// Insertion order of the assigned numbers, for the age-out cap.
+    order: VecDeque<u64>,
 }
 
 impl RequestIds {
@@ -225,44 +234,89 @@ impl RequestIds {
         self.next += 1;
         self.by_string.insert(id.to_string(), number);
         self.by_number.insert(number, id.to_string());
+        self.order.push_back(number);
+        self.evict_oldest();
         number
+    }
+
+    /// Drop the oldest never-answered entries once the map is over its cap.
+    fn evict_oldest(&mut self) {
+        while self.order.len() > MAX_TRACKED_IDS {
+            let Some(number) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(id) = self.by_number.remove(&number) {
+                self.by_string.remove(&id);
+            }
+        }
     }
 
     /// Remember a `(number, string id)` pair assigned by the writer side, so
     /// the reader can map the client's numeric reply back.
     pub fn remember(&mut self, number: u64, id: &str) {
         self.by_number.insert(number, id.to_string());
+        self.order.push_back(number);
+        self.evict_oldest();
+    }
+
+    /// Number of correlation entries currently held (test/observability).
+    pub fn tracked_len(&self) -> usize {
+        self.by_number.len()
     }
 
     /// Rewrite one outgoing value in place: a request's `id` becomes a number,
     /// and an outgoing `$/cancel_request`'s `params.requestId` follows the same
-    /// mapping. Returns the newly assigned `(number, original id)` pair (if
-    /// any) so the reader can remember it.
-    pub fn rewrite_outgoing(&mut self, value: &mut Value) -> Option<(u64, String)> {
-        let object = value.as_object_mut()?;
-        let method = object.get("method").and_then(Value::as_str)?;
-        if method == "$/cancel_request" {
-            let params = object.get_mut("params").and_then(Value::as_object_mut)?;
-            let request_id = params
-                .get("requestId")
-                .and_then(Value::as_str)
-                .map(str::to_string)?;
-            let number = self.by_string.get(&request_id).copied()?;
-            params.insert("requestId".to_string(), json!(number));
-            return None;
+    /// mapping. Batches (arrays) are rewritten item by item. Returns every
+    /// newly assigned `(number, original id)` pair so the reader can remember
+    /// them all — a batch member's response needs its own mapping back.
+    pub fn rewrite_outgoing(&mut self, value: &mut Value) -> Vec<(u64, String)> {
+        match value {
+            Value::Array(items) => {
+                let mut assigned = Vec::new();
+                for item in items {
+                    assigned.extend(self.rewrite_outgoing(item));
+                }
+                assigned
+            }
+            Value::Object(object) => {
+                let Some(method) = object.get("method").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                if method == "$/cancel_request" {
+                    let params = object.get_mut("params").and_then(Value::as_object_mut);
+                    let Some(params) = params else {
+                        return Vec::new();
+                    };
+                    let request_id = params
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let Some(request_id) = request_id else {
+                        return Vec::new();
+                    };
+                    let number = self.by_string.get(&request_id).copied();
+                    let Some(number) = number else {
+                        return Vec::new();
+                    };
+                    params.insert("requestId".to_string(), json!(number));
+                    return Vec::new();
+                }
+                let id = object.get("id").and_then(Value::as_str).map(str::to_string);
+                let Some(id) = id else {
+                    return Vec::new();
+                };
+                let number = self.number_for(&id);
+                object.insert("id".to_string(), json!(number));
+                vec![(number, id)]
+            }
+            _ => Vec::new(),
         }
-        let id = object
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)?;
-        let number = self.number_for(&id);
-        object.insert("id".to_string(), json!(number));
-        Some((number, id))
     }
 
     /// Rewrite one incoming value in place: a response to one of our requests
     /// gets the crate's original string id back (batches are handled member by
-    /// member). Client requests keep their own ids untouched.
+    /// member), and its correlation entry is dropped. Client requests keep
+    /// their own ids untouched.
     pub fn rewrite_incoming(&mut self, value: &mut Value) {
         match value {
             Value::Array(items) => {
@@ -277,7 +331,7 @@ impl RequestIds {
                 let Some(id) = object.get("id").and_then(Value::as_u64) else {
                     return;
                 };
-                let Some(original) = self.by_number.get(&id).cloned() else {
+                let Some(original) = self.by_number.remove(&id) else {
                     return;
                 };
                 object.insert("id".to_string(), Value::String(original));
@@ -293,10 +347,11 @@ fn wire_line(value: &Value) -> String {
 }
 
 /// Rewrite an outgoing wire line (crate -> client) through [`RequestIds`],
-/// also returning any newly assigned `(number, original id)` mapping.
-pub fn rewrite_outgoing_line(line: &str, ids: &mut RequestIds) -> (String, Option<(u64, String)>) {
+/// also returning every newly assigned `(number, original id)` mapping (a batch
+/// has one per member).
+pub fn rewrite_outgoing_line(line: &str, ids: &mut RequestIds) -> (String, Vec<(u64, String)>) {
     let Ok(mut value) = serde_json::from_str::<Value>(line) else {
-        return (line.to_string(), None);
+        return (line.to_string(), Vec::new());
     };
     let assigned = ids.rewrite_outgoing(&mut value);
     (wire_line(&value), assigned)
@@ -513,7 +568,7 @@ impl ConnectTo<Agent> for WireTransport {
             (outgoing, assigned_tx, RequestIds::default()),
             |(tx, assigned_tx, mut ids), line: String| async move {
                 let (rewritten, assigned) = rewrite_outgoing_line(&line, &mut ids);
-                if let Some((number, id)) = assigned {
+                for (number, id) in assigned {
                     let _ = assigned_tx.send((number, id));
                 }
                 tx.unbounded_send(rewritten)
@@ -728,7 +783,7 @@ mod tests {
         });
         assert_eq!(
             ids.rewrite_outgoing(&mut request),
-            Some((0, "11111111-1111-1111-1111-111111111111".to_string()))
+            vec![(0, "11111111-1111-1111-1111-111111111111".to_string())]
         );
         assert_eq!(request["id"], json!(0));
 
@@ -740,13 +795,15 @@ mod tests {
         });
         assert_eq!(
             ids.rewrite_outgoing(&mut second),
-            Some((1, "22222222-2222-2222-2222-222222222222".to_string()))
+            vec![(1, "22222222-2222-2222-2222-222222222222".to_string())]
         );
         assert_eq!(second["id"], json!(1));
 
         let mut reply = json!({"jsonrpc": "2.0", "id": 0, "result": {}});
         ids.rewrite_incoming(&mut reply);
         assert_eq!(reply["id"], "11111111-1111-1111-1111-111111111111");
+        // The answered request is pruned from the correlation map.
+        assert_eq!(ids.tracked_len(), 1);
 
         // A client request that happens to reuse the number 0 keeps its id.
         let mut client_request =
@@ -777,7 +834,7 @@ mod tests {
             "method": "$/cancel_request",
             "params": {"requestId": "abc-uuid"}
         });
-        assert_eq!(ids.rewrite_outgoing(&mut cancel), None);
+        assert!(ids.rewrite_outgoing(&mut cancel).is_empty());
         assert_eq!(cancel["params"]["requestId"], json!(0));
 
         // A batch of responses is rewritten member by member.
@@ -798,7 +855,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":"u-1","method":"session/request_permission","params":{}}"#,
             &mut ids,
         );
-        assert_eq!(assigned, Some((0, "u-1".to_string())));
+        assert_eq!(assigned, vec![(0, "u-1".to_string())]);
         let value: Value = serde_json::from_str(&outgoing).expect("valid JSON");
         assert_eq!(value["id"], json!(0));
 
@@ -810,7 +867,7 @@ mod tests {
         // it to the crate; it is answered as a parse error).
         assert_eq!(
             rewrite_outgoing_line("nope", &mut ids),
-            ("nope".to_string(), None)
+            ("nope".to_string(), Vec::new())
         );
     }
 
@@ -883,5 +940,199 @@ mod tests {
             "the numeric reply must map back to the uuid"
         );
         handle.join().expect("reader thread ends");
+    }
+
+    #[test]
+    fn inv_79_ids_sequential_from_zero() {
+        let mut ids = RequestIds::default();
+        let mut req0 = json!({"jsonrpc":"2.0","id":"uuid-a","method":"session/request_permission","params":{}});
+        let mut req1 = json!({"jsonrpc":"2.0","id":"uuid-b","method":"session/request_permission","params":{}});
+        let mut req2 = json!({"jsonrpc":"2.0","id":"uuid-c","method":"session/request_permission","params":{}});
+
+        let res0 = ids.rewrite_outgoing(&mut req0);
+        assert_eq!(res0, vec![(0, "uuid-a".to_string())]);
+        assert_eq!(req0["id"], 0);
+
+        let res1 = ids.rewrite_outgoing(&mut req1);
+        assert_eq!(res1, vec![(1, "uuid-b".to_string())]);
+        assert_eq!(req1["id"], 1);
+
+        let res2 = ids.rewrite_outgoing(&mut req2);
+        assert_eq!(res2, vec![(2, "uuid-c".to_string())]);
+        assert_eq!(req2["id"], 2);
+
+        // Same string id re-uses the allocated number
+        let mut req0_dup = json!({"jsonrpc":"2.0","id":"uuid-a","method":"session/request_permission","params":{}});
+        let res0_dup = ids.rewrite_outgoing(&mut req0_dup);
+        assert_eq!(res0_dup, vec![(0, "uuid-a".to_string())]);
+        assert_eq!(req0_dup["id"], 0);
+    }
+
+    #[test]
+    fn inv_79_response_id_restored_and_unknown_passes() {
+        let mut ids = RequestIds::default();
+        let mut req = json!({"jsonrpc":"2.0","id":"uuid-x","method":"session/request_permission","params":{}});
+        ids.rewrite_outgoing(&mut req);
+
+        let mut res = json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}});
+        ids.rewrite_incoming(&mut res);
+        assert_eq!(res["id"], "uuid-x");
+
+        let mut unknown_res = json!({"jsonrpc":"2.0","id":999,"result":{}});
+        ids.rewrite_incoming(&mut unknown_res);
+        assert_eq!(unknown_res["id"], 999);
+    }
+
+    #[test]
+    fn inv_79_cancel_request_id_rewritten() {
+        let mut ids = RequestIds::default();
+        let mut req = json!({"jsonrpc":"2.0","id":"uuid-cancelling","method":"session/request_permission","params":{}});
+        ids.rewrite_outgoing(&mut req);
+
+        let mut cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancel_request",
+            "params": {
+                "requestId": "uuid-cancelling"
+            }
+        });
+        let res = ids.rewrite_outgoing(&mut cancel);
+        assert!(res.is_empty());
+        assert_eq!(cancel["params"]["requestId"], 0);
+    }
+
+    #[test]
+    fn inv_79_batch_entries_mapped() {
+        // The writer and the reader own separate maps in the transport: the
+        // writer assigns, the reader remembers each pair it is sent. A single
+        // map for both directions would hide a batch member losing its pair.
+        let mut writer = RequestIds::default();
+        let mut reader = RequestIds::default();
+        let mut batch_req = json!([
+            {"jsonrpc":"2.0","id":"u1","method":"m1","params":{}},
+            {"jsonrpc":"2.0","id":"u2","method":"m2","params":{}}
+        ]);
+        let assigned = writer.rewrite_outgoing(&mut batch_req);
+        assert_eq!(
+            assigned,
+            vec![(0, "u1".to_string()), (1, "u2".to_string())],
+            "every batch member must return its own pair"
+        );
+        assert_eq!(batch_req[0]["id"], 0);
+        assert_eq!(batch_req[1]["id"], 1);
+        for (number, id) in assigned {
+            reader.remember(number, &id);
+        }
+
+        let mut batch_res = json!([
+            {"jsonrpc":"2.0","id":0,"result":"r1"},
+            {"jsonrpc":"2.0","id":1,"result":"r2"}
+        ]);
+        reader.rewrite_incoming(&mut batch_res);
+        assert_eq!(batch_res[0]["id"], "u1");
+        assert_eq!(batch_res[1]["id"], "u2");
+        assert_eq!(reader.tracked_len(), 0, "both answered pairs are pruned");
+    }
+
+    #[test]
+    fn inv_79_notifications_and_client_requests_untouched() {
+        let mut ids = RequestIds::default();
+        let mut notif = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s"}
+        });
+        let res = ids.rewrite_outgoing(&mut notif);
+        assert!(res.is_empty());
+        assert!(notif.get("id").is_none());
+
+        let mut client_req = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "session/prompt",
+            "params": {}
+        });
+        ids.rewrite_incoming(&mut client_req);
+        assert_eq!(client_req["id"], 42);
+    }
+
+    #[test]
+    fn inv_79_correlation_maps_pruned_and_capped() {
+        // The reader drops a mapping as soon as the response is restored.
+        let mut writer = RequestIds::default();
+        let mut reader = RequestIds::default();
+        for i in 0..100 {
+            let mut req = json!({"jsonrpc":"2.0","id":format!("u-{i}"),"method":"m","params":{}});
+            for (number, id) in writer.rewrite_outgoing(&mut req) {
+                reader.remember(number, &id);
+            }
+        }
+        assert_eq!(reader.tracked_len(), 100);
+        for i in 0..100 {
+            let mut res = json!({"jsonrpc":"2.0","id":i,"result":{}});
+            reader.rewrite_incoming(&mut res);
+            assert_eq!(res["id"], format!("u-{i}"));
+        }
+        assert_eq!(
+            reader.tracked_len(),
+            0,
+            "answered requests must not grow the map"
+        );
+
+        // A never-answered entry is aged out once newer ids push the map past
+        // its cap, so a long-lived process cannot grow it without bound.
+        let mut writer = RequestIds::default();
+        for i in 0..(MAX_TRACKED_IDS + 100) {
+            let mut req =
+                json!({"jsonrpc":"2.0","id":format!("never-{i}"),"method":"m","params":{}});
+            writer.rewrite_outgoing(&mut req);
+        }
+        assert_eq!(writer.tracked_len(), MAX_TRACKED_IDS);
+        // The oldest ids are gone; the newest still translate a cancel.
+        let mut cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancel_request",
+            "params": {"requestId": format!("never-{}", MAX_TRACKED_IDS + 99)}
+        });
+        assert!(writer.rewrite_outgoing(&mut cancel).is_empty());
+        assert_eq!(cancel["params"]["requestId"], json!(MAX_TRACKED_IDS + 99));
+    }
+
+    #[tokio::test]
+    async fn inv_79_bridge_forwards_all_frames_before_close() {
+        use agent_client_protocol::{Channel, RawJsonRpcMessage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (a1, a2) = Channel::duplex();
+        let (b1, b2) = Channel::duplex();
+        let a_to_b_count = Arc::new(AtomicUsize::new(0));
+        let b_to_a_count = Arc::new(AtomicUsize::new(0));
+        let c1 = a_to_b_count.clone();
+        let c2 = b_to_a_count.clone();
+
+        let bridge = tokio::spawn(async move {
+            Channel::bridge_with_inspection(
+                a2,
+                b2,
+                move |_msg: &RawJsonRpcMessage| {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                move |_msg: &RawJsonRpcMessage| {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        drop(a1);
+        drop(b1);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), bridge)
+            .await
+            .expect("bridge closed within timeout")
+            .expect("join handle ok");
+        assert!(res.is_ok());
     }
 }

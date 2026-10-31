@@ -1,4 +1,9 @@
-#![forbid(unsafe_code)]
+// Decision D8: the Windows Job Object FFI needs a scoped `#[allow(unsafe_code)]`
+// on the private `windows_job` module in `process.rs`. `forbid` cannot coexist
+// with an inner module `allow` (E0453), so Windows keeps the crate-level lint at
+// `deny`; every other target keeps `forbid(unsafe_code)` unchanged (D12/R33).
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -11,9 +16,11 @@ pub mod codec;
 pub mod control;
 pub mod dispatch;
 pub mod env_snapshot;
+pub mod goal;
 pub mod hooks;
 pub mod logger;
 pub mod map;
+pub mod mcp_command;
 pub mod meta_filter;
 pub mod notices;
 pub mod permission;
@@ -30,7 +37,9 @@ pub mod session_methods;
 pub mod session_model;
 pub mod session_store;
 pub mod session_timing;
+pub mod session_titles;
 pub mod settings;
+pub mod settings_manager;
 pub mod system_prompt;
 pub mod tool_meta;
 pub mod tools;
@@ -38,6 +47,14 @@ pub mod transcript;
 pub mod turn;
 pub mod unfinished;
 pub mod usage;
+
+// Public library surface mirroring upstream `src/lib.ts` (FX-4 / O-83, Q-19).
+pub use agent::serve as run_acp;
+pub use agent::{serve, serve_handle, ClaudeAcpAgent, ServeHandle, ServeOptions};
+pub use auth_status::{AuthAccount as AuthStatusAccount, AuthStatus, AUTH_STATUS_UPDATE_METHOD};
+pub use map::map_user_frame as to_acp_notifications;
+pub use settings_manager::{SettingsManager, SettingsManagerOptions};
+pub use tools::{plan_entries, to_display_path, tool_info_from_tool_use, ClaudePlanEntry};
 
 /// Composed `<crate>+upstream.<npm-pin>` version string, e.g. `0.1.0+upstream.0.94.0`.
 ///

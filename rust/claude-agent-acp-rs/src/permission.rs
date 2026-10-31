@@ -292,8 +292,23 @@ pub fn build_tool_call(
     tool_use_id: &str,
     parent_tool_use_id: Option<&str>,
     cwd: Option<&std::path::Path>,
+    air: bool,
 ) -> Value {
     let shape = tools::tool_shape(tool_name, tool_input, cwd);
+    if air {
+        // Node's AIR `permissionToolCall` (`renderer.ts:333-341`) sends only
+        // the id, the title and `rawInput` (without the file text that a diff
+        // holds); the client already holds the streamed tool call. It never
+        // sends `name`/`status`/`kind`/`content`/`locations`/`_meta`.
+        let mut tc = serde_json::Map::new();
+        tc.insert("toolCallId".into(), Value::String(tool_use_id.to_string()));
+        tc.insert("title".into(), Value::String(shape.title.clone()));
+        tc.insert(
+            "rawInput".into(),
+            air_permission_raw_input(tool_name, tool_input),
+        );
+        return Value::Object(tc);
+    }
     let mut tc = serde_json::Map::new();
     tc.insert("toolCallId".into(), Value::String(tool_use_id.to_string()));
     // E-9: the request_permission `toolCall` carries the programmatic tool name
@@ -331,7 +346,51 @@ pub fn build_tool_call(
             }),
         );
     }
-    Value::Object(tc)
+    let mut val = Value::Object(tc);
+    crate::map::materialize_tool_call_defaults(&mut val);
+    crate::map::materialize_diff_old_text(&mut val);
+    val
+}
+
+/// Node's `rawInput(facts, input)` for AIR (`renderer.ts:729-744`): the file
+/// text a diff already holds is removed from the input (`Write`'s content key,
+/// `Edit`'s `old_string`/`new_string`). Every other tool sends its input as is.
+fn air_permission_raw_input(tool_name: &str, tool_input: &Value) -> Value {
+    let Some(obj) = tool_input.as_object() else {
+        return tool_input.clone();
+    };
+    let mut input = obj.clone();
+    match tool_name {
+        "Write" => {
+            // `fileTextKeys = [write.contentKey]`: the first present non-null
+            // alias (`reporters/file-edit.ts:55,79`).
+            if let Some(key) = ["content", "file_text", "file_content"]
+                .into_iter()
+                .find(|key| obj.get(*key).is_some_and(|value| !value.is_null()))
+            {
+                input.remove(key);
+            }
+        }
+        "Edit" => {
+            // `fileTextKeys = ["old_string", "new_string"]` when the diff is
+            // built: a file path and a non-empty old or new string.
+            let has_file = obj
+                .get("file_path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.is_empty());
+            let has_text = ["old_string", "new_string"].into_iter().any(|key| {
+                obj.get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            });
+            if has_file && has_text {
+                input.remove("old_string");
+                input.remove("new_string");
+            }
+        }
+        _ => {}
+    }
+    Value::Object(input)
 }
 
 /// Emit the `tool_call` a permission request references if the client has not
@@ -839,6 +898,7 @@ mod tests {
             "toolu_SUB",
             Some("toolu_PARENT"),
             None,
+            false,
         );
         assert_eq!(
             tc["_meta"]["claudeCode"]["parentToolUseId"],
@@ -866,13 +926,88 @@ mod tests {
         );
     }
 
+    /// Review G14 finding 7 — Node's AIR `permissionToolCall`
+    /// (`renderer.ts:333-341`) sends only `toolCallId`, `title` and `rawInput`
+    /// (with the file text a diff already holds removed); no `locations:[]`,
+    /// no `name`/`status`/`kind`/`content`/`_meta`.
+    #[test]
+    fn inv_79_air_permission_tool_call_has_node_shape() {
+        let tc = build_tool_call(
+            "Read",
+            &json!({"file_path": "/w/a.txt"}),
+            "toolu_air",
+            None,
+            Some(std::path::Path::new("/w")),
+            true,
+        );
+        assert_eq!(
+            tc,
+            json!({
+                "toolCallId": "toolu_air",
+                "title": "Read a.txt",
+                "rawInput": {"file_path": "/w/a.txt"},
+            }),
+            "AIR must not get name/status/kind/content/locations/_meta"
+        );
+        assert!(tc.get("locations").is_none());
+
+        // Write's file text (the content alias that is present) is dropped.
+        let write = build_tool_call(
+            "Write",
+            &json!({"file_path": "/w/a.txt", "file_text": "hello"}),
+            "toolu_w",
+            None,
+            Some(std::path::Path::new("/w")),
+            true,
+        );
+        assert_eq!(
+            write["rawInput"],
+            json!({"file_path": "/w/a.txt"}),
+            "AIR rawInput drops the Write content key"
+        );
+
+        // Edit's snippet is dropped when the diff is built.
+        let edit = build_tool_call(
+            "Edit",
+            &json!({"file_path": "/w/a.txt", "old_string": "a", "new_string": "b"}),
+            "toolu_e",
+            None,
+            Some(std::path::Path::new("/w")),
+            true,
+        );
+        assert_eq!(edit["rawInput"], json!({"file_path": "/w/a.txt"}));
+
+        // Non-AIR keeps the whole tool call (and the materialised defaults).
+        let non_air = build_tool_call(
+            "Read",
+            &json!({"file_path": "/w/a.txt"}),
+            "toolu_n",
+            None,
+            Some(std::path::Path::new("/w")),
+            false,
+        );
+        assert_eq!(non_air["status"], "pending");
+        assert_eq!(non_air["name"], "Read");
+        assert_eq!(
+            non_air["locations"],
+            json!([{"path": "/w/a.txt", "line": 1}])
+        );
+    }
+
     /// 2.11 (E-10): without a durable choice the request offers only Yes/No
     /// (no allow-always, no `_meta.permission`).
     #[test]
     fn inv_21_request_options_yes_no_only() {
         let params = build_request_permission(
             "sess1",
-            build_tool_call("Bash", &json!({"command":"ls"}), "toolu_1", None, None),
+            build_tool_call(
+                "Bash",
+                &json!({"command":"ls"}),
+                "toolu_1",
+                None,
+                None,
+                false,
+            ),
             None,
         );
         assert_eq!(

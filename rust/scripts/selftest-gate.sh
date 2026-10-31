@@ -62,6 +62,14 @@ else
     echo "0.T4b ok: clippy rejected tokio::sync::broadcast::channel"
 fi
 
+echo "==> 0.T4c: D8 unsafe gate check (a-e)"
+if ! bash "$ROOT/rust/scripts/d8-check.sh" --selftest; then
+    echo "0.T4c FAIL: D8 selftest failed"
+    FAIL=1
+else
+    echo "0.T4c ok: D8 selftest passed"
+fi
+
 if [ "$FAIL" != "0" ]; then
     echo "==> selftest FAILED"
     exit 1

@@ -400,6 +400,17 @@ async fn run_script(
                     let _response = sent.block_task().await?;
                 }
             }
+            Step::WaitRecv { contains } => {
+                // Ordered barrier (F42): wait for the agent's wire condition
+                // instead of sleeping for a guessed duration.
+                if !wait_for_line(&mut line_rx, &mut recv_lines, contains, UPDATE_WAIT_TIMEOUT)
+                    .await
+                {
+                    return Err(agent_client_protocol::Error::internal_error().data(format!(
+                        "timed out waiting for an agent line with `{contains}`"
+                    )));
+                }
+            }
             Step::ElicitReply { response } => {
                 // F1: answer the next agent->client `elicitation/create` that a
                 // (usually `no_wait`) prompt produced. The client handler has

@@ -43,8 +43,29 @@ pub struct Settings {
     pub model_overrides: Option<HashMap<String, String>>,
     /// `deniedModels` from the managed tier only (F5b/O-46).
     pub managed_denied_models: Vec<String>,
+    /// `apiKeyHelper` from the managed tier only (O-61).
+    pub managed_api_key_helper: Option<String>,
     /// The full effective document (provenance-free).
     pub effective: Value,
+}
+
+impl Settings {
+    /// Precedence: managed > --settings override > user/project/local (O-61, O-67).
+    pub fn get_api_key_helper(&self, settings_override: Option<&Value>) -> Option<String> {
+        let override_helper = settings_override
+            .and_then(|v| v.get("apiKeyHelper"))
+            .and_then(Value::as_str)
+            .map(String::from);
+        self.managed_api_key_helper
+            .clone()
+            .or(override_helper)
+            .or_else(|| {
+                self.effective
+                    .get("apiKeyHelper")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+    }
 }
 
 /// A settings tier and the document it contributed.
@@ -77,25 +98,16 @@ const ESCALATING_MODES: [&str; 3] = ["bypassPermissions", "auto", "acceptEdits"]
 /// Modes only `local` (and `project`) may not escalate (`YZ`).
 const LOCAL_ESCALATING_MODES: [&str; 2] = ["auto", "bypassPermissions"];
 
-/// Recursive merge: objects merge key-wise, any other shape is replaced.
-///
-/// `availableModels` is the exception the SDK's merge engine documents: arrays
-/// from every tier are unioned and deduped in source order (later tiers append
-/// their new entries) instead of the later tier replacing the earlier one.
+/// Recursive merge: objects merge key-wise, arrays concatenate and deduplicate
+/// in source order (except `fallbackModel` which replaces, O-57), everything else replaces.
 fn merge(target: &mut Value, source: Value) {
     match (target, source) {
-        (Value::Object(target), Value::Object(source)) => {
-            for (key, value) in source {
-                match target.get_mut(&key) {
-                    Some(slot) => {
-                        if key == "availableModels" {
-                            merge_available_models(slot, value);
-                        } else {
-                            merge(slot, value);
-                        }
-                    }
+        (Value::Object(target_map), Value::Object(source_map)) => {
+            for (key, value) in source_map {
+                match target_map.get_mut(&key) {
+                    Some(slot) => merge_key(&key, slot, value),
                     None => {
-                        target.insert(key, value);
+                        target_map.insert(key, value);
                     }
                 }
             }
@@ -104,19 +116,36 @@ fn merge(target: &mut Value, source: Value) {
     }
 }
 
-/// Union two `availableModels` arrays in source order, dropping duplicates.
-fn merge_available_models(target: &mut Value, source: Value) {
-    match (&mut *target, source) {
-        (Value::Array(existing), Value::Array(incoming)) => {
-            let mut seen: Vec<Value> = existing.clone();
-            for entry in incoming {
-                if !seen.contains(&entry) {
-                    seen.push(entry);
+fn merge_key(key: &str, slot: &mut Value, value: Value) {
+    if key == "modelPicker" {
+        *slot = value;
+        return;
+    }
+    match (slot, value) {
+        (Value::Object(target_map), Value::Object(source_map)) => {
+            if key == "extraKnownMarketplaces" || key == "managedMcpServers" {
+                for (k, v) in source_map {
+                    target_map.insert(k, v);
+                }
+                return;
+            }
+            for (k, v) in source_map {
+                match target_map.get_mut(&k) {
+                    Some(sub_slot) => merge_key(&k, sub_slot, v),
+                    None => {
+                        target_map.insert(k, v);
+                    }
                 }
             }
-            *existing = seen;
         }
-        (target, source) => *target = source,
+        (Value::Array(target_arr), Value::Array(source_arr)) if key != "fallbackModel" => {
+            for entry in source_arr {
+                if !target_arr.contains(&entry) {
+                    target_arr.push(entry);
+                }
+            }
+        }
+        (slot, value) => *slot = value,
     }
 }
 
@@ -173,11 +202,34 @@ pub fn filter_escalating_default_mode(effective: Value, sources: &[(Source, Valu
 }
 
 /// Resolve the settings for `cwd` with explicit tier locations (testable).
+/// `managed: None` means no managed tier (hermetic, finding 11).
 pub fn resolve(
     cwd: &Path,
     config_dir: Option<&Path>,
     home: Option<&Path>,
     managed: Option<&Path>,
+) -> Settings {
+    let mut managed_docs = Vec::new();
+    if let Some(managed_path) = managed {
+        if let Some(doc) = read_settings(managed_path) {
+            managed_docs.push(doc);
+        }
+        if let Some(parent) = managed_path.parent() {
+            for doc in crate::process::read_managed_settings_dir(&parent.join("managed-settings.d"))
+            {
+                managed_docs.push(doc);
+            }
+        }
+    }
+    resolve_with_docs(cwd, config_dir, home, managed_docs)
+}
+
+/// Resolve settings with explicit managed documents (hermetic when empty).
+pub fn resolve_with_docs(
+    cwd: &Path,
+    config_dir: Option<&Path>,
+    home: Option<&Path>,
+    managed_docs: Vec<Value>,
 ) -> Settings {
     let user_dir = config_dir
         .map(PathBuf::from)
@@ -197,7 +249,9 @@ pub fn resolve(
         Source::Local,
         Some(cwd.join(".claude").join("settings.local.json")),
     );
-    push(Source::Managed, managed.map(PathBuf::from));
+    for doc in managed_docs {
+        sources.push((Source::Managed, doc));
+    }
 
     let mut effective = Value::Object(Map::new());
     for (_, doc) in &sources {
@@ -236,6 +290,12 @@ pub fn resolve(
         .flat_map(|entries| entries.iter().filter_map(Value::as_str))
         .map(String::from)
         .collect();
+    let managed_api_key_helper = sources
+        .iter()
+        .filter(|(source, _)| *source == Source::Managed)
+        .filter_map(|(_, doc)| doc.get("apiKeyHelper").and_then(Value::as_str))
+        .next_back()
+        .map(String::from);
     Settings {
         default_mode: permission
             .and_then(|p| p.get("defaultMode"))
@@ -262,16 +322,50 @@ pub fn resolve(
         available_models,
         model_overrides,
         managed_denied_models,
+        managed_api_key_helper,
         effective,
     }
 }
 
 /// Resolve the settings for `cwd` from the environment snapshot.
+/// If `env.managed_docs()` is injected (`Some`), those documents are used (hermetic for tests).
+/// Otherwise, platform-managed sources are read.
 pub fn load(cwd: &Path, env: &crate::env_snapshot::EnvSnapshot) -> Settings {
+    match env.managed_docs() {
+        Some(docs) => load_with_managed(cwd, env, docs.to_vec()),
+        None => load_with_managed(cwd, env, crate::process::read_managed_sources()),
+    }
+}
+
+/// Resolve the settings for `cwd` from the environment snapshot with explicitly
+/// injected managed sources. Tests and isolated embedders pass empty/mock docs.
+pub fn load_with_managed(
+    cwd: &Path,
+    env: &crate::env_snapshot::EnvSnapshot,
+    managed_docs: Vec<Value>,
+) -> Settings {
     let config_dir = env.get_path("CLAUDE_CONFIG_DIR");
     let home = env.get_path("HOME");
-    let managed = crate::process::managed_settings_path();
-    resolve(cwd, config_dir.as_deref(), home.as_deref(), Some(&managed))
+    resolve_with_docs(cwd, config_dir.as_deref(), home.as_deref(), managed_docs)
+}
+
+/// Resolve settings with the managed FILE tier read from an explicit
+/// `managed-settings.json` path (plus `managed-settings.d` beside it).
+///
+/// Production resolves [`crate::process::managed_settings_path`]; this seam lets
+/// the SettingsManager hot-reload test exercise the real per-resolve file read
+/// against a temp directory (Finding 2), never the host `/Library` or `/etc`
+/// policy path.
+pub fn load_with_managed_file(
+    cwd: &Path,
+    env: &crate::env_snapshot::EnvSnapshot,
+    managed_file: &Path,
+) -> Settings {
+    load_with_managed(
+        cwd,
+        env,
+        crate::process::read_managed_file_sources_at(managed_file),
+    )
 }
 
 /// The managed-policy tier's `env` object (`managed-policy.ts:19-34`).
@@ -295,8 +389,16 @@ pub fn managed_policy_env(managed: Option<&Path>) -> Vec<(String, String)> {
 /// inherits it. A missing policy file is normal (no MDM/managed policy); an
 /// unreadable one is reported to stderr and the adapter still starts
 /// (`managed-policy.ts` catch). Never logs values.
-pub fn apply_managed_policy_env(logger: &crate::logger::Logger) -> Vec<(String, String)> {
-    apply_managed_policy_env_at(&crate::process::managed_settings_path(), logger)
+pub fn apply_managed_policy_env(_logger: &crate::logger::Logger) -> Vec<(String, String)> {
+    // In sdk.mjs applyManagedPolicyEnv / resolveSettings({settingSources: []}):
+    // Winning managed sources (MDM plist, Windows registry, or managed file + .d)
+    // are resolved, and their effective `env` entries are applied.
+    let docs = crate::process::read_managed_sources();
+    let mut entries = Vec::new();
+    for doc in docs {
+        entries.extend(env_entries(&doc));
+    }
+    entries
 }
 
 /// [`apply_managed_policy_env`] against an explicit managed-settings path
@@ -660,6 +762,276 @@ mod tests {
         let settings = resolve(&cwd, None, None, None);
         assert_eq!(settings.model, None);
         assert_eq!(settings.effective["model"], json!(42));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// O-57: arrays are concatenated and deduplicated across tiers, except fallbackModel which replaces.
+    #[test]
+    fn o57_array_merge_and_fallback_model() {
+        let root = temp_root("array-merge");
+        let cwd = root.join("cwd");
+        let config = root.join("config");
+
+        write(
+            &config.join("settings.json"),
+            json!({
+                "customArray": ["item1", "item2"],
+                "fallbackModel": ["fb-old"]
+            }),
+        );
+        write(
+            &cwd.join(".claude/settings.json"),
+            json!({
+                "customArray": ["item2", "item3"],
+                "fallbackModel": ["fb-new"]
+            }),
+        );
+
+        let settings = resolve(&cwd, Some(&config), None, None);
+        assert_eq!(
+            settings.effective["customArray"],
+            json!(["item1", "item2", "item3"])
+        );
+        assert_eq!(settings.effective["fallbackModel"], json!(["fb-new"]));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// O-57: modelPicker is replaced whole; extraKnownMarketplaces / managedMcpServers are shallow merged.
+    #[test]
+    fn o57_model_picker_and_shallow_object_merges() {
+        let root = temp_root("picker-shallow");
+        let cwd = root.join("cwd");
+        let config = root.join("config");
+
+        write(
+            &config.join("settings.json"),
+            json!({
+                "modelPicker": {
+                    "options": [{"id": "m1"}],
+                    "otherField": "keep?"
+                },
+                "extraKnownMarketplaces": {
+                    "mp1": {"url": "u1", "args": ["a1"]}
+                },
+                "managedMcpServers": {
+                    "srv1": {"cmd": "c1", "args": ["a1"]}
+                }
+            }),
+        );
+        write(
+            &cwd.join(".claude/settings.json"),
+            json!({
+                "modelPicker": {
+                    "options": [{"id": "m2"}]
+                },
+                "extraKnownMarketplaces": {
+                    "mp1": {"url": "u2"},
+                    "mp2": {"url": "u3"}
+                },
+                "managedMcpServers": {
+                    "srv1": {"cmd": "c2"}
+                }
+            }),
+        );
+
+        let settings = resolve(&cwd, Some(&config), None, None);
+        // modelPicker replaced whole (no deep merge)
+        assert_eq!(
+            settings.effective["modelPicker"],
+            json!({"options": [{"id": "m2"}]})
+        );
+        // extraKnownMarketplaces shallow merged (mp1 replaced whole, mp2 added)
+        assert_eq!(
+            settings.effective["extraKnownMarketplaces"],
+            json!({
+                "mp1": {"url": "u2"},
+                "mp2": {"url": "u3"}
+            })
+        );
+        // managedMcpServers shallow merged (srv1 replaced whole, inner args not concatenated)
+        assert_eq!(
+            settings.effective["managedMcpServers"],
+            json!({
+                "srv1": {"cmd": "c2"}
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// O-61: apiKeyHelper precedence: managed > --settings override > user/project/local.
+    #[test]
+    fn o61_api_key_helper_precedence() {
+        let root = temp_root("api-key-helper");
+        let cwd = root.join("cwd");
+        let config = root.join("config");
+        let managed = root.join("managed.json");
+
+        write(
+            &config.join("settings.json"),
+            json!({"apiKeyHelper": "user-helper"}),
+        );
+
+        // Case 1: user helper only
+        let settings = resolve(&cwd, Some(&config), None, None);
+        assert_eq!(
+            settings.get_api_key_helper(None),
+            Some("user-helper".to_string())
+        );
+
+        // Case 2: --settings override beats user helper
+        let override_val = json!({"apiKeyHelper": "override-helper"});
+        assert_eq!(
+            settings.get_api_key_helper(Some(&override_val)),
+            Some("override-helper".to_string())
+        );
+
+        // Case 3: managed helper beats --settings override
+        write(&managed, json!({"apiKeyHelper": "managed-helper"}));
+        let settings_managed = resolve(&cwd, Some(&config), None, Some(&managed));
+        assert_eq!(
+            settings_managed.get_api_key_helper(Some(&override_val)),
+            Some("managed-helper".to_string())
+        );
+        assert_eq!(
+            settings_managed.get_api_key_helper(None),
+            Some("managed-helper".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding 1: An unreadable/unparseable MDM plist (or a `reg.exe` timeout)
+    /// drops only the MDM tier; the managed FILE tier is still enforced
+    /// (deniedModels, disableBypassPermissionsMode, apiKeyHelper, managed env).
+    /// Exercises the real file reader on a temp path, so no host policy is read.
+    #[test]
+    fn test_unreadable_mdm_plist_drops_only_mdm_tier_file_tier_enforced() {
+        let root = temp_root("mdm-unreadable-file-enforced");
+        let cwd = root.join("cwd");
+        let managed_file = root.join("managed-settings.json");
+
+        write(
+            &managed_file,
+            json!({
+                "deniedModels": ["forbidden-model-v1"],
+                "permissions": {"disableBypassPermissionsMode": "disable"},
+                "apiKeyHelper": "file-managed-helper",
+                "env": {"MANAGED_VAR": "managed_val"}
+            }),
+        );
+
+        // The OS/MDM source is unreadable, so it contributes no document (None);
+        // only the file tier remains. This is the `Oc` winner list without `mdm`.
+        let file_docs = crate::process::read_managed_file_sources_at(&managed_file);
+        assert_eq!(file_docs.len(), 1, "the file tier is still readable");
+        let settings = load_with_managed(
+            &cwd,
+            &crate::env_snapshot::EnvSnapshot::empty(),
+            file_docs.clone(),
+        );
+
+        assert_eq!(
+            settings.managed_denied_models,
+            vec!["forbidden-model-v1".to_string()]
+        );
+        assert!(settings.disable_bypass);
+        assert_eq!(
+            settings.get_api_key_helper(None),
+            Some("file-managed-helper".to_string())
+        );
+
+        // The managed `env` object is applied from the same file documents.
+        let entries: Vec<(String, String)> = file_docs.iter().flat_map(env_entries).collect();
+        assert!(
+            entries.contains(&("MANAGED_VAR".to_string(), "managed_val".to_string())),
+            "{entries:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding 2: `load_with_managed_file` re-reads the managed file on every
+    /// resolve, so an edit after the first load is visible to the second.
+    #[test]
+    fn test_load_with_managed_file_rereads_after_edit() {
+        let root = temp_root("managed-file-reread");
+        let cwd = root.join("cwd");
+        let managed_file = root.join("managed-settings.json");
+        let env = crate::env_snapshot::EnvSnapshot::empty();
+
+        write(&managed_file, json!({"model": "managed-v1"}));
+        assert_eq!(
+            load_with_managed_file(&cwd, &env, &managed_file)
+                .model
+                .as_deref(),
+            Some("managed-v1")
+        );
+
+        write(&managed_file, json!({"model": "managed-v2"}));
+        assert_eq!(
+            load_with_managed_file(&cwd, &env, &managed_file)
+                .model
+                .as_deref(),
+            Some("managed-v2")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding 3: Hermetic settings load: load() with hermetic EnvSnapshot uses injected
+    /// documents and load_with_managed has real callers.
+    #[test]
+    fn test_hermetic_load_with_managed_docs() {
+        let root = temp_root("hermetic-load");
+        let cwd = root.join("cwd");
+
+        let injected_doc = json!({
+            "deniedModels": ["injected-denied-model"],
+            "apiKeyHelper": "injected-helper"
+        });
+
+        // 1. load_with_managed direct call
+        let env_empty = crate::env_snapshot::EnvSnapshot::empty();
+        let settings = load_with_managed(&cwd, &env_empty, vec![injected_doc.clone()]);
+        assert_eq!(
+            settings.managed_denied_models,
+            vec!["injected-denied-model".to_string()]
+        );
+        assert_eq!(
+            settings.get_api_key_helper(None).as_deref(),
+            Some("injected-helper")
+        );
+
+        // 2. load() via EnvSnapshot::with_managed_docs
+        let env_injected =
+            crate::env_snapshot::EnvSnapshot::empty().with_managed_docs(vec![injected_doc]);
+        let settings2 = load(&cwd, &env_injected);
+        assert_eq!(
+            settings2.managed_denied_models,
+            vec!["injected-denied-model".to_string()]
+        );
+        assert_eq!(
+            settings2.get_api_key_helper(None).as_deref(),
+            Some("injected-helper")
+        );
+
+        // 3. EnvSnapshot::from_pairs defaults to empty managed_docs (hermetic)
+        let env_pairs = crate::env_snapshot::EnvSnapshot::from_pairs([(
+            "CLAUDE_CONFIG_DIR",
+            root.to_str().unwrap(),
+        )]);
+        // Finding 3: the injected tier is the ONLY one consulted — an empty
+        // document set means `load` never touches /Library/... or /etc.
+        assert!(
+            env_pairs.managed_docs().is_some_and(|d| d.is_empty()),
+            "from_pairs must inject an empty managed tier"
+        );
+        let settings_pairs = load(&cwd, &env_pairs);
+        assert!(settings_pairs.managed_denied_models.is_empty());
+        assert_eq!(settings_pairs.get_api_key_helper(None), None);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

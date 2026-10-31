@@ -58,6 +58,15 @@ pub struct SessionExt {
     /// first init frame latches a list (Node's `session.terminalSlashCommands`
     /// is `undefined` before that, so an empty list still counts as a change).
     pub terminal_slash_commands: Option<Vec<String>>,
+    /// Per-turn `/mcp` state (rust-air-gaps G12, Decision 21): the parsed
+    /// command, the CLI text/message id of the first output shape, and the
+    /// produced replacement. Actor-owned, like the rest of this struct.
+    pub mcp: crate::mcp_command::McpTurns,
+    /// Goal bookkeeping (rust-air-gaps G8, Decision 16): the last published
+    /// AIR goal and the optimistic update awaiting its runtime confirmation.
+    pub goal: crate::goal::GoalState,
+    /// Session title state machine (Decision 13 / D6).
+    pub titles: crate::session_titles::SessionTitles,
 }
 
 impl SessionExt {
@@ -83,6 +92,9 @@ impl SessionExt {
             logged_plugin_errors: None,
             commands: Vec::new(),
             terminal_slash_commands: None,
+            mcp: crate::mcp_command::McpTurns::default(),
+            goal: crate::goal::GoalState::default(),
+            titles: crate::session_titles::SessionTitles::new(),
         }
     }
 

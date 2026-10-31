@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize", "client_capabilities_meta": {"subagent-transcript": true}},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "summarize the repo"}
+  ]
+}

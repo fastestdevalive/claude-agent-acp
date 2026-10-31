@@ -3,33 +3,39 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde_json::Value;
+
 /// A snapshot of environment variables used by the adapter.
 ///
 /// In production, this is captured once from the real process environment
 /// (`EnvSnapshot::from_process()`). In tests and in-process scenarios, a hermetic
 /// snapshot (`EnvSnapshot::empty()` or configured snapshot) isolates the adapter
-/// from host process environment pollution.
+/// from host process environment pollution and managed document injection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvSnapshot {
     vars: Arc<HashMap<String, String>>,
+    managed_docs: Option<Arc<Vec<Value>>>,
 }
 
 impl EnvSnapshot {
     /// Capture snapshot from current process environment.
+    /// `managed_docs` is `None`, so platform managed settings sources are resolved normally.
     pub fn from_process() -> Self {
         Self {
             vars: Arc::new(std::env::vars().collect()),
+            managed_docs: None,
         }
     }
 
-    /// Empty, hermetic environment snapshot.
+    /// Empty, hermetic environment snapshot with empty managed documents.
     pub fn empty() -> Self {
         Self {
             vars: Arc::new(HashMap::new()),
+            managed_docs: Some(Arc::new(Vec::new())),
         }
     }
 
-    /// Create from key-value pairs.
+    /// Create from key-value pairs (hermetic by default with empty managed documents).
     pub fn from_pairs<I, K, V>(iter: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -42,7 +48,19 @@ impl EnvSnapshot {
                     .map(|(k, v)| (k.into(), v.into()))
                     .collect(),
             ),
+            managed_docs: Some(Arc::new(Vec::new())),
         }
+    }
+
+    /// Injected managed settings documents (Finding 3).
+    pub fn with_managed_docs(mut self, docs: Vec<Value>) -> Self {
+        self.managed_docs = Some(Arc::new(docs));
+        self
+    }
+
+    /// Return the injected managed settings documents, if any.
+    pub fn managed_docs(&self) -> Option<&[Value]> {
+        self.managed_docs.as_deref().map(Vec::as_slice)
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -79,6 +97,7 @@ impl EnvSnapshot {
         map.insert(key.into(), val.into());
         Self {
             vars: Arc::new(map),
+            managed_docs: self.managed_docs.clone(),
         }
     }
 }

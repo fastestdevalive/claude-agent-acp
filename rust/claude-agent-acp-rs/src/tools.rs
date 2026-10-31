@@ -15,10 +15,14 @@
 //! tooling, so this matches them exactly.
 
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, Diff, TextContent, ToolCallContent, ToolCallLocation, ToolKind,
+    Content, ContentBlock, Diff, PlanEntry, PlanEntryPriority, PlanEntryStatus, TextContent,
+    ToolCallContent, ToolCallLocation, ToolKind,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+pub use display_path as to_display_path;
+pub use tool_shape as tool_info_from_tool_use;
 
 /// The ACP tool-shape fields derived from a tool name + input (port of
 /// `toolInfoFromToolUse`, `src/tools.ts:131-502`).
@@ -28,6 +32,38 @@ pub struct ToolShape {
     pub title: String,
     pub locations: Vec<ToolCallLocation>,
     pub content: Vec<ToolCallContent>,
+}
+
+/// Upstream `ClaudePlanEntry` (`tools.ts:65-69`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudePlanEntry {
+    pub content: String,
+    pub status: String,
+    #[serde(default)]
+    pub active_form: String,
+}
+
+/// Upstream `planEntries` helper (`tools.ts:71-78`).
+#[must_use]
+pub fn plan_entries(todos: Option<&[ClaudePlanEntry]>) -> Vec<PlanEntry> {
+    todos
+        .unwrap_or_default()
+        .iter()
+        .map(|todo| {
+            let content = if todo.status == "in_progress" && !todo.active_form.is_empty() {
+                todo.active_form.clone()
+            } else {
+                todo.content.clone()
+            };
+            let status = match todo.status.as_str() {
+                "in_progress" => PlanEntryStatus::InProgress,
+                "completed" => PlanEntryStatus::Completed,
+                _ => PlanEntryStatus::Pending,
+            };
+            PlanEntry::new(content, PlanEntryPriority::Medium, status)
+        })
+        .collect()
 }
 
 impl ToolShape {
@@ -54,6 +90,15 @@ impl ToolShape {
 /// Whether the tool is one of the Task* tools whose tool_use is suppressed.
 pub fn is_task_tool(name: &str) -> bool {
     matches!(name, "TaskCreate" | "TaskUpdate" | "TaskList" | "TaskGet")
+}
+
+/// Whether the streamed tool_use path surfaces this tool as a standalone
+/// `tool_call` (`shouldEmitToolCall`, `acp-agent.ts:12820-12824`). TodoWrite is
+/// rendered as a `plan` and Task* tools are suppressed (their plan snapshot is
+/// emitted at tool_result time), so neither produces a streamed
+/// tool_call/tool_call_update.
+pub fn should_emit_tool_call(name: &str) -> bool {
+    name != "TodoWrite" && !is_task_tool(name)
 }
 
 /// One text content block (`{type:"content", content:{type:"text",text}}`).
@@ -113,6 +158,78 @@ fn shell_description(input: &Value) -> Option<&str> {
         return Some(description);
     }
     obj.get("command_description").and_then(Value::as_str)
+}
+
+/// JavaScript truthiness of a JSON value (`if (value)`): `undefined` (a missing
+/// key), `null`, `false`, `0` and `""` are falsy, every other value is truthy.
+/// The reporters test their optional input fields this way.
+fn js_truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Array(_)) | Some(Value::Object(_)) => true,
+    }
+}
+
+/// Template-literal interpolation of a JSON value (`${value}`): a missing key
+/// is `"undefined"`, `null` is `"null"`, arrays join with `,` (a `null` element
+/// becomes the empty string) and a plain object is `"[object Object]"`.
+fn js_string(value: Option<&Value>) -> String {
+    match value {
+        None => "undefined".to_string(),
+        Some(Value::Null) => "null".to_string(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(Value::Number(number)) => match (number.as_i64(), number.as_u64()) {
+            (Some(int), _) => int.to_string(),
+            (_, Some(uint)) => uint.to_string(),
+            _ => number.as_f64().map(|n| n.to_string()).unwrap_or_default(),
+        },
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_string(Some(other)),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(Value::Object(_)) => "[object Object]".to_string(),
+    }
+}
+
+/// The output mode of a Grep input (`grepOutputMode`,
+/// `reporters/search.ts:50-61`): an explicit string wins, else the `-l` / `-c`
+/// flags (a boolean `true` or the string `"true"`) name the mode.
+fn grep_output_mode(input: &Value) -> Option<&str> {
+    let obj = input.as_object()?;
+    if let Some(mode) = obj.get("output_mode").and_then(Value::as_str) {
+        return Some(mode);
+    }
+    let flag_is_true = |flag: &str| match obj.get(flag) {
+        Some(Value::Bool(true)) => true,
+        Some(Value::String(text)) => text == "true",
+        _ => false,
+    };
+    if flag_is_true("-l") {
+        return Some("files_with_matches");
+    }
+    if flag_is_true("-c") {
+        return Some("count");
+    }
+    None
+}
+
+/// The path of a Grep input (`grepPath`, `reporters/search.ts:63-67`): `path`
+/// when it is a string, else the `file_path` alias. An empty string is a path
+/// (the caller then tests its truthiness).
+fn grep_path(input: &Value) -> Option<&str> {
+    let obj = input.as_object()?;
+    if let Some(path) = obj.get("path").and_then(Value::as_str) {
+        return Some(path);
+    }
+    obj.get("file_path").and_then(Value::as_str)
 }
 
 /// Split `mcp__<server>__<tool>` the way Claude Code does
@@ -504,25 +621,57 @@ fn normalize_write_input(input: &Value) -> NormalizedWriteInput<'_> {
 /// `src/tools.ts:131-502`). `cwd` relativises the displayed file paths
 /// (`toDisplayPath`, Decision 6); `supportsTerminalOutput` is always `false`.
 pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
+    tool_shape_with(name, input, cwd, false)
+}
+
+/// [`tool_shape`] with the client flavour: `air` selects the AIR-only reporter
+/// facts (`AskUserQuestion`'s fixed title). The permission path keeps the
+/// three-argument [`tool_shape`]; the streamed path passes the map's AIR flag.
+pub fn tool_shape_with(name: &str, input: &Value, cwd: Option<&Path>, air: bool) -> ToolShape {
     match name {
         "Agent" | "Task" => {
-            let description = input.get("description").and_then(Value::as_str);
-            let mut shape = ToolShape::new(ToolKind::Think, description.unwrap_or("Task"));
+            let description = input
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|description| !description.is_empty());
+            // `effort` is set only when the user asked for one (CLI 2.1.292+).
+            // A `subagent_type: "fork"` child ignores it and runs at the
+            // parent's effort (`reporters/agent.ts:10-13`).
+            let effort = input
+                .get("effort")
+                .filter(|effort| js_truthy(Some(effort)))
+                .filter(|_| input.get("subagent_type").and_then(Value::as_str) != Some("fork"));
+            let suffix = effort
+                .map(|effort| format!(" ({} effort)", js_string(Some(effort))))
+                .unwrap_or_default();
+            let mut shape = ToolShape::new(
+                ToolKind::Think,
+                format!("{}{suffix}", description.unwrap_or("Task")),
+            );
             if let Some(prompt) = input.get("prompt").and_then(Value::as_str) {
                 shape = shape.content(vec![text_content(prompt)]);
             }
             shape
         }
-        "Bash" => {
-            let command = input.get("command").and_then(Value::as_str);
+        // PowerShell shares the Bash reporter (`reporters/index.ts:23`).
+        "Bash" | "PowerShell" => {
+            let command = input
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|command| !command.is_empty());
             let mut shape = ToolShape::new(ToolKind::Execute, command.unwrap_or("Terminal"));
-            if let Some(description) = input.get("description").and_then(Value::as_str) {
+            // `shellDescription` falls back to `command_description`; an empty
+            // description adds no display copy (`reporters/bash.ts:6-17,28`).
+            if let Some(description) = shell_description(input).filter(|d| !d.is_empty()) {
                 shape = shape.content(vec![text_content(description)]);
             }
             shape
         }
         "Read" => {
-            let file_path = input.get("file_path").and_then(Value::as_str);
+            let file_path = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty());
             let offset = input.get("offset").and_then(Value::as_u64);
             let limit = input.get("limit").and_then(Value::as_u64);
             let display = display_path(file_path.unwrap_or("File"), cwd);
@@ -543,7 +692,8 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
         }
         "Write" => {
             let write = normalize_write_input(input);
-            let content = if let Some(path) = write.file_path {
+            let file_path = write.file_path.filter(|path| !path.is_empty());
+            let content = if let Some(path) = file_path {
                 // A client that negotiated diff patches gets the exact patch
                 // from the approval preview / PostToolUse hook; the input does
                 // not tell whether the file exists, so its live tool call shows
@@ -551,25 +701,27 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
                 // no v2 client and `diffPatch` only reaches AIR through the
                 // session wiring; a non-AIR client always gets the input diff.
                 vec![diff_content(path, None, write.content.unwrap_or(""))]
-            } else if let Some(content) = write.content {
+            } else if let Some(content) = write.content.filter(|content| !content.is_empty()) {
                 vec![text_content(content)]
             } else {
                 Vec::new()
             };
-            let title = match write.file_path {
-                Some(p) => format!("Write {}", display_path(p, cwd)),
+            let title = match file_path {
+                Some(path) => format!("Write {}", display_path(path, cwd)),
                 None => "Preparing file…".to_string(),
             };
-            let locations = write
-                .file_path
-                .map(|p| vec![location(p, None)])
+            let locations = file_path
+                .map(|path| vec![location(path, None)])
                 .unwrap_or_default();
             ToolShape::new(ToolKind::Edit, title)
                 .content(content)
                 .locations(locations)
         }
         "Edit" => {
-            let file_path = input.get("file_path").and_then(Value::as_str);
+            let file_path = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty());
             let old_string = input.get("old_string").and_then(Value::as_str);
             let new_string = input.get("new_string").and_then(Value::as_str);
             let has_old = old_string.is_some_and(|s| !s.is_empty());
@@ -587,19 +739,25 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
                 _ => Vec::new(),
             };
             let title = match file_path {
-                Some(p) => format!("Edit {}", display_path(p, cwd)),
+                Some(path) => format!("Edit {}", display_path(path, cwd)),
                 None => "Edit".to_string(),
             };
             let locations = file_path
-                .map(|p| vec![location(p, None)])
+                .map(|path| vec![location(path, None)])
                 .unwrap_or_default();
             ToolShape::new(ToolKind::Edit, title)
                 .content(content)
                 .locations(locations)
         }
         "Glob" => {
-            let path = input.get("path").and_then(Value::as_str);
-            let pattern = input.get("pattern").and_then(Value::as_str);
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty());
+            let pattern = input
+                .get("pattern")
+                .and_then(Value::as_str)
+                .filter(|pattern| !pattern.is_empty());
             let mut label = "Find".to_string();
             if let Some(path) = path {
                 label.push_str(&format!(" `{path}`"));
@@ -612,102 +770,97 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
         }
         "Grep" => {
             let mut label = "grep".to_string();
-            if input.get("-i").and_then(Value::as_bool).unwrap_or(false) {
+            if js_truthy(input.get("-i")) {
                 label.push_str(" -i");
             }
-            if input.get("-n").and_then(Value::as_bool).unwrap_or(false) {
+            if js_truthy(input.get("-n")) {
                 label.push_str(" -n");
             }
-            if let Some(a) = input.get("-A") {
-                label.push_str(&format!(" -A {a}"));
-            }
-            if let Some(b) = input.get("-B") {
-                label.push_str(&format!(" -B {b}"));
-            }
-            if let Some(c) = input.get("-C") {
-                label.push_str(&format!(" -C {c}"));
-            }
-            if let Some(mode) = input.get("output_mode").and_then(Value::as_str) {
-                match mode {
-                    "files_with_matches" => label.push_str(" -l"),
-                    "count" => label.push_str(" -c"),
-                    _ => {}
+            // `!== undefined`: an explicit `null` prints as "null".
+            for flag in ["-A", "-B", "-C"] {
+                if let Some(value) = input.get(flag) {
+                    label.push_str(&format!(" {flag} {}", js_string(Some(value))));
                 }
             }
+            match grep_output_mode(input) {
+                Some("files_with_matches") => label.push_str(" -l"),
+                Some("count") => label.push_str(" -c"),
+                _ => {}
+            }
             if let Some(head) = input.get("head_limit") {
-                label.push_str(&format!(" | head -{head}"));
+                label.push_str(&format!(" | head -{}", js_string(Some(head))));
             }
-            if let Some(glob) = input.get("glob").and_then(Value::as_str) {
-                label.push_str(&format!(" --include=\"{glob}\""));
+            if let Some(glob) = input.get("glob").filter(|glob| js_truthy(Some(glob))) {
+                label.push_str(&format!(" --include=\"{}\"", js_string(Some(glob))));
             }
-            if let Some(ty) = input.get("type").and_then(Value::as_str) {
-                label.push_str(&format!(" --type={ty}"));
+            if let Some(ty) = input.get("type").filter(|ty| js_truthy(Some(ty))) {
+                label.push_str(&format!(" --type={}", js_string(Some(ty))));
             }
-            if input
-                .get("multiline")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if js_truthy(input.get("multiline")) {
                 label.push_str(" -P");
             }
-            if let Some(pattern) = input.get("pattern").and_then(Value::as_str) {
-                label.push_str(&format!(" \"{pattern}\""));
+            if let Some(pattern) = input
+                .get("pattern")
+                .filter(|pattern| js_truthy(Some(pattern)))
+            {
+                label.push_str(&format!(" \"{}\"", js_string(Some(pattern))));
             }
-            if let Some(path) = input.get("path").and_then(Value::as_str) {
+            if let Some(path) = grep_path(input).filter(|path| !path.is_empty()) {
                 label.push_str(&format!(" {path}"));
             }
             ToolShape::new(ToolKind::Search, label)
         }
         "WebFetch" => {
-            let url = input.get("url").and_then(Value::as_str);
+            let url = input
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty());
+            // `offset` reads on through a page too long for one call
+            // (CLI 2.1.290+).
+            let from = input
+                .get("offset")
+                .filter(|offset| js_truthy(Some(offset)))
+                .map(|offset| format!(" (from char {})", js_string(Some(offset))))
+                .unwrap_or_default();
             let mut shape = ToolShape::new(
                 ToolKind::Fetch,
-                url.map(|u| format!("Fetch {u}")).unwrap_or("Fetch".into()),
+                url.map(|url| format!("Fetch {url}{from}"))
+                    .unwrap_or_else(|| "Fetch".to_string()),
             );
-            if let Some(prompt) = input.get("prompt").and_then(Value::as_str) {
+            if let Some(prompt) = input
+                .get("prompt")
+                .and_then(Value::as_str)
+                .filter(|prompt| !prompt.is_empty())
+            {
                 shape = shape.content(vec![text_content(prompt)]);
             }
             shape
         }
         "WebSearch" => {
-            let query = input.get("query").and_then(Value::as_str);
-            let mut label = query
-                .map(|q| format!("\"{q}\""))
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .filter(|query| !query.is_empty());
+            let title = query
+                .map(|query| format!("Search \"{query}\""))
                 .unwrap_or_else(|| "Web search".to_string());
-            if let Some(allowed) = input.get("allowed_domains").and_then(Value::as_array) {
-                if !allowed.is_empty() {
-                    let joined = allowed
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    label.push_str(&format!(" (allowed: {joined})"));
-                }
-            }
-            if let Some(blocked) = input.get("blocked_domains").and_then(Value::as_array) {
-                if !blocked.is_empty() {
-                    let joined = blocked
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    label.push_str(&format!(" (blocked: {joined})"));
-                }
-            }
-            ToolShape::new(ToolKind::Fetch, label)
+            ToolShape::new(ToolKind::Fetch, title)
         }
         "TodoWrite" => {
+            // `Array.isArray(todos) ? \`Update TODOs: ${...}\` : "Update TODOs"`
+            // (`reporters/interaction.ts:139-146`): an empty array still names
+            // the colon and an empty list.
             let todos = input.get("todos").and_then(Value::as_array);
             let title = match todos {
-                Some(list) if !list.is_empty() => {
+                Some(list) => {
                     let joined = list
                         .iter()
-                        .filter_map(|t| t.get("content").and_then(Value::as_str))
+                        .map(|todo| js_string(todo.get("content")))
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("Update TODOs: {joined}")
                 }
-                _ => "Update TODOs".to_string(),
+                None => "Update TODOs".to_string(),
             };
             ToolShape::new(ToolKind::Think, title)
         }
@@ -720,18 +873,21 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
                 let plural = if count == 1 { "" } else { "s" };
                 format!("Report {count} finding{plural}")
             };
+            // `**${finding.file}${finding.line ? ":"+line : ""}** — ${summary}`:
+            // a line of 0 is falsy and no entry is dropped
+            // (`reporters/interaction.ts:165-185`).
             let content = findings
                 .map(|list| {
                     list.iter()
-                        .filter_map(|f| {
-                            let file = f.get("file").and_then(Value::as_str)?;
-                            let line = f.get("line").and_then(Value::as_u64);
-                            let summary = f.get("summary").and_then(Value::as_str).unwrap_or("");
-                            let label = match line {
-                                Some(l) => format!("**{file}:{l}** — {summary}"),
-                                None => format!("**{file}** — {summary}"),
-                            };
-                            Some(text_content(label))
+                        .map(|finding| {
+                            let file = js_string(finding.get("file"));
+                            let line = finding
+                                .get("line")
+                                .filter(|line| js_truthy(Some(line)))
+                                .map(|line| format!(":{}", js_string(Some(line))))
+                                .unwrap_or_default();
+                            let summary = js_string(finding.get("summary"));
+                            text_content(format!("**{file}{line}** — {summary}"))
                         })
                         .collect()
                 })
@@ -769,28 +925,34 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
             shape
         }
         "Skill" => {
-            let skill = input.get("skill").and_then(Value::as_str);
+            let skill = input
+                .get("skill")
+                .and_then(Value::as_str)
+                .filter(|skill| !skill.is_empty());
             let title = skill
-                .map(|s| format!("Load skill: {s}"))
+                .map(|skill| format!("Load skill: {skill}"))
                 .unwrap_or_else(|| "Load skill".to_string());
             ToolShape::new(ToolKind::Other, title)
         }
         "AskUserQuestion" => {
+            // AIR gets a fixed title, because the question is input; every
+            // other client gets the question of a single question
+            // (`reporters/interaction.ts:94-116`).
             let questions = input.get("questions").and_then(Value::as_array);
-            let count = questions.map_or(0, Vec::len);
-            let title = if count == 1 {
-                questions
-                    .and_then(|q| q.first())
-                    .and_then(|q| q.get("question").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "Asking for your input".to_string())
+            let single = if air {
+                None
             } else {
-                "Asking for your input".to_string()
+                questions
+                    .filter(|list| list.len() == 1)
+                    .and_then(|list| list.first())
+                    .and_then(|question| question.get("question").and_then(Value::as_str))
+                    .filter(|question| !question.is_empty())
             };
+            let title = single.unwrap_or("Asking for your input").to_string();
             let content = questions
                 .map(|list| {
                     list.iter()
-                        .filter_map(|q| q.get("question").and_then(Value::as_str))
+                        .filter_map(|question| question.get("question").and_then(Value::as_str))
                         .map(text_content)
                         .collect()
                 })
@@ -798,7 +960,9 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
             ToolShape::new(ToolKind::Other, title).content(content)
         }
         "Other" => {
-            let text = format!("```json\n{}\n```", pretty_json(input));
+            // `\`\`\`json\n${json}\`\`\`` — no newline before the closing fence
+            // (`reporters/interaction.ts:191-206`).
+            let text = format!("```json\n{}```", pretty_json(input));
             ToolShape::new(ToolKind::Other, name.to_string()).content(vec![text_content(text)])
         }
         // Unknown tool — generic fallback (never panics, 9.T2).
@@ -827,14 +991,14 @@ fn text_or_error(text: String, is_error: bool) -> String {
     }
 }
 
-/// Markdown-escape `text` by wrapping it in a sufficiently-long fence
-/// (port of `markdownEscape`, `src/tools.ts:1277-1285`).
+/// Markdown-escape `text` by wrapping it in a sufficiently-long fence (port of
+/// `markdownEscape`, `content.ts:238-246`). The fence run counts only backticks
+/// at the start of a line (`/^```+/gm`), so an indented run does not widen it.
 fn markdown_escape(text: &str) -> String {
     let mut fence = "```".to_string();
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            let run = trimmed.chars().take_while(|&c| c == '`').count();
+        if line.starts_with("```") {
+            let run = line.chars().take_while(|&c| c == '`').count();
             while run >= fence.len() {
                 fence.push('`');
             }
@@ -842,6 +1006,20 @@ fn markdown_escape(text: &str) -> String {
     }
     let tail = if text.ends_with('\n') { "" } else { "\n" };
     format!("{fence}\n{text}{tail}{fence}")
+}
+
+/// The agent-control tools (`reporters/index.ts:36-40`): SendMessage, TaskStop,
+/// ListAgents, Monitor.
+pub fn is_agent_control_tool(name: &str) -> bool {
+    matches!(name, "SendMessage" | "TaskStop" | "ListAgents" | "Monitor")
+}
+
+/// AIR's error result of an agent-control tool: the raw content as plain text,
+/// without the error fence (`AgentControlReporter.errorResult`,
+/// `reporters/interaction.ts:209-219`). Every other client falls back to the
+/// fenced error text.
+pub fn agent_control_error_content(content: &Value) -> Option<Vec<ToolCallContent>> {
+    to_acp_content_update(content, false)
 }
 
 /// Tool-result → `ToolCallUpdate` `content` (port of `toolUpdateFromToolResult`,
@@ -862,7 +1040,9 @@ pub fn tool_result_content(
 ) -> Option<Vec<ToolCallContent>> {
     match name {
         "Read" => read_result_content(structured, input, result_content),
-        "Bash" => bash_result_content(structured, result_content, is_error),
+        // PowerShell shares the Bash reporter, including its result
+        // (`reporters/index.ts:23`).
+        "Bash" | "PowerShell" => bash_result_content(structured, result_content, is_error),
         "Agent" | "Task" => generic_content(result_content, is_error),
         // Edit / Write / Skill results are only a confirmation: the diff or
         // display copy already carries the change (`reporters/file-edit.ts`,
@@ -1053,14 +1233,168 @@ fn join_non_empty<const N: usize>(parts: [&str; N]) -> String {
 }
 
 /// A non-text SDK content block as ACP content (`toAcpContentBlock`,
-/// `content.ts:110-240`). Images are converted; a shape this crate does not
-/// model falls back to its JSON text, like the upstream `default` arm.
+/// `content.ts:143-236`): an image becomes an ACP image, a document a compact
+/// placeholder, and every other block type its text form. An unknown block
+/// falls back to its JSON text, like the upstream `default` arm.
 fn acp_content_block(block: &Value, is_error: bool) -> ToolCallContent {
-    if block.get("type").and_then(Value::as_str) == Some("image") {
-        return image_content(block);
+    let wrap = |text: String| text_content(text_or_error(text, is_error));
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => wrap(
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        Some("image") => image_content(block, is_error),
+        Some("document") => wrap(document_placeholder(block)),
+        Some("tool_reference") => wrap(format!("Tool: {}", js_string(block.get("tool_name")))),
+        Some("tool_search_tool_search_result") => {
+            let names = block
+                .get("tool_references")
+                .and_then(Value::as_array)
+                .map(|references| {
+                    references
+                        .iter()
+                        .map(|reference| js_string(reference.get("tool_name")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let names = if names.is_empty() {
+                "none".to_string()
+            } else {
+                names
+            };
+            wrap(format!("Tools found: {names}"))
+        }
+        Some("tool_search_tool_result_error") => {
+            let message = block
+                .get("error_message")
+                .filter(|message| js_truthy(Some(message)))
+                .map(|message| format!(" - {}", js_string(Some(message))))
+                .unwrap_or_default();
+            wrap(format!(
+                "Error: {}{message}",
+                js_string(block.get("error_code"))
+            ))
+        }
+        Some("web_search_result") => wrap(format!(
+            "{} ({})",
+            js_string(block.get("title")),
+            js_string(block.get("url"))
+        )),
+        Some("web_search_tool_result_error") => {
+            wrap(format!("Error: {}", js_string(block.get("error_code"))))
+        }
+        Some("web_fetch_result") => wrap(format!("Fetched: {}", js_string(block.get("url")))),
+        Some("web_fetch_tool_result_error") => {
+            wrap(format!("Error: {}", js_string(block.get("error_code"))))
+        }
+        Some("code_execution_result") | Some("bash_code_execution_result") => {
+            let stdout = block.get("stdout").and_then(Value::as_str).unwrap_or("");
+            let stderr = block.get("stderr").and_then(Value::as_str).unwrap_or("");
+            let output = if !stdout.is_empty() { stdout } else { stderr };
+            wrap(format!("Output: {output}"))
+        }
+        Some("code_execution_tool_result_error")
+        | Some("bash_code_execution_tool_result_error") => {
+            wrap(format!("Error: {}", js_string(block.get("error_code"))))
+        }
+        Some("text_editor_code_execution_view_result") => wrap(js_string(block.get("content"))),
+        Some("text_editor_code_execution_create_result") => wrap(
+            if js_truthy(block.get("is_file_update")) {
+                "File updated"
+            } else {
+                "File created"
+            }
+            .to_string(),
+        ),
+        Some("text_editor_code_execution_str_replace_result") => {
+            let lines = block
+                .get("lines")
+                .and_then(Value::as_array)
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .map(|line| js_string(Some(line)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            wrap(lines)
+        }
+        Some("text_editor_code_execution_tool_result_error") => {
+            let message = block
+                .get("error_message")
+                .filter(|message| js_truthy(Some(message)))
+                .map(|message| format!(" - {}", js_string(Some(message))))
+                .unwrap_or_default();
+            wrap(format!(
+                "Error: {}{message}",
+                js_string(block.get("error_code"))
+            ))
+        }
+        _ => wrap(serde_json::to_string(block).unwrap_or_default()),
     }
-    let text = serde_json::to_string(block).unwrap_or_default();
-    text_content(text_or_error(text, is_error))
+}
+
+/// A document block's compact placeholder (`content.ts:170-198`): a title
+/// suffix when it names one, the URL for a URL source, and the media type and
+/// byte size otherwise. The base64 payload is never shown.
+fn document_placeholder(block: &Value) -> String {
+    let title = block
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
+        .map(|title| format!(" \"{title}\""))
+        .unwrap_or_default();
+    let source = block.get("source");
+    match source
+        .and_then(|source| source.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("url") => format!(
+            "[document{title}: {}]",
+            js_string(source.and_then(|source| source.get("url")))
+        ),
+        Some("base64") => {
+            let data = source
+                .and_then(|source| source.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // base64 inflates the byte count by 4/3.
+            format!(
+                "[document{title}: {}, {}]",
+                js_string(source.and_then(|source| source.get("media_type"))),
+                format_byte_size(data.len() * 3 / 4)
+            )
+        }
+        Some("text") => {
+            let data = source
+                .and_then(|source| source.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!(
+                "[document{title}: {}, {}]",
+                js_string(source.and_then(|source| source.get("media_type"))),
+                format_byte_size(data.len())
+            )
+        }
+        _ => format!("[document{title}]"),
+    }
+}
+
+/// Human-readable byte size for a document placeholder ("312 B", "2.4 KB",
+/// "1.3 MB"), `content.ts:99-104`.
+fn format_byte_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// Port of `toAcpContentUpdate` (`content.ts:89-108`): an array maps every
@@ -1193,33 +1527,22 @@ pub fn exit_plan_mode_result(
     }
 }
 
-/// Render the raw `tool_result.content` (string or text-block array) as ACP
-/// content blocks (upstream `toAcpContentUpdate` generic path).
+/// Render the raw `tool_result.content` as ACP content blocks (upstream
+/// `toAcpContentUpdate`, the `resultText` generic path): every block type goes
+/// through [`acp_content_block`], a bare object with a `type` is one block, and
+/// a non-empty string is text (fenced on error).
 fn generic_content(result_content: &Value, is_error: bool) -> Option<Vec<ToolCallContent>> {
-    match result_content {
-        Value::String(text) if !text.is_empty() => {
-            Some(vec![text_content(text_or_error(text.clone(), is_error))])
-        }
-        Value::Array(blocks) if !blocks.is_empty() => {
-            let mut out = Vec::new();
-            for block in blocks {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    out.push(text_content(text_or_error(text.to_string(), is_error)));
-                } else if block.get("type").and_then(Value::as_str) == Some("image") {
-                    out.push(image_content(block));
-                }
-            }
-            Some(out)
-        }
-        _ => None,
-    }
+    to_acp_content_update(result_content, is_error)
 }
 
-/// An ACP image content block from an `{type:"image", source:{...}}` block.
-fn image_content(block: &Value) -> ToolCallContent {
+/// An ACP image content block from an `{type:"image", source:{...}}` block
+/// (`content.ts:146-168`). A base64 source becomes an ACP image; URL and file
+/// sources cannot (ACP needs data), so they become a bracketed text placeholder
+/// (fenced on error).
+fn image_content(block: &Value, is_error: bool) -> ToolCallContent {
     let source = block.get("source");
     let source_type = source.and_then(|s| s.get("type")).and_then(Value::as_str);
-    let text = match source_type {
+    match source_type {
         Some("base64") => {
             let data = source
                 .and_then(|s| s.get("data"))
@@ -1229,20 +1552,19 @@ fn image_content(block: &Value) -> ToolCallContent {
                 .and_then(|s| s.get("media_type"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            return ToolCallContent::Content(Content::new(ContentBlock::Image(
+            ToolCallContent::Content(Content::new(ContentBlock::Image(
                 agent_client_protocol::schema::v1::ImageContent::new(data, mime),
-            )));
+            )))
         }
-        Some("url") => format!(
-            "[image: {}]",
-            source
-                .and_then(|s| s.get("url"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        ),
-        _ => "[image: file reference]".to_string(),
-    };
-    text_content(text)
+        Some("url") => text_content(text_or_error(
+            format!("[image: {}]", js_string(source.and_then(|s| s.get("url")))),
+            is_error,
+        )),
+        _ => text_content(text_or_error(
+            "[image: file reference]".to_string(),
+            is_error,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1339,7 +1661,7 @@ mod tests {
                 name: "WebSearch",
                 input: json!({"query": "rust"}),
                 kind: ToolKind::Fetch,
-                title: "\"rust\"",
+                title: "Search \"rust\"",
                 locations: 0,
             },
             Case {
@@ -2308,5 +2630,556 @@ mod tests {
         };
         assert_eq!(diff.old_text.as_deref(), Some("a"));
         assert_eq!(diff.new_text, "");
+    }
+
+    /// The text of a single text content block.
+    fn content_text(item: &ToolCallContent) -> &str {
+        let ToolCallContent::Content(content) = item else {
+            panic!("expected content, got {item:?}");
+        };
+        let ContentBlock::Text(text) = &content.content else {
+            panic!("expected text, got {:?}", content.content);
+        };
+        text.text.as_str()
+    }
+
+    /// F6a / T-29 — Bash reads `description`, else `command_description`; an
+    /// empty description adds no display copy, and an empty command is the
+    /// "Terminal" title (`reporters/bash.ts:6-17,28`).
+    #[test]
+    fn f6a_bash_description_fallback_and_truthiness() {
+        let fallback = tool_shape(
+            "Bash",
+            &json!({"command": "ls", "command_description": "List files"}),
+            None,
+        );
+        assert_eq!(fallback.title, "ls");
+        assert_eq!(fallback.content.len(), 1);
+        assert_eq!(content_text(&fallback.content[0]), "List files");
+
+        // The canonical key wins when both are present.
+        let canonical = tool_shape(
+            "Bash",
+            &json!({"command": "ls", "description": "Canonical",
+                    "command_description": "Alias"}),
+            None,
+        );
+        assert_eq!(content_text(&canonical.content[0]), "Canonical");
+
+        // An empty description is falsy: no display copy.
+        let empty = tool_shape(
+            "Bash",
+            &json!({"command": "ls", "description": "", "command_description": ""}),
+            None,
+        );
+        assert!(empty.content.is_empty());
+
+        // An empty command falls back to the "Terminal" title.
+        let no_command = tool_shape("Bash", &json!({"command": ""}), None);
+        assert_eq!(no_command.title, "Terminal");
+        assert_eq!(no_command.kind, ToolKind::Execute);
+    }
+
+    /// F6a / T-30 — PowerShell shares the Bash reporter (`reporters/index.ts:23`).
+    #[test]
+    fn f6a_powershell_shares_the_bash_reporter() {
+        let shape = tool_shape(
+            "PowerShell",
+            &json!({"command": "Get-ChildItem", "command_description": "List files"}),
+            None,
+        );
+        assert_eq!(shape.kind, ToolKind::Execute);
+        assert_eq!(shape.title, "Get-ChildItem");
+        assert_eq!(content_text(&shape.content[0]), "List files");
+
+        let empty = tool_shape("PowerShell", &json!({}), None);
+        assert_eq!(empty.title, "Terminal");
+        assert!(empty.content.is_empty());
+    }
+
+    /// F6a / T-35 — the Read title is a truthy `limit > 0` range, else a truthy
+    /// `offset` start line, else plain; an empty `file_path` is "File" with no
+    /// locations (`reporters/read.ts:19-33`).
+    #[test]
+    fn f6a_read_title_truthiness() {
+        let offset_only = tool_shape("Read", &json!({"file_path": "/w/a", "offset": 7}), None);
+        assert_eq!(offset_only.title, "Read /w/a (from line 7)");
+
+        let zero_limit = tool_shape(
+            "Read",
+            &json!({"file_path": "/w/a", "offset": 4, "limit": 0}),
+            None,
+        );
+        assert_eq!(zero_limit.title, "Read /w/a (from line 4)");
+
+        // `offset ?? 1`: an explicit 0 is kept (not nullish), so the range
+        // starts at 0 and the location line is 0.
+        let zero_offset = tool_shape(
+            "Read",
+            &json!({"file_path": "/w/a", "offset": 0, "limit": 2}),
+            None,
+        );
+        assert_eq!(zero_offset.title, "Read /w/a (0 - 1)");
+        assert_eq!(zero_offset.locations[0].line, Some(0));
+
+        let no_path = tool_shape("Read", &json!({"file_path": ""}), None);
+        assert_eq!(no_path.title, "Read File");
+        assert!(no_path.locations.is_empty());
+    }
+
+    /// F6a / T-47 — an empty Glob path/pattern is absent: no label segment and
+    /// no location (`reporters/search.ts:5-17`).
+    #[test]
+    fn f6a_glob_truthiness() {
+        let empty = tool_shape("Glob", &json!({"path": "", "pattern": ""}), None);
+        assert_eq!(empty.title, "Find");
+        assert!(empty.locations.is_empty());
+
+        let path_only = tool_shape("Glob", &json!({"path": "/w", "pattern": ""}), None);
+        assert_eq!(path_only.title, "Find `/w`");
+        assert_eq!(path_only.locations.len(), 1);
+        assert_eq!(path_only.locations[0].path, PathBuf::from("/w"));
+
+        // An undefined input (no fields) does not throw and gives bare "Find".
+        assert_eq!(tool_shape("Glob", &json!({}), None).title, "Find");
+    }
+
+    /// F6a / T-48 — the Grep title is the equivalent grep command line: `-l` /
+    /// `-c` flags name the output mode, `file_path` is a path alias, and the
+    /// flags are tested for truthiness (`reporters/search.ts:20-67`).
+    #[test]
+    fn f6a_grep_command_line() {
+        let files = tool_shape(
+            "Grep",
+            &json!({"pattern": "foo", "-l": true, "path": "/w"}),
+            None,
+        );
+        assert_eq!(files.title, "grep -l \"foo\" /w");
+
+        let count_string = tool_shape(
+            "Grep",
+            &json!({"pattern": "foo", "-c": "true", "file_path": "/w/src"}),
+            None,
+        );
+        assert_eq!(count_string.title, "grep -c \"foo\" /w/src");
+
+        // An explicit output_mode wins over the flags.
+        let explicit = tool_shape(
+            "Grep",
+            &json!({"pattern": "foo", "-l": true, "output_mode": "count"}),
+            None,
+        );
+        assert_eq!(explicit.title, "grep -c \"foo\"");
+
+        // A non-`true` flag value is no flag.
+        let other = tool_shape("Grep", &json!({"pattern": "foo", "-l": "yes"}), None);
+        assert_eq!(other.title, "grep \"foo\"");
+
+        // The flags are truthy values, not strict booleans.
+        let truthy = tool_shape(
+            "Grep",
+            &json!({"pattern": "foo", "-i": "yes", "-n": 1, "multiline": "yes",
+                    "-A": 2, "-B": null, "head_limit": 5, "glob": "*.rs",
+                    "type": "rust"}),
+            None,
+        );
+        assert_eq!(
+            truthy.title,
+            "grep -i -n -A 2 -B null | head -5 --include=\"*.rs\" --type=rust -P \"foo\""
+        );
+
+        // An empty path is absent; a non-string `path` falls back to `file_path`.
+        let empty_path = tool_shape(
+            "Grep",
+            &json!({"pattern": "foo", "path": "", "file_path": "/w"}),
+            None,
+        );
+        assert_eq!(empty_path.title, "grep \"foo\"");
+        let alias = tool_shape(
+            "Grep",
+            &json!({"pattern": "foo", "path": null, "file_path": "/w"}),
+            None,
+        );
+        assert_eq!(alias.title, "grep \"foo\" /w");
+
+        // An undefined input (no fields) does not throw and gives bare "grep".
+        assert_eq!(tool_shape("Grep", &json!({}), None).title, "grep");
+    }
+
+    /// F6a / T-49 — WebFetch appends "(from char N)" for a truthy offset and
+    /// shows the prompt (`reporters/web.ts:9-21`).
+    #[test]
+    fn f6a_webfetch_offset_and_prompt() {
+        let offset = tool_shape(
+            "WebFetch",
+            &json!({"url": "https://x.com/a", "offset": 120, "prompt": "summarize"}),
+            None,
+        );
+        assert_eq!(offset.title, "Fetch https://x.com/a (from char 120)");
+        assert_eq!(content_text(&offset.content[0]), "summarize");
+
+        let zero = tool_shape(
+            "WebFetch",
+            &json!({"url": "https://x.com/a", "offset": 0, "prompt": ""}),
+            None,
+        );
+        assert_eq!(zero.title, "Fetch https://x.com/a");
+        assert!(zero.content.is_empty());
+
+        let no_url = tool_shape("WebFetch", &json!({"url": ""}), None);
+        assert_eq!(no_url.title, "Fetch");
+    }
+
+    /// F6a / T-50 — WebSearch is `Search "<query>"` or "Web search"; the domain
+    /// filters are not part of the title (`reporters/web.ts:24-31`).
+    #[test]
+    fn f6a_websearch_title() {
+        let query = tool_shape(
+            "WebSearch",
+            &json!({"query": "rust", "allowed_domains": ["a"], "blocked_domains": ["b"]}),
+            None,
+        );
+        assert_eq!(query.title, "Search \"rust\"");
+        assert_eq!(query.kind, ToolKind::Fetch);
+
+        let empty = tool_shape("WebSearch", &json!({"query": ""}), None);
+        assert_eq!(empty.title, "Web search");
+
+        let missing = tool_shape("WebSearch", &json!({}), None);
+        assert_eq!(missing.title, "Web search");
+    }
+
+    /// F6a / T-52 — Agent/Task appends " (<effort> effort)" unless the child is
+    /// a fork (`reporters/agent.ts:8-19`).
+    #[test]
+    fn f6a_agent_effort_suffix() {
+        let effort = tool_shape(
+            "Agent",
+            &json!({"description": "Review", "prompt": "go", "effort": "high"}),
+            None,
+        );
+        assert_eq!(effort.title, "Review (high effort)");
+
+        let fork = tool_shape(
+            "Task",
+            &json!({"description": "Review", "prompt": "go", "effort": "high",
+                    "subagent_type": "fork"}),
+            None,
+        );
+        assert_eq!(fork.title, "Review");
+
+        let no_description = tool_shape("Agent", &json!({"effort": "low"}), None);
+        assert_eq!(no_description.title, "Task (low effort)");
+
+        let empty_effort = tool_shape(
+            "Agent",
+            &json!({"description": "Review", "effort": ""}),
+            None,
+        );
+        assert_eq!(empty_effort.title, "Review");
+    }
+
+    /// F6a / T-61 — AIR gets the fixed AskUserQuestion title; every other
+    /// client gets a single question (`reporters/interaction.ts:94-116`).
+    #[test]
+    fn f6a_ask_user_question_air_title() {
+        let input = json!({"questions": [{"question": "ok?"}]});
+        let plain = tool_shape_with("AskUserQuestion", &input, None, false);
+        assert_eq!(plain.title, "ok?");
+
+        let air = tool_shape_with("AskUserQuestion", &input, None, true);
+        assert_eq!(air.title, "Asking for your input");
+        assert_eq!(air.content.len(), 1);
+        assert_eq!(content_text(&air.content[0]), "ok?");
+
+        let empty_question = json!({"questions": [{"question": ""}, {"question": "second"}]});
+        let plain = tool_shape("AskUserQuestion", &empty_question, None);
+        assert_eq!(plain.title, "Asking for your input");
+    }
+
+    /// F6a / T-62 — an empty TodoWrite array still names the colon
+    /// (`reporters/interaction.ts:139-146`).
+    #[test]
+    fn f6a_todowrite_empty_array() {
+        let empty = tool_shape("TodoWrite", &json!({"todos": []}), None);
+        assert_eq!(empty.title, "Update TODOs: ");
+
+        let missing = tool_shape("TodoWrite", &json!({}), None);
+        assert_eq!(missing.title, "Update TODOs");
+    }
+
+    /// F6a / T-64 — a finding line of 0 is falsy and no entry is dropped
+    /// (`reporters/interaction.ts:165-185`).
+    #[test]
+    fn f6a_report_findings_line_truthiness() {
+        let shape = tool_shape(
+            "ReportFindings",
+            &json!({"findings": [
+                {"file": "a.rs", "line": 0, "summary": "zero"},
+                {"file": "b.rs", "line": 3, "summary": "three"},
+                {"summary": "no file"}
+            ]}),
+            None,
+        );
+        assert_eq!(shape.title, "Report 3 findings");
+        let lines = shape.content.iter().map(content_text).collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "**a.rs** — zero",
+                "**b.rs:3** — three",
+                "**undefined** — no file",
+            ]
+        );
+
+        let none = tool_shape("ReportFindings", &json!({"findings": []}), None);
+        assert_eq!(none.title, "Report findings: none found");
+        assert!(none.content.is_empty());
+    }
+
+    /// F6a / T-66 — the "Other" input is a JSON fence with no newline before
+    /// the closing fence (`reporters/interaction.ts:191-206`).
+    #[test]
+    fn f6a_other_json_fence() {
+        let shape = tool_shape("Other", &json!({"a": 1}), None);
+        assert_eq!(
+            content_text(&shape.content[0]),
+            "```json\n{\n  \"a\": 1\n}```"
+        );
+
+        let non_object = tool_shape("Other", &json!("text"), None);
+        assert_eq!(content_text(&non_object.content[0]), "```json\n{}```");
+    }
+
+    /// F6a / T-67 — the agent-control tools title by name; AIR's error result is
+    /// plain text, every other client's is fenced
+    /// (`reporters/index.ts:36-40`, `reporters/interaction.ts:209-219`).
+    #[test]
+    fn f6a_agent_control_reporters() {
+        for name in ["SendMessage", "TaskStop", "ListAgents", "Monitor"] {
+            let shape = tool_shape(name, &json!({"anything": true}), None);
+            assert_eq!(shape.title, name);
+            assert_eq!(shape.kind, ToolKind::Other);
+            assert!(shape.content.is_empty());
+            assert!(is_agent_control_tool(name));
+        }
+        assert!(!is_agent_control_tool("Bash"));
+
+        let air = agent_control_error_content(&json!("denied")).unwrap();
+        assert_eq!(content_text(&air[0]), "denied");
+    }
+
+    /// F6a / T-38 / T-69 — content.ts block types: documents become compact
+    /// placeholders, tool/web/code-execution/tool-reference blocks their text
+    /// forms, and a bare object with a type is one block.
+    #[test]
+    fn f6a_content_block_types() {
+        // Document placeholders, never the payload.
+        let url_doc = generic_content(
+            &json!({"type": "document",
+                    "title": "report.pdf",
+                    "source": {"type": "url", "url": "https://x.com/r.pdf"}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            content_text(&url_doc[0]),
+            "[document \"report.pdf\": https://x.com/r.pdf]"
+        );
+
+        let base64_doc = generic_content(
+            &json!({"type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf",
+                               "data": "A".repeat(4096)}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            content_text(&base64_doc[0]),
+            "[document: application/pdf, 3.0 KB]"
+        );
+
+        let text_doc = generic_content(
+            &json!({"type": "document",
+                    "source": {"type": "text", "media_type": "text/plain", "data": "abcd"}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(content_text(&text_doc[0]), "[document: text/plain, 4 B]");
+
+        let blocks = generic_content(
+            &json!([
+                {"type": "tool_reference", "tool_name": "Read"},
+                {"type": "tool_search_tool_search_result",
+                 "tool_references": [{"tool_name": "Read"}, {"tool_name": "Grep"}]},
+                {"type": "tool_search_tool_result_error",
+                 "error_code": "bad", "error_message": "nope"},
+                {"type": "web_search_result", "title": "Rust", "url": "https://rust-lang.org"},
+                {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+                {"type": "web_fetch_result", "url": "https://x.com"},
+                {"type": "web_fetch_tool_result_error", "error_code": "denied"},
+                {"type": "code_execution_result", "stdout": "out", "stderr": "err"},
+                {"type": "bash_code_execution_result", "stdout": "", "stderr": "err2"},
+                {"type": "code_execution_tool_result_error", "error_code": "timeout"},
+                {"type": "bash_code_execution_tool_result_error", "error_code": "boom"},
+                {"type": "text_editor_code_execution_view_result", "content": "body"},
+                {"type": "text_editor_code_execution_create_result", "is_file_update": true},
+                {"type": "text_editor_code_execution_create_result"},
+                {"type": "text_editor_code_execution_str_replace_result", "lines": ["a", "b"]},
+                {"type": "text_editor_code_execution_tool_result_error",
+                 "error_code": "conflict", "error_message": "stale"}
+            ]),
+            false,
+        )
+        .unwrap();
+        let texts = blocks.iter().map(content_text).collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "Tool: Read",
+                "Tools found: Read, Grep",
+                "Error: bad - nope",
+                "Rust (https://rust-lang.org)",
+                "Error: unavailable",
+                "Fetched: https://x.com",
+                "Error: denied",
+                "Output: out",
+                "Output: err2",
+                "Error: timeout",
+                "Error: boom",
+                "body",
+                "File updated",
+                "File created",
+                "a\nb",
+                "Error: conflict - stale",
+            ]
+        );
+
+        // A single object with a type is one block; an unknown type is JSON text.
+        let object = generic_content(
+            &json!({"type": "web_fetch_result", "url": "https://x.com"}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(object.len(), 1);
+        assert_eq!(content_text(&object[0]), "Fetched: https://x.com");
+
+        let unknown = generic_content(&json!({"type": "mystery", "x": 1}), false).unwrap();
+        assert_eq!(content_text(&unknown[0]), "{\"type\":\"mystery\",\"x\":1}");
+
+        // A bare object without a type carries no content.
+        assert!(generic_content(&json!({"x": 1}), false).is_none());
+
+        // An error fences the text form.
+        let error = generic_content(
+            &json!({"type": "web_search_result", "title": "Rust", "url": "u"}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(content_text(&error[0]), "```\nRust (u)\n```");
+    }
+
+    /// F6a / T-69 / T-70 — an image URL is a bracketed placeholder and is
+    /// fenced on error; a base64 image becomes an ACP image.
+    #[test]
+    fn f6a_image_placeholders() {
+        let url = generic_content(
+            &json!({"type": "image", "source": {"type": "url", "url": "https://x.com/i.png"}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(content_text(&url[0]), "[image: https://x.com/i.png]");
+
+        let error = generic_content(
+            &json!({"type": "image", "source": {"type": "url", "url": "https://x.com/i.png"}}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            content_text(&error[0]),
+            "```\n[image: https://x.com/i.png]\n```"
+        );
+
+        let file =
+            generic_content(&json!({"type": "image", "source": {"type": "file"}}), false).unwrap();
+        assert_eq!(content_text(&file[0]), "[image: file reference]");
+
+        let base64 = generic_content(
+            &json!({"type": "image", "source": {"type": "base64",
+                    "data": "aGk=", "media_type": "image/png"}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(kind_of(&base64[0]), "content");
+        assert!(matches!(
+            &base64[0],
+            ToolCallContent::Content(c) if matches!(c.content, ContentBlock::Image(_))
+        ));
+    }
+
+    /// F6a / T-74 — the fence run counts only backticks at the start of a line
+    /// (`/^```+/gm`); an indented run does not widen the fence.
+    #[test]
+    fn f6a_markdown_escape_line_start_only() {
+        assert_eq!(markdown_escape("plain"), "```\nplain\n```");
+        assert_eq!(
+            markdown_escape("```\ncode\n```"),
+            "````\n```\ncode\n```\n````"
+        );
+        // An indented run is not at a line start.
+        assert_eq!(markdown_escape("    ```\ncode"), "```\n    ```\ncode\n```");
+        // A trailing newline is not doubled.
+        assert_eq!(markdown_escape("a\n"), "```\na\n```");
+    }
+
+    /// F6a — Write and Edit treat an empty path/content as absent
+    /// (`reporters/file-edit.ts:25-35,101-120`).
+    #[test]
+    fn f6a_write_edit_truthiness() {
+        let write = tool_shape("Write", &json!({"file_path": "", "content": "x"}), None);
+        assert_eq!(write.title, "Preparing file…");
+        assert!(write.locations.is_empty());
+        assert_eq!(write.content.len(), 1);
+        assert_eq!(content_text(&write.content[0]), "x");
+
+        let empty_content = tool_shape("Write", &json!({"file_path": "", "content": ""}), None);
+        assert_eq!(empty_content.title, "Preparing file…");
+        assert!(empty_content.content.is_empty());
+
+        let edit = tool_shape("Edit", &json!({"file_path": ""}), None);
+        assert_eq!(edit.title, "Edit");
+        assert!(edit.locations.is_empty());
+        assert!(edit.content.is_empty());
+    }
+
+    /// F6a / T-38 — a Read result with image and document blocks uses
+    /// `toAcpContentBlock` for the non-text blocks
+    /// (`reporters/read.ts:67-78`).
+    #[test]
+    fn f6a_read_result_document_and_image_blocks() {
+        let raw = json!([
+            {"type": "text", "text": "caption"},
+            {"type": "document",
+             "title": "report.pdf",
+             "source": {"type": "base64", "media_type": "application/pdf",
+                        "data": "A".repeat(1024)}},
+            {"type": "image", "source": {"type": "url", "url": "https://x.com/i.png"}}
+        ]);
+        let content = read_result_content(None, &json!({}), &raw).unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content_text(&content[0]), "```\ncaption\n```");
+        assert_eq!(
+            content_text(&content[1]),
+            "[document \"report.pdf\": application/pdf, 768 B]"
+        );
+        assert_eq!(content_text(&content[2]), "[image: https://x.com/i.png]");
+    }
+
+    /// F6a / T-30 — a PowerShell result is the shared Bash console block.
+    #[test]
+    fn f6a_powershell_result_console_block() {
+        let content =
+            tool_result_content("PowerShell", &json!({}), None, &json!("files"), false).unwrap();
+        assert_eq!(content_text(&content[0]), "```console\nfiles\n```");
     }
 }

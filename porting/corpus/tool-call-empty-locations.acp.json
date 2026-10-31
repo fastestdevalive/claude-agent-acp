@@ -1,0 +1,7 @@
+{
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "empty locations tools"}
+  ]
+}

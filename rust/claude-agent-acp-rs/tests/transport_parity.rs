@@ -278,6 +278,9 @@ async fn wait_for_updates(count: &AtomicUsize, target: usize) -> bool {
 /// `Channel::duplex()` and over stdio yield identical ordered frames.
 #[tokio::test]
 async fn inv_26_transport_parity() {
+    // The in-process run injects `EnvSnapshot::empty()`; the guard proves no
+    // settings load consults the host managed-policy paths.
+    let _guard = claude_agent_acp_rs::process::ManagedSourceGuard::arm();
     let root = repo_root();
     let ignore = transport_ignore();
     for name in SCRIPTS {

@@ -8,10 +8,9 @@
 //!
 //! Emitted (`SessionUpdate` variants, R9): `AgentMessageChunk`,
 //! `AgentThoughtChunk`, `UserMessageChunk`, `ToolCall`, `ToolCallUpdate`,
-//! `CurrentModeUpdate`, `AvailableCommandsUpdate`, `Plan`.
+//! `CurrentModeUpdate`, `AvailableCommandsUpdate`, `Plan`, `SessionInfoUpdate` (via raw session_info_update).
 //!
-//! Never emitted (`skipped-deliberate`, B1): `SessionInfoUpdate`,
-//! `ConfigOptionUpdate`, `UsageUpdate`.
+//! Never emitted (`skipped-deliberate`, B1): `ConfigOptionUpdate`, `UsageUpdate`.
 //!
 //! The mapper is deliberately **stateful** ([`MapState`]): it must remember
 //! which tool calls have already surfaced to the client so a block present in
@@ -105,6 +104,49 @@ pub struct MapState {
     /// `session.cancelled`, `acp-agent.js:5695-5712`). Opened on cancel and
     /// cleared when the next turn activates.
     stopped_work: bool,
+    /// The Agent/Task tool_use id that started the subagent making a tool call
+    /// (`recordToolCallParent`, `acp-agent.ts:12828-12839`), in insertion order
+    /// with a 1000-entry cap. Upstream's cancel paths (`closeOpenToolCalls` /
+    /// `closeCycleToolCalls`, `acp-agent.ts:5263-5277,5401`) read it to keep a
+    /// call with the subagent it belongs to; those consumers are NOT ported yet
+    /// (F17), so nothing outside the tests reads this memory today.
+    tool_call_parents: Vec<(String, String)>,
+    /// The tool name of a tool result kept after the tool-use cache drops the
+    /// entry (`rememberResolvedToolNames`, `acp-agent.ts:12927-12944`), in
+    /// insertion order with a 1000-entry cap. Upstream reads it in
+    /// `asyncTasks.toolNameOf` (`acp-agent.ts:4538`) and clears it on
+    /// `conversation_reset` (`acp-agent.ts:8199`); those consumers are NOT
+    /// ported yet (F17), so nothing outside the tests reads this memory today.
+    resolved_tool_names: Vec<(String, String)>,
+    /// Whether the client gets the text/thinking of a subagent
+    /// (`forwardsSubagentText`, `acp-agent.ts:10947-10953`): the historical
+    /// `_meta["subagent-transcript"]` capability, native subagent sessions, or
+    /// the `forwardSubagentText` session option. Off by default.
+    forward_subagent_text: bool,
+}
+
+/// `MAX_TOOL_CALL_PARENTS` / `MAX_RESOLVED_TOOL_NAMES` (`acp-agent.ts:12826,12925`).
+const MAX_TOOL_MEMORY: usize = 1000;
+
+/// Insert `(id, value)` at the end of an insertion-ordered memory, dropping the
+/// oldest entry past the cap. Node's `Map.delete` + `Map.set` moves a repeated
+/// key to the end.
+fn remember(memory: &mut Vec<(String, String)>, id: &str, value: &str) {
+    if let Some(pos) = memory.iter().position(|(key, _)| key == id) {
+        memory.remove(pos);
+    }
+    memory.push((id.to_string(), value.to_string()));
+    if memory.len() > MAX_TOOL_MEMORY {
+        memory.remove(0);
+    }
+}
+
+/// Look up an insertion-ordered memory.
+fn recall<'a>(memory: &'a [(String, String)], id: &str) -> Option<&'a str> {
+    memory
+        .iter()
+        .find(|(key, _)| key == id)
+        .map(|(_, value)| value.as_str())
 }
 
 impl MapState {
@@ -122,6 +164,45 @@ impl MapState {
         self.set_cwd(cwd);
     }
 
+    /// Whether the client gets a subagent's text/thinking
+    /// (`forwardsSubagentText`): the `_meta["subagent-transcript"]` capability
+    /// (C-42) or native subagent sessions. Node also forwards it for the
+    /// `forwardSubagentText` session option (F2/F5b).
+    pub(crate) fn set_forward_subagent_text(&mut self, forward: bool) {
+        self.forward_subagent_text = forward;
+    }
+
+    /// Record the Agent/Task call that started the subagent making `id`
+    /// (`recordToolCallParent`). A repeated id moves to the end of the
+    /// insertion-ordered memory.
+    fn record_tool_call_parent(&mut self, id: &str, parent: &str) {
+        remember(&mut self.tool_call_parents, id, parent);
+    }
+
+    /// Forget the parent of a tool call that reached a final status
+    /// (`session.toolCallParents?.delete`, `acp-agent.ts:4570`).
+    fn forget_tool_call_parent(&mut self, id: &str) {
+        self.tool_call_parents.retain(|(key, _)| key != id);
+    }
+
+    /// The Agent/Task call of the subagent that made `id`, if recorded
+    /// (`session.toolCallParents?.get`, `acp-agent.ts:5268`).
+    pub fn tool_call_parent(&self, id: &str) -> Option<&str> {
+        recall(&self.tool_call_parents, id)
+    }
+
+    /// Keep the tool name of a tool result before the tool-use cache drops it
+    /// (`rememberResolvedToolNames`).
+    fn remember_resolved_tool_name(&mut self, id: &str, name: &str) {
+        remember(&mut self.resolved_tool_names, id, name);
+    }
+
+    /// The remembered tool name of a resolved tool call, if any
+    /// (`session.resolvedToolNames?.get`, `acp-agent.ts:4538`).
+    pub fn resolved_tool_name(&self, id: &str) -> Option<&str> {
+        recall(&self.resolved_tool_names, id)
+    }
+
     /// Open the stopped-work window after a cancel (Decision 18): a late
     /// consolidated assistant message emits no remainder until the next turn
     /// activates.
@@ -133,6 +214,11 @@ impl MapState {
     /// `activateTurn` clears `session.cancelled`).
     pub(crate) fn end_stopped_work(&mut self) {
         self.stopped_work = false;
+    }
+
+    /// True if the session was cancelled (stopped work window is open).
+    pub(crate) fn is_stopped_work(&self) -> bool {
+        self.stopped_work
     }
 
     /// Clear the streamed text/thinking record for one lane (a new
@@ -200,6 +286,7 @@ impl MapState {
         self.tool_use_cache.remove(id);
         self.tool_tracker.remove(id);
         self.pending_hooks.remove(id);
+        self.tool_call_parents.retain(|(key, _)| key != id);
         self.books.forget(id);
     }
 
@@ -594,12 +681,81 @@ fn map_consolidated_ctx(
 /// the single-result `tool_use_result` and the `tool_result_meta` sidecar ride
 /// along to the tool updates. The echo-skip itself stays in the session actor.
 pub fn map_user_frame(frame: &Value, state: &mut MapState) -> Vec<SessionUpdate> {
+    remember_user_frame_tool_names(frame, state);
     let content = frame
         .pointer("/message/content")
         .cloned()
         .unwrap_or(Value::Null);
     let ctx = FrameCtx::of_user_frame(frame, &content);
-    map_consolidated_ctx(&content, MsgRole::User, state, &ctx)
+    let updates = match &content {
+        // Map one block at a time so a caller that owns extra updates (the
+        // actor's plan/suppressed resolution, session.rs) can interleave them
+        // in block order like Node's `toAcpNotifications`
+        // (`acp-agent.ts:13232-13253`).
+        Value::Array(blocks) => blocks
+            .iter()
+            .flat_map(|block| map_user_block(block, state, &ctx))
+            .collect(),
+        _ => map_consolidated_ctx(&content, MsgRole::User, state, &ctx),
+    };
+    let message_id = crate::mcp_command::message_id_of(frame).unwrap_or_default();
+    apply_stream_message_id(updates, &message_id)
+}
+
+/// Keep the tool names of a user frame's results before the cache drops them
+/// (`rememberResolvedToolNames`, `acp-agent.ts:8020`). The actor calls it once
+/// per frame before mapping the blocks one by one ([`map_user_frame_block`]).
+pub fn remember_user_frame_tool_names(frame: &Value, state: &mut MapState) {
+    let content = frame
+        .pointer("/message/content")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let Some(blocks) = content.as_array() else {
+        return;
+    };
+    for block in blocks {
+        if block["type"].as_str() != Some("tool_result") {
+            continue;
+        }
+        let Some(id) = block["tool_use_id"].as_str() else {
+            continue;
+        };
+        if let Some(name) = state
+            .tool_use_cache
+            .get(id)
+            .and_then(|tool_use| tool_use["name"].as_str())
+            .filter(|name| !name.is_empty())
+        {
+            let name = name.to_string();
+            state.remember_resolved_tool_name(id, &name);
+        }
+    }
+}
+
+/// Map ONE block of a consolidated `user` frame with the frame attribution, so
+/// the actor can interleave the resolution updates it owns in block order
+/// (`acp-agent.ts:13232`). [`remember_user_frame_tool_names`] must run once per
+/// frame first.
+pub fn map_user_frame_block(
+    frame: &Value,
+    block: &Value,
+    state: &mut MapState,
+) -> Vec<SessionUpdate> {
+    let content = frame
+        .pointer("/message/content")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let ctx = FrameCtx::of_user_frame(frame, &content);
+    let updates = map_user_block(block, state, &ctx);
+    let message_id = crate::mcp_command::message_id_of(frame).unwrap_or_default();
+    apply_stream_message_id(updates, &message_id)
+}
+
+/// Map one consolidated `user` block into `out` (7.1, 7.3, 7.5, 7.6).
+fn map_user_block(block: &Value, state: &mut MapState, ctx: &FrameCtx) -> Vec<SessionUpdate> {
+    let mut out = Vec::new();
+    map_block(block, MsgRole::User, state, &mut out, ctx);
+    out
 }
 
 /// Map a consolidated `assistant` message the way Node does (rust-parity-fixes
@@ -619,18 +775,25 @@ pub fn map_consolidated_assistant(frame: &Value, state: &mut MapState) -> Vec<Se
         .cloned()
         .unwrap_or(Value::Null);
     let streamed = state.take_streamed_blocks(key);
-    let content = if is_strict_top_level(frame) && !state.stopped_work {
+    let forward = state.forward_subagent_text;
+    let content = if state.stopped_work {
+        // A post-cancel remainder is dropped.
+        drop_text_thinking(&content)
+    } else if is_strict_top_level(frame) || forward {
+        // The main conversation always forwards its text; a client that gets a
+        // subagent's transcript (C-42) forwards the nested one too
+        // (`message.parent_tool_use_id === null || forwardsSubagentText()`,
+        // `acp-agent.ts:7994`).
         unstreamed_remainder(&content, &streamed)
     } else {
         // Nested text/thinking stays internal for a client that does not get
-        // subagent text, and a post-cancel remainder is dropped.
+        // subagent text.
         drop_text_thinking(&content)
     };
-    let updates = map_consolidated_ctx(
-        &content,
-        MsgRole::Assistant,
-        state,
-        &FrameCtx::of_frame(frame),
+    let ctx = FrameCtx::of_frame(frame);
+    let updates = stamp_chunk_parent(
+        map_consolidated_ctx(&content, MsgRole::Assistant, state, &ctx),
+        ctx.parent.as_deref(),
     );
     // Node groups every chunk under the message id (`messageIdForGrouping`,
     // `acp-agent.js:9789-9800`): the API message id, else the SDK frame uuid.
@@ -733,22 +896,23 @@ fn map_block(
     let name = block["name"].as_str().unwrap_or("");
     match block["type"].as_str() {
         Some("tool_use") | Some("server_tool_use") | Some("mcp_tool_use") => {
+            // Node caches EVERY tool_use by id before branching, TodoWrite
+            // included (`toolUseCache[chunk.id] = chunk`, `acp-agent.ts:13083`,
+            // T-19), so a later tool_result always finds its name/input.
+            state.tool_use_cache.insert(
+                block["id"].as_str().unwrap_or("").to_string(),
+                block.clone(),
+            );
             if name == "TodoWrite" {
-                if let Some(plan) = plan_from_todo_write(block) {
+                if let Some(plan) = plan_from_todo_write(block, ctx.parent.as_deref()) {
                     out.push(plan);
                 }
             } else if is_task_tool(name) {
-                // Task* tool_use is suppressed (no tool_call); keep the cache
-                // entry so the tool_result path can resolve the tool name and
-                // input (X12/Decision 12).
-                state.tool_use_cache.insert(
-                    block["id"].as_str().unwrap_or("").to_string(),
-                    block.clone(),
-                );
-            } else {
-                if let Some(update) = tool_call_from_use(block, state, ctx) {
-                    out.push(update);
-                }
+                // Task* tool_use is suppressed (no tool_call); the cache entry
+                // lets the tool_result path resolve the tool name and input
+                // (X12/Decision 12).
+            } else if let Some(update) = tool_call_from_use(block, state, ctx) {
+                out.push(update);
             }
         }
         Some("tool_result")
@@ -759,33 +923,74 @@ fn map_block(
         | Some("bash_code_execution_tool_result")
         | Some("text_editor_code_execution_tool_result")
         | Some("mcp_tool_result") => {
-            let id = block["tool_use_id"].as_str().unwrap_or("");
-            let tool_name = state
-                .tool_use_cache
-                .get(id)
-                .and_then(|v| v["name"].as_str());
-            if tool_name == Some("TodoWrite") {
-                // Plan-lane tool results never emit a tool_call_update (the
-                // plan was already emitted at tool_use time).
-                state.tool_use_cache.remove(id);
-            } else if tool_name.is_some_and(tools::is_task_tool) {
+            let id = block["tool_use_id"].as_str().unwrap_or("").to_string();
+            let is_error = block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let status = if is_error {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            };
+            // Node clears the emitted marker on EVERY tool_result
+            // (`acp-agent.ts:13171`), so a permission-surfaced call is resolved
+            // exactly once.
+            let was_emitted = state.emitted.remove(&id);
+            let cached = state.tool_use_cache.remove(&id);
+            let Some(tool_use) = cached else {
+                // T-20: a result whose tool_use never reached the cache. The
+                // permission flow may have surfaced the tool_call before the
+                // assistant message was dropped, so resolve that call with
+                // `{status, rawOutput}` and no `claudeCode` meta (the tool name
+                // is unknown here). Without a surfaced call there is nothing
+                // pending: Node logs and drops it (`acp-agent.ts:13193-13215`).
+                if was_emitted {
+                    let mut fields = ToolCallUpdateFields::new().status(status);
+                    if let Some(content) = block.get("content") {
+                        fields = fields.raw_output(content.clone());
+                    }
+                    state.books.forget(&id);
+                    state.forget_tool_call_parent(&id);
+                    out.push(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        id.clone(),
+                        fields,
+                    )));
+                }
+                // The call is fully resolved — finishResult for every
+                // tool_result (`acp-agent.ts:13181`).
+                state.finish_result_tool_tracker(&id, false);
+                return;
+            };
+            let name = tool_use["name"].as_str().unwrap_or("").to_string();
+            // A permission request may have surfaced a plan-rendered (TodoWrite)
+            // or suppressed (Task*) tool as a real tool_call so the request
+            // referenced a known id (issue #851). Those branches never emit a
+            // tool_call_update, so the actor resolves the surfaced call at the
+            // tool_result call site (`acp-agent.ts:13218-13245`, session.rs).
+            if tools::is_task_tool(&name) {
                 // Task* tool results are suppressed too (no tool_call_update);
                 // the plan update is published by the actor at tool_result time
                 // (X12/Decision 12).
-                state.tool_use_cache.remove(id);
-                // PC-1.5: a permission-surfaced Task* call is resolved by a raw update the
-                // unfinished-tool books never see. Node clears the emitted marker on every
-                // tool_result (acp-agent.ts:13171) and forgets the call on a final status
-                // (acp-agent.ts:4592-4603), so the turn must not report it as stuck.
-                state.emitted.remove(id);
-                state.books.forget(id);
-                // Review PC-1 (c): finishResult (acp-agent.ts:13181) for every tool_result.
-                state.finish_result_tool_tracker(id, false);
-            } else {
-                if let Some(update) = tool_update_from_result(block, state, ctx) {
+                // PC-1.5: the call is resolved now, so the unfinished-tool books
+                // must not report it as stuck.
+                state.books.forget(&id);
+                // Review PC-1 (c): finishResult for the suppressed result (no
+                // hook is registered for Task*).
+                state.finish_result_tool_tracker(&id, false);
+            } else if name != "TodoWrite" {
+                if let Some(update) = tool_update_from_result(block, &tool_use, state, ctx) {
                     out.push(update);
                 }
+            } else {
+                // Plan-lane tool results never emit a tool_call_update (the plan
+                // was already emitted at tool_use time).
+                state.books.forget(&id);
+                // Review PC-1 (c): finishResult (`acp-agent.ts:13181`) for the
+                // suppressed result (no hook is registered for TodoWrite).
+                state.finish_result_tool_tracker(&id, false);
             }
+            state.forget_tool_call_parent(&id);
         }
         _ => {
             if let Some(update) = chunk_from_block(block, role) {
@@ -809,18 +1014,28 @@ fn tool_call_from_use(
     let raw_input = block.get("input").cloned();
 
     if state.emitted.contains(&id) {
-        // Already surfaced (streamed block, or consolidated after streaming) —
-        // refine rather than emit a duplicate ToolCall (7.7).
+        // A permission request surfaced the tool call with its complete input;
+        // the empty input at the stream start has nothing to add
+        // (`alreadyEmitted && inputComplete === false`, `acp-agent.ts:13162`,
+        // U-23). Otherwise refine rather than emit a duplicate ToolCall (7.7).
+        if state.input_incomplete {
+            return None;
+        }
         return tool_call_update_refine(id, &name, raw_input, state, ctx);
     }
     state.emitted.insert(id.clone());
     state.tool_use_cache.insert(id.clone(), block.clone());
+    // T-15: remember the Agent/Task call that started the subagent making this
+    // call (`recordToolCallParent`).
+    if let Some(parent) = ctx.parent.as_deref() {
+        state.record_tool_call_parent(&id, parent);
+    }
     if name != "TodoWrite" && !tools::is_task_tool(&name) {
         state.pending_hooks.insert(id.clone());
     }
 
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = tools::tool_shape(&name, &input, state.cwd.as_deref());
+    let shape = tools::tool_shape_with(&name, &input, state.cwd.as_deref(), state.air);
     // AIR gets `rawInput` once it is complete; every other client gets the
     // input as it stands, also the empty input at the stream start.
     let sent_raw_input = if state.air && state.input_incomplete {
@@ -858,19 +1073,17 @@ fn tool_call_from_use(
     ))
 }
 
-/// 7.3 — a `tool_result` block becomes a completing `ToolCallUpdate`.
+/// 7.3 — a `tool_result` block becomes a completing `ToolCallUpdate`. The
+/// caller already took the cached tool_use and cleared the emitted marker (Node
+/// does both at the top of its `tool_result` case).
 fn tool_update_from_result(
     block: &Value,
+    tool_use: &Value,
     state: &mut MapState,
     ctx: &FrameCtx,
 ) -> Option<SessionUpdate> {
     let id = block["tool_use_id"].as_str().unwrap_or("").to_string();
-    let name = state
-        .tool_use_cache
-        .get(&id)
-        .and_then(|v| v["name"].as_str())
-        .unwrap_or("Other")
-        .to_string();
+    let name = tool_use["name"].as_str().unwrap_or("Other").to_string();
     let is_error = block
         .get("is_error")
         .and_then(Value::as_bool)
@@ -881,14 +1094,7 @@ fn tool_update_from_result(
         ToolCallStatus::Completed
     };
 
-    // The call is resolved — never emit it again, and drop the cache entry so
-    // a long session doesn't retain every tool call.
-    state.emitted.remove(&id);
-    let use_input = state
-        .tool_use_cache
-        .remove(&id)
-        .and_then(|use_block| use_block.get("input").cloned())
-        .unwrap_or(Value::Null);
+    let use_input = tool_use.get("input").cloned().unwrap_or(Value::Null);
 
     let result_input = block.get("content").cloned().unwrap_or(Value::Null);
     let result_meta = crate::tool_meta::meta_with_parent_and_nonexec(
@@ -927,6 +1133,13 @@ fn tool_update_from_result(
         &result_input,
         is_error,
     );
+    // An AIR client gets the error of an agent-control tool as plain text,
+    // without the fence (`AgentControlReporter.errorResult`,
+    // `reporters/interaction.ts:209-219`); every other client keeps the fenced
+    // fallback.
+    if state.air && is_error && tools::is_agent_control_tool(&name) {
+        content = tools::agent_control_error_content(&result_input);
+    }
     if state.air {
         // AIR shows a read or a search that names a path as the list of viewed
         // files, which does not show the text of the result: it stays out. AIR
@@ -977,8 +1190,13 @@ fn tool_call_update_refine(
     state: &mut MapState,
     ctx: &FrameCtx,
 ) -> Option<SessionUpdate> {
+    // T-15: a refinement can be the first update to name the subagent's parent
+    // for a call the permission flow surfaced.
+    if let Some(parent) = ctx.parent.as_deref() {
+        state.record_tool_call_parent(&id, parent);
+    }
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = tools::tool_shape(name, &input, state.cwd.as_deref());
+    let shape = tools::tool_shape_with(name, &input, state.cwd.as_deref(), state.air);
     let mut fields = ToolCallUpdateFields::new()
         .kind(shape.kind)
         .title(shape.title)
@@ -1068,8 +1286,10 @@ fn text_chunk(text: &str, role: MsgRole) -> SessionUpdate {
     }
 }
 
-/// 7.5 — a `TodoWrite` tool_use becomes a `Plan` snapshot.
-fn plan_from_todo_write(block: &Value) -> Option<SessionUpdate> {
+/// 7.5 — a `TodoWrite` tool_use becomes a `Plan` snapshot. A nested (subagent)
+/// frame's plan carries `_meta.claudeCode.parentToolUseId` like every other
+/// update of that frame (`stampParentToolUseId`, `acp-agent.ts:13356`).
+fn plan_from_todo_write(block: &Value, parent: Option<&str>) -> Option<SessionUpdate> {
     let todos = block.get("input")?.get("todos")?.as_array()?;
     let entries = todos
         .iter()
@@ -1089,7 +1309,16 @@ fn plan_from_todo_write(block: &Value) -> Option<SessionUpdate> {
             PlanEntry::new(content, PlanEntryPriority::Medium, status)
         })
         .collect();
-    Some(SessionUpdate::Plan(Plan::new(entries)))
+    let plan = Plan::new(entries);
+    let plan = match parent {
+        Some(parent) => {
+            let mut meta = serde_json::Map::new();
+            crate::tool_meta::stamp_parent(&mut meta, Some(parent));
+            plan.meta(meta)
+        }
+        None => plan,
+    };
+    Some(SessionUpdate::Plan(plan))
 }
 
 /// 7.5 — a `commands_changed` system frame becomes an `AvailableCommandsUpdate`.
@@ -1216,6 +1445,100 @@ pub fn available_commands_json(update: &AvailableCommandsUpdate) -> Value {
     value
 }
 
+/// The tool reporters that unconditionally define `locations` on `tool_call`:
+/// - `Read` (`reporters/read.js:17`)
+/// - `Write` (`reporters/file-edit.js:14`)
+/// - `Edit` (`reporters/file-edit.js:80`)
+/// - `NotebookEdit` (`reporters/file-edit.js:167`)
+/// - `Glob` (`reporters/search.js:13`)
+///
+/// Other reporters (Bash, Grep, WebSearch, etc.) leave `locations` undefined.
+const LOCATION_DEFAULT_TOOLS: [&str; 5] = ["Read", "Write", "Edit", "NotebookEdit", "Glob"];
+
+/// Materialise defaults on a serialized typed `SessionUpdate::ToolCall` (Decision 4 / D2).
+///
+/// The pinned `agent-client-protocol` crate omits `status:"pending"`, empty
+/// `content:[]`, `kind:"other"` and empty `locations:[]` because of
+/// `skip_serializing_if = is_default` / `Vec::is_empty`. Node's `renderer.toolCall()`
+/// always explicitly emits:
+/// - `status: "pending"`
+/// - `content: []`
+/// - `kind: "other"` (when not already set)
+/// - `locations: []` if missing and the tool is one of the 5 reporters above.
+pub fn materialize_tool_call_defaults(update: &mut Value) {
+    let Some(map) = update.as_object_mut() else {
+        return;
+    };
+    if let Some(su) = map.get("sessionUpdate").and_then(Value::as_str) {
+        if su != "tool_call" {
+            return;
+        }
+    } else if !map.contains_key("toolCallId") {
+        return;
+    }
+    map.entry("status")
+        .or_insert_with(|| Value::String("pending".to_string()));
+    map.entry("content")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    map.entry("kind")
+        .or_insert_with(|| Value::String("other".to_string()));
+
+    if !map.contains_key("locations") {
+        let tool_name = map
+            .get("_meta")
+            .and_then(|m| m.get("claudeCode"))
+            .and_then(|c| c.get("toolName"))
+            .and_then(Value::as_str)
+            .or_else(|| map.get("name").and_then(Value::as_str));
+        if let Some(name) = tool_name {
+            if LOCATION_DEFAULT_TOOLS.contains(&name) {
+                map.insert("locations".to_string(), Value::Array(Vec::new()));
+            }
+        }
+    }
+}
+
+/// Materialise `oldText: null` for `{type: "diff"}` content blocks where
+/// `oldText` is omitted (Decision 4 / D8).
+///
+/// Rust's `Diff` struct has `old_text: Option<String>`, so serde omits the field
+/// when it is `None` (such as creating a new file or empty `old_string`). Node's
+/// plain object diffs explicitly include `oldText: null`.
+///
+/// Only the `content[*]` entries of a `tool_call` / `tool_call_update` (or the
+/// permission `toolCall`, recognised by its `toolCallId`) are touched. The
+/// `rawInput`, `rawOutput` and `_meta.claudeCode.toolResponse` fields carry the
+/// tool's own data verbatim — a `{"type":"diff"}` object inside them (an MCP
+/// tool input or output, a hook's tool response) must stay byte-identical to
+/// Node's.
+pub fn materialize_diff_old_text(tool_call: &mut Value) {
+    let Some(map) = tool_call.as_object_mut() else {
+        return;
+    };
+    let is_tool_call = match map.get("sessionUpdate").and_then(Value::as_str) {
+        Some("tool_call" | "tool_call_update") => true,
+        Some(_) => false,
+        // The permission request's `toolCall` has no `sessionUpdate`.
+        None => map.contains_key("toolCallId"),
+    };
+    if !is_tool_call {
+        return;
+    }
+    let Some(content) = map.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for entry in content {
+        let Value::Object(entry) = entry else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) == Some("diff")
+            && !entry.contains_key("oldText")
+        {
+            entry.insert("oldText".to_string(), Value::Null);
+        }
+    }
+}
+
 /// 7.5 — a mode change becomes a `CurrentModeUpdate`.
 pub fn map_mode_update(mode_id: impl Into<SessionModeId>) -> SessionUpdate {
     SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id))
@@ -1251,7 +1574,13 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
                 &ctx,
             );
             state.input_incomplete = false;
-            apply_stream_message_id(mapped, &state.current_stream_message_id)
+            apply_stream_message_id(
+                stamp_chunk_parent(
+                    drop_air_nested_text(state, mapped, is_strict_top_level(message)),
+                    ctx.parent.as_deref(),
+                ),
+                &state.current_stream_message_id,
+            )
         }
         Some("content_block_delta") => {
             let delta = &event["delta"];
@@ -1274,12 +1603,16 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
                     state.record_streamed_delta(&stream_key, index, kind, text);
                 }
                 // A text/thinking delta maps like a one-block assistant message.
+                let mapped = map_consolidated_ctx(
+                    &Value::Array(vec![delta.clone()]),
+                    MsgRole::Assistant,
+                    state,
+                    &ctx,
+                );
                 apply_stream_message_id(
-                    map_consolidated_ctx(
-                        &Value::Array(vec![delta.clone()]),
-                        MsgRole::Assistant,
-                        state,
-                        &ctx,
+                    stamp_chunk_parent(
+                        drop_air_nested_text(state, mapped, is_strict_top_level(message)),
+                        ctx.parent.as_deref(),
                     ),
                     &state.current_stream_message_id,
                 )
@@ -1300,7 +1633,7 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
             state.clear_streamed_blocks(&stream_key);
             Vec::new()
         }
-        Some("content_block_stop") | Some("message_stop") => {
+        Some("message_stop") => {
             // A message boundary ends the input stream on this lane; drop any
             // leftover partial input so the next message starts clean.
             state
@@ -1308,9 +1641,72 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
                 .retain(|(key, _), _| *key != stream_key);
             Vec::new()
         }
+        Some("content_block_stop") => {
+            // content_block_stop drops only that block's streamed input (N-48,
+            // acp-agent.ts:13511-13515).
+            if let Some(idx) = event.get("index").and_then(Value::as_u64) {
+                state.streamed_inputs.remove(&(stream_key, idx));
+            }
+            Vec::new()
+        }
         // `ping` and `message_delta` are keep-alive/boundary no-ops.
         _ => Vec::new(),
     }
+}
+
+/// Stamp `_meta.claudeCode.parentToolUseId` onto the message/thought chunks a
+/// nested frame produced (`stampParentToolUseId` runs on every update of a
+/// frame with a string `parent_tool_use_id`, `acp-agent.ts:13476-13480`).
+/// A top-level frame (`None`) is left untouched.
+/// AIR gets no STREAMED subagent text without the transcript capability (or
+/// native subagent sessions): the nested text/thinking stays internal to the
+/// Agent tool call (`acp-agent.ts:7680-7692`). Every other client gets it, like
+/// upstream, and a client that forwards the transcript gets it too.
+/// Node's gate is `message.parent_tool_use_id !== null`, so a frame with the
+/// field MISSING counts as nested (dropped), not top level; only a present
+/// `null` is the main conversation.
+fn drop_air_nested_text(
+    state: &MapState,
+    updates: Vec<SessionUpdate>,
+    top_level: bool,
+) -> Vec<SessionUpdate> {
+    if !state.air || state.forward_subagent_text || top_level {
+        return updates;
+    }
+    updates
+        .into_iter()
+        .filter(|update| {
+            !matches!(
+                update,
+                SessionUpdate::AgentMessageChunk(_) | SessionUpdate::AgentThoughtChunk(_)
+            )
+        })
+        .collect()
+}
+
+fn stamp_chunk_parent(updates: Vec<SessionUpdate>, parent: Option<&str>) -> Vec<SessionUpdate> {
+    let Some(parent) = parent else {
+        return updates;
+    };
+    updates
+        .into_iter()
+        .map(|update| {
+            let (mut chunk, tag) = match update {
+                SessionUpdate::AgentMessageChunk(chunk) => (chunk, 0u8),
+                SessionUpdate::AgentThoughtChunk(chunk) => (chunk, 1),
+                SessionUpdate::UserMessageChunk(chunk) => (chunk, 2),
+                other => return other,
+            };
+            let mut meta = chunk.meta.take().unwrap_or_default();
+            crate::tool_meta::stamp_parent(&mut meta, Some(parent));
+            chunk.meta = Some(meta);
+            match tag {
+                0 => SessionUpdate::AgentMessageChunk(chunk),
+                1 => SessionUpdate::AgentThoughtChunk(chunk),
+                _ => SessionUpdate::UserMessageChunk(chunk),
+            }
+        })
+        .collect()
 }
 
 /// Stamp `message_id` onto the chunk updates a stream-event block produced
@@ -1408,6 +1804,12 @@ fn input_json_delta(
     // `state.track_tool_call_update`).
     let id = streamed.id.clone();
     let name = streamed.name.clone();
+    // TodoWrite and the Task* tools never surfaced a tool_call to refine, so
+    // their streamed input stays out of the tool feed (`acp-agent.ts:13468-13470`,
+    // T-14/N-47).
+    if !tools::should_emit_tool_call(&name) {
+        return Vec::new();
+    }
     // Refine, never duplicate: this is a tool_call_update, not a tool_call.
     streamed_input_refinement(state, &id, &name, input, ctx)
         .into_iter()
@@ -1425,7 +1827,12 @@ fn streamed_input_refinement(
     input: Value,
     ctx: &FrameCtx,
 ) -> Option<SessionUpdate> {
-    let shape = tools::tool_shape(name, &input, state.cwd.as_deref());
+    // T-15: the partial refinement is a `tool_call_update`, so a subagent call
+    // records its Agent/Task parent here too (`recordToolCallParent`).
+    if let Some(parent) = ctx.parent.as_deref() {
+        state.record_tool_call_parent(id, parent);
+    }
+    let shape = tools::tool_shape_with(name, &input, state.cwd.as_deref(), state.air);
     // The `_meta` reads the recovered partial input (`partialRefinement`).
     let mut meta = state.use_meta(name, &input);
     crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
@@ -1620,6 +2027,19 @@ mod tests {
 
         for (desc, content, role, expected) in cases {
             let mut state = MapState::default();
+            // A `tool_result` only maps when its `tool_use` is cached and was
+            // surfaced (T-20); seed that state for the variant case.
+            if content.as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b["type"].as_str() == Some("tool_result"))
+            }) {
+                state.tool_use_cache.insert(
+                    "t1".to_string(),
+                    json!({"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}),
+                );
+                state.emitted.insert("t1".to_string());
+            }
             let updates = map_consolidated(&content, role, &mut state);
             assert_eq!(
                 updates.len(),
@@ -2310,7 +2730,9 @@ mod tests {
             "tool_use_id": "toolu_HK1",
             "content": "output"
         });
-        let _ = tool_update_from_result(&result_chunk, &mut state, &FrameCtx::default());
+        let tool_use = state.tool_use_cache.remove("toolu_HK1").unwrap();
+        state.emitted.remove("toolu_HK1");
+        let _ = tool_update_from_result(&result_chunk, &tool_use, &mut state, &FrameCtx::default());
 
         // Tracker entry is KEPT because hook is pending
         assert_eq!(state.tracked_tool_calls(), 1);
@@ -2528,5 +2950,743 @@ mod tests {
             assert_eq!(t.text.as_str(), "```\none\n```");
             break;
         }
+    }
+
+    /// F6b / T-09 + T-19: Node caches EVERY tool_use by id, TodoWrite included
+    /// (`acp-agent.ts:13083`), so its tool_result is resolved silently instead
+    /// of hitting the untracked path. The plan shows `activeForm` for an
+    /// in_progress entry, but an EMPTY activeForm falls back to the content
+    /// (U-27, `tools.ts:70`).
+    #[test]
+    fn f6b_todo_write_is_cached_and_its_result_is_silent() {
+        let mut state = MapState::default();
+        let use_block = json!([{
+            "type": "tool_use", "id": "toolu_TODO", "name": "TodoWrite",
+            "input": {"todos": [
+                {"content": "Write tests", "status": "in_progress", "activeForm": "Writing tests"},
+                {"content": "Empty form", "status": "in_progress", "activeForm": ""},
+                {"content": "Ship", "status": "pending", "activeForm": "Shipping"}
+            ]}
+        }]);
+        let updates = map_consolidated(&use_block, MsgRole::Assistant, &mut state);
+        assert_eq!(updates.len(), 1);
+        let plan = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(plan["sessionUpdate"], "plan");
+        assert_eq!(plan["entries"][0]["content"], "Writing tests");
+        assert_eq!(plan["entries"][1]["content"], "Empty form");
+        assert_eq!(plan["entries"][2]["content"], "Ship");
+        assert!(
+            state.tool_use_cache.contains_key("toolu_TODO"),
+            "TodoWrite must be cached like every other tool_use (T-19)"
+        );
+        assert!(
+            !state.has_emitted("toolu_TODO"),
+            "TodoWrite is never a tool_call"
+        );
+
+        let result = json!([{
+            "type": "tool_result", "tool_use_id": "toolu_TODO", "content": "Todos updated"
+        }]);
+        let updates = map_consolidated(&result, MsgRole::User, &mut state);
+        assert!(
+            updates.is_empty(),
+            "a TodoWrite result must stay silent: {updates:?}"
+        );
+        assert!(state.tool_use_cache.is_empty());
+        assert!(!state.has_emitted("toolu_TODO"));
+    }
+
+    /// G10c review (3) / T-76: a nested (subagent) TodoWrite's plan carries
+    /// `_meta.claudeCode.parentToolUseId` like every other update of its frame
+    /// (`stampParentToolUseId`, `acp-agent.ts:13356`); a top-level plan carries
+    /// no `_meta` at all.
+    #[test]
+    fn nested_todo_write_plan_carries_parent_tool_use_id() {
+        let todos = json!([{"content": "x", "status": "pending", "activeForm": "x"}]);
+        let mut state = MapState::default();
+        let frame = json!({
+            "type": "assistant", "parent_tool_use_id": "toolu_TASK",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_TODO", "name": "TodoWrite",
+                 "input": {"todos": todos.clone()}}
+            ]}
+        });
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        let SessionUpdate::Plan(plan) = &updates[0] else {
+            panic!("expected a plan, got {:?}", updates[0]);
+        };
+        let meta = serde_json::to_value(plan.meta.clone().unwrap_or_default()).unwrap();
+        assert_eq!(meta["claudeCode"]["parentToolUseId"], "toolu_TASK");
+
+        let mut state = MapState::default();
+        let top = json!({
+            "type": "assistant", "parent_tool_use_id": null,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_TODO2", "name": "TodoWrite",
+                 "input": {"todos": todos}}
+            ]}
+        });
+        let updates = map_consolidated_assistant(&top, &mut state);
+        let SessionUpdate::Plan(plan) = &updates[0] else {
+            panic!("expected a plan");
+        };
+        assert!(plan.meta.is_none(), "a top-level plan carries no _meta");
+    }
+
+    /// G10c review (7): Node's AIR gate is `message.parent_tool_use_id !== null`,
+    /// so a stream frame with the field MISSING is nested and its text is
+    /// dropped; only a present `null` is the main conversation.
+    #[test]
+    fn air_drops_stream_text_when_the_parent_field_is_missing() {
+        let delta = json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "nested"}}
+        });
+        let mut state = MapState::default();
+        state.configure_air(PathBuf::new());
+        let updates = map_stream_event(&delta, &mut state);
+        assert!(
+            updates.is_empty(),
+            "a missing parent field is nested for AIR: {updates:?}"
+        );
+
+        let mut top = delta.clone();
+        top["parent_tool_use_id"] = Value::Null;
+        let mut state = MapState::default();
+        state.configure_air(PathBuf::new());
+        let updates = map_stream_event(&top, &mut state);
+        assert_eq!(
+            updates.len(),
+            1,
+            "a present null parent is top level: {updates:?}"
+        );
+    }
+
+    /// F6b / T-14 + N-47 + T-07: TodoWrite and Task* never surface a tool_call,
+    /// so their streamed input must never refine one (`shouldEmitToolCall`,
+    /// `acp-agent.ts:12820-12824,13468-13470`).
+    #[test]
+    fn f6b_streamed_todo_and_task_input_never_refine() {
+        let cases = [
+            ("TodoWrite", r#"{"todos":[{"content":"x"}],"other":"#),
+            ("TaskCreate", r#"{"subject":"s","description":"#),
+            ("TaskUpdate", r#"{"taskId":"1","status":"#),
+            ("TaskList", r#"{"a":1,"b":"#),
+            ("TaskGet", r#"{"taskId":"1","x":"#),
+        ];
+        for (name, partial) in cases {
+            let mut state = MapState::default();
+            let start = json!({
+                "type": "stream_event", "parent_tool_use_id": null,
+                "event": {"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "tool_use", "id": "toolu_P",
+                                            "name": name, "input": {}}}
+            });
+            let started = map_stream_event(&start, &mut state);
+            assert!(
+                started.is_empty(),
+                "{name} start must stay silent: {started:?}"
+            );
+            let delta = json!({
+                "type": "stream_event", "parent_tool_use_id": null,
+                "event": {"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "input_json_delta", "partial_json": partial}}
+            });
+            let refined = map_stream_event(&delta, &mut state);
+            assert!(
+                refined.is_empty(),
+                "{name} partial input must not refine a tool_call: {refined:?}"
+            );
+        }
+    }
+
+    /// F6b / T-20: an untracked tool_result resolves only a call the permission
+    /// flow surfaced (`wasEmitted`), with `{status, rawOutput}` and no
+    /// `claudeCode` meta; otherwise it is dropped (`acp-agent.ts:13193-13215`).
+    #[test]
+    fn f6b_untracked_result_resolves_only_a_surfaced_call() {
+        let result = json!([{
+            "type": "tool_result", "tool_use_id": "toolu_GHOST", "content": "late output"
+        }]);
+        let mut state = MapState::default();
+        let updates = map_consolidated(&result, MsgRole::User, &mut state);
+        assert!(
+            updates.is_empty(),
+            "an uncached result that never surfaced must be dropped: {updates:?}"
+        );
+
+        let mut state = MapState::default();
+        state.emitted.insert("toolu_GHOST".to_string());
+        let updates = map_consolidated(&result, MsgRole::User, &mut state);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        let value = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(value["sessionUpdate"], "tool_call_update");
+        assert_eq!(value["toolCallId"], "toolu_GHOST");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["rawOutput"], "late output");
+        assert!(
+            value.get("_meta").is_none(),
+            "the tool name is unknown, so no claudeCode meta: {value}"
+        );
+        assert!(!state.has_emitted("toolu_GHOST"));
+    }
+
+    /// F6b / U-23: a call a permission request surfaced with its complete input
+    /// must not be refined by the empty input at the stream start
+    /// (`alreadyEmitted && inputComplete === false`, `acp-agent.ts:13162`).
+    #[test]
+    fn f6b_surfaced_call_ignores_the_empty_stream_start_input() {
+        let mut state = MapState::default();
+        state.mark_emitted(
+            "toolu_W".to_string(),
+            json!({"type": "tool_use", "id": "toolu_W", "name": "Write",
+                   "input": {"file_path": "/w/a", "content": "hi"}}),
+        );
+        let start = json!({
+            "type": "stream_event", "parent_tool_use_id": null,
+            "event": {"type": "content_block_start", "index": 0,
+                      "content_block": {"type": "tool_use", "id": "toolu_W",
+                                        "name": "Write", "input": {}}}
+        });
+        let updates = map_stream_event(&start, &mut state);
+        assert!(
+            updates.is_empty(),
+            "the empty stream-start input adds nothing: {updates:?}"
+        );
+
+        // The consolidated message replays the block with its complete input
+        // and refines the surfaced call.
+        let frame = json!({
+            "type": "assistant", "parent_tool_use_id": null,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_W", "name": "Write",
+                 "input": {"file_path": "/w/a", "content": "hi"}}
+            ]}
+        });
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert!(matches!(updates[0], SessionUpdate::ToolCallUpdate(_)));
+    }
+
+    /// F6b / T-15: a nested subagent tool call remembers its Agent/Task parent
+    /// in an insertion-ordered memory capped at 1000 (`recordToolCallParent`,
+    /// `acp-agent.ts:12828-12839`), and a final result forgets it.
+    #[test]
+    fn f6b_tool_call_parent_memory_records_and_forgets() {
+        let mut state = MapState::default();
+        let child = json!({
+            "type": "assistant", "parent_tool_use_id": "toolu_TASK",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_CHILD", "name": "Read",
+                 "input": {"file_path": "/w/a"}}
+            ]}
+        });
+        let _ = map_consolidated_assistant(&child, &mut state);
+        assert_eq!(state.tool_call_parent("toolu_CHILD"), Some("toolu_TASK"));
+
+        let result = json!({
+            "type": "user", "parent_tool_use_id": "toolu_TASK",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_CHILD", "content": "file"}
+            ]}
+        });
+        let _ = map_user_frame(&result, &mut state);
+        assert_eq!(
+            state.tool_call_parent("toolu_CHILD"),
+            None,
+            "a final status forgets the parent"
+        );
+
+        // The cap drops the oldest entry.
+        for index in 0..=MAX_TOOL_MEMORY {
+            let frame = json!({
+                "type": "assistant", "parent_tool_use_id": "toolu_TASK",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": format!("toolu_{index}"), "name": "Read",
+                     "input": {"file_path": "/w/a"}}
+                ]}
+            });
+            let _ = map_consolidated_assistant(&frame, &mut state);
+        }
+        assert_eq!(state.tool_call_parent("toolu_0"), None, "oldest dropped");
+        assert_eq!(
+            state.tool_call_parent(&format!("toolu_{MAX_TOOL_MEMORY}")),
+            Some("toolu_TASK")
+        );
+    }
+
+    /// F6b / T-16: the tool name of a tool result is remembered before the
+    /// tool-use cache drops it (`rememberResolvedToolNames`,
+    /// `acp-agent.ts:12927-12944`), in an insertion-ordered memory capped at
+    /// 1000.
+    #[test]
+    fn f6b_resolved_tool_name_memory_survives_the_cache_prune() {
+        let mut state = MapState::default();
+        let use_block = json!([{
+            "type": "tool_use", "id": "toolu_R", "name": "Read",
+            "input": {"file_path": "/w/a"}
+        }]);
+        let _ = map_consolidated(&use_block, MsgRole::Assistant, &mut state);
+        let result = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_R", "content": "file"}
+            ]}
+        });
+        let _ = map_user_frame(&result, &mut state);
+        assert!(
+            !state.tool_use_cache.contains_key("toolu_R"),
+            "cache pruned"
+        );
+        assert_eq!(state.resolved_tool_name("toolu_R"), Some("Read"));
+
+        // The cap drops the oldest name.
+        for index in 0..=MAX_TOOL_MEMORY {
+            let id = format!("toolu_N{index}");
+            let _ = map_consolidated(
+                &json!([{"type": "tool_use", "id": id, "name": "Bash",
+                         "input": {"command": "ls"}}]),
+                MsgRole::Assistant,
+                &mut state,
+            );
+            let _ = map_user_frame(
+                &json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": id, "content": "ok"}
+                    ]}
+                }),
+                &mut state,
+            );
+        }
+        assert_eq!(state.resolved_tool_name("toolu_R"), None, "oldest dropped");
+        assert_eq!(
+            state.resolved_tool_name(&format!("toolu_N{MAX_TOOL_MEMORY}")),
+            Some("Bash")
+        );
+    }
+
+    /// F6b / C-42: a client that advertised `_meta["subagent-transcript"]`
+    /// gets the nested assistant text and thinking, stamped with the parent
+    /// (`forwardsSubagentText`, `acp-agent.ts:7994,13476-13480`). Without it,
+    /// the nested text stays internal.
+    #[test]
+    fn f6b_subagent_text_forwarded_when_the_transcript_capability_is_set() {
+        let frame = json!({
+            "type": "assistant", "parent_tool_use_id": "toolu_TASK",
+            "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Look at the layout."},
+                {"type": "text", "text": "The repo has two packages."}
+            ]}
+        });
+
+        let mut plain = MapState::default();
+        let updates = map_consolidated_assistant(&frame, &mut plain);
+        assert!(
+            updates.is_empty(),
+            "nested text stays internal: {updates:?}"
+        );
+
+        let mut transcript = MapState::default();
+        transcript.set_forward_subagent_text(true);
+        let updates = map_consolidated_assistant(&frame, &mut transcript);
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        let thought = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(thought["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(thought["content"]["text"], "Look at the layout.");
+        assert_eq!(
+            thought["_meta"]["claudeCode"]["parentToolUseId"],
+            "toolu_TASK"
+        );
+        let text = serde_json::to_value(&updates[1]).unwrap();
+        assert_eq!(text["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(text["content"]["text"], "The repo has two packages.");
+        assert_eq!(text["_meta"]["claudeCode"]["parentToolUseId"], "toolu_TASK");
+    }
+
+    /// F6b / C-42: AIR keeps nested streamed text internal unless it also gets
+    /// the transcript (native subagent sessions or the capability), while a
+    /// plain client still receives it (`acp-agent.ts:7680-7692`).
+    #[test]
+    fn f6b_air_drops_nested_stream_text_without_the_transcript_capability() {
+        let delta = json!({
+            "type": "stream_event", "parent_tool_use_id": "toolu_TASK",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "internal"}}
+        });
+
+        let mut air = MapState::default();
+        air.configure_air(PathBuf::from("/w"));
+        assert!(
+            map_stream_event(&delta, &mut air).is_empty(),
+            "AIR keeps it internal"
+        );
+
+        let mut air_forwarding = MapState::default();
+        air_forwarding.configure_air(PathBuf::from("/w"));
+        air_forwarding.set_forward_subagent_text(true);
+        let updates = map_stream_event(&delta, &mut air_forwarding);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+
+        let mut plain = MapState::default();
+        let updates = map_stream_event(&delta, &mut plain);
+        assert_eq!(updates.len(), 1, "a plain client gets the streamed text");
+    }
+
+    /// The single text of a completing update's content.
+    fn update_text(update: &ToolCallUpdate) -> &str {
+        let content = update
+            .fields
+            .content
+            .as_ref()
+            .and_then(|items| items.first())
+            .expect("a content item");
+        let ToolCallContent::Content(content) = content else {
+            panic!("expected content, got {content:?}");
+        };
+        let ContentBlock::Text(text) = &content.content else {
+            panic!("expected text, got {:?}", content.content);
+        };
+        text.text.as_str()
+    }
+
+    /// F6a / T-67 — AIR's agent-control error result is plain text; every other
+    /// client keeps the fenced error text
+    /// (`AgentControlReporter.errorResult`, `reporters/interaction.ts:209-219`).
+    #[test]
+    fn f6a_air_agent_control_error_is_unfenced() {
+        let use_frame = json!([{
+            "type": "tool_use", "id": "toolu_MSG", "name": "SendMessage",
+            "input": {"to": "a", "message": "hi"}
+        }]);
+        let result = json!([{
+            "type": "tool_result", "tool_use_id": "toolu_MSG",
+            "content": "denied", "is_error": true
+        }]);
+
+        let mut air = MapState::default();
+        air.configure_air(PathBuf::from("/w"));
+        map_consolidated(&use_frame, MsgRole::Assistant, &mut air);
+        let updates = map_consolidated(&result, MsgRole::User, &mut air);
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected a completing tool_call_update");
+        };
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(update_text(update), "denied", "AIR gets no fence");
+
+        let mut plain = MapState::default();
+        map_consolidated(&use_frame, MsgRole::Assistant, &mut plain);
+        let updates = map_consolidated(&result, MsgRole::User, &mut plain);
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected a completing tool_call_update");
+        };
+        assert_eq!(update_text(update), "```\ndenied\n```");
+    }
+
+    /// F6a / T-61 — an AIR `AskUserQuestion` tool call gets the fixed title; a
+    /// non-AIR client gets the single question
+    /// (`reporters/interaction.ts:94-116`).
+    #[test]
+    fn f6a_air_ask_user_question_title() {
+        let frame = json!([{
+            "type": "tool_use", "id": "toolu_ASK", "name": "AskUserQuestion",
+            "input": {"questions": [{"question": "ok?"}]}
+        }]);
+
+        let mut air = MapState::default();
+        air.configure_air(PathBuf::from("/w"));
+        let updates = map_consolidated(&frame, MsgRole::Assistant, &mut air);
+        let SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("expected a tool_call");
+        };
+        assert_eq!(call.title, "Asking for your input");
+
+        let mut plain = MapState::default();
+        let updates = map_consolidated(&frame, MsgRole::Assistant, &mut plain);
+        let SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("expected a tool_call");
+        };
+        assert_eq!(call.title, "ok?");
+    }
+
+    /// F6a / T-29 / T-30 — the streamed Bash/PowerShell title and display copy
+    /// go through the shared shell reporter.
+    #[test]
+    fn f6a_powershell_tool_call_shape() {
+        let frame = json!([{
+            "type": "tool_use", "id": "toolu_PS", "name": "PowerShell",
+            "input": {"command": "Get-ChildItem", "command_description": "List files"}
+        }]);
+        let mut state = MapState::default();
+        let updates = map_consolidated(&frame, MsgRole::Assistant, &mut state);
+        let SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("expected a tool_call");
+        };
+        assert_eq!(call.kind, ToolKind::Execute);
+        assert_eq!(call.title, "Get-ChildItem");
+        assert_eq!(call.content.len(), 1);
+    }
+
+    /// FX-3 / N-48 — content_block_stop drops only its own block's streamed input.
+    #[test]
+    fn content_block_stop_drops_only_its_block() {
+        let mut state = MapState::default();
+        let start0 = json!({
+            "type": "stream_event", "parent_tool_use_id": null,
+            "event": {"type": "content_block_start", "index": 0,
+                      "content_block": {"type": "tool_use", "id": "toolu_0",
+                                        "name": "Bash", "input": {}}}
+        });
+        let start1 = json!({
+            "type": "stream_event", "parent_tool_use_id": null,
+            "event": {"type": "content_block_start", "index": 1,
+                      "content_block": {"type": "tool_use", "id": "toolu_1",
+                                        "name": "Bash", "input": {}}}
+        });
+        let _ = map_stream_event(&start0, &mut state);
+        let _ = map_stream_event(&start1, &mut state);
+        assert_eq!(state.streamed_inputs.len(), 2);
+
+        // content_block_stop for index 0 drops only index 0
+        let stop0 = json!({
+            "type": "stream_event", "parent_tool_use_id": null,
+            "event": {"type": "content_block_stop", "index": 0}
+        });
+        let _ = map_stream_event(&stop0, &mut state);
+        assert_eq!(state.streamed_inputs.len(), 1);
+        assert!(state.streamed_inputs.contains_key(&("".to_string(), 1)));
+        assert!(!state.streamed_inputs.contains_key(&("".to_string(), 0)));
+
+        // message_stop clears remaining inputs on the lane
+        let stop_msg = json!({
+            "type": "stream_event", "parent_tool_use_id": null,
+            "event": {"type": "message_stop"}
+        });
+        let _ = map_stream_event(&stop_msg, &mut state);
+        assert!(state.streamed_inputs.is_empty());
+    }
+
+    /// FX-3 / M-51 — user chunks get stamped with the frame uuid.
+    #[test]
+    fn m51_user_chunk_message_id_grouping() {
+        let mut state = MapState::default();
+        let frame = json!({
+            "type": "user",
+            "uuid": "u-user-chunk-42",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello 1"},
+                    {"type": "text", "text": "hello 2"}
+                ]
+            }
+        });
+        let updates = map_user_frame(&frame, &mut state);
+        assert_eq!(updates.len(), 2);
+        for update in &updates {
+            let SessionUpdate::UserMessageChunk(chunk) = update else {
+                panic!("expected UserMessageChunk");
+            };
+            assert_eq!(
+                chunk.message_id.as_ref().map(|m| m.0.as_ref()),
+                Some("u-user-chunk-42")
+            );
+        }
+
+        let block_updates = map_user_frame_block(
+            &frame,
+            &json!({"type": "text", "text": "single"}),
+            &mut state,
+        );
+        assert_eq!(block_updates.len(), 1);
+        let SessionUpdate::UserMessageChunk(chunk) = &block_updates[0] else {
+            panic!("expected UserMessageChunk");
+        };
+        assert_eq!(
+            chunk.message_id.as_ref().map(|m| m.0.as_ref()),
+            Some("u-user-chunk-42")
+        );
+    }
+
+    #[test]
+    fn inv_79_defaults_only_on_tool_call() {
+        let mut tool_call = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_123",
+            "title": "echo hi"
+        });
+        materialize_tool_call_defaults(&mut tool_call);
+        assert_eq!(tool_call["status"], "pending");
+        assert_eq!(tool_call["content"], json!([]));
+        assert_eq!(tool_call["kind"], "other");
+
+        let mut tool_update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_123",
+            "title": "echo hi"
+        });
+        materialize_tool_call_defaults(&mut tool_update);
+        assert!(tool_update.get("status").is_none());
+        assert!(tool_update.get("content").is_none());
+        assert!(tool_update.get("kind").is_none());
+    }
+
+    #[test]
+    fn inv_79_locations_only_for_listed_tools() {
+        for tool in ["Read", "Write", "Edit", "NotebookEdit", "Glob"] {
+            let mut tc = json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "toolu_1",
+                "name": tool,
+                "title": tool
+            });
+            materialize_tool_call_defaults(&mut tc);
+            assert_eq!(
+                tc["locations"],
+                json!([]),
+                "tool {tool} must have locations default"
+            );
+        }
+
+        for tool in ["Bash", "Grep", "WebSearch", "mcp__server__tool"] {
+            let mut tc = json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "toolu_2",
+                "name": tool,
+                "title": tool
+            });
+            materialize_tool_call_defaults(&mut tc);
+            assert!(
+                tc.get("locations").is_none(),
+                "tool {tool} must not have locations default"
+            );
+        }
+    }
+
+    #[test]
+    fn inv_79_existing_values_untouched() {
+        let mut tc = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_1",
+            "name": "Read",
+            "title": "Read a.txt",
+            "status": "completed",
+            "kind": "read",
+            "content": [{"type": "text", "text": "foo"}],
+            "locations": [{"path": "a.txt", "line": 5}]
+        });
+        materialize_tool_call_defaults(&mut tc);
+        assert_eq!(tc["status"], "completed");
+        assert_eq!(tc["kind"], "read");
+        assert_eq!(tc["content"], json!([{"type": "text", "text": "foo"}]));
+        assert_eq!(tc["locations"], json!([{"path": "a.txt", "line": 5}]));
+    }
+
+    #[test]
+    fn inv_79_old_text_null_added_not_overwritten() {
+        let mut diff_missing = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_write",
+            "content": [{
+                "type": "diff",
+                "path": "new.txt",
+                "newText": "hello"
+            }]
+        });
+        materialize_diff_old_text(&mut diff_missing);
+        assert_eq!(diff_missing["content"][0]["oldText"], Value::Null);
+
+        let mut diff_existing = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_edit",
+            "content": [{
+                "type": "diff",
+                "path": "existing.txt",
+                "oldText": "old",
+                "newText": "hello"
+            }]
+        });
+        materialize_diff_old_text(&mut diff_existing);
+        assert_eq!(diff_existing["content"][0]["oldText"], "old");
+
+        let mut nested = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_1",
+            "content": [
+                {
+                    "type": "diff",
+                    "path": "file.rs",
+                    "newText": "fn main() {}"
+                }
+            ]
+        });
+        materialize_diff_old_text(&mut nested);
+        assert_eq!(nested["content"][0]["oldText"], Value::Null);
+    }
+
+    /// Review G14 finding 1: a `{"type":"diff"}` object inside the tool's own
+    /// data (`rawInput`, `rawOutput`, `_meta.claudeCode.toolResponse`) is Node's
+    /// to send verbatim; only the `content[*]` diff blocks gain `oldText`.
+    #[test]
+    fn inv_79_diff_only_in_content() {
+        let mut update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "mcp__srv__diff_tool",
+            "rawInput": {
+                "patch": {"type": "diff", "path": "a.txt", "newText": "x"}
+            },
+            "rawOutput": {
+                "result": {"type": "diff", "path": "b.txt", "newText": "y"}
+            },
+            "_meta": {
+                "claudeCode": {
+                    "toolResponse": {"type": "diff", "path": "c.txt", "newText": "z"}
+                }
+            },
+            "content": [
+                {"type": "diff", "path": "d.txt", "newText": "w"}
+            ]
+        });
+        materialize_diff_old_text(&mut update);
+        assert_eq!(update["content"][0]["oldText"], Value::Null);
+        assert!(update["rawInput"]["patch"].get("oldText").is_none());
+        assert!(update["rawOutput"]["result"].get("oldText").is_none());
+        assert!(update["_meta"]["claudeCode"]["toolResponse"]
+            .get("oldText")
+            .is_none());
+
+        // A permission `toolCall` (no `sessionUpdate`) has the same rule.
+        let mut permission_tool_call = json!({
+            "toolCallId": "toolu_perm",
+            "title": "Write a.txt",
+            "rawInput": {"content": {"type": "diff", "newText": "x"}},
+            "content": [{"type": "diff", "path": "a.txt", "newText": "x"}]
+        });
+        materialize_diff_old_text(&mut permission_tool_call);
+        assert_eq!(permission_tool_call["content"][0]["oldText"], Value::Null);
+        assert!(permission_tool_call["rawInput"]["content"]
+            .get("oldText")
+            .is_none());
+
+        // A non-tool update is left alone entirely.
+        let mut other = json!({
+            "sessionUpdate": "plan",
+            "entries": [{"type": "diff", "newText": "x"}]
+        });
+        materialize_diff_old_text(&mut other);
+        assert!(other["entries"][0].get("oldText").is_none());
+    }
+
+    #[test]
+    fn inv_79_raw_tool_call_not_touched() {
+        let mut plan = json!({
+            "sessionUpdate": "plan",
+            "entries": []
+        });
+        materialize_tool_call_defaults(&mut plan);
+        assert!(plan.get("status").is_none());
+        assert!(plan.get("content").is_none());
+        assert!(plan.get("kind").is_none());
     }
 }
