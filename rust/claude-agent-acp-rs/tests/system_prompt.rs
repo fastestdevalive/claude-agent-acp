@@ -6,7 +6,6 @@
 mod common;
 
 use common::{read_json, repo_root, run_recorder_with_init, rust_agent_binary};
-use serde_json::Value;
 
 /// Scripts that record their own `initialize` control_request.
 const INIT_SCRIPTS: [&str; 5] = [
@@ -17,21 +16,8 @@ const INIT_SCRIPTS: [&str; 5] = [
     "system-prompt-combined",
 ];
 
-/// Drop the two request keys the Rust agent deliberately never sends: the SDK
-/// `hooks` payload (PARITY: "Hooks ... skipped-deliberate") and
-/// `promptSuggestions` (`InitializeOptions::prompt_suggestions`, left `None` by
-/// the live agent). Every other key is compared exactly.
-fn without_skipped_keys(mut init: Value) -> Value {
-    if let Some(request) = init.get_mut("request").and_then(Value::as_object_mut) {
-        request.remove("hooks");
-        request.remove("promptSuggestions");
-    }
-    init
-}
-
-/// 1.3 — for every system-prompt script the Rust initialize request carries
-/// exactly the Node's `systemPrompt` / `appendSystemPrompt` (and every other
-/// non-skipped key).
+/// 1.3 / 3.1 (INV-39) — for every system-prompt script the Rust initialize request carries
+/// exactly the Node's initialize control_request including `hooks` and `promptSuggestions`.
 #[test]
 fn inv_39_initialize_matches_node() {
     let root = repo_root();
@@ -50,8 +36,8 @@ fn inv_39_initialize_matches_node() {
             &tmp.join("out.jsonl"),
         );
         assert_eq!(
-            without_skipped_keys(init),
-            without_skipped_keys(read_json(&fixture)),
+            init,
+            read_json(&fixture),
             "{name}: Rust initialize request differs from the Node fixture"
         );
         let _ = std::fs::remove_dir_all(&tmp);

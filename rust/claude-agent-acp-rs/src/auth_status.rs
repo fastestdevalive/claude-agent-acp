@@ -320,9 +320,17 @@ pub fn same_status(a: Option<&AuthStatus>, b: &AuthStatus) -> bool {
 /// `apiKeyHelper` from the user / project / local `settings.json` files (last
 /// one wins), the `SettingsManager.getApiKeyHelper` sources.
 pub async fn read_api_key_helper(cwd: &Path) -> Option<String> {
-    let user_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")));
+    read_api_key_helper_with_env(cwd, &crate::env_snapshot::EnvSnapshot::from_process()).await
+}
+
+/// `apiKeyHelper` read using an explicit environment snapshot.
+pub async fn read_api_key_helper_with_env(
+    cwd: &Path,
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> Option<String> {
+    let user_dir = env
+        .get_path("CLAUDE_CONFIG_DIR")
+        .or_else(|| env.get_path("HOME").map(|h| h.join(".claude")));
     let mut files = Vec::new();
     if let Some(dir) = user_dir {
         files.push(dir.join("settings.json"));
@@ -344,16 +352,26 @@ pub async fn read_api_key_helper(cwd: &Path) -> Option<String> {
     helper
 }
 
+/// The outcome of one CLI auth status probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Status(AuthStatus),
+    LoggedOut,
+    TimedOut,
+}
+
 /// Run `claude auth status --json` once (5 s bound, stdin null) and map it.
 /// A non-zero exit still counts when stdout holds the JSON (logged out exits 1);
-/// a timeout or an unreadable answer is `None` (silence).
+/// a timeout returns `TimedOut`, and an unreadable answer is `LoggedOut`.
 pub async fn probe_cli(
     claude_path: Option<&Path>,
     cwd: &Path,
     extra_env: &[(String, String)],
-) -> Option<AuthStatus> {
-    let binary = crate::process::resolve_claude(claude_path).ok()?;
-    let run = crate::process::run_cli(
+) -> ProbeOutcome {
+    let Ok(binary) = crate::process::resolve_claude(claude_path) else {
+        return ProbeOutcome::LoggedOut;
+    };
+    let run = match crate::process::run_cli(
         &binary,
         &["auth", "status", "--json"],
         Some(cwd),
@@ -361,12 +379,21 @@ pub async fn probe_cli(
         AUTH_STATUS_PROBE_TIMEOUT,
     )
     .await
-    .ok()?;
-    if run.timed_out || run.stdout.trim().is_empty() {
-        return None;
+    {
+        Ok(r) => r,
+        Err(_) => return ProbeOutcome::LoggedOut,
+    };
+    if run.timed_out {
+        return ProbeOutcome::TimedOut;
+    }
+    if run.stdout.trim().is_empty() {
+        return ProbeOutcome::LoggedOut;
     }
     let helper = read_api_key_helper(cwd).await;
-    from_cli_status(&run.stdout, helper.as_deref())
+    match from_cli_status(&run.stdout, helper.as_deref()) {
+        Some(st) => ProbeOutcome::Status(st),
+        None => ProbeOutcome::LoggedOut,
+    }
 }
 
 /// Why `claude auth logout` failed: the Node `RequestError.internalError`
@@ -420,7 +447,7 @@ pub async fn run_logout(
 
 /// A boxed probe: the cwd in, the mapped status out.
 pub type ProbeFn =
-    Box<dyn Fn(PathBuf) -> Pin<Box<dyn Future<Output = Option<AuthStatus>> + Send>> + Send + Sync>;
+    Box<dyn Fn(PathBuf) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send>> + Send + Sync>;
 
 /// Messages of the auth-status actor ([`spawn_auth_actor`]).
 #[derive(Debug)]
@@ -428,6 +455,8 @@ pub enum AuthCmd {
     /// Re-read the identity from the CLI. `fresh` forces a new run even when
     /// one is in flight.
     Probe { cwd: PathBuf, fresh: bool },
+    /// Bump epoch to invalidate in-flight probes (e.g. before logout subprocess).
+    BumpEpoch,
     /// A session was created: publish its account (if informative) and re-probe
     /// when its cwd differs from the last probe's.
     SessionCreated {
@@ -445,7 +474,7 @@ pub enum AuthCmd {
     /// A spawned probe finished (internal). `epoch` is the actor epoch the
     /// probe started in; `reply` is set for the post-logout read.
     ProbeDone {
-        status: Option<AuthStatus>,
+        outcome: ProbeOutcome,
         epoch: u64,
         reply: Option<tokio::sync::oneshot::Sender<()>>,
     },
@@ -461,6 +490,11 @@ impl AuthHandle {
     /// Fire-and-forget; a stopped actor is ignored.
     pub fn send(&self, cmd: AuthCmd) {
         let _ = self.tx.send(cmd);
+    }
+
+    /// Bump epoch before running logout (in-flight probes dropped).
+    pub fn bump_epoch(&self) {
+        self.send(AuthCmd::BumpEpoch);
     }
 
     /// Run a fresh probe in `cwd`.
@@ -505,6 +539,9 @@ pub fn spawn_auth_actor(
         };
         while let Some(cmd) = rx.recv().await {
             match cmd {
+                AuthCmd::BumpEpoch => {
+                    epoch += 1;
+                }
                 AuthCmd::Probe { cwd, fresh } => {
                     if in_flight > 0 && !fresh {
                         continue;
@@ -514,7 +551,7 @@ pub fn spawn_auth_actor(
                     let done = self_tx.clone();
                     tokio::spawn(async move {
                         let _ = done.send(AuthCmd::ProbeDone {
-                            status: fut.await,
+                            outcome: fut.await,
                             epoch,
                             reply: None,
                         });
@@ -527,14 +564,14 @@ pub fn spawn_auth_actor(
                     let done = self_tx.clone();
                     tokio::spawn(async move {
                         let _ = done.send(AuthCmd::ProbeDone {
-                            status: fut.await,
+                            outcome: fut.await,
                             epoch,
                             reply: Some(reply),
                         });
                     });
                 }
                 AuthCmd::ProbeDone {
-                    status,
+                    outcome,
                     epoch: started,
                     reply,
                 } => {
@@ -542,14 +579,24 @@ pub fn spawn_auth_actor(
                     if reply.is_some() {
                         // The post-logout read: an unreadable store means the
                         // old identity is stale, so report "not logged in".
-                        let next = match status {
-                            Some(status) => merge(current.as_ref(), &status),
-                            None => not_logged_in(),
-                        };
-                        set(&mut current, next);
+                        // On probe timeout, keep current status instead of pushing notLoggedIn.
+                        match outcome {
+                            ProbeOutcome::Status(st) => {
+                                let next = merge(current.as_ref(), &st);
+                                set(&mut current, next);
+                            }
+                            ProbeOutcome::LoggedOut => {
+                                set(&mut current, not_logged_in());
+                            }
+                            ProbeOutcome::TimedOut => {
+                                if current.is_none() {
+                                    set(&mut current, not_logged_in());
+                                }
+                            }
+                        }
                     } else if started == epoch {
-                        if let Some(status) = status {
-                            let merged = merge(current.as_ref(), &status);
+                        if let ProbeOutcome::Status(st) = outcome {
+                            let merged = merge(current.as_ref(), &st);
                             set(&mut current, merged);
                         }
                     }
@@ -765,7 +812,12 @@ mod tests {
     fn fixed_probe(status: Option<AuthStatus>) -> ProbeFn {
         Box::new(move |_cwd| {
             let status = status.clone();
-            Box::pin(async move { status })
+            Box::pin(async move {
+                match status {
+                    Some(s) => ProbeOutcome::Status(s),
+                    None => ProbeOutcome::LoggedOut,
+                }
+            })
         })
     }
 
@@ -826,7 +878,13 @@ mod tests {
         let probe: ProbeFn = Box::new(move |_cwd| {
             let first = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
             let known = known.clone();
-            Box::pin(async move { first.then_some(known) })
+            Box::pin(async move {
+                if first {
+                    ProbeOutcome::Status(known)
+                } else {
+                    ProbeOutcome::LoggedOut
+                }
+            })
         });
         let (handle, mut push_rx) = actor(probe, "/a");
         handle.probe(PathBuf::from("/a"), false);
@@ -841,6 +899,76 @@ mod tests {
             next_push(&mut push_rx).await,
             Some(not_logged_in().to_json()),
             "an unreadable store after logout reports not logged in"
+        );
+    }
+
+    #[tokio::test]
+    async fn inv_50_actor_logout_probe_timeout_keeps_current() {
+        let known = acct("pro", Some("a@b.c"), None);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let known_clone = known.clone();
+        let probe: ProbeFn = Box::new(move |_cwd| {
+            let first = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let known = known_clone.clone();
+            Box::pin(async move {
+                if first {
+                    ProbeOutcome::Status(known)
+                } else {
+                    ProbeOutcome::TimedOut
+                }
+            })
+        });
+        let (handle, mut push_rx) = actor(probe, "/a");
+        handle.probe(PathBuf::from("/a"), false);
+        assert_eq!(next_push(&mut push_rx).await, Some(known.to_json()));
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        handle.send(AuthCmd::Logout {
+            cwd: PathBuf::from("/a"),
+            reply: reply_tx,
+        });
+        reply_rx.await.expect("logout read finished");
+        assert_eq!(
+            next_push(&mut push_rx).await,
+            None,
+            "probe timeout after logout must keep current status without pushing notLoggedIn"
+        );
+    }
+
+    #[tokio::test]
+    async fn inv_50_actor_logout_with_no_known_status_pushes_not_logged_in() {
+        let probe: ProbeFn = Box::new(move |_cwd| Box::pin(async move { ProbeOutcome::TimedOut }));
+        let (handle, mut push_rx) = actor(probe, "/a");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        handle.send(AuthCmd::Logout {
+            cwd: PathBuf::from("/a"),
+            reply: reply_tx,
+        });
+        reply_rx.await.expect("logout read finished");
+        assert_eq!(
+            next_push(&mut push_rx).await,
+            Some(not_logged_in().to_json()),
+            "logout with no known status must push notLoggedIn"
+        );
+    }
+
+    #[tokio::test]
+    async fn inv_50_actor_bump_epoch_drops_in_flight() {
+        let known = acct("pro", Some("a@b.c"), None);
+        let probe: ProbeFn = Box::new(move |_cwd| {
+            let known = known.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                ProbeOutcome::Status(known)
+            })
+        });
+        let (handle, mut push_rx) = actor(probe, "/a");
+        handle.probe(PathBuf::from("/a"), false);
+        handle.bump_epoch();
+        assert_eq!(
+            next_push(&mut push_rx).await,
+            None,
+            "bump_epoch before in-flight probe completes drops stale probe outcome"
         );
     }
 

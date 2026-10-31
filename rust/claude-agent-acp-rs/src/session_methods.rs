@@ -24,7 +24,7 @@ fn join_error(error: tokio::task::JoinError) -> Error {
 }
 
 /// `session/list`: one page of sessions, newest first.
-pub async fn list(params: &Value) -> Result<Value, Error> {
+pub async fn list(params: &Value, env: &crate::env_snapshot::EnvSnapshot) -> Result<Value, Error> {
     let cwd = params
         .get("cwd")
         .and_then(Value::as_str)
@@ -34,13 +34,9 @@ pub async fn list(params: &Value) -> Result<Value, Error> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let offset = session_store::parse_cursor(cursor.as_deref()).map_err(|e| to_rpc(&e))?;
+    let root = session_store::projects_root_with_env(env);
     let page = tokio::task::spawn_blocking(move || {
-        session_store::list(
-            &session_store::projects_root(),
-            cwd.as_deref(),
-            offset,
-            SESSION_LIST_PAGE_SIZE,
-        )
+        session_store::list(&root, cwd.as_deref(), offset, SESSION_LIST_PAGE_SIZE)
     })
     .await
     .map_err(join_error)?;
@@ -54,13 +50,15 @@ pub async fn list(params: &Value) -> Result<Value, Error> {
 }
 
 /// `session/delete` (non-AIR): the SDK delete; an unknown session succeeds.
-pub async fn delete(session_id: String) -> Result<(), Error> {
-    tokio::task::spawn_blocking(move || {
-        session_store::delete(&session_store::projects_root(), &session_id)
-    })
-    .await
-    .map_err(join_error)?
-    .map_err(|e| to_rpc(&e))
+pub async fn delete(
+    session_id: String,
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> Result<(), Error> {
+    let root = session_store::projects_root_with_env(env);
+    tokio::task::spawn_blocking(move || session_store::delete(&root, &session_id))
+        .await
+        .map_err(join_error)?
+        .map_err(|e| to_rpc(&e))
 }
 
 /// The id of a `session/fork` request's AIR fork point
@@ -76,14 +74,14 @@ pub fn fork_point_message_id(params: &Value) -> Option<String> {
 
 /// Copy the latest transcript of `source_id` into a new session under `cwd`'s
 /// project; returns the new session id.
-pub async fn fork_copy(source_id: String, cwd: String) -> Result<String, Error> {
+pub async fn fork_copy(
+    source_id: String,
+    cwd: String,
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> Result<String, Error> {
+    let root = session_store::projects_root_with_env(env);
     tokio::task::spawn_blocking(move || {
-        session_store::fork(
-            &session_store::projects_root(),
-            &source_id,
-            &cwd,
-            &mut crate::agent::uuid_v4,
-        )
+        session_store::fork(&root, &source_id, &cwd, &mut crate::agent::uuid_v4)
     })
     .await
     .map_err(join_error)?

@@ -1,0 +1,16 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "_meta": {"claudeCode": {"options": {
+                  "betas": ["context-1m-2025-08-07"],
+                  "extraArgs": {"chrome": null},
+                  "env": {"CLAUDE_CODE_ARTIFACT": "1"},
+                  "model": "haiku",
+                  "permissionMode": "plan"
+                }}}}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}

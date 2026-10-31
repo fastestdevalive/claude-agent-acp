@@ -51,13 +51,18 @@ impl ToolShape {
     }
 }
 
+/// Whether the tool is one of the Task* tools whose tool_use is suppressed.
+pub fn is_task_tool(name: &str) -> bool {
+    matches!(name, "TaskCreate" | "TaskUpdate" | "TaskList" | "TaskGet")
+}
+
 /// One text content block (`{type:"content", content:{type:"text",text}}`).
-fn text_content(text: impl Into<String>) -> ToolCallContent {
+pub(crate) fn text_content(text: impl Into<String>) -> ToolCallContent {
     ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(text))))
 }
 
 /// One diff content block (`{type:"diff", path, oldText, newText}`).
-fn diff_content(path: &str, old_text: Option<&str>, new_text: &str) -> ToolCallContent {
+pub(crate) fn diff_content(path: &str, old_text: Option<&str>, new_text: &str) -> ToolCallContent {
     let mut diff = Diff::new(path, new_text);
     if let Some(old) = old_text {
         diff = diff.old_text(old);
@@ -66,7 +71,7 @@ fn diff_content(path: &str, old_text: Option<&str>, new_text: &str) -> ToolCallC
 }
 
 /// A file location for the "follow-along" feature.
-fn location(path: &str, line: Option<u32>) -> ToolCallLocation {
+pub(crate) fn location(path: &str, line: Option<u32>) -> ToolCallLocation {
     let mut loc = ToolCallLocation::new(path);
     if let Some(line) = line {
         loc = loc.line(line);
@@ -340,7 +345,20 @@ fn skills_by_declared_name(container: &Path) -> std::collections::HashMap<String
 /// `resolveSkillPath`, `reporters/interaction.js:358`). The home directory is
 /// read from `HOME`.
 pub fn resolve_skill_path(skill_name: &str, cwd: Option<&Path>) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_skill_path_with_env(
+        skill_name,
+        cwd,
+        &crate::env_snapshot::EnvSnapshot::from_process(),
+    )
+}
+
+/// Resolve skill path with an explicit environment snapshot.
+pub fn resolve_skill_path_with_env(
+    skill_name: &str,
+    cwd: Option<&Path>,
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> Option<PathBuf> {
+    let home = env.get_path("HOME");
     resolve_skill_path_in(skill_name, cwd, home.as_deref())
 }
 

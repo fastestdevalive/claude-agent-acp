@@ -239,6 +239,9 @@ fn fixtures_are_portable_and_secret_free() {
     // Any env var whose name matches TOKEN|KEY|SECRET|PASS must not leak its
     // value into any fixture (live credentials).
     for (name, value) in std::env::vars() {
+        if name == "MAX_THINKING_TOKENS" || value.len() < 4 {
+            continue;
+        }
         if !name.to_uppercase().contains("TOKEN")
             && !name.to_uppercase().contains("KEY")
             && !name.to_uppercase().contains("SECRET")

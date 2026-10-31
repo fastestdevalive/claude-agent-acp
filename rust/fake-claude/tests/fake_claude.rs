@@ -57,7 +57,7 @@ fn binary_exits_nonzero_on_mismatch() {
     )
     .unwrap();
     let bin = fake_claude_binary();
-    let output = Command::new(&bin)
+    let output = fake_claude_cmd(&bin)
         .env("FAKE_CLAUDE_SCRIPT", &script)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -145,11 +145,14 @@ fn records_argv_to_arg_out() {
     .unwrap();
     let arg_out = dir.join("argv.json");
     let bin = fake_claude_binary();
-    let output = Command::new(&bin)
+    let output = fake_claude_cmd(&bin)
         .args(["--replay-user-messages", "--session-id=abc"])
         .env("FAKE_CLAUDE_SCRIPT", &script)
         .env("FAKE_CLAUDE_ARGV_OUT", &arg_out)
         .env("FAKE_CLAUDE_INIT_OUT", dir.join("init.json"))
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")
+        .env("UNRECORDED_SECRET", "discard-me")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -182,6 +185,48 @@ fn records_argv_to_arg_out() {
         argv["node_options_present"].is_boolean(),
         "node_options_present must be a boolean"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// rust-parity-fixes Phase 1 (item 1.1) — `CLAUDE_CODE_ARTIFACT` joins the env
+/// allow-list: when the adapter forwards it (a client option env key), the argv
+/// record persists it; non-allow-listed vars stay discarded (none leaks).
+#[test]
+fn records_claude_code_artifact_env() {
+    let dir = std::env::temp_dir().join(format!("fake-claude-artifact-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("b.transcript.jsonl");
+    std::fs::write(
+        &script,
+        r#"{"expect":{"type":"user"},"emit":[{"type":"result","subtype":"success"}]}"#,
+    )
+    .unwrap();
+    let arg_out = dir.join("argv.json");
+    let bin = fake_claude_binary();
+    let output = fake_claude_cmd(&bin)
+        .args(["--session-id=abc"])
+        .env("FAKE_CLAUDE_SCRIPT", &script)
+        .env("FAKE_CLAUDE_ARGV_OUT", &arg_out)
+        .env("CLAUDE_CODE_ARTIFACT", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"{\"type\":\"user\",\"uuid\":\"u1\"}\n")
+                .unwrap();
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(output.status.success());
+    let argv: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arg_out).unwrap()).unwrap();
+    assert_eq!(argv["env"]["CLAUDE_CODE_ARTIFACT"], "1");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -254,7 +299,7 @@ fn records_initialize_to_init_out() {
     .unwrap();
     let init_out = dir.join("initialize.json");
     let bin = fake_claude_binary();
-    let output = Command::new(&bin)
+    let output = fake_claude_cmd(&bin)
         .env("FAKE_CLAUDE_SCRIPT", &script)
         .env("FAKE_CLAUDE_INIT_OUT", &init_out)
         .stdin(std::process::Stdio::piped())
@@ -373,6 +418,37 @@ fn fake_claude_binary() -> std::path::PathBuf {
         assert!(status.success(), "cargo build --bin fake-claude failed");
     }
     bin
+}
+
+/// Spawn fake-claude under a scrubbed environment mirroring `capture.sh`'s `env -i`.
+fn fake_claude_cmd(bin: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        cmd.env("TMPDIR", tmpdir);
+    } else {
+        cmd.env("TMPDIR", "/tmp");
+    }
+    if let Some(lang) = std::env::var_os("LANG") {
+        cmd.env("LANG", lang);
+    } else {
+        cmd.env("LANG", "C");
+    }
+    for (k, v) in std::env::vars() {
+        if k.starts_with("LC_") {
+            cmd.env(k, v);
+        }
+    }
+    #[cfg(windows)]
+    for key in ["SystemRoot", "SYSTEMROOT", "COMSPEC", "PATHEXT"] {
+        if let Some(val) = std::env::var_os(key) {
+            cmd.env(key, val);
+        }
+    }
+    cmd
 }
 
 /// rust-air-gaps 1.1 — `auth status` prints the transcript's special line

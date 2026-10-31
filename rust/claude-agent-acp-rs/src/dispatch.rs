@@ -73,7 +73,9 @@ pub fn route(msg: &StreamMsg, _view: &TurnView) -> Route {
         "keep_alive" | "control_response" | "control_request" | "control_cancel_request" => {
             Route::Control
         }
-        "user" | "assistant" | "result" | "system" | "stream_event" => Route::Session,
+        "user" | "assistant" | "result" | "system" | "stream_event" | "rate_limit_event" => {
+            Route::Session
+        }
         _ => Route::Ignore,
     }
 }

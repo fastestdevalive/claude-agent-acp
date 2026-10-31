@@ -103,36 +103,54 @@ async fn inv_unhandled_method_returns_method_not_found() {
     assert!(ok);
 }
 
-/// 8.T5 — `session/new` with a model and permission mode yields
-/// `--model` / `--permission-mode` / `--session-id=<uuid>` in the spawned argv,
-/// and the returned `sessionId` equals that uuid.
+/// 8.T5 / rust-parity-fixes 1.3 — `session/new` spawns Node's argv: the mode
+/// comes from the user settings tier (`acceptEdits`), `_meta.claudeCode.options.
+/// permissionMode` is IGNORED (X3), `model`/`betas`/`extraArgs`/`env` map to
+/// tokens and allow-listed env keys, and the returned `sessionId` equals the
+/// `--session-id=<uuid>`.
 #[tokio::test]
 async fn inv_session_new_model_permission_and_uuid() {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("acp-agent-t5-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp dir");
+    // Hermetic settings tier (.claude/settings.local.json under cwd), so the
+    // host's real ~/.claude/settings.json cannot decide this test's argv,
+    // avoiding process-wide std::env::set_var("CLAUDE_CONFIG_DIR") that affects
+    // parallel tests.
+    let cwd = tmp.join("cwd");
+    let claude_dir = cwd.join(".claude");
+    std::fs::create_dir_all(&claude_dir).expect("create cwd/.claude");
+    std::fs::write(
+        claude_dir.join("settings.local.json"),
+        r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
+    )
+    .expect("write settings");
     let transcript = init_only_transcript(&tmp);
     let argv_out = tmp.join("argv.json");
 
     let opts = fake_opts(&root, &transcript, &argv_out);
     let (agent_channel, client_channel) = Channel::duplex();
     let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
-    let root_for_client = root.clone();
+    let cwd_for_client = cwd.clone();
     let result = Client
         .builder()
         .connect_with(
             client_channel,
             move |connection: ConnectionTo<agent_client_protocol::Agent>| {
-                let root_for_client = root_for_client.clone();
+                let cwd_for_client = cwd_for_client.clone();
                 async move {
                     let params = json!({
-                        "cwd": root_for_client.to_string_lossy(),
+                        "cwd": cwd_for_client.to_string_lossy(),
                         "_meta": {
                             "claudeCode": {
                                 "options": {
                                     "model": "claude-sonnet-4-5",
-                                    "permissionMode": "acceptEdits",
+                                    // Ignored by Node and Rust (X3).
+                                    "permissionMode": "plan",
+                                    "betas": ["context-1m-2025-08-07"],
+                                    "extraArgs": {"chrome": null},
+                                    "env": {"CLAUDE_CODE_ARTIFACT": "1"},
                                 }
                             }
                         }
@@ -159,7 +177,24 @@ async fn inv_session_new_model_permission_and_uuid() {
     );
     assert!(
         argv.iter().any(|a| a == "--permission-mode=acceptEdits"),
-        "permission mode -> --permission-mode=acceptEdits in argv: {argv:?}"
+        "settings defaultMode -> --permission-mode=acceptEdits: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|a| a == "--permission-mode=plan"),
+        "_meta permissionMode is ignored (X3): {argv:?}"
+    );
+    assert!(
+        argv.iter().any(|a| a == "--betas=context-1m-2025-08-07"),
+        "betas -> --betas=a,b: {argv:?}"
+    );
+    assert!(
+        argv.iter().any(|a| a == "--chrome"),
+        "extraArgs null -> a bare --chrome: {argv:?}"
+    );
+    assert!(
+        argv.iter()
+            .any(|a| a == "--disallowedTools=AskUserQuestion"),
+        "AskUserQuestion is always disallowed (Decision 4): {argv:?}"
     );
     let session_arg = argv.iter().find_map(|a| a.strip_prefix("--session-id="));
     assert_eq!(
@@ -167,7 +202,17 @@ async fn inv_session_new_model_permission_and_uuid() {
         Some(session_id.as_str()),
         "the returned sessionId equals the --session-id=<uuid>: {argv:?}"
     );
+    // Env is asserted by KEY, never by value.
+    let record = read_json(&argv_out);
+    assert!(
+        record["env"].get("CLAUDE_CODE_ARTIFACT").is_some(),
+        "options.env key reaches claude: {:?}",
+        record["env"]
+            .as_object()
+            .map(|m| m.keys().collect::<Vec<_>>())
+    );
 
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -262,6 +307,7 @@ async fn inv_steering_end_to_end() {
         )],
         default_cwd: Some(root.clone()),
         timings,
+        ..Default::default()
     };
     let (agent_channel, client_channel) = Channel::duplex();
     let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
@@ -432,7 +478,30 @@ fn nothing_but_jsonrpc_on_stdout() {
     let bin = rust_agent_binary();
     assert!(bin.exists(), "rust agent binary missing: {}", bin.display());
 
-    let mut child = std::process::Command::new(&bin)
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        cmd.env("TMPDIR", tmpdir);
+    }
+    if let Some(lang) = std::env::var_os("LANG") {
+        cmd.env("LANG", lang);
+    }
+    for (k, v) in std::env::vars() {
+        if k.starts_with("LC_") {
+            cmd.env(k, v);
+        }
+    }
+    #[cfg(windows)]
+    for key in ["SystemRoot", "SYSTEMROOT", "COMSPEC", "PATHEXT"] {
+        if let Some(val) = std::env::var_os(key) {
+            cmd.env(key, val);
+        }
+    }
+
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -459,4 +528,181 @@ fn nothing_but_jsonrpc_on_stdout() {
             "stdout line {i} is not a JSON-RPC frame: {line}"
         );
     }
+}
+
+/// rust-parity-fixes Decision 10 (P6) & Item 2.5/2.6:
+/// - session/new returns {sessionId, modes, configOptions} without models
+/// - session/set_mode and session/set_config_option succeed and reject invalid values
+/// - session/set_model returns method not found (-32601)
+/// - session/resume on live session reuses existing session without leak and reports live mode
+#[tokio::test]
+async fn inv_63_set_mode_and_config_option() {
+    let tmp = std::env::temp_dir().join(format!("acp-agent-inv63-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let cwd = tmp.join("cwd");
+    let claude_dir = cwd.join(".claude");
+    let config_dir = tmp.join("config");
+    std::fs::create_dir_all(&claude_dir).expect("create cwd/.claude");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        r#"{"model":"claude-sonnet-4-5","effortLevel":"default"}"#,
+    )
+    .expect("write settings");
+    let transcript = tmp.join("config.transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"expect\":{\"type\":\"control_request\",\"request\":{\"subtype\":\"initialize\"}},\"emit\":[{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$REQ\",\"response\":{\"models\":[{\"value\":\"claude-sonnet-4-5\"}],\"commands\":[],\"account\":{}}}}]}\n\
+{\"expect\":{\"type\":\"control_request\",\"request\":{\"subtype\":\"set_permission_mode\",\"mode\":\"acceptEdits\"}},\"emit\":[{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$REQ\",\"response\":{}}}]}\n\
+{\"expect\":{\"type\":\"control_request\",\"request\":{\"subtype\":\"set_permission_mode\",\"mode\":\"plan\"}},\"emit\":[{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$REQ\",\"response\":{}}}]}\n",
+    )
+    .expect("write transcript");
+    let argv_out = tmp.join("argv.json");
+
+    let opts = fake_opts(&cwd, &transcript, &argv_out).with_env(
+        claude_agent_acp_rs::env_snapshot::EnvSnapshot::from_iter([(
+            "CLAUDE_CONFIG_DIR",
+            config_dir.to_string_lossy().to_string(),
+        )]),
+    );
+    let (agent_channel, client_channel) = Channel::duplex();
+    let serve_task = tokio::spawn(async move { serve(agent_channel, opts).await });
+
+    let cwd_for_client = cwd.clone();
+    let result = Client
+        .builder()
+        .connect_with(
+            client_channel,
+            move |connection: ConnectionTo<agent_client_protocol::Agent>| {
+                let cwd_for_client = cwd_for_client.clone();
+                async move {
+                    // initialize
+                    let _ = connection
+                        .send_request(UntypedMessage::new(
+                            "initialize",
+                            json!({ "protocolVersion": 1 }),
+                        )?)
+                        .block_task()
+                        .await?;
+
+                    // session/new
+                    let created = connection
+                        .send_request(UntypedMessage::new(
+                            "session/new",
+                            json!({ "cwd": cwd_for_client.to_string_lossy() }),
+                        )?)
+                        .block_task()
+                        .await?;
+
+                    let session_id = created["sessionId"].as_str().unwrap().to_string();
+                    assert!(
+                        created.get("models").is_none(),
+                        "session/new response has no models"
+                    );
+                    assert!(
+                        created.get("modes").is_some(),
+                        "session/new response has modes"
+                    );
+                    assert!(
+                        created.get("configOptions").is_some(),
+                        "session/new response has configOptions"
+                    );
+                    assert_eq!(created["modes"]["currentModeId"], "default");
+
+                    // session/set_mode with valid mode
+                    let set_mode_res = connection
+                        .send_request(UntypedMessage::new(
+                            "session/set_mode",
+                            json!({ "sessionId": session_id, "modeId": "acceptEdits" }),
+                        )?)
+                        .block_task()
+                        .await?;
+                    assert_eq!(set_mode_res, json!({}));
+
+                    // session/set_mode with invalid mode -> -32603 "Invalid Mode"
+                    let err = connection
+                        .send_request(UntypedMessage::new(
+                            "session/set_mode",
+                            json!({ "sessionId": session_id, "modeId": "unknown_mode" }),
+                        )?)
+                        .block_task()
+                        .await
+                        .expect_err("invalid mode must fail");
+                    assert_eq!(i32::from(err.code), -32603);
+                    assert_eq!(err.data.as_ref().unwrap()["details"], "Invalid Mode");
+
+                    // session/set_config_option for mode
+                    let set_cfg_mode = connection
+                        .send_request(UntypedMessage::new(
+                            "session/set_config_option",
+                            json!({ "sessionId": session_id, "configId": "mode", "value": "plan" }),
+                        )?)
+                        .block_task()
+                        .await?;
+                    let opts = set_cfg_mode["configOptions"].as_array().unwrap();
+                    let mode_opt = opts.iter().find(|o| o["id"] == "mode").unwrap();
+                    assert_eq!(mode_opt["currentValue"], "plan");
+
+                    // session/set_config_option missing value -> invalid value ... undefined
+                    let err = connection
+                        .send_request(UntypedMessage::new(
+                            "session/set_config_option",
+                            json!({ "sessionId": session_id, "configId": "mode" }),
+                        )?)
+                        .block_task()
+                        .await
+                        .expect_err("missing value must fail");
+                    assert_eq!(i32::from(err.code), -32603);
+                    assert_eq!(
+                        err.data.as_ref().unwrap()["details"],
+                        "Invalid value for config option mode: undefined"
+                    );
+
+                    // session/set_config_option with unknown config option
+                    let err = connection
+                        .send_request(UntypedMessage::new(
+                            "session/set_config_option",
+                            json!({ "sessionId": session_id, "configId": "bogus", "value": "x" }),
+                        )?)
+                        .block_task()
+                        .await
+                        .expect_err("unknown config option must fail");
+                    assert_eq!(i32::from(err.code), -32603);
+                    assert_eq!(
+                        err.data.as_ref().unwrap()["details"],
+                        "Unknown config option: bogus"
+                    );
+
+                    // session/set_model returns method not found (-32601)
+                    let err = connection
+                        .send_request(UntypedMessage::new(
+                            "session/set_model",
+                            json!({ "sessionId": session_id, "model": "haiku" }),
+                        )?)
+                        .block_task()
+                        .await
+                        .expect_err("session/set_model must be -32601");
+                    assert_eq!(i32::from(err.code), -32601);
+
+                    // session/resume on live session reuses it and returns live state (MAJOR 5)
+                    let resumed = connection
+                        .send_request(UntypedMessage::new(
+                            "session/resume",
+                            json!({ "sessionId": session_id }),
+                        )?)
+                        .block_task()
+                        .await?;
+                    assert_eq!(resumed["sessionId"], session_id);
+                    assert_eq!(resumed["modes"]["currentModeId"], "plan");
+
+                    Ok::<(), agent_client_protocol::Error>(())
+                }
+            },
+        )
+        .await;
+
+    assert!(result.is_ok(), "result: {result:?}");
+    let _ = timeout(Duration::from_secs(5), serve_task).await;
+    let _ = std::fs::remove_dir_all(&tmp);
 }

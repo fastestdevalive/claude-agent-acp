@@ -55,6 +55,7 @@ use crate::control::{Control, ControlOptions, InitializeOptions, RequestHandler}
 use crate::dispatch::{self, Route, StreamMsg};
 use crate::map::{self, MapState, MsgRole};
 use crate::permission;
+use crate::permission_options;
 use crate::process::{self, SpawnOptions, Timings};
 use crate::session_ext::SessionExt;
 use crate::turn::{FailureKind, Turn, TurnEvent, TurnMachine};
@@ -153,7 +154,7 @@ pub struct PromptUsage {
 
 /// A request sent by the ACP client to the session actor (D4). Each request
 /// carries a `oneshot` reply resolved by the actor when the operation settles.
-enum Command {
+pub(crate) enum Command {
     /// Enqueue a prompt turn (8.7). `uuid` is stamped into `frame`'s `uuid`
     /// field by the caller; the actor registers `uuid -> reply`, enqueues the
     /// turn and pushes `frame` to `claude` immediately.
@@ -215,6 +216,76 @@ enum Command {
         error: String,
         reply: oneshot::Sender<Result<bool, String>>,
     },
+    /// Update context window size from background get_context_usage or initialize info.
+    UpdateContextWindow { size: u64 },
+    /// Initialize session config state after initialize handshake.
+    InitConfig {
+        config: crate::session_config::SessionConfigState,
+    },
+    /// Set permission mode (`session/set_mode`).
+    SetMode {
+        mode_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Re-entry after `set_permission_mode` control request for `SetMode`.
+    ModeApplied {
+        effective_mode: String,
+        requested_mode: String,
+        result: Result<(), String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// ExitPlanMode's setMode selection effect: Node `publishCurrent` +
+    /// `updateConfigOption` after an ExitPlanMode allow-with-setMode (no CLI
+    /// control request — the mode is applied to session state only, and
+    /// `current_mode_update` + `config_option_update` are published to the
+    /// client).
+    ExitPlanModeApplied { mode: String },
+    /// Set config option (`session/set_config_option`).
+    SetConfigOption {
+        config_id: String,
+        value: Value,
+        reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+    },
+    /// Re-entry after `set_permission_mode` control request for mode config option.
+    ConfigModeApplied {
+        requested_mode: String,
+        effective_mode: String,
+        result: Result<(), String>,
+        reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+    },
+    /// Re-entry after `set_model` control request.
+    ModelApplied {
+        model_val: String,
+        result: Result<(), String>,
+        reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+    },
+    /// Re-entry after `apply_flag_settings` control request.
+    EffortApplied {
+        effort_val: String,
+        result: Result<(), String>,
+        reply: oneshot::Sender<Result<Vec<crate::session_config::ConfigOption>, String>>,
+    },
+    /// Fetch the actor's LIVE modes + config options (MAJOR 5: `session/resume`
+    /// on a live session must return the current state, not a creation-time copy).
+    GetState {
+        reply: oneshot::Sender<
+            Result<
+                (
+                    crate::session_config::ModesState,
+                    Vec<crate::session_config::ConfigOption>,
+                ),
+                String,
+            >,
+        >,
+    },
+    /// Inbound `hook_callback` control_request (Decision 12).
+    HookCallback {
+        request_id: String,
+        callback_id: String,
+        input: Value,
+        tool_use_id: Option<String>,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// Configuration used to start a session (phase 8 / 8.2, 8.4).
@@ -230,6 +301,8 @@ pub struct SessionOptions {
     /// the connection Registry. Async-task updates (item 3.5) run only when the
     /// client advertised AIR `asyncTasks`.
     pub air: Option<AirClient>,
+    /// Environment snapshot for hermetic adapter reads.
+    pub env: crate::env_snapshot::EnvSnapshot,
 }
 
 impl SessionOptions {
@@ -240,6 +313,7 @@ impl SessionOptions {
             timings,
             initialize,
             air: None,
+            env: crate::env_snapshot::EnvSnapshot::default(),
         }
     }
 
@@ -247,6 +321,13 @@ impl SessionOptions {
     #[must_use]
     pub fn with_air(mut self, air: Option<AirClient>) -> Self {
         self.air = air;
+        self
+    }
+
+    /// Set the environment snapshot.
+    #[must_use]
+    pub fn with_env(mut self, env: crate::env_snapshot::EnvSnapshot) -> Self {
+        self.env = env;
         self
     }
 }
@@ -266,6 +347,9 @@ pub struct Session {
     /// The `account` from the initialize response (the session account that
     /// feeds the `authStatus` push).
     account: Option<Value>,
+    control: Control,
+    modes: crate::session_config::ModesState,
+    config_options: Vec<crate::session_config::ConfigOption>,
 }
 
 impl Session {
@@ -324,13 +408,14 @@ impl Session {
             opts.timings,
             session_id.clone(),
             hw,
-            opts.air,
+            opts.air.clone(),
             opts.spawn
                 .default_cwd
                 .clone()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_default(),
             resumed,
+            opts.env.clone(),
         ));
 
         // Phase-4 initialize handshake. The actor loop is already running so it
@@ -343,6 +428,166 @@ impl Session {
             .await
             .map_err(|e| SessionError::Start(format!("initialize handshake: {e}")))?;
 
+        let sdk_models: Vec<crate::session_config::ModelInfo> = info
+            .models
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+        let models = sdk_models.clone();
+
+        let cwd = opts
+            .spawn
+            .default_cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let settings = crate::settings::load(&cwd, &opts.env);
+
+        let is_resumed = opts.spawn.resume.is_some();
+        // MAJOR 2 / P4: read the resumed tail WITH the model (acp-agent.js:8290-8293),
+        // so the resumed-model hint actually reaches `get_available_models` and
+        // re-selects the model the resumed transcript last used.
+        let resumed_model_hint = opts.spawn.resume.as_ref().and_then(|id| {
+            crate::resumed_session::read_resumed_tail_with_env(id, true, &opts.env).model
+        });
+
+        let (available_models, current_model_id, needs_set_model) =
+            crate::session_config::get_available_models(
+                &models,
+                &sdk_models,
+                settings.model.as_deref(),
+                opts.env.get("ANTHROPIC_MODEL"),
+                is_resumed,
+                resumed_model_hint.as_deref(),
+            );
+
+        if needs_set_model {
+            let outcome = control
+                .send_request(json!({
+                    "subtype": "set_model",
+                    "model": &current_model_id,
+                }))
+                .await;
+            if !is_resumed {
+                if let Err(e) = outcome {
+                    return Err(SessionError::Start(format!("set_model failed: {e}")));
+                }
+            }
+        }
+
+        let allowlisted_info = models.iter().find(|m| m.value == current_model_id).cloned();
+        let fallback_info = if allowlisted_info.is_none() {
+            crate::session_config::resolve_model_preference(&sdk_models, &current_model_id)
+        } else {
+            None
+        };
+        let current_model_info = allowlisted_info.or(fallback_info.clone());
+        let mut model_infos = models.clone();
+        if let Some(fb) = fallback_info {
+            let mut patched = fb;
+            patched.value = current_model_id.clone();
+            patched.display_name = current_model_id.clone();
+            patched.description = String::new();
+            patched.resolved_model = None;
+            model_infos.push(patched);
+        }
+
+        let is_air = opts.air.is_some();
+        // MAJOR 3/4 / P4: Node only seeds/syncs the concrete effort for clients
+        // that declare the AIR `recommendedValue` capability
+        // (`clientSupportsRecommendedConfigValue`, acp-agent.js:9510-9512).
+        let use_recommended_value = opts
+            .air
+            .as_ref()
+            .is_some_and(|a| a.supports("recommendedValue"));
+        let allow_bypass = opts.spawn.allow_dangerously_skip_permissions;
+        let available_modes = crate::session_config::build_available_modes(allow_bypass, is_air);
+
+        let initial_mode = opts.spawn.permission_mode.as_deref().unwrap_or("default");
+        let is_auto_unavailable = current_model_info
+            .as_ref()
+            .is_some_and(|m| m.supports_auto_mode != Some(true));
+        let mut effective_mode = if initial_mode == "auto" && is_auto_unavailable {
+            crate::session_config::AUTO_MODE_FALLBACK.to_string()
+        } else {
+            initial_mode.to_string()
+        };
+        if !available_modes.iter().any(|m| m.id == effective_mode) {
+            effective_mode = "default".to_string();
+        }
+        if effective_mode != initial_mode {
+            let _ = control
+                .send_request(json!({
+                    "subtype": "set_permission_mode",
+                    "mode": &effective_mode,
+                }))
+                .await;
+        }
+
+        let modes = crate::session_config::ModesState {
+            current_mode_id: effective_mode,
+            available_modes,
+        };
+
+        let current_effort = opts.spawn.effort.clone().or_else(|| {
+            crate::session_config::settings_effort_for_model(
+                settings.model_settings.as_ref(),
+                settings.effort_level.as_deref(),
+                current_model_info.as_ref(),
+                &current_model_id,
+            )
+        });
+
+        let config_options = crate::session_config::build_config_options(
+            &modes,
+            &available_models,
+            &current_model_id,
+            &model_infos,
+            current_effort.as_deref(),
+            use_recommended_value,
+        );
+
+        // MAJOR 3 / P4 (acp-agent.js:8804-8807): Node seeds `apply_flag_settings
+        // {effortLevel}` at session creation ONLY when the client opts in via the
+        // AIR `useRecommendedValue` capability. A legacy (non-AIR) client gets no
+        // effort flag at creation — the CLI resolves persisted effort itself.
+        if use_recommended_value {
+            if let Some(effort_opt) = config_options
+                .iter()
+                .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
+            {
+                if effort_opt.current_value != "default" {
+                    let _ = control
+                        .send_request(json!({
+                            "subtype": "apply_flag_settings",
+                            "settings": {
+                                "effortLevel": &effort_opt.current_value,
+                            }
+                        }))
+                        .await;
+                }
+            }
+        }
+
+        let config_state = crate::session_config::SessionConfigState {
+            modes: modes.clone(),
+            available_models: available_models.clone(),
+            current_model_id: current_model_id.clone(),
+            model_infos: model_infos.clone(),
+            config_options: config_options.clone(),
+            current_effort,
+            effort_pinned: None,
+            applied_effort: None,
+            allow_bypass,
+            is_air,
+            ultracode: settings.ultracode,
+            pre_plan_mode: None,
+        };
+
+        let _ = tx.send(Command::InitConfig {
+            config: config_state,
+        });
+
         Ok((
             Session {
                 tx,
@@ -350,9 +595,22 @@ impl Session {
                 session_id,
                 commands: info.commands,
                 account: info.account,
+                control,
+                modes,
+                config_options,
             },
             update_rx,
         ))
+    }
+
+    /// Access the control handle to the child process.
+    pub fn control(&self) -> &Control {
+        &self.control
+    }
+
+    /// Access the command channel sender for this session actor.
+    pub(crate) fn command_sender(&self) -> &mpsc::UnboundedSender<Command> {
+        &self.tx
     }
 
     /// The ACP `sessionId` this session is known by.
@@ -462,6 +720,59 @@ impl Session {
     pub fn high_water(&self) -> usize {
         self.high_water.load(Ordering::Relaxed)
     }
+
+    /// Modes state of the session.
+    pub fn modes(&self) -> &crate::session_config::ModesState {
+        &self.modes
+    }
+
+    /// Config options exposed by the session.
+    pub fn config_options(&self) -> &[crate::session_config::ConfigOption] {
+        &self.config_options
+    }
+
+    /// Set permission mode (`session/set_mode`).
+    pub async fn set_mode(&self, mode_id: String) -> Result<(), String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetMode { mode_id, reply })
+            .map_err(|_| "Session ended".to_string())?;
+        reply_rx.await.map_err(|_| "Session ended".to_string())?
+    }
+
+    /// Set config option (`session/set_config_option`).
+    pub async fn set_config_option(
+        &self,
+        config_id: String,
+        value: Value,
+    ) -> Result<Vec<crate::session_config::ConfigOption>, String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetConfigOption {
+                config_id,
+                value,
+                reply,
+            })
+            .map_err(|_| "Session ended".to_string())?;
+        reply_rx.await.map_err(|_| "Session ended".to_string())?
+    }
+
+    /// Fetch the actor's LIVE modes + config options (MAJOR 5).
+    pub async fn live_state(
+        &self,
+    ) -> Result<
+        (
+            crate::session_config::ModesState,
+            Vec<crate::session_config::ConfigOption>,
+        ),
+        String,
+    > {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::GetState { reply })
+            .map_err(|_| "Session ended".to_string())?;
+        reply_rx.await.map_err(|_| "Session ended".to_string())?
+    }
 }
 
 /// Build the inbound `control_request` handler injected into the control
@@ -501,6 +812,31 @@ fn build_permission_request_handler(
                 reply_rx.await.unwrap_or_else(|_| {
                     permission::deny_control_response(&request_id, &tool_use_id)
                 })
+            } else if subtype == "hook_callback" {
+                let callback_id = frame
+                    .pointer("/request/callback_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let input = frame
+                    .pointer("/request/input")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let tool_use_id = frame
+                    .pointer("/request/tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = command_tx.send(Command::HookCallback {
+                    request_id: request_id.clone(),
+                    callback_id,
+                    input,
+                    tool_use_id,
+                    reply: reply_tx,
+                });
+                reply_rx
+                    .await
+                    .unwrap_or_else(|_| crate::hooks::hook_control_response_error(&request_id))
             } else {
                 json!({
                     "type": "control_response",
@@ -527,6 +863,7 @@ async fn run(
     air: Option<AirClient>,
     cwd: PathBuf,
     resumed: bool,
+    env: crate::env_snapshot::EnvSnapshot,
 ) {
     // The `_process` handle is held only for its lifetime (it owns the child and
     // kills it on drop); the actor loop itself never touches it, so the core
@@ -547,6 +884,7 @@ async fn run(
         air,
         cwd,
         resumed,
+        env,
     )
     .await
 }
@@ -568,8 +906,9 @@ async fn run_loop(
     air: Option<AirClient>,
     cwd: PathBuf,
     resumed: bool,
+    env: crate::env_snapshot::EnvSnapshot,
 ) {
-    let ext = SessionExt::new(air, cwd);
+    let mut ext = SessionExt::new(air, cwd, env);
     let mut machine = TurnMachine::new();
     if resumed {
         machine.mark_resumed();
@@ -659,6 +998,10 @@ async fn run_loop(
                         map_state.clear_tool_tracker();
                         // 8.9: settle swept queued turns, then interrupt.
                         let events = machine.cancel();
+                        // Decision 18: a late consolidated assistant message
+                        // must not emit its remainder while the stopped-work
+                        // window is open (Node `session.cancelled`).
+                        map_state.begin_stopped_work();
                     settle_events(
                         events,
                         &mut map_state,
@@ -803,6 +1146,15 @@ async fn run_loop(
                         // Prune finished round-trips first so the registry stays a
                         // live-set of pending permissions (abortable on cancel).
                         pending_permissions.retain(|_, h| !h.is_finished());
+                        let available_modes: Vec<String> = ext
+                            .config
+                            .modes
+                            .available_modes
+                            .iter()
+                            .map(|m| m.id.clone())
+                            .collect();
+                        let pre_plan_mode = ext.config.pre_plan_mode.as_deref();
+                        let home_dir = ext.env.get_path("HOME");
                         handle_permission(
                             frame,
                             reply,
@@ -812,6 +1164,12 @@ async fn run_loop(
                             &update_tx,
                             &session_id,
                             &mut pending_permissions,
+                            &ext.cwd,
+                            &available_modes,
+                            pre_plan_mode,
+                            home_dir.as_deref(),
+                            None,
+                            &command_tx,
                         );
                     }
                     Command::Steer {
@@ -934,6 +1292,559 @@ async fn run_loop(
                         tasks.release_stop(&task_id);
                         let _ = reply.send(Err(error));
                     }
+                    Command::UpdateContextWindow { size } => {
+                        // MAJOR 1 / P4 (acp-agent.js:7884-7891): the background
+                        // get_context_usage answer only refines a NON-authoritative
+                        // window. Once the window is authoritative (seeded from the
+                        // model row, learned from `result.modelUsage`/cache), the
+                        // background result is dropped.
+                        if !ext.usage.authoritative {
+                            ext.usage.update_window_if_positive(Some(size));
+                        }
+                    }
+                    Command::InitConfig { config } => {
+                        // MAJOR 1 / P4: seed the context window at session creation
+                        // from the current model's row (id/displayName/description
+                        // heuristic -> 1M, else the default), mirroring Node's
+                        // `immediateContextWindow` (acp-agent.js:10577-10585). The
+                        // cross-session `contextWindowCache` is a PARITY pending row.
+                        if let Some(info) = config
+                            .model_infos
+                            .iter()
+                            .find(|m| m.value == config.current_model_id)
+                        {
+                            let texts = [
+                                info.resolved_model.as_deref(),
+                                Some(info.value.as_str()),
+                                Some(info.display_name.as_str()),
+                                Some(info.description.as_str()),
+                            ];
+                            let seed = crate::usage::infer_context_window_from_model(
+                                &texts.into_iter().flatten().collect::<Vec<_>>(),
+                            );
+                            if let Some(size) = seed {
+                                if !ext.usage.authoritative {
+                                    ext.usage.context_window = size;
+                                }
+                            }
+                        }
+                        ext.config = config;
+                    }
+                    Command::SetMode { mode_id, reply } => {
+                        match mode_id.as_str() {
+                            "auto" | "default" | "acceptEdits" | "bypassPermissions" | "dontAsk" | "plan" => {}
+                            _ => {
+                                let _ = reply.send(Err("Invalid Mode".to_string()));
+                                continue;
+                            }
+                        }
+                        if !ext.config.modes.available_modes.iter().any(|m| m.id == mode_id) {
+                            let _ = reply.send(Err(format!("Mode {mode_id} is not available in this session")));
+                            continue;
+                        }
+                        let current_model_info = ext.config.model_infos.iter().find(|m| m.value == ext.config.current_model_id);
+                        let is_auto_unavailable = current_model_info.is_some_and(|m| m.supports_auto_mode != Some(true));
+                        let effective_mode = if mode_id == "auto" && is_auto_unavailable {
+                            crate::session_config::AUTO_MODE_FALLBACK.to_string()
+                        } else {
+                            mode_id.clone()
+                        };
+                        let control = control.clone();
+                        let command_tx = command_tx.clone();
+                        tokio::spawn(async move {
+                            let outcome = control
+                                .send_request(json!({
+                                    "subtype": "set_permission_mode",
+                                    "mode": &effective_mode,
+                                }))
+                                .await;
+                            let mode_result = match outcome {
+                                Ok(_) => Ok(()),
+                                Err(_) => Err("Invalid Mode".to_string()),
+                            };
+                            let _ = command_tx.send(Command::ModeApplied {
+                                effective_mode,
+                                requested_mode: mode_id,
+                                result: mode_result,
+                                reply,
+                            });
+                        });
+                    }
+                    Command::ModeApplied {
+                        effective_mode,
+                        requested_mode,
+                        result,
+                        reply,
+                    } => {
+                        match result {
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                            Ok(()) => {
+                                let prev_mode = ext.config.modes.current_mode_id.clone();
+                                if effective_mode != "plan" {
+                                    ext.config.pre_plan_mode = None;
+                                } else if prev_mode != "plan" {
+                                    ext.config.pre_plan_mode = Some(prev_mode);
+                                }
+                                ext.config.modes.current_mode_id = effective_mode.clone();
+                                for opt in &mut ext.config.config_options {
+                                    if opt.id == crate::session_config::MODE_CONFIG_ID {
+                                        opt.current_value = effective_mode.clone();
+                                    }
+                                }
+                                if effective_mode != requested_mode {
+                                    if requested_mode == "auto" && !ext.auto_mode_fallback_warning_shown {
+                                        ext.auto_mode_fallback_warning_shown = true;
+                                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                            "sessionId": session_id,
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": {
+                                                    "type": "text",
+                                                    "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
+                                                }
+                                            }
+                                        })));
+                                    }
+                                    let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                        "sessionId": session_id,
+                                        "update": {
+                                            "sessionUpdate": "current_mode_update",
+                                            "currentModeId": effective_mode,
+                                        }
+                                    })));
+                                }
+                                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "config_option_update",
+                                        "configOptions": ext.config.config_options,
+                                    }
+                                })));
+                                // Node emits the update BEFORE the response; the
+                                // Flush barrier keeps that wire order (INV-20).
+                                let (flush_tx, flush_rx) = oneshot::channel();
+                                let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
+                                tokio::spawn(async move {
+                                    let _ = flush_rx.await;
+                                    let _ = reply.send(Ok(()));
+                                });
+                            }
+                        }
+                    }
+                    Command::ExitPlanModeApplied { mode } => {
+                        // Node `publishCurrent` + `updateConfigOption` after an
+                        // ExitPlanMode allow-with-setMode (`acp-agent.js:7665-7677`):
+                        // update the session mode/config state and publish both
+                        // updates to the client. No CLI control request is issued
+                        // (unlike `session/set_mode`).
+                        ext.config.modes.current_mode_id = mode.clone();
+                        for opt in &mut ext.config.config_options {
+                            if opt.id == crate::session_config::MODE_CONFIG_ID {
+                                opt.current_value = mode.clone();
+                            }
+                        }
+                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "current_mode_update",
+                                "currentModeId": mode,
+                            }
+                        })));
+                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "config_option_update",
+                                "configOptions": ext.config.config_options,
+                            }
+                        })));
+                    }
+                    Command::SetConfigOption {
+                        config_id,
+                        value,
+                        reply,
+                    } => {
+                        let Some(opt) = ext.config.config_options.iter().find(|o| o.id == config_id).cloned() else {
+                            let _ = reply.send(Err(format!("Unknown config option: {config_id}")));
+                            continue;
+                        };
+                        let Some(val_str) = value.as_str() else {
+                            let _ = reply.send(Err(format!("Invalid value for config option {config_id}: {value}")));
+                            continue;
+                        };
+                        let mut valid_value: Option<String> = None;
+                        if opt.options.iter().any(|o| o.value == val_str) || opt.current_value == val_str {
+                            valid_value = Some(val_str.to_string());
+                        } else if config_id == crate::session_config::MODEL_CONFIG_ID {
+                            if let Some(resolved) = crate::session_config::resolve_model_preference(&ext.config.model_infos, val_str) {
+                                if opt.options.iter().any(|o| o.value == resolved.value) {
+                                    valid_value = Some(resolved.value.clone());
+                                }
+                            }
+                            if valid_value.is_none() {
+                                let option_infos: Vec<crate::session_config::ModelInfo> = opt.options.iter().map(|o| {
+                                    crate::session_config::ModelInfo {
+                                        value: o.value.clone(),
+                                        display_name: o.name.clone(),
+                                        description: o.description.clone().unwrap_or_default(),
+                                        ..Default::default()
+                                    }
+                                }).collect();
+                                if let Some(resolved) = crate::session_config::resolve_model_preference(&option_infos, val_str) {
+                                    valid_value = Some(resolved.value.clone());
+                                }
+                            }
+                        }
+                        let Some(resolved_val) = valid_value else {
+                            let _ = reply.send(Err(format!("Invalid value for config option {config_id}: {val_str}")));
+                            continue;
+                        };
+                        if config_id == crate::session_config::MODE_CONFIG_ID {
+                            match resolved_val.as_str() {
+                                "auto" | "default" | "acceptEdits" | "bypassPermissions" | "dontAsk" | "plan" => {}
+                                _ => {
+                                    let _ = reply.send(Err("Invalid Mode".to_string()));
+                                    continue;
+                                }
+                            }
+                            if !ext.config.modes.available_modes.iter().any(|m| m.id == resolved_val) {
+                                let _ = reply.send(Err(format!("Mode {resolved_val} is not available in this session")));
+                                continue;
+                            }
+                            let current_model_info = ext.config.model_infos.iter().find(|m| m.value == ext.config.current_model_id);
+                            let is_auto_unavailable = current_model_info.is_some_and(|m| m.supports_auto_mode != Some(true));
+                            let effective_mode = if resolved_val == "auto" && is_auto_unavailable {
+                                crate::session_config::AUTO_MODE_FALLBACK.to_string()
+                            } else {
+                                resolved_val.clone()
+                            };
+                            let control = control.clone();
+                            let command_tx = command_tx.clone();
+                            let requested_mode = resolved_val.clone();
+                            tokio::spawn(async move {
+                                let outcome = control
+                                    .send_request(json!({
+                                        "subtype": "set_permission_mode",
+                                        "mode": &effective_mode,
+                                    }))
+                                    .await;
+                                let mode_result = match outcome {
+                                    Ok(_) => Ok(()),
+                                    Err(_) => Err("Invalid Mode".to_string()),
+                                };
+                                let _ = command_tx.send(Command::ConfigModeApplied {
+                                    requested_mode,
+                                    effective_mode,
+                                    result: mode_result,
+                                    reply,
+                                });
+                            });
+                        } else if config_id == crate::session_config::MODEL_CONFIG_ID {
+                            let control = control.clone();
+                            let command_tx = command_tx.clone();
+                            let model_val = resolved_val.clone();
+                            tokio::spawn(async move {
+                                let outcome = control
+                                    .send_request(json!({
+                                        "subtype": "set_model",
+                                        "model": &model_val,
+                                    }))
+                                    .await;
+                                let model_result = match outcome {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(e.to_string()),
+                                };
+                                let _ = command_tx.send(Command::ModelApplied {
+                                    model_val,
+                                    result: model_result,
+                                    reply,
+                                });
+                            });
+                        } else if config_id == crate::session_config::EFFORT_CONFIG_ID {
+                            let control = control.clone();
+                            let command_tx = command_tx.clone();
+                            let effort_val = resolved_val.clone();
+                            let effort_payload = crate::session_config::effort_flag_settings(Some(&effort_val), ext.config.ultracode);
+                            tokio::spawn(async move {
+                                let outcome = control
+                                    .send_request(json!({
+                                        "subtype": "apply_flag_settings",
+                                        "settings": effort_payload,
+                                    }))
+                                    .await;
+                                let effort_result = match outcome {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(e.to_string()),
+                                };
+                                let _ = command_tx.send(Command::EffortApplied {
+                                    effort_val,
+                                    result: effort_result,
+                                    reply,
+                                });
+                            });
+                        }
+                    }
+                    Command::ConfigModeApplied {
+                        requested_mode,
+                        effective_mode,
+                        result,
+                        reply,
+                    } => {
+                        match result {
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                            Ok(()) => {
+                                let prev_mode = ext.config.modes.current_mode_id.clone();
+                                if effective_mode != "plan" {
+                                    ext.config.pre_plan_mode = None;
+                                } else if prev_mode != "plan" {
+                                    ext.config.pre_plan_mode = Some(prev_mode);
+                                }
+                                ext.config.modes.current_mode_id = effective_mode.clone();
+                                for opt in &mut ext.config.config_options {
+                                    if opt.id == crate::session_config::MODE_CONFIG_ID {
+                                        opt.current_value = effective_mode.clone();
+                                    }
+                                }
+                                if requested_mode == "auto" && effective_mode != requested_mode && !ext.auto_mode_fallback_warning_shown {
+                                    ext.auto_mode_fallback_warning_shown = true;
+                                    let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                        "sessionId": session_id,
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": {
+                                                "type": "text",
+                                                "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
+                                            }
+                                        }
+                                    })));
+                                }
+                                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "current_mode_update",
+                                        "currentModeId": effective_mode,
+                                    }
+                                })));
+                                // Node emits the update BEFORE the response; the
+                                // Flush barrier keeps that wire order (INV-20).
+                                let options = ext.config.config_options.clone();
+                                let (flush_tx, flush_rx) = oneshot::channel();
+                                let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
+                                tokio::spawn(async move {
+                                    let _ = flush_rx.await;
+                                    let _ = reply.send(Ok(options));
+                                });
+                            }
+                        }
+                    }
+                    Command::ModelApplied {
+                        model_val,
+                        result,
+                        reply,
+                    } => {
+                        match result {
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                            Ok(()) => {
+                                let model_changed = ext.config.current_model_id != model_val;
+                                if model_changed {
+                                    ext.config.current_model_id = model_val.clone();
+                                    let new_model_info = ext.config.model_infos.iter().find(|m| m.value == model_val).cloned();
+                                    // MAJOR 1 / P4: re-seed the context window on a model
+                                    // switch (acp-agent.js:7917-7919) — sized from the new
+                                    // model's row heuristic unless already authoritative.
+                                    let seed = new_model_info.as_ref().and_then(|m| {
+                                        let texts = [
+                                            m.resolved_model.as_deref(),
+                                            Some(m.value.as_str()),
+                                            Some(m.display_name.as_str()),
+                                            Some(m.description.as_str()),
+                                        ];
+                                        crate::usage::infer_context_window_from_model(
+                                            &texts.into_iter().flatten().collect::<Vec<_>>(),
+                                        )
+                                    });
+                                    ext.usage.context_window =
+                                        seed.unwrap_or(crate::usage::DEFAULT_CONTEXT_WINDOW);
+                                    ext.usage.authoritative = false;
+                                }
+                                let new_model_info = ext.config.model_infos.iter().find(|m| m.value == model_val).cloned();
+                                let mut mode_downgraded = false;
+                                if ext.config.modes.current_mode_id == "auto" {
+                                    let auto_ok = new_model_info.as_ref().and_then(|m| m.supports_auto_mode) == Some(true);
+                                    if !auto_ok {
+                                        ext.config.modes.current_mode_id = crate::session_config::AUTO_MODE_FALLBACK.to_string();
+                                        let fallback = crate::session_config::AUTO_MODE_FALLBACK.to_string();
+                                        let control = control.clone();
+                                        tokio::spawn(async move {
+                                            let _ = control.send_request(json!({
+                                                "subtype": "set_permission_mode",
+                                                "mode": &fallback,
+                                            })).await;
+                                        });
+                                        mode_downgraded = true;
+                                    }
+                                }
+                                let pinned_effort = ext.config.effort_pinned.clone();
+                                let effort_was_pinned = pinned_effort.is_some();
+                                let effort_pinned_for_new = effort_was_pinned && new_model_info.as_ref().is_some_and(|m| {
+                                    m.supports_effort == Some(true) && m.supported_effort_levels.as_ref().is_some_and(|lvls| {
+                                        lvls.iter().any(|l| Some(l) == pinned_effort.as_ref())
+                                    })
+                                });
+                                let seed_effort = if effort_pinned_for_new {
+                                    pinned_effort.clone()
+                                } else {
+                                    let settings = crate::settings::load(&ext.cwd, &ext.env);
+                                    crate::session_config::settings_effort_for_model(
+                                        settings.model_settings.as_ref(),
+                                        settings.effort_level.as_deref(),
+                                        new_model_info.as_ref(),
+                                        &model_val,
+                                    )
+                                };
+                                // MAJOR 3/4 / P4: rebuild config options for the new
+                                // model honouring the client's `useRecommendedValue`
+                                // (AIR) capability, matching the session-start seed.
+                                let use_recommended_value = ext
+                                    .air
+                                    .as_ref()
+                                    .is_some_and(|a| a.supports("recommendedValue"));
+                                ext.config.config_options = crate::session_config::build_config_options(
+                                    &ext.config.modes,
+                                    &ext.config.available_models,
+                                    &ext.config.current_model_id,
+                                    &ext.config.model_infos,
+                                    seed_effort.as_deref(),
+                                    use_recommended_value,
+                                );
+                                // MAJOR 4 / P4 (acp-agent.js:7975-7989): sync effort on
+                                // every switch for opted-in (AIR) clients; for a legacy
+                                // non-AIR client only when a user pin was clamped away —
+                                // and then send `effortLevel:null` (`toSdkEffortLevel
+                                // (undefined)`) to clear the flag layer, never the
+                                // displayed value.
+                                let should_sync = use_recommended_value
+                                    || (effort_was_pinned && !effort_pinned_for_new);
+                                if should_sync {
+                                    let new_effort_opt = ext.config.config_options.iter().find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID);
+                                    let new_effort = new_effort_opt.map(|o| o.current_value.clone());
+                                    let sync_value = if use_recommended_value { new_effort.as_deref() } else { None };
+                                    let effort_payload = crate::session_config::effort_flag_settings(sync_value, ext.config.ultracode);
+                                    let control = control.clone();
+                                    tokio::spawn(async move {
+                                        let _ = control.send_request(json!({
+                                            "subtype": "apply_flag_settings",
+                                            "settings": effort_payload,
+                                        })).await;
+                                    });
+                                    ext.config.effort_pinned = if effort_pinned_for_new { pinned_effort } else { None };
+                                }
+                                if mode_downgraded {
+                                    let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                        "sessionId": session_id,
+                                        "update": {
+                                            "sessionUpdate": "current_mode_update",
+                                            "currentModeId": crate::session_config::AUTO_MODE_FALLBACK,
+                                        }
+                                    })));
+                                    if !ext.auto_mode_fallback_warning_shown {
+                                        ext.auto_mode_fallback_warning_shown = true;
+                                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                            "sessionId": session_id,
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": {
+                                                    "type": "text",
+                                                    "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
+                                                }
+                                            }
+                                        })));
+                                    }
+                                }
+                                if model_changed {
+                                    let control = control.clone();
+                                    let tx = command_tx.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(res) = control
+                                            .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
+                                            .await
+                                        {
+                                            if let Some(raw) = res.get("rawMaxTokens").and_then(serde_json::Value::as_u64) {
+                                                if raw > 0 {
+                                                    let _ = tx.send(Command::UpdateContextWindow { size: raw });
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                let options = ext.config.config_options.clone();
+                                let (flush_tx, flush_rx) = oneshot::channel();
+                                let _ = update_tx.send(SessionOutbound::Flush(flush_tx));
+                                tokio::spawn(async move {
+                                    let _ = flush_rx.await;
+                                    let _ = reply.send(Ok(options));
+                                });
+                            }
+                        }
+                    }
+                    Command::EffortApplied {
+                        effort_val,
+                        result,
+                        reply,
+                    } => {
+                        match result {
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                            Ok(()) => {
+                                for opt in &mut ext.config.config_options {
+                                    if opt.id == crate::session_config::EFFORT_CONFIG_ID {
+                                        opt.current_value = effort_val.clone();
+                                    }
+                                }
+                                ext.config.current_effort = Some(effort_val.clone());
+                                ext.config.effort_pinned = if effort_val != "default" {
+                                    Some(effort_val)
+                                } else {
+                                    None
+                                };
+                                let _ = reply.send(Ok(ext.config.config_options.clone()));
+                            }
+                        }
+                    }
+                    Command::GetState { reply } => {
+                        // MAJOR 5: return the actor's LIVE modes + config options so a
+                        // `session/resume` on a live session reflects `set_config_option
+                        // mode` etc. (Node reads the live session state).
+                        let _ = reply.send(Ok((
+                            ext.config.modes.clone(),
+                            ext.config.config_options.clone(),
+                        )));
+                    }
+                    Command::HookCallback {
+                        request_id,
+                        callback_id,
+                        input,
+                        tool_use_id,
+                        reply,
+                    } => {
+                        handle_hook_callback(
+                            &request_id,
+                            &callback_id,
+                            &input,
+                            tool_use_id.as_deref(),
+                            &mut map_state,
+                            &mut ext,
+                            &update_tx,
+                            &session_id,
+                            reply,
+                        );
+                    }
                 }
             }
             msg = stream.recv() => {
@@ -965,7 +1876,9 @@ async fn run_loop(
                     &update_tx,
                     &session_id,
                     &high_water,
-                    &mut tasks,                )
+                    &mut tasks,
+                    &mut ext,
+                )
                 .await;
             }
         }
@@ -976,6 +1889,157 @@ async fn run_loop(
         // fresh.
         if !machine.has_active() {
             force_cancel_deadline = None;
+        }
+    }
+}
+
+fn publish_task_plan(
+    session_id: &str,
+    ext: &mut SessionExt,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+) {
+    let entries = crate::hooks::task_state_to_plan_entries(&ext.task_state);
+
+    if ext.air_supports("air") {
+        let serialized = serde_json::to_string(&entries).unwrap_or_default();
+        if ext.last_published_task_plan.as_deref() == Some(&serialized) {
+            return;
+        }
+        ext.last_published_task_plan = Some(serialized);
+    }
+
+    let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "plan",
+            "entries": entries
+        }
+    })));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_hook_callback(
+    request_id: &str,
+    callback_id: &str,
+    input: &Value,
+    tool_use_id: Option<&str>,
+    map_state: &mut MapState,
+    ext: &mut SessionExt,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    reply: oneshot::Sender<Value>,
+) {
+    match callback_id {
+        crate::hooks::POST_TOOL_USE_HOOK_ID => {
+            if input.get("tool_name").and_then(Value::as_str) == Some("EnterPlanMode") {
+                ext.config.modes.current_mode_id = "plan".to_string();
+                if let Some(opt) = ext
+                    .config
+                    .config_options
+                    .iter_mut()
+                    .find(|o| o.id == crate::session_config::MODE_CONFIG_ID)
+                {
+                    opt.current_value = "plan".to_string();
+                }
+                let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": "plan"
+                    }
+                })));
+                let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": ext.config.config_options
+                    }
+                })));
+            }
+
+            if let Some(id) = tool_use_id {
+                let entry = ext.hooks.unregister(id);
+                let tool_response = input.get("tool_response").cloned().unwrap_or(Value::Null);
+                if let Some(entry) = entry {
+                    let mut update = crate::hooks::build_post_tool_use_update(
+                        id,
+                        &entry.tool_name,
+                        entry.parent_tool_use_id.as_deref(),
+                        &tool_response,
+                    );
+                    map_state.filter_hook_tool_call_update(id, &mut update);
+                    let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                        "sessionId": session_id,
+                        "update": update
+                    })));
+                }
+                map_state.finish_hook_tool_tracker(id);
+                map_state.pending_hooks.remove(id);
+            }
+            let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
+        }
+        crate::hooks::POST_MODEL_SWITCH_HOOK_ID => {
+            if input.get("source").and_then(Value::as_str) != Some("sdk")
+                && input.get("source").and_then(Value::as_str) != Some("resume")
+            {
+                if let Some(to_model) = input.get("to_model").and_then(Value::as_str) {
+                    if let Some(opt) = ext
+                        .config
+                        .config_options
+                        .iter_mut()
+                        .find(|o| o.id == crate::session_config::MODEL_CONFIG_ID)
+                    {
+                        opt.current_value = to_model.to_string();
+                        let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "config_option_update",
+                                "configOptions": ext.config.config_options
+                            }
+                        })));
+                    }
+                }
+            }
+            let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
+        }
+        crate::hooks::POST_COMPACT_HOOK_ID => {
+            let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
+        }
+        crate::hooks::TASK_CREATED_HOOK_ID => {
+            if let Some(task_id) = input.get("task_id").and_then(Value::as_str) {
+                if let Some(task_subject) = input.get("task_subject").and_then(Value::as_str) {
+                    if !ext.task_state.iter().any(|(id, _)| id == task_id) {
+                        ext.task_state.push((
+                            task_id.to_string(),
+                            crate::hooks::TaskStateEntry {
+                                subject: task_subject.to_string(),
+                                status: "pending".to_string(),
+                                active_form: None,
+                                description: input
+                                    .get("task_description")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                            },
+                        ));
+                        publish_task_plan(session_id, ext, update_tx);
+                    }
+                }
+            }
+            let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
+        }
+        crate::hooks::TASK_COMPLETED_HOOK_ID => {
+            if let Some(task_id) = input.get("task_id").and_then(Value::as_str) {
+                if let Some((_, entry)) = ext.task_state.iter_mut().find(|(id, _)| id == task_id) {
+                    if entry.status != "completed" {
+                        entry.status = "completed".to_string();
+                        publish_task_plan(session_id, ext, update_tx);
+                    }
+                }
+            }
+            let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
+        }
+        _ => {
+            let _ = reply.send(crate::hooks::hook_control_response_error(request_id));
         }
     }
 }
@@ -996,6 +2060,7 @@ async fn dispatch_stream(
     session_id: &str,
     high_water: &AtomicUsize,
     tasks: &mut AsyncTaskRuntime,
+    ext: &mut SessionExt,
 ) {
     let view = dispatch::TurnView::default();
     match dispatch::route(&msg, &view) {
@@ -1015,6 +2080,7 @@ async fn dispatch_stream(
                 session_id,
                 high_water,
                 tasks,
+                ext,
             );
         }
         Route::Ignore => {}
@@ -1035,14 +2101,27 @@ fn handle_session_frame(
     session_id: &str,
     high_water: &AtomicUsize,
     tasks: &mut AsyncTaskRuntime,
+    ext: &mut SessionExt,
 ) {
     let frame_type = line.get("type").and_then(Value::as_str).unwrap_or("");
     match frame_type {
         // The CLI re-emits the user message (--replay-user-messages); its echo
         // promotes the queued turn. The turn's own echo is not forwarded.
         "user" => {
-            if let Some(uuid) = line.get("uuid").and_then(Value::as_str) {
+            let mut matched_echo = false;
+            let uuid_opt = line.get("uuid").and_then(Value::as_str);
+            if let Some(uuid) = uuid_opt {
                 let events = machine.on_echo(uuid);
+                // Node's `activateTurn` clears `session.cancelled`, ending the
+                // stopped-work window (Decision 18).
+                if events
+                    .iter()
+                    .any(|e| matches!(e, TurnEvent::Activated { .. }))
+                {
+                    map_state.end_stopped_work();
+                    matched_echo = true;
+                    ext.usage.reset_turn_scratch();
+                }
                 settle_events(
                     events,
                     map_state,
@@ -1069,12 +2148,72 @@ fn handle_session_frame(
                 .pointer("/message/content")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let is_echo = match &content {
-                Value::String(_) => true,
-                Value::Array(blocks) => blocks.len() == 1 && blocks[0]["type"] == "text",
-                _ => false,
-            };
+            let is_uuid_matched =
+                matched_echo || uuid_opt.is_some_and(|u| machine.foreground_target() == Some(u));
+            let is_echo =
+                if line.get("isReplay").and_then(Value::as_bool) == Some(true) || is_uuid_matched {
+                    // Decision 5 / P3 & Minor I: any replayed user frame or uuid-matched
+                    // echo is the CLI's echo of a turn, never a tool result. Node `break`s it
+                    // after promoting the turn (`acp-agent.js:5682-5694`).
+                    true
+                } else {
+                    match &content {
+                        Value::String(_) => true,
+                        Value::Array(blocks) => blocks.len() == 1 && blocks[0]["type"] == "text",
+                        _ => false,
+                    }
+                };
             if !is_echo {
+                if let Value::Array(blocks) = &content {
+                    for block in blocks {
+                        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                            if let Some(tool_use_id) =
+                                block.get("tool_use_id").and_then(Value::as_str)
+                            {
+                                ext.hooks.complete(tool_use_id);
+                                ext.hooks.prune_expired(std::time::Instant::now());
+
+                                if let Some(tool_use) = map_state.tool_use_from_cache(tool_use_id) {
+                                    let name =
+                                        tool_use.get("name").and_then(Value::as_str).unwrap_or("");
+                                    let is_err = block
+                                        .get("is_error")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false);
+                                    if !is_err {
+                                        let input = tool_use.get("input").unwrap_or(&Value::Null);
+                                        if name == "TaskCreate" {
+                                            let parsed_id = crate::hooks::parse_task_create_output(
+                                                &block["content"],
+                                            );
+                                            crate::hooks::apply_task_create(
+                                                &mut ext.task_state,
+                                                input,
+                                                parsed_id.as_deref(),
+                                            );
+                                            publish_task_plan(session_id, ext, update_tx);
+                                        } else if name == "TaskUpdate" {
+                                            crate::hooks::apply_task_update(
+                                                &mut ext.task_state,
+                                                input,
+                                            );
+                                            publish_task_plan(session_id, ext, update_tx);
+                                        } else if name == "TaskList" {
+                                            let parsed_tasks = crate::hooks::parse_task_list_output(
+                                                &block["content"],
+                                            );
+                                            crate::hooks::apply_task_list(
+                                                &mut ext.task_state,
+                                                parsed_tasks,
+                                            );
+                                            publish_task_plan(session_id, ext, update_tx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let updates = map::map_consolidated(&content, MsgRole::User, map_state);
                 note_tool_updates(&updates, true, machine.foreground_target(), map_state);
                 emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
@@ -1084,7 +2223,43 @@ fn handle_session_frame(
             // Decided BEFORE `on_result` (a folded-prompt result names a pending
             // turn that `on_result` may promote or settle).
             let autonomous = machine.result_is_autonomous(&line);
+
+            // Decision 9 / 2.1: update context window if matchingModelUsage has contextWindow > 0
+            if let Some(model_usage) = line.get("modelUsage") {
+                if let Some(ref current_model) = ext.usage.last_model {
+                    if let Some((_key, val)) =
+                        crate::usage::get_matching_model_usage(model_usage, current_model)
+                    {
+                        let cw = val.get("contextWindow").and_then(Value::as_u64);
+                        ext.usage.update_window_if_positive(cw);
+                    }
+                }
+            }
+
+            // Emit usage_update if lastAssistantTotalUsage is recorded
+            if let Some(last_total) = ext.usage.last_total {
+                let cost = line.get("total_cost_usd");
+                let origin = line.get("origin");
+                let update = crate::usage::build_result_usage_update(
+                    last_total,
+                    ext.usage.context_window,
+                    ext.usage.last_model.as_deref(),
+                    cost,
+                    origin,
+                );
+                let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                    "sessionId": session_id,
+                    "update": update
+                })));
+            }
+
             let events = machine.on_result(&line, *emitted_assistant_text);
+            if events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Activated { .. }))
+            {
+                ext.usage.reset_turn_scratch();
+            }
             // Upstream clears emittedAssistantText in the result finally for
             // non-autonomous results.
             if !autonomous {
@@ -1169,6 +2344,66 @@ fn handle_session_frame(
                         );
                     }
                 }
+                "compact_boundary" => {
+                    if let Some(compact_meta) =
+                        line.get("compact_metadata").and_then(Value::as_object)
+                    {
+                        let mut raw_output = serde_json::Map::new();
+                        let trigger = compact_meta
+                            .get("trigger")
+                            .and_then(Value::as_str)
+                            .map(|t| if t == "auto" { "automatic" } else { "manual" })
+                            .unwrap_or("manual");
+                        raw_output.insert("trigger".into(), json!(trigger));
+                        if let Some(pre) = compact_meta.get("pre_tokens") {
+                            raw_output.insert("preTokens".into(), pre.clone());
+                        }
+                        if let Some(post) = compact_meta.get("post_tokens") {
+                            raw_output.insert("postTokens".into(), post.clone());
+                        }
+                        if let Some(dur) = compact_meta.get("duration_ms") {
+                            raw_output.insert("durationMs".into(), dur.clone());
+                        }
+                        let mut tool_call_update = serde_json::Map::new();
+                        tool_call_update.insert("sessionUpdate".into(), json!("tool_call"));
+                        if let Some(uuid) = line.get("uuid").and_then(Value::as_str) {
+                            tool_call_update.insert("toolCallId".into(), json!(uuid));
+                        }
+                        tool_call_update.insert("title".into(), json!("Compact conversation"));
+                        tool_call_update.insert("kind".into(), json!("think"));
+                        tool_call_update.insert("status".into(), json!("completed"));
+                        tool_call_update.insert("rawOutput".into(), Value::Object(raw_output));
+                        tool_call_update.insert(
+                            "_meta".into(),
+                            json!({
+                                "claudeCode": {
+                                    "toolName": "compact"
+                                }
+                            }),
+                        );
+                        let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                            "sessionId": session_id,
+                            "update": Value::Object(tool_call_update)
+                        })));
+                    }
+
+                    let used_tokens = line
+                        .pointer("/compact_metadata/post_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    ext.usage.last_usage = None;
+                    ext.usage.last_total = Some(used_tokens);
+                    ext.usage.used = used_tokens;
+                    let update = crate::usage::build_stream_usage_update(
+                        used_tokens,
+                        ext.usage.context_window,
+                        ext.usage.last_model.as_deref(),
+                    );
+                    let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                        "sessionId": session_id,
+                        "update": update
+                    })));
+                }
                 "session_state_changed" => {
                     let state = line.get("state").and_then(Value::as_str).unwrap_or("");
                     machine.on_session_state(state);
@@ -1192,7 +2427,106 @@ fn handle_session_frame(
                 _ => {}
             }
         }
+        "rate_limit_event" => {
+            if let Some(last_total) = ext.usage.last_total {
+                let rl_info = line.get("rate_limit_info").unwrap_or(&Value::Null);
+                let update = crate::usage::build_rate_limit_usage_update(
+                    last_total,
+                    ext.usage.context_window,
+                    ext.usage.last_model.as_deref(),
+                    rl_info,
+                );
+                let _ = update_tx.send(SessionOutbound::RawUpdate(serde_json::json!({
+                    "sessionId": session_id,
+                    "update": update
+                })));
+            }
+        }
         "stream_event" | "assistant" => {
+            // Strict null check per Decision 18 and authoring rules: missing is NOT top-level
+            let is_strict_top_level = line.get("parent_tool_use_id") == Some(&Value::Null);
+            if is_strict_top_level {
+                if frame_type == "stream_event" {
+                    if let Some(event) = line.get("event") {
+                        let ev_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+                        if ev_type == "message_start" {
+                            if let Some(msg) = event.get("message") {
+                                // MAJOR 1 / P4: Node resets the turn usage snapshot on
+                                // every message_start (acp-agent.js:5434-5435); a
+                                // message_start WITHOUT `usage` clears the snapshot to
+                                // zero (`snapshotFromUsage(undefined)`) rather than
+                                // keeping the prior turn's values.
+                                let usage_val = msg.get("usage").unwrap_or(&Value::Null);
+                                ext.usage.last_usage =
+                                    Some(crate::usage::snapshot_from_usage(usage_val));
+                                if let Some(model) = msg.get("model").and_then(Value::as_str) {
+                                    if model != "<synthetic>" {
+                                        ext.usage.last_model = Some(model.to_string());
+                                        if !ext.usage.authoritative
+                                            && ext.usage.context_window
+                                                == crate::usage::DEFAULT_CONTEXT_WINDOW
+                                        {
+                                            if let Some(inferred) =
+                                                crate::usage::infer_context_window_from_model(&[
+                                                    model,
+                                                ])
+                                            {
+                                                ext.usage.context_window = inferred;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if ev_type == "message_delta" {
+                            if let Some(delta_usage) = event.get("usage") {
+                                let next_snap = crate::usage::apply_message_delta(
+                                    ext.usage.last_usage.as_ref(),
+                                    delta_usage,
+                                );
+                                ext.usage.last_usage = Some(next_snap);
+                            }
+                        }
+                        if ev_type == "message_start" || ev_type == "message_delta" {
+                            if let Some(ref snap) = ext.usage.last_usage {
+                                let next_usage = snap.total_tokens();
+                                if ext.usage.last_total != Some(next_usage) {
+                                    ext.usage.last_total = Some(next_usage);
+                                    ext.usage.used = next_usage;
+                                    let update = crate::usage::build_stream_usage_update(
+                                        next_usage,
+                                        ext.usage.context_window,
+                                        ext.usage.last_model.as_deref(),
+                                    );
+                                    let _ = update_tx.send(SessionOutbound::RawUpdate(
+                                        serde_json::json!({
+                                            "sessionId": session_id,
+                                            "update": update
+                                        }),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else if frame_type == "assistant" {
+                    if let Some(msg) = line.get("message") {
+                        let model = msg.get("model").and_then(Value::as_str);
+                        if model != Some("<synthetic>") {
+                            if let Some(usage_val) = msg.get("usage") {
+                                let snap = crate::usage::snapshot_from_usage(usage_val);
+                                let total = snap.total_tokens();
+                                ext.usage.last_usage = Some(snap);
+                                ext.usage.last_total = Some(total);
+                                ext.usage.used = total;
+                            }
+                        }
+                        if let Some(m) = model {
+                            if m != "<synthetic>" {
+                                ext.usage.last_model = Some(m.to_string());
+                            }
+                        }
+                    }
+                }
+            }
             // The Node snapshots `lastAssistantError` from a top-level `error`
             // on the assistant frame (`acp-agent.ts:4333-4335`); record it so
             // the turn's failure can attach `data.errorKind` only when present.
@@ -1218,34 +2552,57 @@ fn handle_session_frame(
             if frame_type == "assistant" {
                 if let Some(content) = line.pointer("/message/content") {
                     map_state.books.record_dispatched(content);
+                    if let Some(blocks) = content.as_array() {
+                        for block in blocks {
+                            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                                if let Some(id) = block.get("id").and_then(Value::as_str) {
+                                    let name = block
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Other");
+                                    if name != "TodoWrite" && !crate::tools::is_task_tool(name) {
+                                        let parent = line
+                                            .get("parent_tool_use_id")
+                                            .and_then(Value::as_str)
+                                            .map(String::from);
+                                        ext.hooks.register_once(
+                                            id.to_string(),
+                                            name.to_string(),
+                                            parent,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if frame_type == "stream_event"
+                && line.pointer("/event/type").and_then(Value::as_str)
+                    == Some("content_block_start")
+            {
+                if let Some(block) = line.pointer("/event/content_block") {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                        if let Some(id) = block.get("id").and_then(Value::as_str) {
+                            let name = block.get("name").and_then(Value::as_str).unwrap_or("Other");
+                            if name != "TodoWrite" && !crate::tools::is_task_tool(name) {
+                                let parent = line
+                                    .get("parent_tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .map(String::from);
+                                ext.hooks
+                                    .register_once(id.to_string(), name.to_string(), parent);
+                            }
+                        }
+                    }
                 }
             }
             let updates = if frame_type == "stream_event" {
                 map::map_stream_event(&line, map_state)
             } else {
-                // A consolidated assistant/user message: Node does NOT deliver
-                // its text/thinking as chunks (only the stream_event deltas do;
-                // the consolidated text is the #453/fallback source). Emit only
-                // the tool/plan updates, matching the captured fixtures.
-                map::map_consolidated(
-                    &line
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                    MsgRole::Assistant,
-                    map_state,
-                )
-                .into_iter()
-                .filter(|u| {
-                    !matches!(
-                        u,
-                        SessionUpdate::AgentMessageChunk(_)
-                            | SessionUpdate::AgentThoughtChunk(_)
-                            | SessionUpdate::UserMessageChunk(_)
-                    )
-                })
-                .collect::<Vec<_>>()
+                // Consolidated assistant message: forward only the text/thinking
+                // its stream did not already deliver (`unstreamedRemainder`,
+                // Decision 18), plus tool/image/plan blocks.
+                map::map_consolidated_assistant(&line, map_state)
             };
             for update in &updates {
                 if is_top_level_text(update, &line) {
@@ -1257,6 +2614,9 @@ fn handle_session_frame(
             let top_level = line.get("parent_tool_use_id").is_none_or(Value::is_null);
             note_tool_updates(&updates, top_level, machine.foreground_target(), map_state);
             emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
+        }
+        "prompt_suggestion" => {
+            // Consumed without error (Item 3.3 / INV-65). Publishing is AIR-only and skipped.
         }
         _ => {}
     }
@@ -1278,6 +2638,12 @@ fn handle_permission(
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
     pending_permissions: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    cwd: &std::path::Path,
+    available_modes: &[String],
+    pre_plan_mode: Option<&str>,
+    home_dir: Option<&std::path::Path>,
+    context_used_percent: Option<u32>,
+    command_tx: &mpsc::UnboundedSender<Command>,
 ) {
     let can = permission::parse_can_use_tool(&frame);
     // Subagent attribution (10.5): the parent Agent/Task tool call that spawned
@@ -1319,41 +2685,49 @@ fn handle_permission(
         &can.tool_use_id,
         parent.as_deref(),
     );
-    // 3.9: the durable Bash choice, when Node can describe the suggestions.
-    let durable =
-        permission::durable_bash(&can.tool_name, &can.suggestions, can.no_persistent_rule);
-    let params = permission::build_request_permission(session_id, tool_call, durable.as_ref());
+    // 3.6 (Decision 7): build the ACP options from the P7 permission_option
+    // module (Node's `buildClaudePermissionOptions`), and the request params.
+    let ctx = permission_options::OptionsContext {
+        tool_name: can.tool_name.clone(),
+        display_name: can.display_name.clone(),
+        input: can.tool_input.clone(),
+        cwd: cwd.to_path_buf(),
+        change_set: permission_options::normalize_change_set(
+            &can.suggestions,
+            can.no_persistent_rule,
+        ),
+        no_persistent_rule: can.no_persistent_rule,
+        default_to_no: can.default_to_no,
+        available_modes: available_modes.to_vec(),
+        pre_plan_mode: pre_plan_mode.map(String::from),
+        context_used_percent,
+        home_dir: home_dir.map(|p| p.to_path_buf()),
+    };
+    let options = permission_options::build_options(&ctx);
+    let mut params = serde_json::Map::new();
+    params.insert("options".into(), Value::Array(options));
+    params.insert("sessionId".into(), Value::String(session_id.to_string()));
+    params.insert("toolCall".into(), tool_call);
+    let params = Value::Object(params);
 
     // Spawn the round-trip (D14): ask the agent layer to send
     // `session/request_permission` and await the outcome, map it, resolve `reply`
     // (the `control.rs` on-request task writes the response frame). The handle is
     // registered so `Command::Cancel` can abort it (CUJ 2, INV-27).
     let update_tx = update_tx.clone();
+    let ctx = Arc::new(ctx);
+    let command_tx = command_tx.clone();
     let handle = tokio::spawn(async move {
         let (ptx, prx) = oneshot::channel();
         let _ = update_tx.send(SessionOutbound::RequestPermission { params, reply: ptx });
         let response = match prx.await {
-            Ok(Ok(value)) => match permission::map_outcome(&value) {
-                permission::Outcome::Allow => permission::allow_control_response(
-                    &can.request_id,
-                    &can.tool_use_id,
-                    &can.tool_input,
-                ),
-                // The durable choice counts only if it was actually offered.
-                permission::Outcome::AllowWithUpdates => match &durable {
-                    Some(d) => permission::allow_with_updates_control_response(
-                        &can.request_id,
-                        &can.tool_use_id,
-                        &can.tool_input,
-                        &d.updates,
-                    ),
-                    None => permission::deny_control_response(&can.request_id, &can.tool_use_id),
-                },
-                // Deny and Cancelled both refuse the tool.
-                permission::Outcome::Deny | permission::Outcome::Cancelled => {
-                    permission::deny_control_response(&can.request_id, &can.tool_use_id)
-                }
-            },
+            Ok(Ok(value)) => permission::permission_control_response(
+                &value,
+                &ctx,
+                &can.request_id,
+                &can.tool_use_id,
+                &can.tool_input,
+            ),
             // The request errored or the round-trip was dropped (e.g. the client
             // closed / cancelled): refuse the tool (R28 deny) so the turn settles
             // on the next `result` (INV-21).
@@ -1361,6 +2735,29 @@ fn handle_permission(
                 permission::deny_control_response(&can.request_id, &can.tool_use_id)
             }
         };
+        // ExitPlanMode mode effect (Node `acp-agent.js:7665-7677`): an allow with
+        // a session `setMode` update publishes current_mode_update +
+        // config_option_update to the client (no CLI control request). Routed
+        // through the actor so session mode/config state is updated (INV-27).
+        if ctx.tool_name == "ExitPlanMode"
+            && response["response"]["response"]["behavior"] == "allow"
+        {
+            if let Some(perms) = response["response"]["response"]["updatedPermissions"].as_array() {
+                if let Some(mode) = perms.iter().find_map(|u| {
+                    if u.get("type").and_then(Value::as_str) == Some("setMode")
+                        && u.get("destination").and_then(Value::as_str) == Some("session")
+                    {
+                        u.get("mode").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                }) {
+                    let _ = command_tx.send(Command::ExitPlanModeApplied {
+                        mode: mode.to_string(),
+                    });
+                }
+            }
+        }
         let _ = reply.send(response);
     });
     pending_permissions.insert(request_id, handle);
@@ -1574,6 +2971,14 @@ fn settle_events(
     high_water: &AtomicUsize,
     assistant_had_error: bool,
 ) {
+    // Node's `activateTurn` clears `session.cancelled`, ending the stopped-work
+    // window whenever a turn activates (whether by user echo or ensure_active_turn).
+    if events
+        .iter()
+        .any(|e| matches!(e, TurnEvent::Activated { .. }))
+    {
+        map_state.end_stopped_work();
+    }
     let background: std::collections::HashSet<&str> =
         live_background.values().map(String::as_str).collect();
     let (events, closing) = crate::unfinished::gate_events(events, map_state, &background);
@@ -1600,11 +3005,13 @@ fn emit_commands_changed(
         .cloned()
         .unwrap_or(Value::Null);
     let update = map::map_commands_changed(&commands, &terminal);
-    let notif = SessionNotification::new(
-        session_id.to_string(),
-        SessionUpdate::AvailableCommandsUpdate(update),
+    // Decision 8: raw JSON so a command without an argument hint carries
+    // `input: null` like Node (the typed update would omit the field).
+    emit_raw_updates(
+        vec![map::available_commands_json(&update)],
+        update_tx,
+        session_id,
     );
-    let _ = update_tx.send(SessionOutbound::Update(notif));
 }
 
 /// Send a batch of updates to the client as `session/update` notifications.
@@ -1653,6 +3060,41 @@ fn emit_raw_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_handle_frame(
+        line: Value,
+        machine: &mut TurnMachine,
+        map_state: &mut MapState,
+        live_background: &mut HashMap<String, String>,
+        pending: &mut HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>>,
+        emitted_assistant_text: &mut bool,
+        assistant_had_error: &mut bool,
+        update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+        session_id: &str,
+        high_water: &AtomicUsize,
+        tasks: &mut AsyncTaskRuntime,
+    ) {
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        super::handle_session_frame(
+            line,
+            machine,
+            map_state,
+            live_background,
+            pending,
+            emitted_assistant_text,
+            assistant_had_error,
+            update_tx,
+            session_id,
+            high_water,
+            tasks,
+            &mut ext,
+        );
+    }
 
     /// 8.T7-style unit: a lagging trailing idle after the next echo is absorbed,
     /// not a false #825 fail. Exercises the machine via the actor-facing
@@ -1949,7 +3391,7 @@ mod tests {
         let _ = machine.on_idle();
 
         // Drive the `running` transition through the ACTOR frame path.
-        handle_session_frame(
+        test_handle_frame(
             json!({"type":"system","subtype":"session_state_changed","state":"running"}),
             &mut machine,
             &mut map_state,
@@ -2005,7 +3447,7 @@ mod tests {
         // The assistant streams the `Read` tool_use via a stream_event
         // content_block_start — this surfaces the `tool_call` and caches the
         // block so the later tool_result can resolve it.
-        handle_session_frame(
+        test_handle_frame(
             json!({
                 "type": "stream_event",
                 "event": {
@@ -2033,7 +3475,7 @@ mod tests {
 
         // The tool executes and the CLI emits a `user` frame carrying the
         // `tool_result` block — the terminal completion must be emitted.
-        handle_session_frame(
+        test_handle_frame(
             json!({
                 "type": "user",
                 "message": {
@@ -2086,6 +3528,439 @@ mod tests {
         );
     }
 
+    /// rust-parity-fixes 1.5 (P3, Decision 5) — any `isReplay:true` user frame
+    /// (text-only, image+text, or a multi-block steer echo) is NOT forwarded;
+    /// a non-replay `tool_result` user frame is still mapped.
+    #[tokio::test]
+    async fn inv_58_image_echo_not_forwarded() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+
+        machine.enqueue(Turn::new("p1".into(), false));
+        machine.on_echo("p1");
+
+        // Register a streamed tool_use so the later tool_result resolves.
+        test_handle_frame(
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_echo",
+                        "name": "Read",
+                        "input": {},
+                    }
+                }
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        while urx.try_recv().is_ok() {}
+
+        // (a) the image prompt echo carries [image, text] and isReplay:true.
+        test_handle_frame(
+            json!({"type":"user","uuid":"p1","isReplay":true,"message":{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","data":"AAA","media_type":"image/png"}},
+                {"type":"text","text":"look"}]}}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        // (b) a single-text echo without isReplay stays skipped (Node too).
+        test_handle_frame(
+            json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"look"}]}}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        // (c) a steered prompt's echo is multi-block and isReplay:true.
+        test_handle_frame(
+            json!({"type":"user","uuid":"p1","isReplay":true,"message":{"role":"user","content":[
+                {"type":"text","text":"a"},{"type":"text","text":"b"}]}}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        assert!(
+            urx.try_recv().is_err(),
+            "no echo frame may be forwarded, whatever its content"
+        );
+
+        // A non-replay tool_result frame is still mapped (the completion is
+        // not an echo).
+        test_handle_frame(
+            json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_echo","content":"out"}]}}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        let mut completed = false;
+        while let Ok(item) = urx.try_recv() {
+            if let SessionOutbound::Update(notif) = item {
+                let json = serde_json::to_value(&notif.update).unwrap();
+                completed |= json["sessionUpdate"] == "tool_call_update"
+                    && json["toolCallId"] == "toolu_echo";
+            }
+        }
+        assert!(completed, "a tool_result user frame must still be mapped");
+    }
+
+    /// rust-parity-fixes 1.7 (B1/X9, Decision 18) — after a cancel the
+    /// consolidated remainder is NOT emitted while the stopped-work window is
+    /// open (Node's `session.cancelled` guard, `acp-agent.js:5695-5712`); the
+    /// next prompt's activation clears it (Node `activateTurn`).
+    #[tokio::test]
+    async fn inv_68_no_remainder_after_cancel() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+
+        machine.enqueue(Turn::new("p1".into(), false));
+        machine.on_echo("p1");
+        // `Command::Cancel` opens the stopped-work window on the map state.
+        map_state.begin_stopped_work();
+
+        let frame = json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"late text"}]}});
+        test_handle_frame(
+            frame.clone(),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        assert!(
+            urx.try_recv().is_err(),
+            "the remainder must not be emitted after a cancel"
+        );
+        assert!(
+            !emitted_assistant_text,
+            "a dropped remainder is not delivered assistant text"
+        );
+
+        // The next prompt's echo activates its turn and clears the window.
+        machine.enqueue(Turn::new("p2".into(), false));
+        test_handle_frame(
+            json!({"type":"user","uuid":"p2","message":{"role":"user",
+                "content":[{"type":"text","text":"next"}]}}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        test_handle_frame(
+            frame,
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        let mut delivered = String::new();
+        while let Ok(item) = urx.try_recv() {
+            if let SessionOutbound::Update(notif) = item {
+                let json = serde_json::to_value(&notif.update).unwrap();
+                if json["sessionUpdate"] == "agent_message_chunk" {
+                    delivered.push_str(json["content"]["text"].as_str().unwrap_or(""));
+                }
+            }
+        }
+        assert_eq!(
+            delivered, "late text",
+            "activation must clear the stopped-work window"
+        );
+    }
+
+    /// Minor H: a turn activated through ensure_active_turn on result clears
+    /// the stopped-work window and allows consolidated text to be emitted.
+    #[tokio::test]
+    async fn inv_68_remainder_after_cancel_when_activated_by_result() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+
+        machine.enqueue(Turn::new("p1".into(), false));
+        machine.on_echo("p1");
+        machine.cancel();
+        // Cancel opens the stopped-work window.
+        map_state.begin_stopped_work();
+        // Trailing idle settles the cancelled turn p1.
+        machine.on_idle();
+
+        // Queue p2 without an echo arriving yet.
+        machine.enqueue(Turn::new("p2".into(), false));
+
+        // Result arrives for p2, triggering ensure_active_turn and activating p2.
+        test_handle_frame(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "user_message_uuid": "p2",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+
+        // A consolidated assistant frame for the now-activated turn arrives:
+        // its consolidated text IS emitted because the activation cleared the stopped-work window.
+        let frame = json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {
+                "id": "msg_2",
+                "model": "claude-sonnet-4-5",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "result-promoted text"}]
+            }
+        });
+        test_handle_frame(
+            frame,
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+
+        let mut delivered = String::new();
+        while let Ok(item) = urx.try_recv() {
+            if let SessionOutbound::Update(notif) = item {
+                let json = serde_json::to_value(&notif.update).unwrap();
+                if json["sessionUpdate"] == "agent_message_chunk" {
+                    delivered.push_str(json["content"]["text"].as_str().unwrap_or(""));
+                }
+            }
+        }
+        assert_eq!(
+            delivered, "result-promoted text",
+            "activation via ensure_active_turn in result must clear the stopped-work window"
+        );
+    }
+
+    /// Minor I: Node also drops a uuid-matched echo that has NO isReplay flag.
+    #[tokio::test]
+    async fn inv_58_uuid_matched_echo_without_is_replay_dropped() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+
+        machine.enqueue(Turn::new("p1".into(), false));
+
+        // Multi-block user frame matching "p1" with NO isReplay flag.
+        // It should activate the turn and be dropped (suppressed) as an echo.
+        test_handle_frame(
+            json!({
+                "type": "user",
+                "uuid": "p1",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "data": "AAA", "media_type": "image/png"}},
+                        {"type": "text", "text": "look at this"}
+                    ]
+                }
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+
+        // Verify nothing was forwarded to the client.
+        assert!(
+            urx.try_recv().is_err(),
+            "uuid-matched echo without isReplay must be dropped"
+        );
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18) — the #453 result-text fallback
+    /// still fires when nothing was delivered: a consolidated assistant frame
+    /// without the strict-null parent field keeps its text internal.
+    #[tokio::test]
+    async fn inv_68_result_text_fallback_still_fires() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pending.insert("p1".into(), reply_tx);
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+
+        machine.enqueue(Turn::new("p1".into(), false));
+        machine.on_echo("p1");
+
+        test_handle_frame(
+            json!({"type":"assistant",
+                "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+                "content":[{"type":"text","text":"internal text"}]}}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+        assert!(!emitted_assistant_text);
+
+        test_handle_frame(
+            json!({"type":"result","subtype":"success","is_error":false,
+                "stop_reason":"end_turn","result":"fallback text",
+                "usage":{"input_tokens":7,"output_tokens":0}}),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+        );
+
+        let reply = reply_rx.await.expect("the prompt resolves");
+        let reply = reply.expect("a success result settles the turn");
+        let delivered: String = reply
+            .updates
+            .iter()
+            .filter_map(|notif| match &notif.update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered, "fallback text",
+            "the result-text fallback must still fire when nothing was emitted"
+        );
+        // No assistant chunk went out through the update stream either.
+        while let Ok(item) = urx.try_recv() {
+            if let SessionOutbound::Update(notif) = item {
+                let json = serde_json::to_value(&notif.update).unwrap();
+                assert_ne!(json["sessionUpdate"], "agent_message_chunk", "{json}");
+            }
+        }
+    }
+
     /// 3.7 (E-12) wiring through the real frame path: a streamed-only tool_use
     /// (never in a complete assistant message) is closed `failed` at the
     /// `end_turn` result and the prompt still resolves `end_turn`; a dispatched
@@ -2118,7 +3993,7 @@ mod tests {
             frames.push(json!({"type":"result","subtype":"success","is_error":false,
                 "stop_reason":"end_turn","result":"ok","usage":{}}));
             for f in frames {
-                handle_session_frame(
+                test_handle_frame(
                     f,
                     &mut machine,
                     &mut map_state,
@@ -2176,7 +4051,7 @@ mod tests {
         machine.enqueue(Turn::new("p1".into(), false));
         machine.on_echo("p1");
         let mut frame = |f: Value, m: &mut TurnMachine, ms: &mut MapState| {
-            handle_session_frame(
+            test_handle_frame(
                 f,
                 m,
                 ms,
@@ -2248,6 +4123,7 @@ mod tests {
             None,
             std::env::temp_dir(),
             false,
+            crate::env_snapshot::EnvSnapshot::empty(),
         ));
         let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
@@ -2394,6 +4270,7 @@ mod tests {
             None,
             std::env::temp_dir(),
             false,
+            crate::env_snapshot::EnvSnapshot::empty(),
         ));
 
         // Reader: turn the duplex "stdin" (b) into whole lines.
@@ -2529,6 +4406,7 @@ mod tests {
             None,
             std::env::temp_dir(),
             false,
+            crate::env_snapshot::EnvSnapshot::empty(),
         ));
 
         // Reader: turn the duplex "stdin" (b) into whole lines.
@@ -2660,7 +4538,7 @@ mod tests {
         let mut assistant_had_error = false;
 
         // The subagent starts, spawned by the Agent/Task call `toolu_PARENT`.
-        handle_session_frame(
+        test_handle_frame(
             json!({"type":"system","subtype":"task_started","task_id":"sub1","tool_use_id":"toolu_PARENT","subagent_type":"Task"}),
             &mut machine,
             &mut map_state,
@@ -2689,6 +4567,7 @@ mod tests {
         });
         let (reply_tx, _reply_rx) = oneshot::channel();
         let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel::<Command>();
         handle_permission(
             frame,
             reply_tx,
@@ -2698,6 +4577,12 @@ mod tests {
             &utx,
             "s",
             &mut pending_permissions,
+            std::path::Path::new(""),
+            &[],
+            None,
+            None,
+            None,
+            &command_tx,
         );
 
         // The emitted tool_call must carry the parent's parentToolUseId.
@@ -2746,6 +4631,7 @@ mod tests {
             None,
             std::env::temp_dir(),
             false,
+            crate::env_snapshot::EnvSnapshot::empty(),
         ));
         // Drain the child stdin so the duplex never fills up (the actor writes
         // the prompt user frame and the interrupt request to it).
@@ -3266,5 +5152,436 @@ mod tests {
             .expect("resolved")
             .expect("Ok");
         assert_eq!(r2.stop_reason, "end_turn");
+    }
+
+    #[tokio::test]
+    async fn inv_61_result_without_prior_assistant_usage_emits_nothing() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+
+        machine.enqueue(Turn::new("p1".into(), false));
+        machine.on_echo("p1");
+
+        // Result without prior assistant/stream frame
+        handle_session_frame(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "stop_reason": "end_turn",
+                "result": "ok",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s1",
+            &hw,
+            &mut tasks,
+            &mut ext,
+        );
+
+        // Assert NO usage_update was emitted
+        let mut saw_usage_update = false;
+        while let Ok(msg) = urx.try_recv() {
+            if let SessionOutbound::RawUpdate(v) = msg {
+                if v.pointer("/update/sessionUpdate").and_then(Value::as_str)
+                    == Some("usage_update")
+                {
+                    saw_usage_update = true;
+                }
+            }
+        }
+        assert!(
+            !saw_usage_update,
+            "result without prior assistant usage must emit no usage_update"
+        );
+    }
+
+    #[tokio::test]
+    async fn inv_61_compact_boundary_post_tokens() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+
+        // Send compact_boundary system frame
+        handle_session_frame(
+            json!({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "compact_metadata": {
+                    "post_tokens": 42000
+                }
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s1",
+            &hw,
+            &mut tasks,
+            &mut ext,
+        );
+
+        assert_eq!(ext.usage.last_total, Some(42000));
+        assert_eq!(ext.usage.used, 42000);
+
+        let mut saw_usage_update = false;
+        while let Ok(msg) = urx.try_recv() {
+            if let SessionOutbound::RawUpdate(v) = msg {
+                if v.pointer("/update/sessionUpdate").and_then(Value::as_str)
+                    == Some("usage_update")
+                {
+                    assert_eq!(
+                        v.pointer("/update/used").and_then(Value::as_u64),
+                        Some(42000)
+                    );
+                    assert_eq!(
+                        v.pointer("/update/size").and_then(Value::as_u64),
+                        Some(200_000)
+                    );
+                    saw_usage_update = true;
+                }
+            }
+        }
+        assert!(
+            saw_usage_update,
+            "compact_boundary must emit a usage_update with post_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn inv_61_subagent_never_touches_usage_state() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let mut tasks = AsyncTaskRuntime::new(false);
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+
+        // Subagent assistant message (parent_tool_use_id is set)
+        handle_session_frame(
+            json!({
+                "type": "assistant",
+                "parent_tool_use_id": "toolu_parent_123",
+                "message": {
+                    "id": "sub_msg_1",
+                    "model": "claude-haiku-3-5",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "subagent work"}],
+                    "usage": { "input_tokens": 100, "output_tokens": 50 }
+                }
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s1",
+            &hw,
+            &mut tasks,
+            &mut ext,
+        );
+
+        assert!(ext.usage.last_usage.is_none());
+        assert!(ext.usage.last_total.is_none());
+        assert!(ext.usage.last_model.is_none());
+
+        // Subagent stream_event message (parent_tool_use_id is set)
+        handle_session_frame(
+            json!({
+                "type": "stream_event",
+                "parent_tool_use_id": "toolu_parent_123",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": "sub_msg_2",
+                        "model": "claude-haiku-3-5",
+                        "usage": { "input_tokens": 200, "output_tokens": 10 }
+                    }
+                }
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s1",
+            &hw,
+            &mut tasks,
+            &mut ext,
+        );
+
+        assert!(ext.usage.last_usage.is_none());
+        assert!(ext.usage.last_total.is_none());
+        assert!(ext.usage.last_model.is_none());
+
+        while let Ok(msg) = urx.try_recv() {
+            if let SessionOutbound::RawUpdate(v) = msg {
+                assert_ne!(
+                    v.pointer("/update/sessionUpdate").and_then(Value::as_str),
+                    Some("usage_update"),
+                    "subagent frames must never emit usage_update"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inv_63_model_reselection_keeps_learned_window() {
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        ext.config.current_model_id = "claude-sonnet-4-5".to_string();
+        ext.config.model_infos = vec![
+            crate::session_config::ModelInfo {
+                value: "claude-sonnet-4-5".to_string(),
+                display_name: "Claude Sonnet 4.5".to_string(),
+                description: "Standard model".to_string(),
+                resolved_model: None,
+                supports_auto_mode: Some(true),
+                supports_effort: Some(true),
+                supported_effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
+                supports_fast_mode: None,
+            },
+            crate::session_config::ModelInfo {
+                value: "claude-haiku-3-5".to_string(),
+                display_name: "Claude Haiku 3.5".to_string(),
+                description: "Fast model".to_string(),
+                resolved_model: None,
+                supports_auto_mode: Some(true),
+                supports_effort: Some(false),
+                supported_effort_levels: None,
+                supports_fast_mode: None,
+            },
+        ];
+        ext.usage.context_window = 500_000;
+        ext.usage.authoritative = true;
+
+        // 1. Re-applying the SAME model: model_changed is false -> keeps window
+        let model_val = "claude-sonnet-4-5".to_string();
+        let model_changed = ext.config.current_model_id != model_val;
+        assert!(!model_changed);
+        assert_eq!(ext.usage.context_window, 500_000);
+        assert!(ext.usage.authoritative);
+
+        // 2. Applying a DIFFERENT model: model_changed is true -> re-seeds and clears authoritative
+        let model_val = "claude-haiku-3-5".to_string();
+        let model_changed = ext.config.current_model_id != model_val;
+        assert!(model_changed);
+        if model_changed {
+            ext.config.current_model_id = model_val.clone();
+            let new_model_info = ext
+                .config
+                .model_infos
+                .iter()
+                .find(|m| m.value == model_val)
+                .cloned();
+            let seed = new_model_info.as_ref().and_then(|m| {
+                let texts = [
+                    m.resolved_model.as_deref(),
+                    Some(m.value.as_str()),
+                    Some(m.display_name.as_str()),
+                    Some(m.description.as_str()),
+                ];
+                crate::usage::infer_context_window_from_model(
+                    &texts.into_iter().flatten().collect::<Vec<_>>(),
+                )
+            });
+            ext.usage.context_window = seed.unwrap_or(crate::usage::DEFAULT_CONTEXT_WINDOW);
+            ext.usage.authoritative = false;
+        }
+        assert_eq!(
+            ext.usage.context_window,
+            crate::usage::DEFAULT_CONTEXT_WINDOW
+        );
+        assert!(!ext.usage.authoritative);
+
+        // 3. UpdateContextWindow updates when NOT authoritative
+        assert!(!ext.usage.authoritative);
+        assert!(ext.usage.update_window_if_positive(Some(1_000_000)));
+        assert_eq!(ext.usage.context_window, 1_000_000);
+        assert!(ext.usage.authoritative);
+
+        // Once authoritative, background update does not overwrite
+        if !ext.usage.authoritative {
+            ext.usage.update_window_if_positive(Some(200_000));
+        }
+        assert_eq!(ext.usage.context_window, 1_000_000);
+    }
+
+    #[test]
+    fn inv_63_air_client_without_recommended_value_effort() {
+        let caps_no_rec = json!({
+            "_meta": {
+                "jetbrains": {
+                    "air": {
+                        "version": 1,
+                        "capabilities": ["diffPatch"]
+                    }
+                }
+            }
+        });
+        let air_no_rec = AirClient::from_client_capabilities(&caps_no_rec).expect("air client");
+        assert!(air_no_rec.is_air());
+        assert!(!air_no_rec.supports("recommendedValue"));
+
+        let caps_with_rec = json!({
+            "_meta": {
+                "jetbrains": {
+                    "air": {
+                        "version": 1,
+                        "capabilities": ["recommendedValue", "diffPatch"]
+                    }
+                }
+            }
+        });
+        let air_with_rec = AirClient::from_client_capabilities(&caps_with_rec).expect("air client");
+        assert!(air_with_rec.is_air());
+        assert!(air_with_rec.supports("recommendedValue"));
+
+        let modes = crate::session_config::ModesState {
+            current_mode_id: "default".into(),
+            available_modes: vec![],
+        };
+        let available_models = vec![crate::session_config::AvailableModel {
+            model_id: "m1".into(),
+            name: "Model 1".into(),
+            description: None,
+        }];
+        let model_infos = vec![crate::session_config::ModelInfo {
+            value: "m1".into(),
+            display_name: "Model 1".into(),
+            description: "".into(),
+            resolved_model: None,
+            supports_auto_mode: Some(true),
+            supports_effort: Some(true),
+            supported_effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
+            supports_fast_mode: None,
+        }];
+
+        // Without recommendedValue capability -> non-AIR effort behaviour:
+        // has "default" entry, current_value is "default".
+        let use_rec_false = air_no_rec.supports("recommendedValue");
+        let opts_no_rec = crate::session_config::build_config_options(
+            &modes,
+            &available_models,
+            "m1",
+            &model_infos,
+            None,
+            use_rec_false,
+        );
+        let effort_no_rec = opts_no_rec
+            .iter()
+            .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
+            .expect("effort option");
+        assert_eq!(effort_no_rec.current_value, "default");
+        assert!(effort_no_rec.options.iter().any(|o| o.value == "default"));
+
+        // With recommendedValue capability -> AIR effort behaviour:
+        // concrete recommendation, no "default" entry.
+        let use_rec_true = air_with_rec.supports("recommendedValue");
+        let opts_with_rec = crate::session_config::build_config_options(
+            &modes,
+            &available_models,
+            "m1",
+            &model_infos,
+            None,
+            use_rec_true,
+        );
+        let effort_with_rec = opts_with_rec
+            .iter()
+            .find(|o| o.id == crate::session_config::EFFORT_CONFIG_ID)
+            .expect("effort option");
+        assert_ne!(effort_with_rec.current_value, "default");
+        assert!(!effort_with_rec.options.iter().any(|o| o.value == "default"));
+    }
+
+    /// 3.3 (INV-65) — `prompt_suggestion` frames from the CLI are consumed
+    /// without error, emitting no updates for a plain (non-AIR) client.
+    #[tokio::test]
+    async fn inv_65_prompt_suggestion_frame_ignored() {
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut live_background = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut emitted_text = false;
+        let mut assistant_error = false;
+        let mut tasks = AsyncTaskRuntime::new(false);
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::from("/tmp"),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+
+        handle_session_frame(
+            json!({
+                "type": "prompt_suggestion",
+                "suggestion": "How about running tests?"
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_text,
+            &mut assistant_error,
+            &update_tx,
+            "s1",
+            &hw,
+            &mut tasks,
+            &mut ext,
+        );
+
+        // No update is sent to the client
+        assert!(update_rx.try_recv().is_err());
     }
 }

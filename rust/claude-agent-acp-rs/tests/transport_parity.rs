@@ -124,6 +124,7 @@ async fn run_over_channel(
         )],
         default_cwd: Some(root.clone()),
         timings,
+        env: claude_agent_acp_rs::env_snapshot::EnvSnapshot::empty(),
     };
     let serve_task = tokio::spawn(async move { serve(a1, opts).await });
 
@@ -301,4 +302,44 @@ async fn inv_26_transport_parity() {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+}
+
+/// Regression test for Task A: under a heavily polluted host environment
+/// (ANTHROPIC_MODEL, CLAUDE_CONFIG_DIR, IS_SANDBOX, etc.), `inv_26_transport_parity`
+/// still passes because in-process tests use hermetic snapshots and do not leak
+/// host environment into the channel run.
+#[test]
+fn inv_26_transport_parity_polluted_host_env() {
+    let root = repo_root();
+    let status = std::process::Command::new("cargo")
+        .args([
+            "test",
+            "--manifest-path",
+            "rust/Cargo.toml",
+            "-p",
+            "claude-agent-acp-rs",
+            "--test",
+            "transport_parity",
+            "inv_26_transport_parity",
+            "--",
+            "--exact",
+        ])
+        .current_dir(&root)
+        .env("CLAUDE_CODE_ARTIFACT", "1")
+        .env("ANTHROPIC_MODEL", "sonnet")
+        .env("CLAUDE_AGENT_SDK_VERSION", "9.9.9")
+        .env("CLAUDE_CODE_ENTRYPOINT", "host-test")
+        .env("CLAUDE_CODE_EXECUTABLE", "/nonexistent")
+        .env("CLAUDE_CODE_MESSAGING_SOCKET", "/nonexistent")
+        .env("IS_SANDBOX", "1")
+        .env("NO_BROWSER", "1")
+        .env("SSH_CONNECTION", "x")
+        .env("MAX_THINKING_TOKENS", "1")
+        .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+        .status()
+        .expect("spawn cargo test for transport_parity");
+    assert!(
+        status.success(),
+        "inv_26_transport_parity must succeed even when host environment is heavily polluted"
+    );
 }

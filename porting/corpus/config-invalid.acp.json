@@ -1,0 +1,14 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}},
+    {"call": "request", "method": "session/set_mode", "expect_error": true,
+     "params": {"sessionId": "$SESSION", "modeId": "unknown_mode"}},
+    {"call": "request", "method": "session/set_config_option", "expect_error": true,
+     "params": {"sessionId": "$SESSION", "configId": "unknown_option", "value": "val"}},
+    {"call": "request", "method": "session/set_config_option", "expect_error": true,
+     "params": {"sessionId": "$SESSION", "configId": "mode", "value": "unknown_mode"}}
+  ]
+}

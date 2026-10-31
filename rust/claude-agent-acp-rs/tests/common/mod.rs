@@ -9,8 +9,8 @@
 //! The differ compares two ordered frame lists after:
 //!
 //! 1. dropping whole frames matched by an ignore path's value filter (e.g. a
-//!    `usage_update` frame the Rust side never emits),
-//! 2. removing nodes at plain-field ignore paths (e.g. `result.configOptions`),
+//!    synthetic test notification missing on one side),
+//! 2. removing nodes at plain-field ignore paths (e.g. in test fixtures),
 //! 3. materialising ACP defaults the pinned crate omits on `tool_call` frames
 //!    (absent `status` → `"pending"`, absent `content` → `[]`, absent `kind` →
 //!    `"other"`) on both sides,
@@ -321,9 +321,7 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
             (
                 f.0,
                 normalize(
-                    normalize_request_permission_id(normalize_available_commands_input(
-                        normalize_tool_call_defaults(f.1),
-                    )),
+                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
                     &mut norm_a,
                 ),
             )
@@ -335,9 +333,7 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
             (
                 f.0,
                 normalize(
-                    normalize_request_permission_id(normalize_available_commands_input(
-                        normalize_tool_call_defaults(f.1),
-                    )),
+                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
                     &mut norm_b,
                 ),
             )
@@ -428,46 +424,17 @@ fn normalize_tool_call_defaults(value: Value) -> Value {
                 map.entry("kind")
                     .or_insert_with(|| Value::String("other".to_string()));
             }
+            if map.get("type").and_then(Value::as_str) == Some("diff")
+                && map.get("oldText") == Some(&Value::Null)
+            {
+                map.remove("oldText");
+            }
             Value::Object(map)
         }
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
                 .map(normalize_tool_call_defaults)
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-/// Phase 15 (Item 1): the pinned schema's `AvailableCommand` carries
-/// `#[skip_serializing_none]`, so the Rust side omits `input` (and `meta`) when
-/// unset, while the Node adapter always emits `input: null` on every
-/// `available_commands_update`. Materialise `input: null` on each
-/// `availableCommands` entry on BOTH sides so the proactive command-list
-/// differential is byte-comparable.
-fn normalize_available_commands_input(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            for (_, v) in map.iter_mut() {
-                *v = normalize_available_commands_input(std::mem::take(v));
-            }
-            if map.get("sessionUpdate").and_then(Value::as_str) == Some("available_commands_update")
-            {
-                if let Some(Value::Array(cmds)) = map.get_mut("availableCommands") {
-                    for cmd in cmds.iter_mut() {
-                        if let Value::Object(cmd_map) = cmd {
-                            cmd_map.entry("input").or_insert(Value::Null);
-                        }
-                    }
-                }
-            }
-            Value::Object(map)
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(normalize_available_commands_input)
                 .collect(),
         ),
         other => other,
@@ -599,6 +566,19 @@ pub fn normalize_init(value: Value, root: &Path, fake: &Path) -> Value {
         &root.to_string_lossy(),
         &fake.to_string_lossy(),
     )
+}
+
+/// Normalise a fake-claude argv record (`{"argv":[...],"env":{...},
+/// "node_options_present":bool}`) the same way `capture.sh normalize_object ...
+/// argv` does: every string is walked with uuid -> `$0..` placeholders,
+/// `$ROOT`/`$FAKE_CLAUDE` path rewriting and short-id placeholder normalisation.
+///
+/// fake-claude already writes `CLAUDE_CODE_ENTRYPOINT` as the literal
+/// `"$ENTRYPOINT"`, so `env` needs no env-specific rewriting here; the
+/// `--session-id=<uuid>` argv token is normalised to `--session-id=$0` by the
+/// uuid walk, matching the committed `<name>.argv.json` fixtures.
+pub fn normalize_argv(value: Value, root: &Path, fake: &Path) -> Value {
+    normalize_init(value, root, fake)
 }
 
 /// Normalise the two sides' `agentInfo.version` so a composed Rust version can
@@ -795,7 +775,14 @@ pub fn run_recorder(
     transcript_path: &Path,
     out_path: &Path,
 ) -> Vec<Frame> {
-    run_recorder_inner(agent_cmd, script_path, transcript_path, out_path, None)
+    run_recorder_inner(
+        agent_cmd,
+        script_path,
+        transcript_path,
+        out_path,
+        None,
+        None,
+    )
 }
 
 /// As [`run_recorder`], also returning the NORMALISED first `initialize`
@@ -814,6 +801,7 @@ pub fn run_recorder_with_init(
         transcript_path,
         out_path,
         Some(&init_out),
+        None,
     );
     let raw = read_json(&init_out);
     let _ = std::fs::remove_file(&init_out);
@@ -834,6 +822,36 @@ pub fn run_recorder_with_init(
     )
 }
 
+/// Run the `acp-recorder` against `agent_cmd` while also asking fake-claude to
+/// record the argv (+ env allow-list) it was spawned with, then apply the argv
+/// normalisation mirroring `capture.sh normalize_object ... argv` (uuids ->
+/// `$0..`, paths -> `$ROOT`/`$FAKE_CLAUDE`, `$ENTRYPOINT` already present).
+///
+/// Returns the ordered frames and the NORMALISED argv record. A corpus script
+/// that never spawns the CLI (its request fails before spawn) owns no argv
+/// fixture; callers iterate only scripts with a committed `<name>.argv.json`.
+pub fn run_recorder_with_argv(
+    agent_cmd: &str,
+    script_path: &Path,
+    transcript_path: &Path,
+    out_path: &Path,
+) -> (Vec<Frame>, Value) {
+    let argv_out = out_path.with_extension("argv.raw");
+    let _ = std::fs::remove_file(&argv_out);
+    let frames = run_recorder_inner(
+        agent_cmd,
+        script_path,
+        transcript_path,
+        out_path,
+        None,
+        Some(&argv_out),
+    );
+    let raw = read_json(&argv_out);
+    let _ = std::fs::remove_file(&argv_out);
+    let normalized = normalize_argv(raw, &repo_root(), &fake_claude_binary());
+    (frames, normalized)
+}
+
 /// Per-run unique suffix for the hermetic HOME dirs.
 static NEXT_HOME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -843,6 +861,7 @@ fn run_recorder_inner(
     transcript_path: &Path,
     out_path: &Path,
     init_out: Option<&Path>,
+    argv_out: Option<&Path>,
 ) -> Vec<Frame> {
     let recorder = acp_recorder_binary();
     let fake = fake_claude_binary();
@@ -874,6 +893,31 @@ fn run_recorder_inner(
     std::fs::create_dir_all(home.join(".claude")).expect("create hermetic HOME");
 
     let mut command = std::process::Command::new(&recorder);
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        command.env("TMPDIR", tmpdir);
+    } else {
+        command.env("TMPDIR", "/tmp");
+    }
+    if let Some(lang) = std::env::var_os("LANG") {
+        command.env("LANG", lang);
+    } else {
+        command.env("LANG", "C");
+    }
+    for (k, v) in std::env::vars() {
+        if k.starts_with("LC_") {
+            command.env(k, v);
+        }
+    }
+    #[cfg(windows)]
+    for key in ["SystemRoot", "SYSTEMROOT", "COMSPEC", "PATHEXT"] {
+        if let Some(val) = std::env::var_os(key) {
+            command.env(key, val);
+        }
+    }
     command
         .arg(agent_cmd)
         .arg(script_path)
@@ -890,6 +934,16 @@ fn run_recorder_inner(
         .env("CLAUDE_ACP_FORCE_CANCEL_GRACE_MS", "1000");
     if let Some(init_out) = init_out {
         command.env("FAKE_CLAUDE_INIT_OUT", init_out);
+    }
+    if let Some(argv_out) = argv_out {
+        command.env("FAKE_CLAUDE_ARGV_OUT", argv_out);
+    }
+    // Hermetic bypass behavior: if running as root (e.g. in containerized CI),
+    // set IS_SANDBOX=1 so that argv fixtures (captured on non-root with
+    // allow_bypass=true) evaluate allow_bypass=true identically.
+    #[cfg(unix)]
+    if nix::unistd::geteuid().is_root() {
+        command.env("IS_SANDBOX", "1");
     }
     let status = command.status().expect("spawn acp-recorder");
     let _ = std::fs::remove_dir_all(&home);

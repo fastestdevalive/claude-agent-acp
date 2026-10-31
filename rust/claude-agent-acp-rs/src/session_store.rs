@@ -50,9 +50,14 @@ pub enum StoreError {
 
 /// `<CLAUDE_CONFIG_DIR>/projects`, else `$HOME/.claude/projects`.
 pub fn projects_root() -> PathBuf {
-    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))
+    projects_root_with_env(&crate::env_snapshot::EnvSnapshot::from_process())
+}
+
+/// Derive the projects root from an explicit environment snapshot.
+pub fn projects_root_with_env(env: &crate::env_snapshot::EnvSnapshot) -> PathBuf {
+    let config = env
+        .get_path("CLAUDE_CONFIG_DIR")
+        .or_else(|| env.get_path("HOME").map(|h| h.join(".claude")))
         .unwrap_or_default();
     config.join("projects")
 }

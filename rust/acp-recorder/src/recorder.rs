@@ -83,7 +83,7 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
     // Shared count of `session/update` notifications, used to implement the
     // "cancel after N updates" prompt option.
     let update_count = Arc::new(AtomicUsize::new(0));
-    let permission = script.permission;
+    let permission = script.permission.clone();
 
     let outcome = Client
         .builder()
@@ -98,8 +98,11 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_request(
-            async move |request: RequestPermissionRequest, responder, _connection| {
-                responder.respond(reply_permission(request, permission))
+            {
+                let permission = permission.clone();
+                async move |request: RequestPermissionRequest, responder, _connection| {
+                    responder.respond(reply_permission(request, permission.clone()))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -190,6 +193,20 @@ fn reply_permission(
                 o.kind == PermissionOptionKind::RejectOnce
                     || o.kind == PermissionOptionKind::RejectAlways
             });
+            match option {
+                Some(option) => RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                    SelectedPermissionOutcome::new(option.option_id.clone()),
+                )),
+                None => RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
+            }
+        }
+        // Fix 1: pick the exact offered `optionId` (ExitPlanMode selections that
+        // are not distinguishable by kind), or cancel when it was not offered.
+        PermissionPolicy::OptionId(id) => {
+            let option = request
+                .options
+                .iter()
+                .find(|o| o.option_id.to_string() == *id);
             match option {
                 Some(option) => RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
                     SelectedPermissionOutcome::new(option.option_id.clone()),
@@ -517,6 +534,50 @@ mod tests {
             )],
         );
         let response = reply_permission(request, PermissionPolicy::Deny);
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn option_id_policy_selects_exact_option() {
+        let request = RequestPermissionRequest::new(
+            "s1",
+            tool_call(),
+            vec![
+                agent_client_protocol::schema::v1::PermissionOption::new(
+                    "exit-plan-auto",
+                    "Yes, and use auto mode",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                agent_client_protocol::schema::v1::PermissionOption::new(
+                    "exit-plan-default",
+                    "Yes, manually approve edits",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                agent_client_protocol::schema::v1::PermissionOption::new(
+                    "reject",
+                    "No, keep planning",
+                    PermissionOptionKind::RejectOnce,
+                ),
+            ],
+        );
+        // Picks the exact ExitPlanMode option regardless of its kind.
+        let response = reply_permission(
+            request.clone(),
+            PermissionPolicy::OptionId("exit-plan-default".to_string()),
+        );
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(ref s)
+                if s.option_id.to_string() == "exit-plan-default"
+        ));
+        // An id that was never offered cancels.
+        let response = reply_permission(
+            request,
+            PermissionPolicy::OptionId("not-offered".to_string()),
+        );
         assert!(matches!(
             response.outcome,
             RequestPermissionOutcome::Cancelled

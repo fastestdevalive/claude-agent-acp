@@ -9,19 +9,29 @@ pub mod auth_status;
 pub mod codec;
 pub mod control;
 pub mod dispatch;
+pub mod env_snapshot;
+pub mod hooks;
 pub mod map;
 pub mod meta_filter;
 pub mod permission;
+pub mod permission_mode;
+pub mod permission_options;
 pub mod process;
 pub mod quota;
+pub mod resumed_session;
+pub mod sdk_options;
 pub mod session;
+pub mod session_config;
 pub mod session_ext;
 pub mod session_methods;
 pub mod session_store;
+pub mod settings;
 pub mod system_prompt;
 pub mod tools;
+pub mod transcript;
 pub mod turn;
 pub mod unfinished;
+pub mod usage;
 
 /// Composed `<crate>+upstream.<npm-pin>` version string, e.g. `0.1.0+upstream.0.94.0`.
 ///

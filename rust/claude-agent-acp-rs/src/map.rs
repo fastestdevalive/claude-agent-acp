@@ -75,8 +75,11 @@ pub struct MapState {
     /// Per-tool-call "what the client holds", for the field tracker (2.9 /
     /// X-7). Seeded when a `tool_call` is surfaced (map.rs + permission.rs);
     /// each `tool_call_update` emits only fields whose value differs, then
-    /// updates the held state; the entry ends after the `tool_result`.
+    /// updates the held state; the entry ends after the `tool_result` (or after
+    /// PostToolUse hook callback when a hook is pending, M3/Decision 12).
     tool_tracker: HashMap<String, TrackedToolCall>,
+    /// Tool calls with a pending PostToolUse hook (M3/Decision 12).
+    pub(crate) pending_hooks: HashSet<String>,
     /// Unfinished-tool books (3.7): dispatched ids + per-turn foreground set.
     pub(crate) books: crate::unfinished::ToolBooks,
     /// The client is AIR (rust-air-gaps G11): tool reports carry
@@ -91,6 +94,17 @@ pub struct MapState {
     input_incomplete: bool,
     /// The AIR changed-`_meta` filter (Decision 25).
     meta_filter: ChangedMetaFilter,
+    /// Per-stream record of the text/thinking actually streamed as deltas, so a
+    /// consolidated assistant message forwards only the un-streamed remainder
+    /// (rust-parity-fixes 1.7 / Decision 18). Keyed by `parent_tool_use_id`
+    /// (`""` for the top level), like Node's `streamedBlocksByParent`
+    /// (`acp-agent.js:2742-2750`).
+    streamed_blocks: HashMap<String, Vec<StreamedBlock>>,
+    /// Whether the stopped-work window after a cancel is open, so a late
+    /// consolidated assistant message must not emit its remainder (Node's
+    /// `session.cancelled`, `acp-agent.js:5695-5712`). Opened on cancel and
+    /// cleared when the next turn activates.
+    stopped_work: bool,
 }
 
 impl MapState {
@@ -99,6 +113,49 @@ impl MapState {
     pub(crate) fn configure_air(&mut self, cwd: PathBuf) {
         self.air = true;
         self.cwd = Some(cwd);
+    }
+
+    /// Open the stopped-work window after a cancel (Decision 18): a late
+    /// consolidated assistant message emits no remainder until the next turn
+    /// activates.
+    pub(crate) fn begin_stopped_work(&mut self) {
+        self.stopped_work = true;
+    }
+
+    /// Clear the stopped-work window when a turn activates (Node
+    /// `activateTurn` clears `session.cancelled`).
+    pub(crate) fn end_stopped_work(&mut self) {
+        self.stopped_work = false;
+    }
+
+    /// Clear the streamed text/thinking record for one lane (a new
+    /// `message_start`, Node `acp-agent.js:5429-5430`).
+    fn clear_streamed_blocks(&mut self, key: &str) {
+        self.streamed_blocks.remove(key);
+    }
+
+    /// Append a non-empty text/thinking delta to a lane's record, extending the
+    /// last entry when it continues the same block
+    /// (`acp-agent.js:5542-5548`).
+    fn record_streamed_delta(&mut self, key: &str, index: u64, kind: StreamedKind, text: &str) {
+        let blocks = self.streamed_blocks.entry(key.to_string()).or_default();
+        if let Some(last) = blocks.last_mut() {
+            if last.index == index && last.kind == kind {
+                last.text.push_str(text);
+                return;
+            }
+        }
+        blocks.push(StreamedBlock {
+            index,
+            kind,
+            text: text.to_string(),
+        });
+    }
+
+    /// Take (and reset) a lane's streamed record for a consolidated message
+    /// (`acp-agent.js:5835-5838`).
+    fn take_streamed_blocks(&mut self, key: &str) -> Vec<StreamedBlock> {
+        self.streamed_blocks.remove(key).unwrap_or_default()
     }
 
     /// Whether the client is AIR (see [`MapState::configure_air`]).
@@ -135,6 +192,7 @@ impl MapState {
         self.emitted.remove(id);
         self.tool_use_cache.remove(id);
         self.tool_tracker.remove(id);
+        self.pending_hooks.remove(id);
         self.books.forget(id);
     }
 
@@ -149,6 +207,11 @@ impl MapState {
     pub(crate) fn mark_emitted(&mut self, id: String, block: Value) {
         self.emitted.insert(id.clone());
         self.tool_use_cache.insert(id, block);
+    }
+
+    /// Retrieve the cached tool_use block for an id, if present.
+    pub(crate) fn tool_use_from_cache(&self, id: &str) -> Option<&Value> {
+        self.tool_use_cache.get(id)
     }
 
     /// Seed the field tracker for a freshly-surfaced `tool_call` (2.9 / X-7).
@@ -181,10 +244,58 @@ impl MapState {
         }
     }
 
-    /// End a tool call's field-tracker entry after its `tool_result` (2.9 /
-    /// X-7: "entry ends after the `tool_result`").
-    pub(crate) fn finish_tool_tracker(&mut self, id: &str) {
-        self.tool_tracker.remove(id);
+    /// Mark the tool_result of a tool call in the field tracker (M3/Decision 12).
+    /// If a hook is pending, keep the entry and mark `result_seen = true`.
+    pub(crate) fn finish_result_tool_tracker(&mut self, id: &str, hook_pending: bool) {
+        if let Some(entry) = self.tool_tracker.get_mut(id) {
+            if hook_pending {
+                entry.result_seen = true;
+            } else {
+                self.tool_tracker.remove(id);
+            }
+        }
+    }
+
+    /// Mark the end of the PostToolUse hook callback in the field tracker (M3/Decision 12).
+    /// The entry is removed if the tool_result was already seen.
+    pub(crate) fn finish_hook_tool_tracker(&mut self, id: &str) {
+        if let Some(entry) = self.tool_tracker.get(id) {
+            if entry.result_seen {
+                self.tool_tracker.remove(id);
+            }
+        }
+    }
+
+    /// Filters unchanged `content` or `locations` from a PostToolUse hook update,
+    /// mirroring Node's `ToolCallFieldTracker.apply` behavior.
+    pub(crate) fn filter_hook_tool_call_update(&mut self, id: &str, update: &mut Value) {
+        let Some(entry) = self.tool_tracker.get_mut(id) else {
+            return;
+        };
+        if let Some(content_val) = update.get("content") {
+            if let Ok(new_content) =
+                serde_json::from_value::<Vec<ToolCallContent>>(content_val.clone())
+            {
+                if new_content == entry.content {
+                    if let Some(obj) = update.as_object_mut() {
+                        obj.remove("content");
+                    }
+                } else {
+                    entry.content = new_content;
+                }
+            }
+        }
+        if let Some(loc_val) = update.get("locations") {
+            if let Ok(new_locs) = serde_json::from_value::<Vec<ToolCallLocation>>(loc_val.clone()) {
+                if new_locs == entry.locations {
+                    if let Some(obj) = update.as_object_mut() {
+                        obj.remove("locations");
+                    }
+                } else {
+                    entry.locations = new_locs;
+                }
+            }
+        }
     }
 
     /// Clear EVERY per-tool-call field-tracker entry (review follow-up
@@ -200,6 +311,7 @@ impl MapState {
 
     pub(crate) fn clear_tool_tracker(&mut self) {
         self.tool_tracker.clear();
+        self.pending_hooks.clear();
     }
 }
 
@@ -215,6 +327,7 @@ pub(crate) struct TrackedToolCall {
     locations: Vec<ToolCallLocation>,
     raw_input: Option<Value>,
     raw_output: Option<Value>,
+    pub(crate) result_seen: bool,
 }
 
 impl TrackedToolCall {
@@ -235,6 +348,7 @@ impl TrackedToolCall {
             locations,
             raw_input,
             raw_output: None,
+            result_seen: false,
         }
     }
 
@@ -355,6 +469,27 @@ struct StreamedInput {
     emitted_through_comma: isize,
 }
 
+/// The kind of a block that streamed as deltas (Node's `chunk.type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamedKind {
+    /// A `text_delta` block.
+    Text,
+    /// A `thinking_delta` block.
+    Thinking,
+}
+
+/// One entry of the per-lane record of what already reached the client as
+/// streamed deltas (`streamedBlocksByParent`, `acp-agent.js:5542-5548`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamedBlock {
+    /// The content-block index the deltas belonged to.
+    index: u64,
+    /// Text or thinking.
+    kind: StreamedKind,
+    /// The concatenated streamed text.
+    text: String,
+}
+
 /// Map a consolidated Claude message's `content` into ACP `SessionUpdate`s
 /// (7.1, 7.3, 7.5, 7.6). `content` is either a JSON string (a whole-message
 /// text) or a JSON array of content blocks — the two shapes `claude` emits.
@@ -381,6 +516,121 @@ pub fn map_consolidated(
     out
 }
 
+/// Map a consolidated `assistant` message the way Node does (rust-parity-fixes
+/// 1.7 / Decision 18, `acp-agent.js:5829-5844`).
+///
+/// Only a STRICT top-level frame — one whose `parent_tool_use_id` is PRESENT
+/// and `null` — forwards text/thinking, and only the tail its stream did not
+/// already cover ([`unstreamed_remainder`]). A frame with the field MISSING
+/// counts as nested (Node's `=== null` gate), so its text/thinking stay
+/// internal, as they do for a subagent frame. In either case the frame consumes
+/// its lane's streamed record so the next message starts fresh. Images, tool
+/// uses, tool results and plans map unchanged.
+pub fn map_consolidated_assistant(frame: &Value, state: &mut MapState) -> Vec<SessionUpdate> {
+    let key = frame["parent_tool_use_id"].as_str().unwrap_or("");
+    let content = frame
+        .pointer("/message/content")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let streamed = state.take_streamed_blocks(key);
+    let content = if is_strict_top_level(frame) && !state.stopped_work {
+        unstreamed_remainder(&content, &streamed)
+    } else {
+        // Nested text/thinking stays internal for a client that does not get
+        // subagent text, and a post-cancel remainder is dropped.
+        drop_text_thinking(&content)
+    };
+    let updates = map_consolidated(&content, MsgRole::Assistant, state);
+    // Node groups every chunk under the message id (`messageIdForGrouping`,
+    // `acp-agent.js:9789-9800`): the API message id, else the SDK frame uuid.
+    let message_id = frame
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            frame
+                .get("uuid")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+        })
+        .unwrap_or("");
+    apply_stream_message_id(updates, message_id)
+}
+
+/// Node's top-level gate: `message.parent_tool_use_id === null`, which a
+/// MISSING field does not satisfy (`acp-agent.js:5432,5731,5829`).
+fn is_strict_top_level(frame: &Value) -> bool {
+    frame.get("parent_tool_use_id").is_some_and(Value::is_null)
+}
+
+/// Port of `unstreamedRemainder` (`acp-agent.js:519-545`): keep the blocks the
+/// stream did not already deliver, in document order.
+///
+/// A text/thinking block is diffed against the next streamed block of the same
+/// type: a non-empty streamed prefix is consumed and only the tail is kept (the
+/// whole block when it never streamed, the tail when the stream was cut short,
+/// nothing when it streamed in full). Empty assembled blocks are dropped;
+/// everything else passes through untouched.
+fn unstreamed_remainder(content: &Value, streamed: &[StreamedBlock]) -> Value {
+    let Value::Array(blocks) = content else {
+        return content.clone();
+    };
+    let mut kept = Vec::with_capacity(blocks.len());
+    let mut stream_pos = 0;
+    for item in blocks {
+        let kind = match item["type"].as_str() {
+            Some("text") => StreamedKind::Text,
+            Some("thinking") => StreamedKind::Thinking,
+            _ => {
+                kept.push(item.clone());
+                continue;
+            }
+        };
+        let field = match kind {
+            StreamedKind::Text => "text",
+            StreamedKind::Thinking => "thinking",
+        };
+        let full = item[field].as_str().unwrap_or("");
+        // Empty assembled blocks carry nothing: drop them.
+        if full.is_empty() {
+            continue;
+        }
+        if let Some(streamed) = streamed.get(stream_pos) {
+            if streamed.kind == kind
+                && !streamed.text.is_empty()
+                && full.starts_with(&streamed.text)
+            {
+                stream_pos += 1;
+                let remainder = &full[streamed.text.len()..];
+                if remainder.is_empty() {
+                    continue;
+                }
+                let mut truncated = item.clone();
+                truncated[field] = Value::String(remainder.to_string());
+                kept.push(truncated);
+                continue;
+            }
+        }
+        kept.push(item.clone());
+    }
+    Value::Array(kept)
+}
+
+/// Drop text/thinking blocks from a consolidated message, keeping every other
+/// block (`acp-agent.js:5841-5844`).
+fn drop_text_thinking(content: &Value) -> Value {
+    let Value::Array(blocks) = content else {
+        return content.clone();
+    };
+    Value::Array(
+        blocks
+            .iter()
+            .filter(|b| !matches!(b["type"].as_str(), Some("text") | Some("thinking")))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// Map one consolidated content block into `out` (7.1, 7.3, 7.5, 7.6).
 fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<SessionUpdate>) {
     let name = block["name"].as_str().unwrap_or("");
@@ -391,8 +641,13 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
                     out.push(plan);
                 }
             } else if is_task_tool(name) {
-                // Task* tool_use is suppressed; its plan snapshot is emitted at
-                // tool_result time (Node `toAcpNotifications`, isTaskTool branch).
+                // Task* tool_use is suppressed (no tool_call); keep the cache
+                // entry so the tool_result path can resolve the tool name and
+                // input (X12/Decision 12).
+                state.tool_use_cache.insert(
+                    block["id"].as_str().unwrap_or("").to_string(),
+                    block.clone(),
+                );
             } else {
                 if let Some(update) = tool_call_from_use(block, state) {
                     out.push(update);
@@ -415,6 +670,11 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
             if tool_name == Some("TodoWrite") {
                 // Plan-lane tool results never emit a tool_call_update (the
                 // plan was already emitted at tool_use time).
+                state.tool_use_cache.remove(id);
+            } else if tool_name.is_some_and(tools::is_task_tool) {
+                // Task* tool results are suppressed too (no tool_call_update);
+                // the plan update is published by the actor at tool_result time
+                // (X12/Decision 12).
                 state.tool_use_cache.remove(id);
             } else {
                 if let Some(update) = tool_update_from_result(block, state) {
@@ -446,6 +706,9 @@ fn tool_call_from_use(block: &Value, state: &mut MapState) -> Option<SessionUpda
     }
     state.emitted.insert(id.clone());
     state.tool_use_cache.insert(id.clone(), block.clone());
+    if name != "TodoWrite" && !tools::is_task_tool(&name) {
+        state.pending_hooks.insert(id.clone());
+    }
 
     let input = raw_input.clone().unwrap_or(Value::Null);
     let shape = tools::tool_shape(&name, &input);
@@ -547,8 +810,9 @@ fn tool_update_from_result(block: &Value, state: &mut MapState) -> Option<Sessio
     // 2.9 (X-7): emit only fields the client does not already hold; the
     // status always differs (Pending -> Completed/Failed) so this is `Some`.
     let fields = state.track_tool_call_update(&id, &fields)?;
-    // Entry ends after the tool_result.
-    state.finish_tool_tracker(&id);
+    // Entry ends after the tool_result (or kept if hook is pending, M3/Decision 12).
+    let hook_pending = state.pending_hooks.contains(&id);
+    state.finish_result_tool_tracker(&id, hook_pending);
     Some(SessionUpdate::ToolCallUpdate(
         ToolCallUpdate::new(id, fields).meta(tools::tool_meta(&name, &result_input)),
     ))
@@ -602,23 +866,43 @@ fn chunk_from_block(block: &Value, role: MsgRole) -> Option<SessionUpdate> {
         }
         Some("thinking") | Some("thinking_delta") => {
             let thinking = block["thinking"].as_str()?;
+            // Node drops signature-only / empty thinking blocks (`chunk.thinking`
+            // truthiness, `acp-agent.js:10007-10019`, P5).
+            if thinking.is_empty() {
+                return None;
+            }
             Some(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
                 ContentBlock::Text(TextContent::new(thinking)),
             )))
         }
         Some("image") => {
+            // Node maps an image by ROLE and keeps a URL image's `uri`
+            // (`acp-agent.js:9994`): a base64 source carries data+mimeType, a
+            // url source carries only `uri`.
             let source = block.get("source")?;
-            if source["type"].as_str() == Some("base64") {
-                Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                    ContentBlock::Image(ImageContent::new(
-                        source["data"].as_str().unwrap_or(""),
-                        source["media_type"].as_str().unwrap_or(""),
-                    )),
-                )))
-            } else {
-                // Non-base64 images are dropped (Node: `type === "base64"` gate).
+            let base64 = source["type"].as_str() == Some("base64");
+            let image = ImageContent::new(
+                if base64 {
+                    source["data"].as_str().unwrap_or("")
+                } else {
+                    ""
+                },
+                if base64 {
+                    source["media_type"].as_str().unwrap_or("")
+                } else {
+                    ""
+                },
+            )
+            .uri(if base64 {
                 None
-            }
+            } else {
+                source["url"].as_str().map(String::from)
+            });
+            let chunk = ContentChunk::new(ContentBlock::Image(image));
+            Some(match role {
+                MsgRole::Assistant => SessionUpdate::AgentMessageChunk(chunk),
+                MsgRole::User => SessionUpdate::UserMessageChunk(chunk),
+            })
         }
         _ => None,
     }
@@ -753,6 +1037,35 @@ pub fn map_commands_changed(
     AvailableCommandsUpdate::new(avail)
 }
 
+/// Serialise an `AvailableCommandsUpdate` to the raw wire JSON Node emits
+/// (rust-parity-fixes 1.8 / Decision 8).
+///
+/// The typed crate type skips `input` when a command has none
+/// (`#[skip_serializing_none]`), while the Node adapter always spreads it — a
+/// command without an argument hint carries `input: null`
+/// (`acp-agent.js:9645-9651`). Emitting the raw value keeps the
+/// `available_commands_update` byte-identical, with no test-side normaliser.
+pub fn available_commands_json(update: &AvailableCommandsUpdate) -> Value {
+    let mut value = serde_json::to_value(update).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "sessionUpdate".into(),
+            Value::String("available_commands_update".into()),
+        );
+        if let Some(commands) = map
+            .get_mut("availableCommands")
+            .and_then(Value::as_array_mut)
+        {
+            for command in commands {
+                if let Value::Object(command) = command {
+                    command.entry("input").or_insert(Value::Null);
+                }
+            }
+        }
+    }
+    value
+}
+
 /// 7.5 — a mode change becomes a `CurrentModeUpdate`.
 pub fn map_mode_update(mode_id: impl Into<SessionModeId>) -> SessionUpdate {
     SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id))
@@ -792,6 +1105,20 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
                 let index = event["index"].as_u64().unwrap_or(0);
                 input_json_delta(state, &stream_key, index, delta)
             } else {
+                // Record the text/thinking that reaches the client so the
+                // consolidated message can diff against it (Decision 18).
+                // Empty deltas are skipped: they would create an entry the
+                // consolidated handler's `text.length > 0` guard can never
+                // consume, stalling the cursor (`acp-agent.js:5536-5548`).
+                let index = event["index"].as_u64().unwrap_or(0);
+                let (kind, text) = match delta["type"].as_str() {
+                    Some("text_delta") => (StreamedKind::Text, delta["text"].as_str()),
+                    Some("thinking_delta") => (StreamedKind::Thinking, delta["thinking"].as_str()),
+                    _ => (StreamedKind::Text, None),
+                };
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    state.record_streamed_delta(&stream_key, index, kind, text);
+                }
                 // A text/thinking delta maps like a one-block assistant message.
                 apply_stream_message_id(
                     map_consolidated(
@@ -807,12 +1134,15 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow are tagged with the same id
             // (`acp-agent.js:2889`). Also ends the input stream on this lane
-            // (drops leftover partial input).
+            // (drops leftover partial input) and clears the streamed-content
+            // record: block indices restart at 0 each message, so leftover
+            // entries would otherwise truncate this message (`acp-agent.js:5429`).
             state.current_stream_message_id =
                 event["message"]["id"].as_str().unwrap_or("").to_string();
             state
                 .streamed_inputs
                 .retain(|(key, _), _| *key != stream_key);
+            state.clear_streamed_blocks(&stream_key);
             Vec::new()
         }
         Some("content_block_stop") | Some("message_stop") => {
@@ -1141,6 +1471,251 @@ mod tests {
         }
     }
 
+    /// rust-parity-fixes 1.5 (P3) — an image maps by ROLE and keeps a URL
+    /// image's `uri`; a base64 source carries `data`+`mimeType` and no `uri`
+    /// (Node `acp-agent.js:9994`).
+    #[test]
+    fn inv_58_image_role_and_uri() {
+        let mut state = MapState::default();
+        let assistant = map_consolidated(
+            &json!([{"type":"image","source":{"type":"base64","data":"AAA","media_type":"image/png"}}]),
+            MsgRole::Assistant,
+            &mut state,
+        );
+        assert_eq!(assistant.len(), 1);
+        let v = serde_json::to_value(&assistant[0]).unwrap();
+        assert_eq!(v["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(v["content"]["type"], "image");
+        assert_eq!(v["content"]["data"], "AAA");
+        assert_eq!(v["content"]["mimeType"], "image/png");
+        assert!(v["content"].get("uri").is_none(), "{v}");
+
+        let user = map_consolidated(
+            &json!([{"type":"image","source":{"type":"url","url":"https://example.test/a.png"}}]),
+            MsgRole::User,
+            &mut state,
+        );
+        assert_eq!(user.len(), 1);
+        let v = serde_json::to_value(&user[0]).unwrap();
+        assert_eq!(v["sessionUpdate"], "user_message_chunk");
+        assert_eq!(v["content"]["type"], "image");
+        assert_eq!(v["content"]["uri"], "https://example.test/a.png");
+        assert_eq!(v["content"]["data"], "");
+        assert_eq!(v["content"]["mimeType"], "");
+    }
+
+    /// rust-parity-fixes 1.6 (P5, Decision 6) — empty / signature-only thinking
+    /// produces no `agent_thought_chunk`, on the consolidated and delta paths;
+    /// non-empty thinking still maps (Node `acp-agent.js:10007-10019`).
+    #[test]
+    fn inv_59_empty_thinking_dropped() {
+        for content in [
+            json!([{"type": "thinking", "thinking": ""}]),
+            json!([{"type": "thinking", "thinking": "", "signature": "sig"}]),
+            json!([{"type": "thinking_delta", "thinking": ""}]),
+        ] {
+            let mut state = MapState::default();
+            let updates = map_consolidated(&content, MsgRole::Assistant, &mut state);
+            assert!(
+                updates.is_empty(),
+                "empty thinking must not emit: {updates:?}"
+            );
+        }
+
+        let mut state = MapState::default();
+        let delta = json!({"type":"stream_event","event":{"type":"content_block_delta",
+            "index":0,"delta":{"type":"thinking_delta","thinking":""}}});
+        assert!(
+            map_stream_event(&delta, &mut state).is_empty(),
+            "an empty thinking_delta must not emit"
+        );
+
+        let non_empty = json!([{"type": "thinking", "thinking": "reasoning"}]);
+        let mut state = MapState::default();
+        let updates = map_consolidated(&non_empty, MsgRole::Assistant, &mut state);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(kind(&updates[0]), "agent_thought_chunk");
+    }
+
+    /// rust-parity-fixes 1.7 (B1/X9, Decision 18) — a streamed block that
+    /// covers the consolidated text in full produces nothing; consuming it
+    /// resets the record, so the next message is not diffed against it
+    /// (`unstreamedRemainder`, `acp-agent.js:519-545,5835-5838`).
+    #[test]
+    fn inv_68_unstreamed_remainder_full_stream_covers_it() {
+        let mut state = MapState::default();
+        for text in ["Hello ", "there"] {
+            let delta = json!({"type":"stream_event","parent_tool_use_id":null,
+                "event":{"type":"content_block_delta","index":0,
+                "delta":{"type":"text_delta","text":text}}});
+            let _ = map_stream_event(&delta, &mut state);
+        }
+        let frame = json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"Hello there"}]}});
+        assert!(
+            map_consolidated_assistant(&frame, &mut state).is_empty(),
+            "text already streamed in full must not be forwarded again"
+        );
+        // The record was consumed: a second identical message is not deduped
+        // against the first message's stream.
+        let again = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(again.len(), 1);
+        assert_eq!(kind(&again[0]), "agent_message_chunk");
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18) — a stream cut short mid-block
+    /// forwards only the un-streamed tail (`acp-agent.js:535-543`).
+    #[test]
+    fn inv_68_unstreamed_remainder_partial_stream() {
+        let mut state = MapState::default();
+        let delta = json!({"type":"stream_event","parent_tool_use_id":null,
+            "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"Hello "}}});
+        let _ = map_stream_event(&delta, &mut state);
+        let frame = json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"Hello there"}]}});
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        let v = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(v["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(v["content"]["text"], "there", "{v}");
+        assert_eq!(v["messageId"], "msg_1", "{v}");
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18) — with no streamed record a
+    /// consolidated assistant text is forwarded whole (a non-streaming
+    /// gateway); thinking is diffed the same way on its own lane.
+    #[test]
+    fn inv_68_unstreamed_remainder_none_and_thinking() {
+        let mut state = MapState::default();
+        let frame = json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"thinking","thinking":"Think more"},
+                {"type":"text","text":"Hello there"}]}});
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert_eq!(kind(&updates[0]), "agent_thought_chunk");
+        assert_eq!(kind(&updates[1]), "agent_message_chunk");
+
+        // A streamed thinking block only consumes the matching thinking block.
+        let mut state = MapState::default();
+        let delta = json!({"type":"stream_event","parent_tool_use_id":null,
+            "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"thinking_delta","thinking":"Think "}}});
+        let _ = map_stream_event(&delta, &mut state);
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        let thought = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(thought["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(thought["content"]["text"], "more", "{thought}");
+        let text = serde_json::to_value(&updates[1]).unwrap();
+        assert_eq!(text["content"]["text"], "Hello there", "{text}");
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18) — the diff walks the streamed
+    /// record in document order: a second block of the same type is forwarded
+    /// whole when the first consumed the record.
+    #[test]
+    fn inv_68_unstreamed_remainder_two_blocks_in_order() {
+        let mut state = MapState::default();
+        let delta = json!({"type":"stream_event","parent_tool_use_id":null,
+            "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"A"}}});
+        let _ = map_stream_event(&delta, &mut state);
+        let frame = json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"A"},{"type":"text","text":"B"}]}});
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        let v = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(v["content"]["text"], "B", "{v}");
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18) — an empty delta must not create a
+    /// record entry the consolidated handler can never consume (#793).
+    #[test]
+    fn inv_68_unstreamed_remainder_empty_delta_does_not_stall() {
+        let mut state = MapState::default();
+        let empty = json!({"type":"stream_event","parent_tool_use_id":null,
+            "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"thinking_delta","thinking":""}}});
+        let _ = map_stream_event(&empty, &mut state);
+        let delta = json!({"type":"stream_event","parent_tool_use_id":null,
+            "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"Hello"}}});
+        let _ = map_stream_event(&delta, &mut state);
+        let frame = json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"Hello"}]}});
+        assert!(
+            map_consolidated_assistant(&frame, &mut state).is_empty(),
+            "an empty thinking delta must not stall the diff cursor"
+        );
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18, STRICT-NULL) — a frame whose
+    /// `parent_tool_use_id` is MISSING counts as nested: its text/thinking are
+    /// dropped; an explicit `null` forwards them (`acp-agent.js:5829`).
+    #[test]
+    fn inv_68_missing_parent_field_emits_nothing() {
+        let mut state = MapState::default();
+        let frame = json!({"type":"assistant",
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"Hello there"},
+                {"type":"thinking","thinking":"reasoning"}]}});
+        assert!(
+            map_consolidated_assistant(&frame, &mut state).is_empty(),
+            "a missing parent_tool_use_id must not count as top level"
+        );
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18) — an explicit `null` parent
+    /// forwards the whole text, and images stay mapped on either path.
+    #[test]
+    fn inv_68_explicit_null_emits_remainder() {
+        let mut state = MapState::default();
+        let frame = json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":"msg_1","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"Hello there"},
+                {"type":"image","source":{"type":"base64","data":"AAA","media_type":"image/png"}}]}});
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert_eq!(kind(&updates[0]), "agent_message_chunk");
+        assert_eq!(kind(&updates[1]), "agent_message_chunk");
+        let text = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(text["content"]["text"], "Hello there", "{text}");
+        let image = serde_json::to_value(&updates[1]).unwrap();
+        assert_eq!(image["content"]["type"], "image", "{image}");
+    }
+
+    /// rust-parity-fixes 1.7 (Decision 18) — a nested assistant frame keeps
+    /// only its tool/image blocks (text and thinking stay internal); its own
+    /// stream lane is consumed.
+    #[test]
+    fn inv_68_unstreamed_remainder_subagent_text_dropped() {
+        let mut state = MapState::default();
+        let delta = json!({"type":"stream_event","parent_tool_use_id":"toolu_parent",
+            "event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"nested"}}});
+        let _ = map_stream_event(&delta, &mut state);
+        let frame = json!({"type":"assistant","parent_tool_use_id":"toolu_parent",
+            "message":{"id":"msg_2","model":"claude-sonnet-4-5","role":"assistant",
+            "content":[{"type":"text","text":"nested more"},
+                {"type":"thinking","thinking":"hmm"},
+                {"type":"tool_use","id":"t_nested","name":"Bash","input":{"command":"ls"}}]}});
+        let updates = map_consolidated_assistant(&frame, &mut state);
+        assert!(
+            updates.iter().all(|u| !matches!(
+                u,
+                SessionUpdate::AgentMessageChunk(_) | SessionUpdate::AgentThoughtChunk(_)
+            )),
+            "nested text/thinking must stay internal: {updates:?}"
+        );
+        assert_eq!(kind(&updates[0]), "tool_call");
+    }
+
     /// 7.T2 (INV-19) — a tool input streamed across 5 `input_json_delta`
     /// fragments yields exactly one `ToolCall` plus refining `ToolCallUpdate`s,
     /// never a second `ToolCall`.
@@ -1298,6 +1873,19 @@ mod tests {
             ],
             "CLI `mcp` is dropped and replaced at the end; unsupported commands filtered"
         );
+
+        // Decision 8: the raw wire JSON always carries `input` — `null` for a
+        // command without an argument hint (the typed update omits it).
+        let wire = available_commands_json(&result);
+        let cmds = wire["availableCommands"].as_array().expect("array");
+        let compact = cmds
+            .iter()
+            .find(|c| c["name"] == "compact")
+            .expect("compact");
+        assert_eq!(compact["input"], Value::Null, "{compact}");
+        let config = cmds.iter().find(|c| c["name"] == "config").expect("config");
+        assert_eq!(config["input"]["hint"], "[key] [value]", "{config}");
+        assert_eq!(wire["sessionUpdate"], "available_commands_update");
 
         // Empty commands -> only the appended mcp + remote-control.
         let empty = map_commands_changed(&json!([]), &json!([]));
@@ -1467,5 +2055,37 @@ mod tests {
             matches!(updates[0], SessionUpdate::ToolCallUpdate(_)),
             "a completing tool_call_update is still emitted after the clear"
         );
+    }
+
+    /// M3 / Decision 12 (INV-64) — the field tracker entry is retained after
+    /// `tool_result` when a PostToolUse hook is pending, so hook updates can
+    /// deduplicate content against what the client holds. The tracker entry is
+    /// only dropped once the hook callback finishes.
+    #[test]
+    fn inv_64_tracker_kept_until_hook() {
+        let mut state = MapState::default();
+        let start = json!([{
+            "type": "tool_use", "id": "toolu_HK1", "name": "Bash", "input": {"command": "ls"}
+        }]);
+        let _ = map_consolidated(&start, MsgRole::Assistant, &mut state);
+        assert_eq!(state.tracked_tool_calls(), 1);
+        assert!(state.pending_hooks.contains("toolu_HK1"));
+
+        // tool_result arrives with hook pending
+        let result_chunk = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_HK1",
+            "content": "output"
+        });
+        let _ = tool_update_from_result(&result_chunk, &mut state);
+
+        // Tracker entry is KEPT because hook is pending
+        assert_eq!(state.tracked_tool_calls(), 1);
+
+        // Hook arrives and finishes
+        state.finish_hook_tool_tracker("toolu_HK1");
+
+        // Now tracker entry is removed
+        assert_eq!(state.tracked_tool_calls(), 0);
     }
 }

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// How the recorder answers `session/request_permission` requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionPolicy {
     /// Select the first permission option offered.
@@ -20,6 +20,12 @@ pub enum PermissionPolicy {
     /// 3.9), falling back to the `allow_once` option when none is offered.
     #[serde(rename = "allow_always")]
     AllowAlways,
+    /// Select the exact option whose `optionId` matches (Fix 1): lets a script
+    /// choose a specific ExitPlanMode selection (e.g. `exit-plan-default` vs the
+    /// elevated modes) regardless of its kind. Cancels when no offered option
+    /// matches.
+    #[serde(rename = "option_id")]
+    OptionId(String),
 }
 
 /// One ACP call to issue.
@@ -333,5 +339,17 @@ mod tests {
             Script::parse(r#"{"permission": "allow_always", "steps": [{"call": "initialize"}]}"#)
                 .unwrap();
         assert_eq!(script.permission, PermissionPolicy::AllowAlways);
+    }
+
+    #[test]
+    fn parses_permission_option_id() {
+        let script = Script::parse(
+            r#"{"permission": {"option_id": "exit-plan-default"}, "steps": [{"call": "initialize"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.permission,
+            PermissionPolicy::OptionId("exit-plan-default".to_string())
+        );
     }
 }

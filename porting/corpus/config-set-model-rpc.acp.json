@@ -1,0 +1,10 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}},
+    {"call": "request", "method": "session/set_model", "expect_error": true,
+     "params": {"sessionId": "$SESSION", "modelId": "claude-haiku-3-5"}}
+  ]
+}

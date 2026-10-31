@@ -147,11 +147,12 @@ pub fn load_transcript(path: &Path) -> Result<Transcript, TranscriptError> {
 /// env (no `.env_clear()`), matching the crate's `apply_claude_env`
 /// (`process.rs`) and the Node adapter's `{ ...process.env, ...providerEnv }`.
 /// Do not read this list as the set of env vars forwarded to `claude`.
-const ARGV_ENV_ALLOWLIST: [&str; 4] = [
+const ARGV_ENV_ALLOWLIST: [&str; 5] = [
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS",
     "CLAUDE_CODE_SDK_READS_SESSION_STATE",
     "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+    "CLAUDE_CODE_ARTIFACT",
 ];
 
 /// Record the argv and the allow-listed env we were launched with to `out`.

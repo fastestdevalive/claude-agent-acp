@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::StopReason;
 use agent_client_protocol::{Agent, ConnectTo, ConnectionTo, Error, Result, UntypedMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -52,6 +52,8 @@ pub struct ServeOptions {
     pub default_cwd: Option<PathBuf>,
     /// Grace constants for the child lifecycle (injectable for tests).
     pub timings: Timings,
+    /// Environment snapshot the adapter reads through (hermetic by default).
+    pub env: crate::env_snapshot::EnvSnapshot,
 }
 
 impl ServeOptions {
@@ -61,10 +63,15 @@ impl ServeOptions {
     /// grace (milliseconds; default 30 s, R29) so the differential harness can
     /// shorten a wedged-cancel settle (11.2 / 11.T4).
     pub fn from_env() -> Self {
-        let claude_path = std::env::var_os("CLAUDE_CODE_EXECUTABLE").map(PathBuf::from);
-        let default_cwd = std::env::var_os("CLAUDE_CODE_DEFAULT_CWD").map(PathBuf::from);
+        Self::from_snapshot(crate::env_snapshot::EnvSnapshot::from_process())
+    }
+
+    /// Build options from an explicit environment snapshot.
+    pub fn from_snapshot(env: crate::env_snapshot::EnvSnapshot) -> Self {
+        let claude_path = env.get_path("CLAUDE_CODE_EXECUTABLE");
+        let default_cwd = env.get_path("CLAUDE_CODE_DEFAULT_CWD");
         let mut timings = Timings::default();
-        if let Ok(ms) = std::env::var("CLAUDE_ACP_FORCE_CANCEL_GRACE_MS") {
+        if let Some(ms) = env.get("CLAUDE_ACP_FORCE_CANCEL_GRACE_MS") {
             if let Ok(ms) = ms.parse::<u64>() {
                 timings.force_cancel_grace = std::time::Duration::from_millis(ms);
             }
@@ -74,7 +81,14 @@ impl ServeOptions {
             extra_env: Vec::new(),
             default_cwd,
             timings,
+            env,
         }
+    }
+
+    #[must_use]
+    pub fn with_env(mut self, env: crate::env_snapshot::EnvSnapshot) -> Self {
+        self.env = env;
+        self
     }
 }
 
@@ -151,22 +165,16 @@ fn initialize_response(air: Option<&AirClient>) -> Value {
     })
 }
 
-/// The `session/new` and `session/load` response body (modes/configOptions are
-/// ignored by the differential).
-fn session_response(session_id: &str) -> Value {
+/// The `session/new` and `session/load` response body (`{sessionId, modes, configOptions}`).
+fn session_response(
+    session_id: &str,
+    modes: &crate::session_config::ModesState,
+    config_options: &[crate::session_config::ConfigOption],
+) -> Value {
     json!({
         "sessionId": session_id,
-        "modes": {
-            "currentModeId": "default",
-            "availableModes": [
-                {"id": "default", "name": "Manual", "description": "Standard behavior, prompts for dangerous operations"},
-                {"id": "acceptEdits", "name": "Accept Edits", "description": "Auto-accept file edit operations"},
-                {"id": "plan", "name": "Plan Mode", "description": "Planning mode, no actual tool execution"},
-                {"id": "dontAsk", "name": "Don't Ask", "description": "Don't prompt for permissions, deny if not pre-approved"},
-                {"id": "bypassPermissions", "name": "Bypass Permissions", "description": "Bypass all permission checks"}
-            ]
-        },
-        "configOptions": []
+        "modes": modes,
+        "configOptions": config_options,
     })
 }
 
@@ -288,53 +296,114 @@ fn format_uri_as_link(uri: &str) -> String {
     format!("[{name}]({uri})")
 }
 
-/// Build the child [`SpawnOptions`] for a session (8.4).
+/// Build the child [`SpawnOptions`] for a session (8.4, rust-parity-fixes 1.3).
 ///
-/// `cwd`, `model` and `permission_mode` come from the ACP request; `session_id`
-/// is the minted uuid (or resumed id); a default `cwd` falls back to
-/// `ServeOptions.default_cwd` then the process cwd.
+/// `cwd` comes from the ACP request (falling back to `ServeOptions.default_cwd`
+/// then the process cwd); `session_id` is the minted uuid (or resumed id);
+/// [`crate::sdk_options::ClaudeOptions`], the resolved permission mode and the
+/// bypass availability are resolved by [`spawn_inputs`]. Unknown
+/// `_meta.claudeCode.options` keys are ignored (Decision 2).
 pub fn session_spawn_options(
     serve: &ServeOptions,
     cwd: Option<PathBuf>,
     session_id: String,
-    model: Option<String>,
-    permission_mode: Option<String>,
+    claude: crate::sdk_options::ClaudeOptions,
+    permission_mode: String,
+    allow_bypass: bool,
+    ask_disallowed: bool,
 ) -> SpawnOptions {
     let cwd = cwd
         .or_else(|| serve.default_cwd.clone())
         .or_else(|| std::env::current_dir().ok());
+    let mut extra_env = claude.env.clone();
+    extra_env.extend(serve.extra_env.iter().cloned());
+    let mut disallowed_tools = claude.disallowed_tools.clone();
+    if ask_disallowed {
+        // Decision 4: `AskUserQuestion` always follows the user list.
+        disallowed_tools.push("AskUserQuestion".to_string());
+    }
+    let (sess_id, resume) = if let Some(r) = claude.resume {
+        (None, Some(r))
+    } else {
+        (Some(session_id), None)
+    };
     SpawnOptions {
         claude_path: serve.claude_path.clone(),
-        extra_env: serve.extra_env.clone(),
+        extra_env,
         default_cwd: cwd,
-        session_id: Some(session_id),
-        model,
-        permission_mode,
-        // The Node adapter always passes `--permission-prompt-tool stdio` (B2):
-        // without it `claude` never emits `can_use_tool`, so permission
-        // translation (phase 10) would never trigger against a real CLI.
+        session_id: sess_id,
+        resume,
+        model: claude.model,
+        effort: claude.effort,
+        max_turns: claude.max_turns,
+        max_budget_usd: claude.max_budget_usd,
+        agent: claude.agent,
+        betas: claude.betas,
+        fallback_model: claude.fallback_model,
+        include_hook_events: claude.include_hook_events,
+        strict_mcp_config: claude.strict_mcp_config,
+        additional_directories: claude.additional_directories,
+        allowed_tools: claude.allowed_tools,
+        permission_mode: Some(permission_mode),
+        setting_sources: claude
+            .setting_sources
+            .unwrap_or_else(|| vec!["user".into(), "project".into(), "local".into()]),
+        disallowed_tools,
+        tools: claude.tools,
+        extra_args: claude.extra_args,
         permission_prompt_tool: true,
+        allow_dangerously_skip_permissions: allow_bypass,
         replay_user_messages: true,
         include_partial_messages: true,
+        env_snapshot: serve.env.clone(),
         ..SpawnOptions::default()
     }
 }
 
-/// Read `model` / `permission_mode` from `_meta.claudeCode.options` if present.
-fn options_from_meta(params: &Value) -> (Option<String>, Option<String>) {
-    let opts = params
-        .get("_meta")
-        .and_then(|m| m.get("claudeCode"))
-        .and_then(|c| c.get("options"));
-    let model = opts
-        .and_then(|o| o.get("model"))
-        .and_then(Value::as_str)
-        .map(String::from);
-    let permission = opts
-        .and_then(|o| o.get("permissionMode"))
-        .and_then(Value::as_str)
-        .map(String::from);
-    (model, permission)
+/// Resolve the spawn inputs for a `session/new|load` request (Decision 2/3/4):
+/// `_meta.claudeCode.options`, the permission mode (explicit > resumed >
+/// settings; Phase 1 has no explicit/resumed source), and whether bypass is
+/// available.
+///
+/// Node IGNORES `_meta.claudeCode.options.permissionMode` (X3): the mode comes
+/// from settings only. `allow_bypass` combines root/`IS_SANDBOX`, the settings'
+/// `disableBypassPermissionsMode` and the client's
+/// `allowDangerouslySkipPermissions !== false` (R6).
+pub fn spawn_inputs(
+    params: &Value,
+    cwd: Option<&std::path::Path>,
+    serve: &ServeOptions,
+    resumed_id: Option<&str>,
+) -> (crate::sdk_options::ClaudeOptions, String, bool) {
+    let dir = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| serve.default_cwd.clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let settings = crate::settings::load(&dir, &serve.env);
+    let claude = crate::sdk_options::claude_options(params);
+    let is_sandbox = serve
+        .env
+        .get("IS_SANDBOX")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let allow_bypass = crate::permission_mode::allow_bypass(crate::process::is_root(), is_sandbox)
+        && !settings.disable_bypass
+        && claude.allow_dangerously_skip_permissions != Some(false);
+
+    let effective_resumed = resumed_id.or(claude.resume.as_deref());
+    let resumed_mode = effective_resumed.and_then(|id| {
+        let tail = crate::resumed_session::read_resumed_tail_with_env(id, true, &serve.env);
+        tail.permission_mode
+    });
+
+    let permission_mode = crate::permission_mode::resolve_initial_permission_mode(
+        None,
+        resumed_mode.as_deref(),
+        settings.default_mode.as_deref(),
+        allow_bypass,
+    );
+    (claude, permission_mode, allow_bypass)
 }
 
 /// Decide the `_session/steering` outcome (R32 / B1 row).
@@ -620,9 +689,14 @@ fn initialize_options_for(params: &Value) -> Result<InitializeOptions, Error> {
     let custom = system_prompt::air_custom_instructions(params.get("_meta"));
     let (system_prompt, append_system_prompt) =
         system_prompt::sdk_initialize_fields(client_prompt.as_ref(), custom.as_deref());
+    let opts = crate::sdk_options::claude_options(params);
+    let prompt_suggestions = opts.prompt_suggestions.unwrap_or(true);
     Ok(InitializeOptions {
         system_prompt,
         append_system_prompt,
+        hooks: Some(crate::hooks::init_hooks_payload()),
+        prompt_suggestions: Some(prompt_suggestions),
+        forward_subagent_text: false,
         ..InitializeOptions::default()
     })
 }
@@ -641,7 +715,30 @@ fn register_session(
     registry
         .sessions
         .insert(session_id.to_string(), session.clone());
-    let _ = registry.session_tx.send((session_id.to_string(), session));
+    let _ = registry
+        .session_tx
+        .send((session_id.to_string(), session.clone()));
+
+    // Decision 9 / 2.1: background get_context_usage {detail:"summary"} spawned after register.
+    let control = session.control().clone();
+    let cmd_tx = session.command_sender().clone();
+    tokio::spawn(async move {
+        if let Ok(res) = control
+            .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
+            .await
+        {
+            let raw_max = res
+                .pointer("/response/rawMaxTokens")
+                .or_else(|| res.get("rawMaxTokens"))
+                .and_then(Value::as_u64);
+            if let Some(tokens) = raw_max {
+                if tokens > 0 {
+                    let _ =
+                        cmd_tx.send(crate::session::Command::UpdateContextWindow { size: tokens });
+                }
+            }
+        }
+    });
     let connection = connection.clone();
     tokio::spawn(async move {
         let mut update_rx = update_rx;
@@ -697,6 +794,7 @@ async fn start_resumed(
     opts: &ServeOptions,
     responder: agent_client_protocol::Responder<Value>,
     connection: &ConnectionTo<agent_client_protocol::Client>,
+    replay: bool,
 ) -> Result<(), Error> {
     let cwd_str = params.get("cwd").and_then(Value::as_str);
     if let Err(e) = validate_cwd(cwd_str) {
@@ -707,13 +805,23 @@ async fn start_resumed(
         Err(e) => return responder.respond_with_error(e),
     };
     let cwd = cwd_str.map(PathBuf::from);
-    let (model, permission_mode) = options_from_meta(params);
-    let mut spawn = session_spawn_options(opts, cwd, session_id.clone(), model, permission_mode);
+    let (claude, permission_mode, allow_bypass) =
+        spawn_inputs(params, cwd.as_deref(), opts, Some(&session_id));
+    let mut spawn = session_spawn_options(
+        opts,
+        cwd,
+        session_id.clone(),
+        claude,
+        permission_mode,
+        allow_bypass,
+        true,
+    );
     spawn.resume = Some(session_id.clone());
     spawn.session_id = None;
     let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
-    let sess_opts =
-        SessionOptions::new(spawn, opts.timings.clone(), initialize).with_air(registry.air.clone());
+    let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
+        .with_air(registry.air.clone())
+        .with_env(opts.env.clone());
     match Session::start(sess_opts, session_id.clone()).await {
         Ok((session, update_rx)) => {
             publish_session_account(registry, auth_cwd, &session);
@@ -725,14 +833,33 @@ async fn start_resumed(
             // system frame. Build it from the initialize handshake's
             // `commands` (a fresh session has no terminal slash commands).
             let commands = session.commands().to_vec();
+            let modes = session.modes().clone();
+            let config_options = session.config_options().to_vec();
             register_session(registry, &session_id, session, update_rx, connection);
-            responder.respond(session_response(&session_id))?;
+            // rust-parity-fixes 3.5 (Decision 14, P10): a `session/load` replays
+            // the stored history BEFORE the response (Node `loadSession` →
+            // `replaySessionHistory`); `session/resume` and `session/fork` do
+            // not. Each replayed message becomes a `session/update` (user /
+            // assistant chunks, tool calls/results).
+            if replay {
+                let messages = crate::transcript::session_messages(&opts.env, &session_id);
+                for value in crate::transcript::replay_notifications(&messages, &session_id) {
+                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                        let _ = connection.send_notification(msg);
+                    }
+                }
+            }
+            responder.respond(session_response(&session_id, &modes, &config_options))?;
             let update = map::map_commands_changed(&json!(commands), &json!([]));
-            let notif = SessionNotification::new(
-                session_id.clone(),
-                SessionUpdate::AvailableCommandsUpdate(update),
-            );
-            let _ = connection.send_notification(notif);
+            // Decision 8: raw JSON with `input: null` for commands without a
+            // hint (the typed update would omit the field).
+            let value = json!({
+                "sessionId": session_id.clone(),
+                "update": map::available_commands_json(&update),
+            });
+            if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                let _ = connection.send_notification(msg);
+            }
             Ok(())
         }
         Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
@@ -783,14 +910,23 @@ async fn handle_request(
                 Ok(initialize) => initialize,
                 Err(e) => return responder.respond_with_error(e),
             };
-            let session_id = uuid_v4();
             let cwd = cwd_str.map(PathBuf::from);
-            let (model, permission_mode) = options_from_meta(&params);
-            let spawn =
-                session_spawn_options(opts, cwd, session_id.clone(), model, permission_mode);
+            let (claude, permission_mode, allow_bypass) =
+                spawn_inputs(&params, cwd.as_deref(), opts, None);
+            let session_id = claude.resume.clone().unwrap_or_else(uuid_v4);
+            let spawn = session_spawn_options(
+                opts,
+                cwd,
+                session_id.clone(),
+                claude,
+                permission_mode,
+                allow_bypass,
+                true,
+            );
             let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
             let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
-                .with_air(registry.air.clone());
+                .with_air(registry.air.clone())
+                .with_env(opts.env.clone());
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
                     publish_session_account(registry, auth_cwd, &session);
@@ -802,14 +938,20 @@ async fn handle_request(
                     // system frame. Build it from the initialize handshake's
                     // `commands` (a fresh session has no terminal slash commands).
                     let commands = session.commands().to_vec();
+                    let modes = session.modes().clone();
+                    let config_options = session.config_options().to_vec();
                     register_session(registry, &session_id, session, update_rx, &connection);
-                    responder.respond(session_response(&session_id))?;
+                    responder.respond(session_response(&session_id, &modes, &config_options))?;
                     let update = map::map_commands_changed(&json!(commands), &json!([]));
-                    let notif = SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::AvailableCommandsUpdate(update),
-                    );
-                    let _ = connection.send_notification(notif);
+                    // Decision 8: raw JSON with `input: null` for commands
+                    // without a hint (the typed update would omit the field).
+                    let value = json!({
+                        "sessionId": session_id.clone(),
+                        "update": map::available_commands_json(&update),
+                    });
+                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                        let _ = connection.send_notification(msg);
+                    }
                     Ok(())
                 }
                 Err(e) => responder.respond_with_error(rpc_error(session_error_to_rpc(&e))),
@@ -823,7 +965,65 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            start_resumed(registry, session_id, &params, opts, responder, &connection).await
+            let replay = method == "session/load";
+            // Follow-up (a): if the request targets an already live session,
+            // reuse it without leaking or starting a redundant child process. A
+            // `session/load` on a live session replays its history (X8,
+            // `acp-agent.js:1583-1587`); `session/resume` does not.
+            if let Some(session) = registry.sessions.get(&session_id) {
+                if replay {
+                    let messages = crate::transcript::session_messages(&opts.env, &session_id);
+                    for value in crate::transcript::replay_notifications(&messages, &session_id) {
+                        if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                            let _ = connection.send_notification(msg);
+                        }
+                    }
+                }
+                // MAJOR 5 (acp-agent.js:8186-8190): return the actor's LIVE
+                // state — after `set_config_option mode plan` a resume must
+                // report currentModeId "plan", not the creation-time copy.
+                match session.live_state().await {
+                    Ok((modes, config_options)) => {
+                        responder.respond(session_response(
+                            &session_id,
+                            &modes,
+                            &config_options,
+                        ))?;
+                    }
+                    Err(_) => {
+                        responder.respond(session_response(
+                            &session_id,
+                            session.modes(),
+                            session.config_options(),
+                        ))?;
+                    }
+                }
+                // Node's `afterSetupResponse` re-sends the proactive
+                // `available_commands_update` after an already-live
+                // `session/load` (`acp-agent.js:1593`), after the response.
+                if replay {
+                    let commands = session.commands().to_vec();
+                    let update = map::map_commands_changed(&json!(commands), &json!([]));
+                    let value = json!({
+                        "sessionId": session_id.clone(),
+                        "update": map::available_commands_json(&update),
+                    });
+                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                        let _ = connection.send_notification(msg);
+                    }
+                }
+                return Ok(());
+            }
+            start_resumed(
+                registry,
+                session_id,
+                &params,
+                opts,
+                responder,
+                &connection,
+                replay,
+            )
+            .await
         }
         "session/fork" => {
             // Node order: validate the systemPrompt, copy the transcript, then
@@ -852,11 +1052,20 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let new_id = match session_methods::fork_copy(fork_session_id, cwd).await {
+            let new_id = match session_methods::fork_copy(fork_session_id, cwd, &opts.env).await {
                 Ok(id) => id,
                 Err(e) => return responder.respond_with_error(e),
             };
-            start_resumed(registry, new_id, &params, opts, responder, &connection).await
+            start_resumed(
+                registry,
+                new_id,
+                &params,
+                opts,
+                responder,
+                &connection,
+                false,
+            )
+            .await
         }
         "session/close" => {
             // Idempotent: an unknown (or already closed) session answers `{}`.
@@ -877,9 +1086,84 @@ async fn handle_request(
                 None => responder.respond(json!({})),
             }
         }
-        "session/list" => {
+        "session/set_mode" => {
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mode_id = params
+                .get("modeId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let session = match registry.sessions.get(&session_id) {
+                Some(s) => s.clone(),
+                None => {
+                    return responder.respond_with_error(
+                        Error::internal_error().data(json!({ "details": "Session not found" })),
+                    );
+                }
+            };
             tokio::spawn(async move {
-                match session_methods::list(&params).await {
+                match session.set_mode(mode_id).await {
+                    Ok(()) => {
+                        let _ = responder.respond(json!({}));
+                    }
+                    Err(e) => {
+                        let _ = responder.respond_with_error(
+                            Error::internal_error().data(json!({ "details": e })),
+                        );
+                    }
+                }
+            });
+            Ok(())
+        }
+        "session/set_config_option" => {
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let config_id = params
+                .get("configId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let value = match params.get("value") {
+                Some(v) => v.clone(),
+                None => {
+                    return responder.respond_with_error(Error::internal_error().data(json!({
+                        "details": format!("Invalid value for config option {config_id}: undefined")
+                    })));
+                }
+            };
+            let session = match registry.sessions.get(&session_id) {
+                Some(s) => s.clone(),
+                None => {
+                    return responder.respond_with_error(
+                        Error::internal_error().data(json!({ "details": "Session not found" })),
+                    );
+                }
+            };
+            tokio::spawn(async move {
+                match session.set_config_option(config_id, value).await {
+                    Ok(config_options) => {
+                        let _ = responder.respond(json!({ "configOptions": config_options }));
+                    }
+                    Err(e) => {
+                        let _ = responder.respond_with_error(
+                            Error::internal_error().data(json!({ "details": e })),
+                        );
+                    }
+                }
+            });
+            Ok(())
+        }
+        "session/list" => {
+            let env = opts.env.clone();
+            tokio::spawn(async move {
+                match session_methods::list(&params, &env).await {
                     Ok(result) => {
                         let _ = responder.respond(result);
                     }
@@ -900,11 +1184,12 @@ async fn handle_request(
                 .to_string();
             // Tear a loaded session down first so its transcript is not recreated.
             let loaded = registry.sessions.remove(&session_id);
+            let env = opts.env.clone();
             tokio::spawn(async move {
                 if let Some(session) = loaded {
                     session.close().await;
                 }
-                match session_methods::delete(session_id).await {
+                match session_methods::delete(session_id, &env).await {
                     Ok(()) => {
                         let _ = responder.respond(json!({}));
                     }
@@ -922,6 +1207,7 @@ async fn handle_request(
                 .auth
                 .get_or_insert_with(|| spawn_auth(opts, &connection))
                 .clone();
+            auth.bump_epoch();
             let claude_path = opts.claude_path.clone();
             let extra_env = opts.extra_env.clone();
             tokio::spawn(async move {
@@ -1115,9 +1401,12 @@ async fn handle_request(
             Ok(())
         }
         _ => {
-            // Unhandled method (8.1): -32601.
+            // Unhandled method (8.1): -32601. Mirror Node's SDK router
+            // (`@agentclientprotocol/sdk/dist/core/jsonrpc.js` `methodNotFound`):
+            // `-"Method not found": <method>"` with `data` `{method}`.
             responder.respond_with_error(
-                Error::method_not_found().data(format!("method {method} not found")),
+                Error::new(-32601, format!("\"Method not found\": {method}"))
+                    .data(json!({ "method": method })),
             )
         }
     }
@@ -1252,8 +1541,13 @@ mod tests {
             &serve,
             None,
             "uu-1234".to_string(),
-            Some("claude-sonnet-4-5".to_string()),
-            Some("acceptEdits".to_string()),
+            crate::sdk_options::ClaudeOptions {
+                model: Some("claude-sonnet-4-5".to_string()),
+                ..Default::default()
+            },
+            "acceptEdits".to_string(),
+            false,
+            true,
         );
         let argv = crate::process::build_argv(&spawn);
         assert_eq!(session_id_from_argv(&argv), Some("uu-1234"));
@@ -1274,7 +1568,15 @@ mod tests {
     #[test]
     fn resume_maps_to_resume_flag() {
         let serve = ServeOptions::default();
-        let mut spawn = session_spawn_options(&serve, None, "sess-id".to_string(), None, None);
+        let mut spawn = session_spawn_options(
+            &serve,
+            None,
+            "sess-id".to_string(),
+            crate::sdk_options::ClaudeOptions::default(),
+            "default".to_string(),
+            false,
+            true,
+        );
         spawn.resume = Some("sess-id".to_string());
         spawn.session_id = None;
         let argv = crate::process::build_argv(&spawn);

@@ -8,8 +8,8 @@ mod common;
 
 use common::{
     diff_frames, normalize_agent_info_version, normalize_for_test, normalize_root_paths,
-    parse_fixture_frames, pinned_upstream_version, repo_root, run_recorder, rust_agent_binary,
-    Frame, JsonPath,
+    parse_fixture_frames, pinned_upstream_version, repo_root, run_recorder, run_recorder_with_argv,
+    rust_agent_binary, Frame, JsonPath,
 };
 use serde_json::json;
 
@@ -95,14 +95,14 @@ fn inv_24_ignore_paths() {
         "the same difference on a non-ignored path must fail"
     );
 
-    // A whole `usage_update` notification missing on one side is ignored via a
+    // A whole synthetic notification missing on one side is ignored via a
     // value-filtered path.
-    let usage_update = Frame::recv(json!({
+    let synthetic_update = Frame::recv(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "sessionId": "33333333-3333-3333-3333-333333333333",
-            "update": { "sessionUpdate": "usage_update", "usage": { "totalTokens": 10 } }
+            "update": { "sessionUpdate": "synthetic_test_update", "count": 10 }
         }
     }));
     let settled = Frame::recv(json!({
@@ -113,18 +113,22 @@ fn inv_24_ignore_paths() {
             "update": { "sessionUpdate": "sessionState_changed", "state": "idle" }
         }
     }));
-    let ignore_usage = [JsonPath::new("params.update[sessionUpdate=usage_update]")];
+    let ignore_synthetic =
+        [
+            std::str::FromStr::from_str("params.update[sessionUpdate=synthetic_test_update]")
+                .unwrap(),
+        ];
     assert!(
         diff_frames(
-            &[usage_update.clone(), settled.clone()],
+            &[synthetic_update.clone(), settled.clone()],
             std::slice::from_ref(&settled),
-            &ignore_usage
+            &ignore_synthetic
         )
         .is_ok(),
         "an ignored whole frame missing on one side must pass"
     );
     assert!(
-        diff_frames(&[usage_update, settled.clone()], &[settled], &[]).is_err(),
+        diff_frames(&[synthetic_update, settled.clone()], &[settled], &[]).is_err(),
         "without the ignore path a missing whole frame must fail"
     );
 }
@@ -237,9 +241,8 @@ fn inv_24_tool_call_update_content_must_match() {
     );
 }
 
-/// The JSON-path ignore list shared by every phase-8 differential: the fields
-/// the Rust side intentionally diverges on (modes/configOptions/models/
-/// authMethods per plan 1.3, and usage updates the port never emits).
+/// The JSON-path ignore list shared by differentials: empty after parity
+/// phases 1 and 2 (modes, configOptions, models, and usage updates are all ported).
 fn differential_ignore() -> Vec<JsonPath> {
     base_ignore()
 }
@@ -255,13 +258,7 @@ fn differential_ignore() -> Vec<JsonPath> {
 /// frame normalizer materialising those defaults on both sides (see
 /// `normalize_tool_call_defaults` in `common/mod.rs`), not by an ignore path.
 fn base_ignore() -> Vec<JsonPath> {
-    vec![
-        JsonPath::new("result.modes"),
-        JsonPath::new("result.configOptions"),
-        JsonPath::new("result.models"),
-        JsonPath::new("result.authMethods"),
-        JsonPath::new("params.update[sessionUpdate=usage_update]"),
-    ]
+    vec![]
 }
 
 /// The ignore set for the phase-9 tool-shape differentials (`inv_24_tools`).
@@ -488,6 +485,29 @@ fn inv_24_permission_suggestions() {
     run_and_diff("permission-suggestions");
 }
 
+/// P7 (3.6) — Edit with an acceptEdits session change set offers the durable
+/// "Yes, allow all edits during this session" option and, on `allow_with_updates`,
+/// returns the CLI's `setMode` suggestion verbatim as `updatedPermissions`
+/// classified `user_permanent`.
+#[test]
+fn inv_24_permission_edit_always() {
+    run_and_diff("permission-edit-always");
+}
+
+/// P7 (3.6) — WebFetch offers a generated domain rule and returns it on
+/// `allow_with_updates`.
+#[test]
+fn inv_24_permission_webfetch() {
+    run_and_diff("permission-webfetch");
+}
+
+/// P7 (3.6) — a generic tool offers a generated `localSettings` rule and returns
+/// it on `allow_with_updates`.
+#[test]
+fn inv_24_permission_generic_tool() {
+    run_and_diff("permission-generic-tool");
+}
+
 /// 8.T7 — lagging trailing idle after the next echo is absorbed, not a false
 /// #825 fail.
 #[test]
@@ -693,4 +713,280 @@ fn inv_24_air_tool_meta() {
 #[test]
 fn inv_24_async_task_stop() {
     run_and_diff("async-task-stop");
+}
+
+/// rust-parity-fixes Phase 1 (item 1.4) — P1/P2 spawn corpus: the
+/// `_meta.claudeCode.options` extras (betas / extraArgs / env / model), the
+/// settings-driven mode, and the bypass clamp (`disableBypassPermissionsMode`,
+/// `allowDangerouslySkipPermissions:false`).
+#[test]
+fn inv_24_spawn_vst_meta() {
+    run_and_diff("spawn-vst-meta");
+}
+
+#[test]
+fn inv_24_spawn_settings_mode() {
+    run_and_diff("spawn-settings-mode");
+}
+
+#[test]
+fn inv_24_spawn_bypass_disabled() {
+    run_and_diff("spawn-bypass-disabled");
+}
+
+#[test]
+fn inv_24_spawn_bypass_opt_out() {
+    run_and_diff("spawn-bypass-opt-out");
+}
+
+#[test]
+fn inv_24_spawn_effort() {
+    run_and_diff("spawn-effort");
+}
+
+#[test]
+fn inv_24_spawn_additional_directories() {
+    run_and_diff("spawn-additional-directories");
+}
+
+/// rust-parity-fixes Phase 1 (item 1.5, P3): the `[image,text]` prompt echo is
+/// dropped and an assistant image maps to `agent_message_chunk` (no
+/// `user_message_chunk` in the fixture).
+#[test]
+fn inv_24_image_prompt_echo() {
+    run_and_diff("image-prompt-echo");
+}
+
+/// rust-parity-fixes Phase 1 (item 1.6, P5): empty / signature-only thinking
+/// never produces an `agent_thought_chunk`.
+#[test]
+fn inv_24_thinking_empty() {
+    run_and_diff("thinking-empty");
+}
+
+/// rust-parity-fixes Phase 1 (item 1.7, B1/X9): a consolidated assistant
+/// message with no streamed deltas forwards its whole text as
+/// `agent_message_chunk` (`unstreamedRemainder`).
+#[test]
+fn inv_24_consolidated_text() {
+    run_and_diff("consolidated-text");
+}
+
+/// rust-parity-fixes Phase 1 (item 1.7, B1/X9): a stream cut short mid-block
+/// forwards only the un-streamed tail of the consolidated text.
+#[test]
+fn inv_24_consolidated_text_partial_stream() {
+    run_and_diff("consolidated-text-partial-stream");
+}
+
+/// rust-parity-fixes Phase 1 (Decision 1, item 1.1/1.4) — for every corpus
+/// script that owns a committed `<name>.argv.json` fixture, run the Rust adapter
+/// under the recorder with `FAKE_CLAUDE_ARGV_OUT` set and compare the argv it
+/// would pass to `claude` (normalised exactly like `capture.sh normalize_object
+/// ... argv`) against the Node-captured fixture.
+#[test]
+fn inv_57_argv_matches_node() {
+    let root = repo_root();
+    let mut scripts: Vec<String> = std::fs::read_dir(root.join("porting/corpus"))
+        .expect("read corpus dir")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".acp.json").map(|s| s.to_string())
+        })
+        .collect();
+    scripts.sort();
+
+    let mut checked = 0usize;
+    for name in scripts {
+        let fixture_path = root.join(format!("porting/fixtures/{name}.argv.json"));
+        if !fixture_path.exists() {
+            // A script that never spawns the CLI (its request fails before
+            // spawn) owns no argv fixture — nothing to compare.
+            continue;
+        }
+        let script = root.join(format!("porting/corpus/{name}.acp.json"));
+        let transcript = root.join(format!("porting/corpus/{name}.transcript.jsonl"));
+        let tmp = std::env::temp_dir().join(format!(
+            "acp-argv-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let out = tmp.join("out.jsonl");
+
+        let agent_cmd = rust_agent_binary();
+        let (_frames, rust_argv) =
+            run_recorder_with_argv(&agent_cmd.to_string_lossy(), &script, &transcript, &out);
+        let expected: serde_json::Value = common::read_json(&fixture_path);
+        assert_eq!(
+            rust_argv, expected,
+            "{name} argv diverges from the Node fixture"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        checked += 1;
+    }
+    assert!(
+        checked >= 1,
+        "inv_57_argv_matches_node must compare at least one argv fixture"
+    );
+}
+
+/// INV-57 regression test — host-environment variables (CLAUDE_CODE_ARTIFACT,
+/// CLAUDE_CODE_ENTRYPOINT, ANTHROPIC_* decoys, SSH_CONNECTION) set in the
+/// parent test process must not leak into the recorded argv/env block: the
+/// block recorded with them equals the one recorded without them.
+///
+/// Failure messages report key NAMES only — values are never printed.
+#[test]
+fn inv_57_argv_is_host_env_independent() {
+    let root = repo_root();
+    let script = root.join("porting/corpus/text-only.acp.json");
+    let transcript = root.join("porting/corpus/text-only.transcript.jsonl");
+    let fixture_path = root.join("porting/fixtures/text-only.argv.json");
+    assert!(script.exists(), "text-only script exists");
+    assert!(transcript.exists(), "text-only transcript exists");
+    assert!(fixture_path.exists(), "text-only argv fixture exists");
+
+    let agent_cmd = rust_agent_binary();
+
+    // Helper to run recorder and return the recorded argv/env Value.
+    let run = || {
+        let tmp = std::env::temp_dir().join(format!(
+            "acp-argv-env-indep-{}-{}",
+            std::process::id(),
+            NEXT_DIFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let out = tmp.join("out.jsonl");
+        let (_frames, rust_argv) =
+            run_recorder_with_argv(&agent_cmd.to_string_lossy(), &script, &transcript, &out);
+        let _ = std::fs::remove_dir_all(&tmp);
+        rust_argv
+    };
+
+    // Assert equality comparing and reporting key NAMES only (never printing values).
+    let assert_argv_env_equal = |a: &serde_json::Value, b: &serde_json::Value| {
+        assert_eq!(a["argv"], b["argv"], "argv arrays differ");
+        assert_eq!(
+            a["node_options_present"], b["node_options_present"],
+            "node_options_present differs"
+        );
+        let a_env = a["env"].as_object().expect("env object");
+        let b_env = b["env"].as_object().expect("env object");
+        let a_keys: std::collections::BTreeSet<_> = a_env.keys().collect();
+        let b_keys: std::collections::BTreeSet<_> = b_env.keys().collect();
+        assert_eq!(
+            a_keys, b_keys,
+            "env key sets differ: left={a_keys:?}, right={b_keys:?}"
+        );
+        for k in a_keys {
+            if a_env[k] != b_env[k] {
+                panic!("env value mismatch for key: {k}");
+            }
+        }
+    };
+
+    // 1. Run without extra host variables (baseline).
+    let baseline = run();
+
+    // 2. Pollute the parent process environment.
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, orig) in &self.vars {
+                match orig {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    let polluted_keys = [
+        "CLAUDE_CODE_ARTIFACT",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "ANTHROPIC_DECOY_SECRET_KEY",
+        "SSH_CONNECTION",
+    ];
+    let guard = EnvGuard {
+        vars: polluted_keys
+            .iter()
+            .map(|&k| (k, std::env::var_os(k)))
+            .collect(),
+    };
+
+    std::env::set_var("CLAUDE_CODE_ARTIFACT", "decoy-artifact-1");
+    std::env::set_var("CLAUDE_CODE_ENTRYPOINT", "host-entrypoint-decoy");
+    std::env::set_var("ANTHROPIC_DECOY_SECRET_KEY", "decoy-secret-key-12345");
+    std::env::set_var("SSH_CONNECTION", "127.0.0.1 12345 127.0.0.1 22");
+
+    let polluted = run();
+    drop(guard);
+
+    // 3. Assert baseline and polluted runs are equal.
+    assert_argv_env_equal(&baseline, &polluted);
+
+    // 4. Assert both also equal the committed Node fixture.
+    let expected: serde_json::Value = common::read_json(&fixture_path);
+    assert_argv_env_equal(&polluted, &expected);
+}
+
+#[test]
+fn inv_24_usage_scenarios() {
+    run_and_diff("usage-update");
+    run_and_diff("usage-compact");
+    run_and_diff("usage-rate-limit");
+    run_and_diff("usage-no-usage");
+    run_and_diff("usage-1m");
+    run_and_diff("usage-1m-seed");
+}
+
+/// rust-parity-fixes Phase 2 (item 2.8, P6): the session/new modes +
+/// configOptions response and the `session/set_mode|set_config_option` wire
+/// behaviour, plus the `session/set_model` -32601 parity case.
+#[test]
+fn inv_24_config_scenarios() {
+    run_and_diff("config-session-new");
+    run_and_diff("config-set-mode");
+    run_and_diff("config-set-model");
+    run_and_diff("config-set-effort");
+    run_and_diff("config-invalid");
+    run_and_diff("config-set-model-rpc");
+}
+
+/// rust-parity-fixes Phase 3 (item 3.2, P9): hook_callback handling, toolResponse meta
+/// update for every tool (hook-bash), structuredPatch and final locations for Edit
+/// (hook-edit), and optimistic creation diff replacement for Write (hook-write-existing).
+#[test]
+fn inv_24_hook_scenarios() {
+    run_and_diff("hook-bash");
+    run_and_diff("hook-edit");
+    run_and_diff("hook-write-existing");
+}
+
+/// rust-parity-fixes Phase 3 (item 3.4, X12/Decision 12): the Task* plan. Both
+/// the TaskCreated/TaskCompleted hooks (`task-plan-hooks`) and the task
+/// tool_result path (`task-plan-no-hook`) accumulate task state and publish a
+/// `plan` update exactly like Node.
+#[test]
+fn inv_24_task_plan_scenarios() {
+    run_and_diff("task-plan-hooks");
+    run_and_diff("task-plan-no-hook");
+}
+
+/// rust-parity-fixes Phase 3 (item 3.5, P10/Decision 14): `session/load`
+/// replays the stored history before the response — user/assistant chunks,
+/// thinking, tool_use/tool_result rendering, and an image user message — with
+/// frame order deterministic (the fake's initialize reply is paced with
+/// `sleep_ms`).
+#[test]
+fn inv_24_session_load_replay() {
+    run_and_diff("session-load-replay");
+    // X8: a `session/load` targeting an already-live session replays too.
+    run_and_diff("session-load-replay-live");
 }

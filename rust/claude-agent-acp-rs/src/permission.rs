@@ -26,6 +26,7 @@ use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall, ToolCallStatus}
 use serde_json::{json, Value};
 
 use crate::map::{MapState, TrackedToolCall};
+use crate::permission_options::{self, SelectionOutcome};
 use crate::tools;
 
 /// The R28 deny payload — the `canUseTool` return for a rejection, written as
@@ -449,6 +450,120 @@ pub fn allow_with_updates_control_response(
     })
 }
 
+/// An allow with `updatedPermissions` classified `user_temporary`: Node's shape
+/// for an ExitPlanMode `default` setMode allow (`effects.js` `allow(..., false)`
+/// with `updatedPermissions` present).
+pub fn allow_temporary_with_updates_control_response(
+    request_id: &str,
+    tool_use_id: &str,
+    updated_input: &Value,
+    updated_permissions: &[Value],
+) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "allow",
+                "updatedInput": updated_input,
+                "updatedPermissions": updated_permissions,
+                "toolUseID": tool_use_id,
+                "decisionClassification": "user_temporary",
+            },
+        },
+    })
+}
+
+/// A deny `control_response` that interrupts the turn (`interrupt:true`):
+/// Node's shape for ExitPlanMode's "keep planning" and clear-context choices
+/// (`effects.js` `deny(..., true)`). The R28 deny does NOT interrupt.
+pub fn deny_with_interrupt_control_response(request_id: &str, tool_use_id: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "deny",
+                "message": "User refused permission to run tool".to_string(),
+                "interrupt": true,
+                "toolUseID": tool_use_id,
+                "decisionClassification": "user_reject",
+            },
+        },
+    })
+}
+
+/// Build the `control_response` for a `session/request_permission` result using
+/// the P7 selection effects (3.6, Decision 7). Applies
+/// [`permission_options::apply_selection`] to the client's selected option id;
+/// a cancelled / malformed / unknown selection degrades to the R28 deny.
+pub fn permission_control_response(
+    response: &Value,
+    ctx: &permission_options::OptionsContext,
+    request_id: &str,
+    tool_use_id: &str,
+    input: &Value,
+) -> Value {
+    let option_id = match selected_option_id(response) {
+        Some(id) => id,
+        None => return deny_control_response(request_id, tool_use_id),
+    };
+    // Node `decodeClaudePermissionResponse` (`permissions/response.js:5-8`): a
+    // selected option id that was never offered is rejected exactly like Node's
+    // thrown `Permission option was not offered` — refuse the tool.
+    if !permission_options::option_was_offered(ctx, option_id) {
+        return deny_control_response(request_id, tool_use_id);
+    }
+    match permission_options::apply_selection(option_id, ctx) {
+        Ok(SelectionOutcome::Allow {
+            updated_permissions,
+            permanent,
+        }) => match (permanent, updated_permissions) {
+            // `permanent && Some(perms)` is every durable allow (allow-with-updates,
+            // skill exact/prefix, WebFetch/generic generated rules).
+            (true, Some(perms)) => {
+                allow_with_updates_control_response(request_id, tool_use_id, input, &perms)
+            }
+            // `!permanent && Some(perms)` is an ExitPlanMode `default` setMode
+            // allow: allow with updatedPermissions but classified user_temporary.
+            (false, Some(perms)) => allow_temporary_with_updates_control_response(
+                request_id,
+                tool_use_id,
+                input,
+                &perms,
+            ),
+            // `!permanent && None` is the one-shot `allow-once`.
+            (false, None) => allow_control_response(request_id, tool_use_id, input),
+            (_, _) => deny_control_response(request_id, tool_use_id),
+        },
+        Ok(SelectionOutcome::Deny { interrupt, .. }) => {
+            // ExitPlanMode's "keep planning" / clear-context choices interrupt the
+            // turn (Node `effects.js`); the plain R28 deny does not.
+            if interrupt {
+                deny_with_interrupt_control_response(request_id, tool_use_id)
+            } else {
+                deny_control_response(request_id, tool_use_id)
+            }
+        }
+        Err(_) => deny_control_response(request_id, tool_use_id),
+    }
+}
+
+/// Extract the chosen `optionId` from a `session/request_permission` response,
+/// or `None` when the outcome was not `selected` (cancelled or malformed).
+fn selected_option_id(response: &Value) -> Option<&str> {
+    let nested = match response.get("outcome") {
+        Some(Value::Object(nested)) => nested,
+        _ => return None,
+    };
+    if nested.get("outcome").and_then(Value::as_str) != Some("selected") {
+        return None;
+    }
+    nested.get("optionId").and_then(Value::as_str)
+}
+
 /// Parse the fields of a `can_use_tool` `control_request` frame.
 pub struct CanUseTool {
     /// The tool name.
@@ -466,6 +581,10 @@ pub struct CanUseTool {
     /// `matched_ask_rule` present or `suppress_always_allow_rule == true`: no
     /// durable choice may be offered (Node `noPersistentRule`).
     pub no_persistent_rule: bool,
+    /// The optional `display_name` label (Node `displayName`).
+    pub display_name: Option<String>,
+    /// Node's `defaultToNo` hint: lead with the reject options.
+    pub default_to_no: bool,
 }
 
 /// Parse a `can_use_tool` `control_request` frame into its fields.
@@ -500,6 +619,11 @@ pub fn parse_can_use_tool(frame: &Value) -> CanUseTool {
             .to_string(),
         no_persistent_rule: req.get("matched_ask_rule").is_some_and(|v| !v.is_null())
             || req.get("suppress_always_allow_rule") == Some(&Value::Bool(true)),
+        display_name: req
+            .get("display_name")
+            .and_then(Value::as_str)
+            .map(String::from),
+        default_to_no: req.get("default_to_no") == Some(&Value::Bool(true)),
     }
 }
 
@@ -781,5 +905,97 @@ mod tests {
         let bad =
             json!([{"type":"addRules","rules":[bash],"behavior":"allow","destination":"nowhere"}]);
         assert!(durable_bash("Bash", &bad, false).is_none());
+    }
+
+    /// Fix 1 + Fix 2 — `permission_control_response` maps an ExitPlanMode
+    /// selection to Node's control_response (setMode for mode choices, an
+    /// interrupt for "keep planning") and rejects an option id that was never
+    /// offered.
+    #[test]
+    fn inv_60_exit_plan_control_response() {
+        let ctx = |input: Value| permission_options::OptionsContext {
+            tool_name: "ExitPlanMode".to_string(),
+            display_name: None,
+            input,
+            cwd: "/repo".into(),
+            change_set: None,
+            no_persistent_rule: false,
+            default_to_no: false,
+            available_modes: vec![
+                "default".into(),
+                "acceptEdits".into(),
+                "plan".into(),
+                "auto".into(),
+                "bypassPermissions".into(),
+            ],
+            pre_plan_mode: None,
+            context_used_percent: None,
+            home_dir: None,
+        };
+        let resp =
+            |option_id: &str| json!({"outcome": {"outcome": "selected", "optionId": option_id}});
+        // exit-plan-default -> allow + setMode default, user_temporary (was a
+        // regression: it used to DENY).
+        let value = permission_control_response(
+            &resp("exit-plan-default"),
+            &ctx(json!({})),
+            "r1",
+            "toolu_1",
+            &json!({"plan": "x"}),
+        );
+        assert_eq!(value["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            value["response"]["response"]["updatedPermissions"],
+            json!([{"type":"setMode","mode":"default","destination":"session"}])
+        );
+        assert_eq!(
+            value["response"]["response"]["decisionClassification"],
+            "user_temporary"
+        );
+        assert!(value["response"]["response"]["interrupt"].is_null());
+
+        // exit-plan-auto -> allow + setMode auto, user_permanent.
+        let value = permission_control_response(
+            &resp("exit-plan-auto"),
+            &ctx(json!({})),
+            "r1",
+            "toolu_1",
+            &json!({}),
+        );
+        assert_eq!(
+            value["response"]["response"]["updatedPermissions"],
+            json!([{"type":"setMode","mode":"auto","destination":"session"}])
+        );
+        assert_eq!(
+            value["response"]["response"]["decisionClassification"],
+            "user_permanent"
+        );
+
+        // "keep planning" (reject) -> deny with interrupt:true.
+        let value = permission_control_response(
+            &resp("reject"),
+            &ctx(json!({})),
+            "r1",
+            "toolu_1",
+            &json!({}),
+        );
+        assert_eq!(value["response"]["response"]["behavior"], "deny");
+        assert_eq!(value["response"]["response"]["interrupt"], true);
+
+        // An option id that was never offered is rejected (Node `response.js`):
+        // `exit-plan-bypass` is only offered when bypass is an available mode.
+        let no_bypass_ctx = permission_options::OptionsContext {
+            available_modes: vec!["default".into(), "acceptEdits".into(), "plan".into()],
+            ..ctx(json!({}))
+        };
+        let value = permission_control_response(
+            &resp("exit-plan-bypass"),
+            &no_bypass_ctx,
+            "r1",
+            "toolu_1",
+            &json!({}),
+        );
+        assert_eq!(value["response"]["response"]["behavior"], "deny");
+        assert!(value["response"]["response"]["updatedPermissions"].is_null());
     }
 }

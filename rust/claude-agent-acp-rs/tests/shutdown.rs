@@ -153,12 +153,22 @@ async fn inv_06_eof_no_orphan() {
 async fn in_process_example_exits_zero() {
     let tmp = tmp_dir("inproc");
     let transcript = tmp.join("text-only.transcript.jsonl");
-    std::fs::write(
-        &transcript,
+    let raw =
         std::fs::read_to_string(repo_root().join("porting/corpus/text-only.transcript.jsonl"))
-            .expect("read text-only transcript"),
-    )
-    .expect("write transcript");
+            .expect("read text-only transcript");
+    let mut lines = raw.lines();
+    let init_line = lines.next().expect("init line");
+    let set_model_line = r#"{"expect":{"type":"control_request","request":{"subtype":"set_model"}},"emit":[{"type":"control_response","response":{"subtype":"success","request_id":"$REQ"}}]}"#;
+    let mut replay = String::new();
+    replay.push_str(init_line);
+    replay.push('\n');
+    replay.push_str(set_model_line);
+    replay.push('\n');
+    for line in lines {
+        replay.push_str(line);
+        replay.push('\n');
+    }
+    std::fs::write(&transcript, replay).expect("write transcript");
 
     let root = repo_root();
     let status = std::process::Command::new("cargo")
@@ -172,6 +182,7 @@ async fn in_process_example_exits_zero() {
         .current_dir(&root)
         .env("CLAUDE_CODE_EXECUTABLE", fake_claude_binary())
         .env("FAKE_CLAUDE_SCRIPT", &transcript)
+        .env("ANTHROPIC_MODEL", "sonnet")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()

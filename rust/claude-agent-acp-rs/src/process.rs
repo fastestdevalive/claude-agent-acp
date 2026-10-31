@@ -123,6 +123,28 @@ pub struct SpawnOptions {
     pub resume: Option<String>,
     /// `--model <m>` (conditional, B2 / phase 8).
     pub model: Option<String>,
+    /// `--effort <e>` (rust-parity-fixes Decision 2).
+    pub effort: Option<String>,
+    /// `--max-turns <n>`.
+    pub max_turns: Option<u32>,
+    /// `--max-budget-usd <n>`.
+    pub max_budget_usd: Option<f64>,
+    /// `--agent <a>`.
+    pub agent: Option<String>,
+    /// `--betas=a,b`.
+    pub betas: Vec<String>,
+    /// `--fallback-model <m>`.
+    pub fallback_model: Option<String>,
+    /// `--include-hook-events`.
+    pub include_hook_events: bool,
+    /// `--strict-mcp-config`.
+    pub strict_mcp_config: bool,
+    /// `--project-config-root <r>`.
+    pub project_config_root: Option<String>,
+    /// `--add-dir=<d>` (one per entry).
+    pub additional_directories: Vec<PathBuf>,
+    /// `--allowedTools <csv>`.
+    pub allowed_tools: Vec<String>,
     /// `--permission-mode <mode>`.
     pub permission_mode: Option<String>,
     /// `--setting-sources=<csv>` (default `user,project,local`).
@@ -131,6 +153,10 @@ pub struct SpawnOptions {
     pub disallowed_tools: Vec<String>,
     /// `--tools default` / `--tools <csv>`; `None` omits the flag.
     pub tools: Option<Vec<String>>,
+    /// User `extraArgs` in insertion order; a `None` value emits a bare
+    /// `--key`, otherwise `--key`,`value` (or `--key=value` when the value
+    /// starts with `-`). Emitted after `--session-id`.
+    pub extra_args: Vec<(String, Option<String>)>,
     /// `--include-partial-messages`.
     pub include_partial_messages: bool,
     /// `--permission-prompt-tool stdio`.
@@ -139,6 +165,8 @@ pub struct SpawnOptions {
     pub allow_dangerously_skip_permissions: bool,
     /// `--replay-user-messages` (plus the SDK's trailing empty value).
     pub replay_user_messages: bool,
+    /// Environment snapshot for executable resolution.
+    pub env_snapshot: crate::env_snapshot::EnvSnapshot,
 }
 
 impl Default for SpawnOptions {
@@ -150,14 +178,27 @@ impl Default for SpawnOptions {
             session_id: None,
             resume: None,
             model: None,
+            effort: None,
+            max_turns: None,
+            max_budget_usd: None,
+            agent: None,
+            betas: Vec::new(),
+            fallback_model: None,
+            include_hook_events: false,
+            strict_mcp_config: false,
+            project_config_root: None,
+            additional_directories: Vec::new(),
+            allowed_tools: Vec::new(),
             permission_mode: None,
             setting_sources: vec!["user".into(), "project".into(), "local".into()],
             disallowed_tools: Vec::new(),
             tools: None,
+            extra_args: Vec::new(),
             include_partial_messages: false,
             permission_prompt_tool: false,
             allow_dangerously_skip_permissions: false,
             replay_user_messages: false,
+            env_snapshot: crate::env_snapshot::EnvSnapshot::default(),
         }
     }
 }
@@ -179,8 +220,28 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         "stream-json".into(),
     ];
 
+    if let Some(effort) = &opts.effort {
+        argv.push(format!("--effort={effort}"));
+    }
+
+    if let Some(max_turns) = &opts.max_turns {
+        argv.push(format!("--max-turns={max_turns}"));
+    }
+
+    if let Some(max_budget) = &opts.max_budget_usd {
+        argv.push(format!("--max-budget-usd={max_budget}"));
+    }
+
     if let Some(model) = &opts.model {
         argv.push(format!("--model={model}"));
+    }
+
+    if let Some(agent) = &opts.agent {
+        argv.push(format!("--agent={agent}"));
+    }
+
+    if !opts.betas.is_empty() {
+        argv.push(format!("--betas={}", opts.betas.join(",")));
     }
 
     if opts.permission_prompt_tool {
@@ -189,6 +250,10 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
 
     if let Some(resume) = &opts.resume {
         argv.push(format!("--resume={resume}"));
+    }
+
+    if !opts.allowed_tools.is_empty() {
+        argv.push(format!("--allowedTools={}", opts.allowed_tools.join(",")));
     }
 
     if !opts.disallowed_tools.is_empty() {
@@ -215,6 +280,10 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         opts.setting_sources.join(",")
     ));
 
+    if opts.strict_mcp_config {
+        argv.push("--strict-mcp-config".into());
+    }
+
     if let Some(mode) = &opts.permission_mode {
         argv.push(format!("--permission-mode={mode}"));
     }
@@ -223,17 +292,44 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         argv.push("--allow-dangerously-skip-permissions".into());
     }
 
+    if let Some(fallback) = &opts.fallback_model {
+        argv.push(format!("--fallback-model={fallback}"));
+    }
+
+    if opts.include_hook_events {
+        argv.push("--include-hook-events".into());
+    }
+
     if opts.include_partial_messages {
         argv.push("--include-partial-messages".into());
+    }
+
+    if let Some(project_root) = &opts.project_config_root {
+        argv.push(format!("--project-config-root={project_root}"));
+    }
+
+    for dir in &opts.additional_directories {
+        argv.push(format!("--add-dir={}", dir.display()));
     }
 
     if let Some(session_id) = &opts.session_id {
         argv.push(format!("--session-id={session_id}"));
     }
 
+    for (key, value) in &opts.extra_args {
+        match value {
+            None => argv.push(format!("--{key}")),
+            Some(v) if v.len() > 1 && v.starts_with('-') => argv.push(format!("--{key}={v}")),
+            Some(v) => {
+                argv.push(format!("--{key}"));
+                argv.push(v.clone());
+            }
+        }
+    }
+
     if opts.replay_user_messages {
         // The SDK pushes `--replay-user-messages` and an empty trailing value
-        // via `Tk(extraArgs)`.
+        // via `Tk(extraArgs)` AFTER the user keys (R3).
         argv.push("--replay-user-messages".into());
         argv.push(String::new());
     }
@@ -434,6 +530,43 @@ async fn signal_group_impl(child: &mut Child, _signal: Signal) -> Result<(), Spa
         .map_err(|e| SpawnError::Signal(std::io::Error::other(format!("child.kill: {e}"))))
 }
 
+/// Compute fixed environment variables for the child process.
+///
+/// `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_SDK_READS_SESSION_STATE` are set
+/// ONLY when absent from both the parent environment and `extra_env` (mirroring
+/// Node SDK behavior).
+pub fn compute_claude_env_defaults(
+    parent_vars: impl IntoIterator<Item = (String, String)>,
+    extra_env: &[(String, String)],
+) -> Vec<(&'static str, &'static str)> {
+    let mut defaults = Vec::new();
+    let parent_map: std::collections::HashMap<String, String> = parent_vars.into_iter().collect();
+
+    let has_entrypoint = extra_env
+        .iter()
+        .any(|(k, v)| k == "CLAUDE_CODE_ENTRYPOINT" && !v.is_empty())
+        || parent_map
+            .get("CLAUDE_CODE_ENTRYPOINT")
+            .is_some_and(|v| !v.is_empty());
+    if !has_entrypoint {
+        defaults.push(("CLAUDE_CODE_ENTRYPOINT", "sdk-ts"));
+    }
+
+    defaults.push(("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"));
+
+    let has_sdk_reads = extra_env
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("CLAUDE_CODE_SDK_READS_SESSION_STATE"))
+        || parent_map
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("CLAUDE_CODE_SDK_READS_SESSION_STATE"));
+    if !has_sdk_reads {
+        defaults.push(("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"));
+    }
+
+    defaults
+}
+
 /// Apply the fixed `claude` environment (B2): merge `extra_env`, set
 /// `CLAUDE_CODE_ENTRYPOINT`, set `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`,
 /// remove `NODE_OPTIONS`. Cross-platform; no `cfg` needed here.
@@ -446,14 +579,8 @@ fn apply_claude_env(cmd: &mut Command, extra_env: &[(String, String)]) {
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
-    cmd.env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1");
-    // SDK 0.3.303 (E-15 / S-3): the SDK tells the CLI it reads session state —
-    // but ONLY when the parent does not already define it (the SDK sets it only
-    // when absent). The child inherits the parent env, so a pre-existing value
-    // must be preserved. Never print env values.
-    if std::env::var_os("CLAUDE_CODE_SDK_READS_SESSION_STATE").is_none() {
-        cmd.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
+    for (k, v) in compute_claude_env_defaults(std::env::vars(), extra_env) {
+        cmd.env(k, v);
     }
     cmd.env_remove("NODE_OPTIONS");
 }
@@ -475,13 +602,46 @@ fn configure_platform(cmd: &mut Command) {
     cmd.kill_on_drop(true);
 }
 
+/// Whether the adapter runs as root, which removes bypass-permissions
+/// availability unless the process is sandboxed (`ALLOW_BYPASS`, Decision 3).
+/// All `cfg` lives in `process.rs` (guard G9).
+#[cfg(unix)]
+pub fn is_root() -> bool {
+    nix::unistd::geteuid().is_root()
+}
+
+/// Windows has no euid; Node's `process.getuid?.() === 0` is false there.
+#[cfg(windows)]
+pub fn is_root() -> bool {
+    false
+}
+
+/// The managed (policy) settings file per OS, mirroring
+/// `getManagedSettingsPath` in `dist/settings.js` (Decision 3).
+#[cfg(target_os = "macos")]
+pub fn managed_settings_path() -> PathBuf {
+    PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json")
+}
+
+/// Windows managed settings path (`getManagedSettingsPath`).
+#[cfg(windows)]
+pub fn managed_settings_path() -> PathBuf {
+    PathBuf::from(r"C:\Program Files\ClaudeCode\managed-settings.json")
+}
+
+/// Every other unix uses the `/etc` policy path.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn managed_settings_path() -> PathBuf {
+    PathBuf::from("/etc/claude-code/managed-settings.json")
+}
+
 /// Spawn the `claude` child with the full B2 argv/env and return a [`Process`]
 /// (3.1, 3.2, 3.6).
 pub async fn spawn(opts: &SpawnOptions) -> Result<Process, SpawnError> {
     let binary = resolve_binary(
         opts.claude_path.as_deref(),
-        std::env::var("CLAUDE_CODE_EXECUTABLE").ok().as_deref(),
-        &std::env::var("PATH").unwrap_or_default(),
+        opts.env_snapshot.get("CLAUDE_CODE_EXECUTABLE"),
+        opts.env_snapshot.get("PATH").unwrap_or_default(),
         current_os(),
     )?;
     let argv = build_argv(opts);
@@ -491,10 +651,21 @@ pub async fn spawn(opts: &SpawnOptions) -> Result<Process, SpawnError> {
 /// Resolve the `claude` binary for a one-shot CLI call (`auth status`,
 /// `auth logout`) with the same precedence as [`spawn`].
 pub fn resolve_claude(claude_path: Option<&Path>) -> Result<PathBuf, ResolveError> {
+    resolve_claude_with_env(
+        claude_path,
+        &crate::env_snapshot::EnvSnapshot::from_process(),
+    )
+}
+
+/// Resolve `claude` binary using an explicit environment snapshot.
+pub fn resolve_claude_with_env(
+    claude_path: Option<&Path>,
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> Result<PathBuf, ResolveError> {
     resolve_binary(
         claude_path,
-        std::env::var("CLAUDE_CODE_EXECUTABLE").ok().as_deref(),
-        &std::env::var("PATH").unwrap_or_default(),
+        env.get("CLAUDE_CODE_EXECUTABLE"),
+        env.get("PATH").unwrap_or_default(),
         current_os(),
     )
 }
@@ -695,6 +866,39 @@ mod tests {
             "3.T10 windows"
         );
         assert_eq!(platform_binary_name(Os::Unix), "claude", "3.T10 unix");
+    }
+
+    #[test]
+    fn inv_57_claude_env_defaults_absent_only() {
+        // When absent from both parent and extra_env, defaults are set.
+        let empty_parent: Vec<(String, String)> = Vec::new();
+        let empty_extra: Vec<(String, String)> = Vec::new();
+        let defs = compute_claude_env_defaults(empty_parent, &empty_extra);
+        assert_eq!(
+            defs,
+            vec![
+                ("CLAUDE_CODE_ENTRYPOINT", "sdk-ts"),
+                ("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"),
+                ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
+            ]
+        );
+
+        // When present in parent env, entrypoint and reads_session_state are NOT defaulted.
+        let parent_with_vars = vec![
+            ("CLAUDE_CODE_ENTRYPOINT".into(), "custom-ts".into()),
+            ("CLAUDE_CODE_SDK_READS_SESSION_STATE".into(), "0".into()),
+        ];
+        let defs = compute_claude_env_defaults(parent_with_vars, &empty_extra);
+        assert_eq!(defs, vec![("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")]);
+
+        // When present in extra_env, entrypoint and reads_session_state are NOT defaulted.
+        let extra_with_vars = vec![
+            ("CLAUDE_CODE_ENTRYPOINT".into(), "user-ep".into()),
+            ("claude_code_sdk_reads_session_state".into(), "1".into()),
+        ];
+        let empty_parent: Vec<(String, String)> = Vec::new();
+        let defs = compute_claude_env_defaults(empty_parent, &extra_with_vars);
+        assert_eq!(defs, vec![("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")]);
     }
 
     #[test]

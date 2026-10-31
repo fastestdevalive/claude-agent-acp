@@ -1,0 +1,10 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "additionalDirectories": ["$CWD/extra-dir"]}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}
