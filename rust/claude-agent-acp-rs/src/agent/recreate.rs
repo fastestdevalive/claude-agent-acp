@@ -36,6 +36,10 @@ pub(super) struct ProviderUpdateEnv {
     pub sessions_view: Arc<watch::Sender<HashMap<String, (Session, Value)>>>,
     /// Set when the connection is ending: the update stops between steps.
     pub cancel: Arc<AtomicBool>,
+    /// The connection serves ACP v2 (M-118).
+    pub is_v2: bool,
+    /// The connection's v2 outbound task, when the connection negotiated v2.
+    pub v2_outbound: Option<crate::v2::agent::V2OutboundHandle>,
 }
 
 impl ProviderUpdateEnv {
@@ -415,7 +419,7 @@ async fn start_update_session(
     provider: Option<&ProviderConfig>,
 ) -> std::result::Result<(), Error> {
     validate_cwd(params.get("cwd").and_then(Value::as_str))?;
-    let initialize = initialize_options_for(params, &env.caps, env.air.as_ref())?;
+    let initialize = initialize_options_for(params, &env.caps, env.air.as_ref(), env.is_v2)?;
     let cwd = params.get("cwd").and_then(Value::as_str).map(PathBuf::from);
     let mut fresh = false;
     let (session, update_rx, auth_context, epoch) = loop {
@@ -426,6 +430,7 @@ async fn start_update_session(
         let settings_arg = claude.settings_arg.clone();
         let launch_env = claude.env.clone();
         let ask_disallowed = !env.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
+        let additional_directories = claude.additional_directories.clone();
         let mut spawn = session_spawn_options(
             opts,
             cwd.clone(),
@@ -456,7 +461,9 @@ async fn start_update_session(
             .with_raw_sdk_messages(raw_sdk_messages)
             .with_env(opts.env.clone())
             .with_logger(opts.logger.clone())
-            .with_gateway_models(providers::gateway_models_of(provider));
+            .with_gateway_models(providers::gateway_models_of(provider))
+            .with_v2(env.is_v2)
+            .with_additional_directories(additional_directories);
         let started = Session::start(sess_opts, session_id.to_string()).await;
         if recreate_falls_back_to_fresh(true, fresh, &started) {
             if let Some(logger) = &opts.logger {
@@ -520,6 +527,8 @@ async fn start_update_session(
             deferred_tx: &env.deferred_tx,
             board: &env.board,
             is_air_client: env.air.is_some(),
+            is_v2: env.is_v2,
+            v2: env.v2_outbound.as_ref(),
         },
         session_id,
         session,
@@ -604,7 +613,12 @@ async fn start_live_session(
     live_mode: String,
 ) -> std::result::Result<(), Error> {
     validate_cwd(params.get("cwd").and_then(Value::as_str))?;
-    let initialize = initialize_options_for(params, &registry.caps, registry.air.as_ref())?;
+    let initialize = initialize_options_for(
+        params,
+        &registry.caps,
+        registry.air.as_ref(),
+        registry.protocol == crate::v2::ProtocolMode::V2,
+    )?;
     let cwd = params.get("cwd").and_then(Value::as_str).map(PathBuf::from);
     let provider = registry.resolve_provider();
     let mut fresh = false;
@@ -616,6 +630,7 @@ async fn start_live_session(
         let settings_arg = claude.settings_arg.clone();
         let launch_env = claude.env.clone();
         let ask_disallowed = !registry.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
+        let additional_directories = claude.additional_directories.clone();
         let mut spawn = session_spawn_options(
             opts,
             cwd.clone(),
@@ -646,7 +661,9 @@ async fn start_live_session(
             .with_raw_sdk_messages(raw_sdk_messages)
             .with_env(opts.env.clone())
             .with_logger(opts.logger.clone())
-            .with_gateway_models(providers::gateway_models_of(provider.as_ref()));
+            .with_gateway_models(providers::gateway_models_of(provider.as_ref()))
+            .with_v2(registry.protocol == crate::v2::ProtocolMode::V2)
+            .with_additional_directories(additional_directories);
         let started = Session::start(sess_opts, session_id.to_string()).await;
         if recreate_falls_back_to_fresh(true, fresh, &started) {
             if let Some(logger) = &opts.logger {

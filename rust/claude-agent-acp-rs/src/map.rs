@@ -155,11 +155,15 @@ pub struct MapState {
     /// records (`NativeSubagentRuntime.logs`): they are drained at the session
     /// boundary so a long session does not accumulate them.
     logger: Option<std::sync::Arc<crate::logger::Logger>>,
+    /// ACP v2 session state (F39): the foreground work, its open requests, the
+    /// prompt intake replies, and the messages owed to the client
+    /// (`foregroundWork`, `openUserInputs`, `v2/prompt.ts`). Inert on v1.
+    pub(crate) v2: crate::turn_events::V2State,
 }
 
 /// A command tool: its output goes to the terminal channel (`BashReporter`,
 /// shared with PowerShell, `reporters/index.ts:23`).
-fn is_command_tool(name: &str) -> bool {
+pub(crate) fn is_command_tool(name: &str) -> bool {
     matches!(name, "Bash" | "PowerShell")
 }
 
@@ -243,6 +247,18 @@ impl MapState {
     /// Whether the client negotiated `diffPatch`.
     pub(crate) fn diff_patch(&self) -> bool {
         self.diff_patch
+    }
+
+    /// Whether the client reads the ExitPlanMode plan from
+    /// `rawInput.planFilePath` (`jetbrains.air` `planFile`).
+    pub(crate) fn plan_file(&self) -> bool {
+        self.caps.plan_file
+    }
+
+    /// Whether the client renders `rawInput` itself (`jetbrains.air`
+    /// `rawInputRendering`): it gets no display copy of the input.
+    pub(crate) fn caps_raw_input_rendering(&self) -> bool {
+        self.caps.raw_input_rendering
     }
 
     /// Record the client's tool-report capabilities (the terminal channel).
@@ -337,17 +353,22 @@ impl MapState {
             name,
             input,
             self.cwd.as_deref(),
-            self.air,
-            false,
-            self.diff_patch,
+            tools::ShapeOptions {
+                air: self.air,
+                diff_patch: self.diff_patch,
+                raw_input_rendering: self.caps.raw_input_rendering,
+                plan_file: self.caps.plan_file,
+                ..tools::ShapeOptions::default()
+            },
         )
     }
 
     /// The `rawInput` of a tool use for this client: an AIR client gets it
-    /// without the file text that the tool call's diff holds.
+    /// without the file text that the tool call's diff holds, and a `planFile`
+    /// client gets the plan file path in place of the plan text.
     pub(crate) fn raw_input(&self, name: &str, input: &Value) -> Value {
         if self.air {
-            tools::air_raw_input(name, input)
+            tools::air_raw_input_with(name, input, self.caps.plan_file)
         } else {
             input.clone()
         }
@@ -667,6 +688,38 @@ impl MapState {
         self.tool_tracker.insert(id, tracked);
     }
 
+    /// Record the merged `_meta` keys of a surfaced `tool_call`, so a later
+    /// update that repeats them is not sent (`ToolCallFieldTracker.apply` on a
+    /// `tool_call`, `field-tracker.ts:64-77`).
+    pub(crate) fn seed_tool_meta(&mut self, id: &str, meta: &serde_json::Map<String, Value>) {
+        if let Some(entry) = self.tool_tracker.get_mut(id) {
+            entry.record_meta(Some(meta));
+        }
+    }
+
+    /// [`MapState::track_tool_call_update`] with the candidate `_meta`: an
+    /// update whose fields are unchanged is still sent when a merged `_meta`
+    /// key changed (or a key outside the merged namespaces is present).
+    pub(crate) fn track_tool_call_update_with_meta(
+        &mut self,
+        id: &str,
+        fields: &ToolCallUpdateFields,
+        meta: Option<&serde_json::Map<String, Value>>,
+    ) -> Option<ToolCallUpdateFields> {
+        match self.tool_tracker.get_mut(id) {
+            Some(entry) => {
+                let meta_changed = entry.record_meta(meta);
+                let changed = entry.apply(fields, false);
+                if changed.is_empty() && !meta_changed {
+                    None
+                } else {
+                    Some(changed.into_fields())
+                }
+            }
+            None => Some(fields.clone()),
+        }
+    }
+
     /// Apply a `tool_call_update` candidate against what the client holds for
     /// `id` (2.9 / X-7): returns the sub-set of fields that actually changed
     /// (compared by value), updating the held state, or `None` when nothing
@@ -814,6 +867,9 @@ pub(crate) struct TrackedToolCall {
     locations: Vec<ToolCallLocation>,
     raw_input: Option<Value>,
     raw_output: Option<Value>,
+    /// The `claudeCode` and `jetbrains.air` keys the client holds, merged by
+    /// key (`field-tracker.ts:22-32,146-182`).
+    merged_meta: HashMap<String, String>,
     /// The content is an exact approval patch (`contentPinned`).
     content_pinned: bool,
     pub(crate) result_seen: bool,
@@ -837,9 +893,48 @@ impl TrackedToolCall {
             locations,
             raw_input,
             raw_output: None,
+            merged_meta: HashMap::new(),
             content_pinned: false,
             result_seen: false,
         }
+    }
+
+    /// Record the merged `_meta` keys of an update; returns whether any key
+    /// changed (`recordMergedMeta`, `field-tracker.ts:156-182`). A `_meta` key
+    /// outside the merged namespaces always counts as a change.
+    fn record_meta(&mut self, meta: Option<&serde_json::Map<String, Value>>) -> bool {
+        let Some(meta) = meta else {
+            return false;
+        };
+        let mut changed = meta
+            .keys()
+            .any(|key| key != "claudeCode" && key != "jetbrains");
+        let mut record = |key: String, value: &Value, changed: &mut bool| {
+            let json = value.to_string();
+            if self.merged_meta.get(&key) != Some(&json) {
+                self.merged_meta.insert(key, json);
+                *changed = true;
+            }
+        };
+        if let Some(values) = meta.get("claudeCode").and_then(Value::as_object) {
+            for (key, value) in values {
+                record(format!("claudeCode.{key}"), value, &mut changed);
+            }
+        }
+        if let Some(jetbrains) = meta.get("jetbrains").and_then(Value::as_object) {
+            for (key, value) in jetbrains {
+                if key == "air" {
+                    if let Some(air) = value.as_object() {
+                        for (air_key, air_value) in air {
+                            record(format!("jetbrains.air.{air_key}"), air_value, &mut changed);
+                        }
+                    }
+                } else {
+                    record(format!("jetbrains.{key}"), value, &mut changed);
+                }
+            }
+        }
+        changed
     }
 
     /// Compare `fields` against the held values; record and return the changed
@@ -1440,6 +1535,12 @@ fn tool_call_from_use(
         raw_input.as_ref().map(|raw| state.raw_input(&name, raw))
     };
     // 2.9 (X-7): seed the field tracker with what the client now holds.
+    let mut meta = state.use_meta(&name, &input);
+    crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
+    state.apply_terminal_info(&name, &id, &mut meta);
+    if state.air && name.starts_with("mcp__") {
+        meta.insert("is_mcp_tool_call".to_string(), Value::Bool(true));
+    }
     state.seed_tool_tracker(
         id.clone(),
         TrackedToolCall::initial(
@@ -1450,12 +1551,7 @@ fn tool_call_from_use(
             sent_raw_input.clone(),
         ),
     );
-    let mut meta = state.use_meta(&name, &input);
-    crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
-    state.apply_terminal_info(&name, &id, &mut meta);
-    if state.air && name.starts_with("mcp__") {
-        meta.insert("is_mcp_tool_call".to_string(), Value::Bool(true));
-    }
+    state.seed_tool_meta(&id, &meta);
     Some(SessionUpdate::ToolCall(
         ToolCall::new(id, shape.title)
             // E-9: the programmatic tool name (e.g. "Bash") is surfaced on the
@@ -1483,8 +1579,6 @@ fn tool_update_from_result(
         return updates;
     }
     tool_update_from_result_single(block, tool_use, state, ctx)
-        .into_iter()
-        .collect()
 }
 
 /// The reports of a finished command on the terminal channel
@@ -1561,13 +1655,14 @@ fn terminal_command_updates(
     Some(updates)
 }
 
-/// [`tool_update_from_result`] without the terminal channel: one report.
+/// [`tool_update_from_result`] without the terminal channel: one report, plus
+/// the AIR plan-file clear signal of an approved ExitPlanMode.
 fn tool_update_from_result_single(
     block: &Value,
     tool_use: &Value,
     state: &mut MapState,
     ctx: &FrameCtx,
-) -> Option<SessionUpdate> {
+) -> Vec<SessionUpdate> {
     let id = block["tool_use_id"].as_str().unwrap_or("").to_string();
     let name = tool_use["name"].as_str().unwrap_or("Other").to_string();
     let is_error = block
@@ -1592,6 +1687,17 @@ fn tool_update_from_result_single(
         // The reporter (`reporters/interaction.ts:51-72`) owns the title, the
         // display copy and the raw output; an accepted plan's title replaces
         // "Approve Plan", and AIR keeps the approval text out of `rawOutput`.
+        // A `planFile` client gets the path of the plan file in place of the
+        // plan text, and an approved plan clears it in a call of its own.
+        let plan_file = if state.caps.plan_file {
+            tools::existing_plan_file(use_input.get("planFilePath")).or_else(|| {
+                ctx.structured
+                    .as_ref()
+                    .and_then(|structured| tools::existing_plan_file(structured.get("filePath")))
+            })
+        } else {
+            None
+        };
         let result = tools::exit_plan_mode_result(block.get("content"), is_error, state.air);
         let mut fields = ToolCallUpdateFields::new().status(status);
         if let Some(title) = result.title {
@@ -1603,12 +1709,21 @@ fn tool_update_from_result_single(
         if let Some(raw_output) = result.raw_output {
             fields = fields.raw_output(raw_output);
         }
-        let fields = state.track_final_tool_call_update(&id, &fields)?;
+        if let Some(path) = &plan_file {
+            fields = fields.raw_input(tools::plan_file_input(&use_input, path));
+        }
+        let mut updates = Vec::new();
+        if let Some(fields) = state.track_final_tool_call_update(&id, &fields) {
+            updates.push(SessionUpdate::ToolCallUpdate(
+                ToolCallUpdate::new(id.clone(), fields).meta(result_meta),
+            ));
+        }
         let hook_pending = state.pending_hooks.contains(&id);
         state.finish_result_tool_tracker(&id, hook_pending);
-        return Some(SessionUpdate::ToolCallUpdate(
-            ToolCallUpdate::new(id, fields).meta(result_meta),
-        ));
+        if plan_file.is_some() && !is_error {
+            updates.push(plan_file_clear_update(&id));
+        }
+        return updates;
     }
 
     let mut raw_output = block.get("content").cloned();
@@ -1646,6 +1761,15 @@ fn tool_update_from_result_single(
             raw_output = None;
         }
     }
+    if state.air && name == "NotebookEdit" {
+        // `NotebookEditReporter.toolResult` (`reporters/file-edit.ts:203-212`):
+        // the result text repeats the new cell source that the input holds, so
+        // it stays out. A deletion has no source, so its text is shown.
+        if tools::notebook_source_present(&use_input) {
+            content = None;
+        }
+        raw_output = None;
+    }
     let mut fields = ToolCallUpdateFields::new().status(status);
     if let Some(content) = content {
         fields = fields.content(content);
@@ -1656,13 +1780,28 @@ fn tool_update_from_result_single(
 
     // 2.9 (X-7): emit only fields the client does not already hold; the
     // status always differs (Pending -> Completed/Failed) so this is `Some`.
-    let fields = state.track_final_tool_call_update(&id, &fields)?;
+    let Some(fields) = state.track_final_tool_call_update(&id, &fields) else {
+        state.finish_result_tool_tracker(&id, state.pending_hooks.contains(&id));
+        return Vec::new();
+    };
     // Entry ends after the tool_result (or kept if hook is pending, M3/Decision 12).
     let hook_pending = state.pending_hooks.contains(&id);
     state.finish_result_tool_tracker(&id, hook_pending);
-    Some(SessionUpdate::ToolCallUpdate(
+    vec![SessionUpdate::ToolCallUpdate(
         ToolCallUpdate::new(id, fields).meta(result_meta),
-    ))
+    )]
+}
+
+/// The call that clears the plan file of an approved plan for AIR
+/// (`renderer.ts:503-516`): a `tool_call` of its own under the
+/// `<id>:plan-file-clear` id, with a blank path as its clear signal.
+fn plan_file_clear_update(id: &str) -> SessionUpdate {
+    SessionUpdate::ToolCall(
+        ToolCall::new(format!("{id}:plan-file-clear"), "Exited Plan Mode")
+            .kind(ToolKind::SwitchMode)
+            .status(ToolCallStatus::Completed)
+            .raw_input(json!({"planFilePath": ""})),
+    )
 }
 
 /// 7.3/7.7 — a refining `ToolCallUpdate` for an already-surfaced tool call.
@@ -1694,9 +1833,9 @@ fn tool_call_update_refine(
     if let Some(raw_input) = raw_input {
         fields = fields.raw_input(state.raw_input(name, &raw_input));
     }
-    let fields = state.track_tool_call_update(&id, &fields)?;
     let mut meta = state.use_meta(name, &input);
     crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
+    let fields = state.track_tool_call_update_with_meta(&id, &fields, Some(&meta))?;
     Some(SessionUpdate::ToolCallUpdate(
         ToolCallUpdate::new(id, fields).meta(meta),
     ))
@@ -2057,7 +2196,10 @@ pub fn materialize_diff_old_text(tool_call: &mut Value) {
         let Value::Object(entry) = entry else {
             continue;
         };
+        // A v2 diff (`changes`/`patch`) has no `oldText`: v2 forbids the v1
+        // diff keys, so it is left as the agent built it.
         if entry.get("type").and_then(Value::as_str) == Some("diff")
+            && !entry.contains_key("changes")
             && !entry.contains_key("oldText")
         {
             entry.insert("oldText".to_string(), Value::Null);
@@ -2373,7 +2515,7 @@ fn streamed_input_refinement(
         fields = fields.locations(shape.locations);
     }
     // 2.9 (X-7): emit only fields the client does not already hold.
-    let fields = state.track_tool_call_update(id, &fields)?;
+    let fields = state.track_tool_call_update_with_meta(id, &fields, Some(&meta))?;
     Some(SessionUpdate::ToolCallUpdate(
         ToolCallUpdate::new(id.to_string(), fields).meta(meta),
     ))

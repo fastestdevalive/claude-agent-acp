@@ -232,6 +232,7 @@ impl LoopRig {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         Self {
             tx,

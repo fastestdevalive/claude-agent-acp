@@ -21,9 +21,9 @@ Mapping of the 23 shared corpus scenarios (defined in `porting/parity/PARITY-PRO
 | image_input | porting/corpus/image-prompt-echo.acp.json | alias | Multi-modal prompt carrying base64 image content |
 | slash_commands_skills | porting/corpus/commands-proactive.acp.json | alias | Slash commands listed in session and executed |
 | usage_update | porting/corpus/usage-update.acp.json | alias | Token usage tracking and metadata updates on turn completion |
-| background_after_prompt | porting/corpus/background_after_prompt.acp.json | pending:F14 | Background task started during turn; full background lifecycle handled by F14 |
+| background_after_prompt | porting/corpus/background_after_prompt.acp.json | new | Background task started during turn; full lifecycle (task_started, turn result) diffs clean against the Node fixture — tests/shared_corpus.rs::shared_background_after_prompt |
 | auth_failure | porting/corpus/auth-required.acp.json | alias | Unauthenticated session state yielding error result requiring login |
-| session_list_close_delete_fork | porting/corpus/session_list_close_delete_fork.acp.json | pending:F27 | Session lifecycle methods (list, close, delete, fork); Turn 2 lane B session_index owner |
+| session_list_close_delete_fork | porting/corpus/session_list_close_delete_fork.acp.json | new | Session lifecycle methods (list, close, delete, fork-after-close error) diff clean against the Node fixture — tests/shared_corpus.rs::shared_session_list_close_delete_fork |
 | initialize_capabilities | porting/corpus/initialize-capabilities-plain.acp.json | alias | Protocol version negotiation and client/agent capabilities handshake |
 | mcp_stdio | porting/corpus/mcp-config-stdio.acp.json | alias | MCP server configured over stdio in session initialization |
-| subagent | porting/corpus/subagent.acp.json | pending:F14 | Subagent / child task lifecycle; full subagent wiring owned by F14/F35 |
+| subagent | porting/corpus/subagent.acp.json | new | Task tool call launches a child agent; child lifecycle frames diff clean against the Node fixture — tests/shared_corpus.rs::shared_subagent |

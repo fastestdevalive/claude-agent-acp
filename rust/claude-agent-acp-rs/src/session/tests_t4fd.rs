@@ -757,6 +757,7 @@ async fn t4fd_autonomous_cycle_refuses_remote_control() {
             action: crate::control::RemoteControlAction::Connect { name: None },
         },
         reply: reply_tx,
+        accepted: None,
     })
     .expect("the actor is alive");
     let result = tokio::time::timeout(Duration::from_secs(2), reply_rx)
@@ -816,6 +817,7 @@ async fn t4fd_a_withdrawn_parked_request_is_not_presented() {
         crate::sdk_options::RawSdkMessages::Off,
         crate::env_snapshot::EnvSnapshot::empty(),
         None,
+        Vec::new(),
     ));
     // Drain the child's stdin so the duplex never fills up.
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();

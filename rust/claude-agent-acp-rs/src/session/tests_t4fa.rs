@@ -415,6 +415,7 @@ fn t4fa_usage_turn_is_removed_when_it_settles_without_a_result() {
         &mut rig.ext.titles,
         &mut rig.ext.t2a.failures,
         &mut rig.ext.t2a.usage_turns,
+        &mut crate::session::FileChangeReports::default(),
     );
     assert!(
         rig.ext.t2a.usage_turns.get("p1").is_none(),

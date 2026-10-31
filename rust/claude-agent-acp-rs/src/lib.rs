@@ -22,6 +22,7 @@ pub mod dispatch;
 pub mod elicitation;
 pub mod env_snapshot;
 pub mod event_loop_yield;
+pub mod file_change_audit;
 pub mod fork_session;
 pub mod gateway_models;
 pub mod goal;
@@ -35,8 +36,10 @@ pub mod meta_filter;
 pub mod native_subagents;
 pub mod notices;
 pub mod permission;
+pub mod permission_effects;
 pub mod permission_mode;
 pub mod permission_options;
+pub mod permission_response;
 pub mod process;
 pub mod prompt_suggestions;
 pub mod quota;
@@ -54,16 +57,25 @@ pub mod session_timing;
 pub mod session_titles;
 pub mod settings;
 pub mod settings_manager;
+pub mod subagent_history;
+pub mod subagent_replay;
 pub mod system_prompt;
 pub mod tool_meta;
 pub mod tool_reporters_compaction;
 pub mod tools;
 pub mod transcript;
 pub mod turn;
+pub mod turn_events;
 pub mod unfinished;
 pub mod usage;
 pub mod usage_markdown;
 pub mod v2;
+
+#[cfg(test)]
+mod tests_t6a2;
+
+#[cfg(test)]
+mod tests_t7c;
 
 // Public library surface mirroring upstream `src/lib.ts` (FX-4 / O-83, Q-19).
 pub use agent::serve as run_acp;

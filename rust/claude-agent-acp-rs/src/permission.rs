@@ -280,12 +280,197 @@ pub fn durable_bash(
     })
 }
 
+/// Everything `AcpToolCallRenderer.permissionToolCall` reads
+/// (`tool-calls/renderer.ts:307-348`, `permissions/presentation.ts:60-136`).
+#[derive(Debug, Clone, Default)]
+pub struct PermissionToolCall {
+    pub tool_name: String,
+    pub tool_input: Value,
+    pub tool_use_id: String,
+    /// The subagent attribution of the request's owner (`toolUseOwner`).
+    pub parent_tool_use_id: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
+    /// Whether the client is AIR: its `toolCall` is the minimal shape.
+    pub air: bool,
+    /// Whether the client reads the ExitPlanMode plan from `rawInput.planFilePath`
+    /// (`jetbrains.air` `planFile`).
+    pub plan_file: bool,
+    /// Whether the client renders a command's terminal (`hasTerminal`): the
+    /// content is then the terminal marker, not the display copy.
+    pub terminal_output: bool,
+    /// `options.title`: the subject of a network/computer-use request, else
+    /// the tool call's own heading.
+    pub title: Option<String>,
+    /// `previewContent`: the exact patch a `diffPatch`/v2 client negotiated.
+    pub preview_content: Option<Value>,
+    /// `blockedPath`: a path the tool may not touch, added as an extra location
+    /// when the tool call does not already carry it (P-53).
+    pub blocked_path: Option<String>,
+    /// `fallbackContent`: the JSON input shown when the call has no content.
+    pub fallback_content: Option<Value>,
+    /// The CLI's `mcpServer {name, source}` (SDK 0.3.274+).
+    pub mcp_server: Option<Value>,
+}
+
 /// Build the `toolCall` object carried in a `session/request_permission`
-/// (port of the `canUseTool` `toolCall` field, `acp-agent.js:4194-4211`).
+/// (port of `AcpToolCallRenderer.permissionToolCall`, `renderer.ts:307-348`).
 ///
-/// The tool is shaped by `tools::tool_shape`, so `kind`/`title`/`content`/
-/// `locations` match the streamed `tool_call`. A `parentToolUseId` (subagent
-/// attribution) is carried in `_meta.claudeCode`, mirroring the streamed path.
+/// A client that is not AIR gets the whole tool call again (name, status,
+/// rawInput, title, kind, content, locations, `_meta`); AIR gets the minimal
+/// shape (`toolCallId`, `title`, `rawInput`, plus the preview content, the extra
+/// locations and `_meta` when the request has them). The tool is shaped by
+/// `tools::tool_shape`, so the heading and the facts match the streamed
+/// `tool_call` (P-16).
+pub fn build_permission_tool_call(input: &PermissionToolCall) -> Value {
+    let cwd = input.cwd.as_deref();
+    let shape = tools::tool_shape(&input.tool_name, &input.tool_input, cwd);
+    let title = input.title.clone().unwrap_or_else(|| shape.title.clone());
+    let meta = permission_tool_call_meta(
+        input.air,
+        &input.tool_name,
+        input.parent_tool_use_id.as_deref(),
+        input.mcp_server.as_ref(),
+    );
+    // `presentation.ts:95-106`: the blocked path is compacted to one line of at
+    // most 4096 characters, and added only when the tool call's own locations do
+    // not already name it.
+    let blocked_path = input
+        .blocked_path
+        .as_deref()
+        .and_then(|path| tools::human_text(path, 4_096, true));
+    let extra_locations: Vec<Value> = match &blocked_path {
+        Some(path)
+            if !shape
+                .locations
+                .iter()
+                .any(|location| location.path.to_string_lossy() == *path) =>
+        {
+            vec![json!({ "path": path })]
+        }
+        _ => Vec::new(),
+    };
+    if input.air {
+        // Node's AIR branch (`renderer.ts:333-346`): the id, the title and
+        // `rawInput` (without the file text a diff already holds); the client
+        // already holds the streamed tool call. The preview patch, the extra
+        // locations and `_meta` ride only when the request adds them.
+        let mut tc = serde_json::Map::new();
+        tc.insert(
+            "toolCallId".into(),
+            Value::String(input.tool_use_id.clone()),
+        );
+        tc.insert("title".into(), Value::String(title));
+        tc.insert(
+            "rawInput".into(),
+            tools::air_raw_input_with(&input.tool_name, &input.tool_input, input.plan_file),
+        );
+        if let Some(preview) = &input.preview_content {
+            tc.insert("content".into(), preview.clone());
+        }
+        if !extra_locations.is_empty() {
+            let mut locations: Vec<Value> = shape
+                .locations
+                .iter()
+                .filter_map(|location| serde_json::to_value(location).ok())
+                .collect();
+            locations.extend(extra_locations);
+            tc.insert("locations".into(), Value::Array(locations));
+        }
+        if let Some(meta) = meta {
+            tc.insert("_meta".into(), meta);
+        }
+        return Value::Object(tc);
+    }
+    let mut tc = serde_json::Map::new();
+    tc.insert(
+        "toolCallId".into(),
+        Value::String(input.tool_use_id.clone()),
+    );
+    // E-9: the request_permission `toolCall` carries the programmatic tool name
+    // and an explicit `status:"pending"` (the pinned crate's pending is the
+    // default, so it is spelled out here), unlike the pre-0.94.0 shape.
+    tc.insert("name".into(), Value::String(input.tool_name.clone()));
+    tc.insert(
+        "status".into(),
+        serde_json::to_value(ToolCallStatus::Pending).unwrap_or(Value::Null),
+    );
+    tc.insert("rawInput".into(), input.tool_input.clone());
+    // Node's key order (`renderer.ts:315-330`): title before kind.
+    tc.insert("title".into(), Value::String(title));
+    tc.insert(
+        "kind".into(),
+        serde_json::to_value(shape.kind).unwrap_or(Value::Null),
+    );
+    // `toolUseContent` (`renderer.ts:750-757`): the terminal marker of a
+    // command the client renders, else the display copy / change the shape
+    // already holds; the preview patch wins over both.
+    let mut content = input.preview_content.clone().unwrap_or_else(|| {
+        if input.terminal_output && crate::map::is_command_tool(&input.tool_name) {
+            json!([{ "type": "terminal", "terminalId": input.tool_use_id }])
+        } else {
+            serde_json::to_value(&shape.content).unwrap_or_else(|_| json!([]))
+        }
+    });
+    if content.as_array().is_some_and(Vec::is_empty) {
+        if let Some(fallback) = &input.fallback_content {
+            content = fallback.clone();
+        }
+    }
+    tc.insert("content".into(), content);
+    if !shape.locations.is_empty() || !extra_locations.is_empty() {
+        let mut locations: Vec<Value> = shape
+            .locations
+            .iter()
+            .filter_map(|location| serde_json::to_value(location).ok())
+            .collect();
+        locations.extend(extra_locations);
+        tc.insert("locations".into(), Value::Array(locations));
+    }
+    if let Some(meta) = meta {
+        tc.insert("_meta".into(), meta);
+    }
+    let mut val = Value::Object(tc);
+    crate::map::materialize_tool_call_defaults(&mut val);
+    crate::map::materialize_diff_old_text(&mut val);
+    val
+}
+
+/// The `_meta` of a permission request's `toolCall` (`acp-agent.ts:10160-10168`):
+/// `claudeCode` carries `toolName` and `parentToolUseId` for every client that
+/// is not AIR, and the CLI's `mcpServer {name, source}` for every client that
+/// has one. AIR already holds the tool name and the parent call, so its
+/// `claudeCode` object carries only the MCP server (P-57).
+fn permission_tool_call_meta(
+    air: bool,
+    tool_name: &str,
+    parent_tool_use_id: Option<&str>,
+    mcp_server: Option<&Value>,
+) -> Option<Value> {
+    if mcp_server.is_none() && (parent_tool_use_id.is_none() || air) {
+        return None;
+    }
+    let mut claude_code = serde_json::Map::new();
+    if !air {
+        claude_code.insert("toolName".into(), Value::String(tool_name.to_string()));
+        if let Some(parent) = parent_tool_use_id {
+            claude_code.insert("parentToolUseId".into(), Value::String(parent.to_string()));
+        }
+    }
+    if let Some(server) = mcp_server {
+        let mut object = serde_json::Map::new();
+        if let Some(name) = server.get("name").filter(|v| !v.is_null()) {
+            object.insert("name".into(), name.clone());
+        }
+        if let Some(source) = server.get("source").filter(|v| !v.is_null()) {
+            object.insert("source".into(), source.clone());
+        }
+        claude_code.insert("mcpServer".into(), Value::Object(object));
+    }
+    Some(json!({ "claudeCode": claude_code }))
+}
+
+/// The pre-presentation call shape: the whole tool call (or AIR's minimal one)
+/// without a preview, extra locations or `_meta` beyond the parent attribution.
 pub fn build_tool_call(
     tool_name: &str,
     tool_input: &Value,
@@ -294,62 +479,15 @@ pub fn build_tool_call(
     cwd: Option<&std::path::Path>,
     air: bool,
 ) -> Value {
-    let shape = tools::tool_shape(tool_name, tool_input, cwd);
-    if air {
-        // Node's AIR `permissionToolCall` (`renderer.ts:333-341`) sends only
-        // the id, the title and `rawInput` (without the file text that a diff
-        // holds); the client already holds the streamed tool call. It never
-        // sends `name`/`status`/`kind`/`content`/`locations`/`_meta`.
-        let mut tc = serde_json::Map::new();
-        tc.insert("toolCallId".into(), Value::String(tool_use_id.to_string()));
-        tc.insert("title".into(), Value::String(shape.title.clone()));
-        tc.insert(
-            "rawInput".into(),
-            tools::air_raw_input(tool_name, tool_input),
-        );
-        return Value::Object(tc);
-    }
-    let mut tc = serde_json::Map::new();
-    tc.insert("toolCallId".into(), Value::String(tool_use_id.to_string()));
-    // E-9: the request_permission `toolCall` carries the programmatic tool name
-    // and an explicit `status:"pending"` (the pinned crate's pending is the
-    // default, so it is spelled out here), unlike the pre-0.94.0 shape.
-    tc.insert("name".into(), Value::String(tool_name.to_string()));
-    tc.insert(
-        "status".into(),
-        serde_json::to_value(ToolCallStatus::Pending).unwrap_or(Value::Null),
-    );
-    tc.insert("rawInput".into(), tool_input.clone());
-    tc.insert(
-        "kind".into(),
-        serde_json::to_value(shape.kind).unwrap_or(Value::Null),
-    );
-    tc.insert("title".into(), Value::String(shape.title.clone()));
-    tc.insert(
-        "content".into(),
-        serde_json::to_value(&shape.content).unwrap_or_else(|_| json!([])),
-    );
-    if !shape.locations.is_empty() {
-        tc.insert(
-            "locations".into(),
-            serde_json::to_value(&shape.locations).unwrap_or_else(|_| json!([])),
-        );
-    }
-    if let Some(parent) = parent_tool_use_id {
-        tc.insert(
-            "_meta".into(),
-            json!({
-                "claudeCode": {
-                    "toolName": tool_name,
-                    "parentToolUseId": parent,
-                }
-            }),
-        );
-    }
-    let mut val = Value::Object(tc);
-    crate::map::materialize_tool_call_defaults(&mut val);
-    crate::map::materialize_diff_old_text(&mut val);
-    val
+    build_permission_tool_call(&PermissionToolCall {
+        tool_name: tool_name.to_string(),
+        tool_input: tool_input.clone(),
+        tool_use_id: tool_use_id.to_string(),
+        parent_tool_use_id: parent_tool_use_id.map(String::from),
+        cwd: cwd.map(std::path::Path::to_path_buf),
+        air,
+        ..Default::default()
+    })
 }
 
 /// Emit the `tool_call` a permission request references if the client has not
@@ -387,9 +525,13 @@ pub fn ensure_tool_call_emitted(
         tool_name,
         tool_input,
         cwd,
-        state.is_air(),
-        false,
-        state.diff_patch(),
+        tools::ShapeOptions {
+            air: state.is_air(),
+            diff_patch: state.diff_patch(),
+            raw_input_rendering: state.caps_raw_input_rendering(),
+            plan_file: state.plan_file(),
+            ..tools::ShapeOptions::default()
+        },
     );
     state.apply_terminal_content(tool_name, tool_use_id, &mut shape);
     let raw_input = state.raw_input(tool_name, tool_input);
@@ -543,7 +685,8 @@ pub fn deny_with_interrupt_control_response(
 /// Build the `control_response` for a `session/request_permission` result using
 /// the P7 selection effects (3.6, Decision 7). Applies
 /// [`permission_options::apply_selection`] to the client's selected option id;
-/// a cancelled / malformed / unknown selection degrades to the R28 deny.
+/// a cancelled / malformed / unknown selection is the SDK's error verdict
+/// (`permissions/response.ts`, P-35/P-36), never a deny.
 pub fn permission_control_response(
     response: &Value,
     ctx: &permission_options::OptionsContext,
@@ -586,57 +729,55 @@ pub fn permission_control_response_with_fallback(
     tool_use_id: &str,
     input: &Value,
 ) -> (Value, bool) {
-    let option_id = match selected_option_id(response) {
-        Some(id) => id,
-        None => return (deny_control_response(request_id, tool_use_id), false),
+    // Node's `decodeClaudePermissionResponse` (`permissions/response.ts:10-36`):
+    // a non-selected outcome, an id that was never offered, and an id no effect
+    // knows all THROW. The SDK turns the throw into an error `control_response`
+    // (`sdk.mjs` `handleControlRequest`), not into a deny verdict (P-35/P-36).
+    let decoded = match crate::permission_response::decode_claude_permission_response(response, ctx)
+    {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return (
+                crate::permission_response::error_control_response(request_id, &error),
+                false,
+            )
+        }
     };
-    // Node `decodeClaudePermissionResponse` (`permissions/response.js:5-8`): a
-    // selected option id that was never offered is rejected exactly like Node's
-    // thrown `Permission option was not offered` — refuse the tool.
-    if !permission_options::option_was_offered(ctx, option_id) {
-        return (deny_control_response(request_id, tool_use_id), false);
-    }
-    let selection = permission_options::apply_selection(option_id, ctx);
-    let fallback = match &selection {
-        Ok(outcome) => fallback_rewrite_applies(ctx, outcome),
-        Err(_) => false,
-    };
-    let selection = selection.map(|outcome| {
+    let fallback = fallback_rewrite_applies(ctx, &decoded.outcome);
+    let selection = match decoded.outcome {
         // Node `applyPermissionFallback` (`session-mode.ts:196-215`) runs on
         // every permission result: an allow that activates Auto on a model
         // without it is rewritten to Accept edits. The caller publishes the
         // fallback warning before the mode update.
-        match outcome {
-            SelectionOutcome::Allow {
-                updated_permissions,
-                permanent,
-            } => SelectionOutcome::Allow {
-                updated_permissions: updated_permissions.map(|updates| {
-                    updates
-                        .into_iter()
-                        .map(|mut update| {
-                            if ctx.auto_unavailable
-                                && update.get("type").and_then(Value::as_str) == Some("setMode")
-                                && update.get("mode").and_then(Value::as_str) == Some("auto")
-                            {
-                                if let Some(object) = update.as_object_mut() {
-                                    object.insert("mode".into(), json!("acceptEdits"));
-                                }
-                            }
-                            update
-                        })
-                        .collect()
-                }),
-                permanent,
-            },
-            other => other,
-        }
-    });
-    let value = match selection {
-        Ok(SelectionOutcome::Allow {
+        SelectionOutcome::Allow {
             updated_permissions,
             permanent,
-        }) => match (permanent, updated_permissions) {
+        } => SelectionOutcome::Allow {
+            updated_permissions: updated_permissions.map(|updates| {
+                updates
+                    .into_iter()
+                    .map(|mut update| {
+                        if ctx.auto_unavailable
+                            && update.get("type").and_then(Value::as_str) == Some("setMode")
+                            && update.get("mode").and_then(Value::as_str) == Some("auto")
+                        {
+                            if let Some(object) = update.as_object_mut() {
+                                object.insert("mode".into(), json!("acceptEdits"));
+                            }
+                        }
+                        update
+                    })
+                    .collect()
+            }),
+            permanent,
+        },
+        other => other,
+    };
+    let value = match selection {
+        SelectionOutcome::Allow {
+            updated_permissions,
+            permanent,
+        } => match (permanent, updated_permissions) {
             // `permanent && Some(perms)` is every durable allow (allow-with-updates,
             // skill exact/prefix, WebFetch/generic generated rules).
             (true, Some(perms)) => {
@@ -654,7 +795,7 @@ pub fn permission_control_response_with_fallback(
             (false, None) => allow_control_response(request_id, tool_use_id, input),
             (_, _) => deny_control_response(request_id, tool_use_id),
         },
-        Ok(SelectionOutcome::Deny { interrupt, message }) => {
+        SelectionOutcome::Deny { interrupt, message } => {
             // ExitPlanMode's "keep planning" / clear-context choices interrupt the
             // turn (Node `effects.js`); the plain R28 deny does not.
             if interrupt {
@@ -663,7 +804,6 @@ pub fn permission_control_response_with_fallback(
                 deny_control_response(request_id, tool_use_id)
             }
         }
-        Err(_) => deny_control_response(request_id, tool_use_id),
     };
     (value, fallback)
 }
@@ -702,6 +842,27 @@ pub struct CanUseTool {
     pub display_name: Option<String>,
     /// Node's `defaultToNo` hint: lead with the reject options.
     pub default_to_no: bool,
+    /// The CLI's `blocked_path`: a path the tool may not touch, shown as an
+    /// extra location on the permission `toolCall` (P-53).
+    pub blocked_path: Option<String>,
+    /// The CLI's `decision_reason`: shown as the `Reason:` description of the
+    /// permission prompt (P-52).
+    pub decision_reason: Option<String>,
+    /// The CLI's `mcp_server {name, source}` of an `mcp__*` tool (SDK
+    /// 0.3.274+), forwarded in `_meta.claudeCode` (P-57).
+    pub mcp_server: Option<Value>,
+}
+
+/// JavaScript truthiness for a wire value (`sdk.mjs` spreads `matched_ask_rule`
+/// only when it is truthy).
+fn js_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(boolean) => *boolean,
+        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
 }
 
 /// Parse a `can_use_tool` `control_request` frame into its fields.
@@ -734,13 +895,32 @@ pub fn parse_can_use_tool(frame: &Value) -> CanUseTool {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        no_persistent_rule: req.get("matched_ask_rule").is_some_and(|v| !v.is_null())
+        // `matchedAskRule !== undefined` (`acp-agent.ts:10127`) is true only when
+        // the SDK mapped the field, and the SDK spreads it only for a truthy
+        // `matched_ask_rule` (`sdk.mjs` `processControlRequest`): a JSON null,
+        // false, 0 or "" is absent, while `{}` or any other value is present
+        // (P-41).
+        no_persistent_rule: req.get("matched_ask_rule").is_some_and(js_truthy)
             || req.get("suppress_always_allow_rule") == Some(&Value::Bool(true)),
         display_name: req
             .get("display_name")
             .and_then(Value::as_str)
             .map(String::from),
         default_to_no: req.get("default_to_no") == Some(&Value::Bool(true)),
+        blocked_path: req
+            .get("blocked_path")
+            .and_then(Value::as_str)
+            .map(String::from),
+        decision_reason: req
+            .get("decision_reason")
+            .and_then(Value::as_str)
+            .map(String::from),
+        // The SDK spreads `mcpServer` only for a truthy `mcp_server`
+        // (`sdk.mjs` `processControlRequest`).
+        mcp_server: req
+            .get("mcp_server")
+            .filter(|value| js_truthy(value))
+            .cloned(),
     }
 }
 
@@ -1047,6 +1227,67 @@ mod tests {
         );
     }
 
+    /// `acp-agent.test.ts` > "does not promise an ineffective always-allow
+    /// fallback for a forced ask rule": a `matched_ask_rule` present on the
+    /// wire suppresses every persistent option (P-41). The SDK maps the field
+    /// only when it is truthy (`sdk.mjs` `processControlRequest`), so a null,
+    /// false, 0 or "" is absent while `{}` is present.
+    #[test]
+    fn t6a2_matched_ask_rule_presence_test() {
+        let can = |value: Value| {
+            parse_can_use_tool(&json!({
+                "type": "control_request",
+                "request_id": "r1",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "terraform destroy"},
+                    "tool_use_id": "tool-1",
+                    "matched_ask_rule": value,
+                }
+            }))
+        };
+        assert!(
+            can(json!({"source": "projectSettings", "tool_name": "Bash"})).no_persistent_rule,
+            "a matched ask rule forces the prompt and suppresses the durable choice"
+        );
+        assert!(
+            can(json!({})).no_persistent_rule,
+            "an empty object is truthy"
+        );
+        for absent in [Value::Null, json!(false), json!(0), json!("")] {
+            assert!(
+                !can(absent.clone()).no_persistent_rule,
+                "{absent} is falsy in JS, so the SDK never maps matchedAskRule"
+            );
+        }
+        // `suppress_always_allow_rule === true` is its own, exact test.
+        assert!(
+            parse_can_use_tool(&json!({
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "rm -rf build"},
+                    "tool_use_id": "tool-1",
+                    "suppress_always_allow_rule": true,
+                }
+            }))
+            .no_persistent_rule
+        );
+        assert!(
+            !parse_can_use_tool(&json!({
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "rm -rf build"},
+                    "tool_use_id": "tool-1",
+                    "suppress_always_allow_rule": false,
+                }
+            }))
+            .no_persistent_rule
+        );
+    }
+
     fn add_rules(rules: Value) -> Value {
         json!([{"type":"addRules","rules":rules,"behavior":"allow","destination":"localSettings"}])
     }
@@ -1243,6 +1484,8 @@ mod tests {
 
         // An option id that was never offered is rejected (Node `response.js`):
         // `exit-plan-bypass` is only offered when bypass is an available mode.
+        // The rejection is the SDK's error verdict (`subtype:"error"`), not a
+        // deny (P-35).
         let no_bypass_ctx = permission_options::OptionsContext {
             available_modes: vec!["default".into(), "acceptEdits".into(), "plan".into()],
             ..ctx(json!({}))
@@ -1254,8 +1497,12 @@ mod tests {
             "toolu_1",
             &json!({}),
         );
-        assert_eq!(value["response"]["response"]["behavior"], "deny");
-        assert!(value["response"]["response"]["updatedPermissions"].is_null());
+        assert_eq!(value["response"]["subtype"], "error");
+        assert_eq!(
+            value["response"]["error"],
+            json!("Permission option was not offered: exit-plan-bypass")
+        );
+        assert!(value["response"]["response"].is_null());
     }
 
     /// G2c-fix 4: Node's `applyPermissionFallback` rewrites and warns for ANY

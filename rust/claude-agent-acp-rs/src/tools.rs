@@ -35,6 +35,10 @@ pub struct ToolShape {
     pub title: String,
     pub locations: Vec<ToolCallLocation>,
     pub content: Vec<ToolCallContent>,
+    /// The content is a display copy of the input (`ToolUseFacts.display`,
+    /// `renderer.ts:750-757`), not a change. AIR renders `rawInput` itself, so
+    /// a `rawInputRendering` client gets no display copy.
+    pub display_only: bool,
 }
 
 /// Upstream `ClaudePlanEntry` (`tools.ts:65-69`).
@@ -76,6 +80,7 @@ impl ToolShape {
             title: title.into(),
             locations: Vec::new(),
             content: Vec::new(),
+            display_only: false,
         }
     }
 
@@ -84,8 +89,17 @@ impl ToolShape {
         self
     }
 
+    /// The change of the tool (a diff): kept for every client.
     fn content(mut self, content: Vec<ToolCallContent>) -> Self {
         self.content = content;
+        self
+    }
+
+    /// A display copy of the input (`facts.display`): dropped for a client
+    /// that renders `rawInput` itself.
+    fn display(mut self, content: Vec<ToolCallContent>) -> Self {
+        self.content = content;
+        self.display_only = true;
         self
     }
 }
@@ -642,7 +656,7 @@ pub(crate) fn is_js_space(c: char) -> bool {
 /// Node's `humanText` (`permissions/presentation.ts:35-52`): control
 /// characters removed, trimmed (all whitespace runs folded when `single_line`),
 /// and `None` when empty or longer than `max_len` UTF-16 units.
-fn human_text(value: &str, max_len: usize, single_line: bool) -> Option<String> {
+pub(crate) fn human_text(value: &str, max_len: usize, single_line: bool) -> Option<String> {
     let without_controls: String = value
         .chars()
         .filter(|c| {
@@ -687,18 +701,17 @@ pub fn permission_subject(
         .flatten()
 }
 
-/// The AIR-only permission presentation `_meta` of a `session/request_permission`
-/// (`buildClaudePermissionPresentation`, `permissions/presentation.ts:70-136`):
-/// the heading and the explanation of the prompt. `tool_call_title` is the
-/// title of the request's tool call.
-pub fn air_permission_meta(
+/// The title and explanation of a permission prompt (upstream `permissions/presentation.ts:82-94`).
+///
+/// Computes the heading (`title`) and reason (`description`), shared between AIR metadata
+/// and ACP v2 permission presentation.
+pub fn permission_title_and_description(
     tool_name: &str,
     input: &Value,
     display_name: Option<&str>,
     tool_call_title: &str,
     decision_reason: Option<&str>,
-    default_to_no: bool,
-) -> Value {
+) -> (String, Option<String>) {
     let call_title = permission_subject(tool_name, input, display_name)
         .unwrap_or_else(|| tool_call_title.to_string());
     let permission_title = if tool_name == "ExitPlanMode" {
@@ -716,6 +729,28 @@ pub fn air_permission_meta(
     let description = decision_reason
         .and_then(|reason| human_text(reason, 4_000, false))
         .map(|reason| format!("Reason: {reason}"));
+    (title, description)
+}
+
+/// The AIR-only permission presentation `_meta` of a `session/request_permission`
+/// (`buildClaudePermissionPresentation`, `permissions/presentation.ts:70-136`):
+/// the heading and the explanation of the prompt. `tool_call_title` is the
+/// title of the request's tool call.
+pub fn air_permission_meta(
+    tool_name: &str,
+    input: &Value,
+    display_name: Option<&str>,
+    tool_call_title: &str,
+    decision_reason: Option<&str>,
+    default_to_no: bool,
+) -> Value {
+    let (title, description) = permission_title_and_description(
+        tool_name,
+        input,
+        display_name,
+        tool_call_title,
+        decision_reason,
+    );
     let mut payload = serde_json::Map::new();
     payload.insert("version".into(), Value::from(1));
     payload.insert("title".into(), Value::String(title));
@@ -734,6 +769,18 @@ pub fn air_permission_meta(
 /// `reporters/file-edit.ts:55,119`). Every other tool, and every other client,
 /// gets the input as it is.
 pub fn air_raw_input(name: &str, input: &Value) -> Value {
+    air_raw_input_with(name, input, false)
+}
+
+/// [`air_raw_input`] with the AIR `planFile` capability: an ExitPlanMode whose
+/// `planFilePath` names an existing file gets the path in place of the plan
+/// text (`AcpToolCallRenderer.rawInput`, `renderer.ts:729-743`).
+pub fn air_raw_input_with(name: &str, input: &Value, plan_file: bool) -> Value {
+    if name == "ExitPlanMode" && plan_file {
+        if let Some(path) = existing_plan_file(input.get("planFilePath")) {
+            return plan_file_input(input, &path);
+        }
+    }
     let Some(obj) = input.as_object() else {
         return input.clone();
     };
@@ -771,6 +818,47 @@ pub fn air_raw_input(name: &str, input: &Value) -> Value {
     Value::Object(stripped)
 }
 
+/// The absolute path of a regular file (`existingPlanFile`,
+/// `reporters/interaction.ts:84-92`): anything else, including a missing file,
+/// is no plan file.
+pub fn existing_plan_file(value: Option<&Value>) -> Option<String> {
+    let path = value.and_then(Value::as_str)?;
+    let path = Path::new(path);
+    if !path.is_absolute() || !path.is_file() {
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// The input with the path of the plan file in place of the plan text
+/// (`planFileInput`, `renderer.ts:810-818`).
+pub fn plan_file_input(raw_input: &Value, plan_file_path: &str) -> Value {
+    let mut input = raw_input.as_object().cloned().unwrap_or_default();
+    input.remove("plan");
+    input.insert(
+        "planFilePath".into(),
+        Value::String(plan_file_path.to_string()),
+    );
+    Value::Object(input)
+}
+
+/// The display copy of a NotebookEdit's new cell source
+/// (`notebookSource`, `reporters/file-edit.ts:215-220`): the source wrapped in
+/// a markdown fence. A deletion has no source.
+pub fn notebook_source(input: &Value) -> Option<Vec<ToolCallContent>> {
+    if input.get("edit_mode").and_then(Value::as_str) == Some("delete") {
+        return None;
+    }
+    let source = input.get("new_source").and_then(Value::as_str)?;
+    Some(vec![text_content(markdown_escape(source))])
+}
+
+/// Whether a NotebookEdit carries a new cell source, which its result text
+/// repeats (`reporters/file-edit.ts:203-212`).
+pub fn notebook_source_present(input: &Value) -> bool {
+    notebook_source(input).is_some()
+}
+
 /// Per-tool ACP shape from a tool name + input (port of `toolInfoFromToolUse`,
 /// `src/tools.ts:131-502`). `cwd` relativises the displayed file paths
 /// (`toDisplayPath`, Decision 6); `supportsTerminalOutput` is always `false`.
@@ -778,11 +866,31 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
     tool_shape_with(name, input, cwd, false)
 }
 
+/// The rendering choices of one client: the AIR flavour of the reporter facts
+/// (`AskUserQuestion`'s fixed title), the replay flag, and the `diffPatch` /
+/// `rawInputRendering` / `planFile` capabilities (`ClientCapabilities`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShapeOptions {
+    pub air: bool,
+    pub replay: bool,
+    pub diff_patch: bool,
+    pub raw_input_rendering: bool,
+    pub plan_file: bool,
+}
+
 /// [`tool_shape`] with the client flavour: `air` selects the AIR-only reporter
 /// facts (`AskUserQuestion`'s fixed title). The permission path keeps the
 /// three-argument [`tool_shape`]; the streamed path passes the map's AIR flag.
 pub fn tool_shape_with(name: &str, input: &Value, cwd: Option<&Path>, air: bool) -> ToolShape {
-    tool_shape_full(name, input, cwd, air, false, false)
+    tool_shape_full(
+        name,
+        input,
+        cwd,
+        ShapeOptions {
+            air,
+            ..ShapeOptions::default()
+        },
+    )
 }
 
 /// Full tool shape port of `toolInfoFromToolUse` (`src/tools.ts:131-502`).
@@ -793,11 +901,54 @@ pub fn tool_info_from_tool_use_facts(
     cwd: Option<&Path>,
     diff_patch: bool,
 ) -> ToolShape {
-    tool_shape_full(name, input, cwd, false, replay, diff_patch)
+    tool_shape_full(
+        name,
+        input,
+        cwd,
+        ShapeOptions {
+            replay,
+            diff_patch,
+            ..ShapeOptions::default()
+        },
+    )
 }
 
-/// [`tool_shape_with`] with replay and diff_patch options (T-40).
+/// [`tool_shape_with`] with the rendering choices of the client (T-40, T-85,
+/// T-86).
 pub fn tool_shape_full(
+    name: &str,
+    input: &Value,
+    cwd: Option<&Path>,
+    options: ShapeOptions,
+) -> ToolShape {
+    let shape = shape_for(
+        name,
+        input,
+        cwd,
+        options.air,
+        options.replay,
+        options.diff_patch,
+    );
+    if !options.air || !shape.display_only {
+        return shape;
+    }
+    // `toolUseContent` (`renderer.ts:750-757`): a client that renders
+    // `rawInput` itself gets no display copy of the input. A `planFile` client
+    // whose ExitPlanMode names an existing plan file gets none either, since
+    // its `rawInput` carries the path instead of the plan text.
+    let plan_file_hides = name == "ExitPlanMode"
+        && options.plan_file
+        && existing_plan_file(input.get("planFilePath")).is_some();
+    if options.raw_input_rendering || plan_file_hides {
+        let mut shape = shape;
+        shape.content.clear();
+        shape
+    } else {
+        shape
+    }
+}
+
+fn shape_for(
     name: &str,
     input: &Value,
     cwd: Option<&Path>,
@@ -826,7 +977,7 @@ pub fn tool_shape_full(
                 format!("{}{suffix}", description.unwrap_or("Task")),
             );
             if let Some(prompt) = input.get("prompt").and_then(Value::as_str) {
-                shape = shape.content(vec![text_content(prompt)]);
+                shape = shape.display(vec![text_content(prompt)]);
             }
             shape
         }
@@ -840,7 +991,7 @@ pub fn tool_shape_full(
             // `shellDescription` falls back to `command_description`; an empty
             // description adds no display copy (`reporters/bash.ts:6-17,28`).
             if let Some(description) = shell_description(input).filter(|d| !d.is_empty()) {
-                shape = shape.content(vec![text_content(description)]);
+                shape = shape.display(vec![text_content(description)]);
             }
             shape
         }
@@ -871,7 +1022,7 @@ pub fn tool_shape_full(
             let write = normalize_write_input(input);
             let file_path = write.file_path.filter(|path| !path.is_empty());
             let input_diff = !diff_patch || replay;
-            let content = if let Some(path) = file_path {
+            let (content, display_only) = if let Some(path) = file_path {
                 // A client that negotiated diff patches gets the exact patch
                 // from the approval preview / PostToolUse hook; the input does
                 // not tell whether the file exists, so its live tool call shows
@@ -879,14 +1030,17 @@ pub fn tool_shape_full(
                 // no v2 client and `diffPatch` only reaches AIR through the
                 // session wiring; a non-AIR client always gets the input diff.
                 if input_diff {
-                    vec![diff_content(path, None, write.content.unwrap_or(""))]
+                    (
+                        vec![diff_content(path, None, write.content.unwrap_or(""))],
+                        false,
+                    )
                 } else {
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             } else if let Some(content) = write.content.filter(|content| !content.is_empty()) {
-                vec![text_content(content)]
+                (vec![text_content(content)], true)
             } else {
-                Vec::new()
+                (Vec::new(), false)
             };
             let title = match file_path {
                 Some(path) => format!("Write {}", display_path(path, cwd)),
@@ -895,9 +1049,11 @@ pub fn tool_shape_full(
             let locations = file_path
                 .map(|path| vec![location(path, None)])
                 .unwrap_or_default();
-            ToolShape::new(ToolKind::Edit, title)
+            let mut shape = ToolShape::new(ToolKind::Edit, title)
                 .content(content)
-                .locations(locations)
+                .locations(locations);
+            shape.display_only = display_only;
+            shape
         }
         "Edit" => {
             let file_path = input
@@ -1014,7 +1170,7 @@ pub fn tool_shape_full(
                 .and_then(Value::as_str)
                 .filter(|prompt| !prompt.is_empty())
             {
-                shape = shape.content(vec![text_content(prompt)]);
+                shape = shape.display(vec![text_content(prompt)]);
             }
             shape
         }
@@ -1074,7 +1230,7 @@ pub fn tool_shape_full(
                         .collect()
                 })
                 .unwrap_or_default();
-            ToolShape::new(ToolKind::Think, title).content(content)
+            ToolShape::new(ToolKind::Think, title).display(content)
         }
         "TaskCreate" => {
             let subject = input.get("subject").and_then(Value::as_str);
@@ -1095,13 +1251,12 @@ pub fn tool_shape_full(
         "ExitPlanMode" => {
             // `ExitPlanModeReporter.toolUse` (`reporters/interaction.ts:37-48`):
             // the plan is input that the user approves, so its text is the
-            // display copy for a non-AIR client (`renderer.ts:750-757`). An
-            // AIR `planFile` client gets the path in `rawInput` instead; that
-            // capability is not threaded into the renderer yet (T-60/T-04).
+            // display copy. A `planFile` client gets the path in `rawInput`
+            // instead and no display copy when the file exists.
             let mut shape = ToolShape::new(ToolKind::SwitchMode, "Approve Plan");
             if let Some(plan) = input.get("plan").and_then(Value::as_str) {
                 if !plan.is_empty() {
-                    shape = shape.content(vec![text_content(plan)]);
+                    shape = shape.display(vec![text_content(plan)]);
                 }
             }
             shape
@@ -1139,13 +1294,48 @@ pub fn tool_shape_full(
                         .collect()
                 })
                 .unwrap_or_default();
-            ToolShape::new(ToolKind::Other, title).content(content)
+            ToolShape::new(ToolKind::Other, title).display(content)
+        }
+        "NotebookEdit" => {
+            // `NotebookEditReporter.toolUse` (`reporters/file-edit.ts:180-201`):
+            // only AIR gets this rendering; every other client gets the generic
+            // `{title:"NotebookEdit", kind:"other"}` shape.
+            if !air {
+                return ToolShape::new(ToolKind::Other, "NotebookEdit");
+            }
+            let notebook_path = input
+                .get("notebook_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty());
+            let cell = input
+                .get("cell_id")
+                .and_then(Value::as_str)
+                .filter(|cell| !cell.is_empty())
+                .map(|cell| format!(" {cell}"))
+                .unwrap_or_default();
+            let verb = match input.get("edit_mode").and_then(Value::as_str) {
+                Some("insert") => "Insert",
+                Some("delete") => "Delete",
+                _ => "Edit",
+            };
+            let title = notebook_path.map_or_else(
+                || "Edit notebook".to_string(),
+                |path| format!("{verb} cell{cell} in {}", display_path(path, cwd)),
+            );
+            let locations = notebook_path
+                .map(|path| vec![location(path, None)])
+                .unwrap_or_default();
+            let mut shape = ToolShape::new(ToolKind::Edit, title).locations(locations);
+            if let Some(source) = notebook_source(input) {
+                shape = shape.display(source);
+            }
+            shape
         }
         "Other" => {
             // `\`\`\`json\n${json}\`\`\`` — no newline before the closing fence
             // (`reporters/interaction.ts:191-206`).
             let text = format!("```json\n{}```", pretty_json(input));
-            ToolShape::new(ToolKind::Other, name.to_string()).content(vec![text_content(text)])
+            ToolShape::new(ToolKind::Other, name.to_string()).display(vec![text_content(text)])
         }
         // Unknown tool — generic fallback (never panics, 9.T2).
         _ => ToolShape::new(ToolKind::Other, name.to_string()),

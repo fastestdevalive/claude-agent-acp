@@ -52,9 +52,13 @@ pub fn is_session_id(value: &str) -> bool {
     crate::session_store::is_session_id(value)
 }
 
-/// `<config>/projects`.
+/// `<config>/projects`, normalized NFC like `projectsRoot`.
 pub fn projects_root(env: &EnvSnapshot) -> PathBuf {
-    crate::session_store::projects_root_with_env(env)
+    let root = crate::session_store::projects_root_with_env(env);
+    match root.to_str() {
+        Some(text) => PathBuf::from(super::nfc::nfc(text)),
+        None => root,
+    }
 }
 
 /// `sanitize`: every UTF-16 unit that is not ASCII alphanumeric becomes `-`.
@@ -93,11 +97,14 @@ pub fn hash_base36(value: &str) -> String {
     digits.iter().rev().collect()
 }
 
-/// NFC on darwin, as the SDK normalizes paths there. The standard library has
-/// no Unicode normalization; paths from the file system are NFC already on the
-/// platforms this matters for, so the value passes through.
-pub fn normalize_path(value: &str, _platform: Platform) -> String {
-    value.to_string()
+/// NFC on darwin, as the SDK normalizes paths there; other platforms pass the
+/// value through (`normalizePath`).
+pub fn normalize_path(value: &str, platform: Platform) -> String {
+    if platform == Platform::Darwin {
+        super::nfc::nfc(value)
+    } else {
+        value.to_string()
+    }
 }
 
 fn sanitized_length(value: &str) -> usize {
@@ -402,5 +409,57 @@ mod tests {
             normalize_path(r"\\server\share\repo", Platform::Win32)
         );
         assert_eq!(real_path_string("/tmp/repo", Platform::Other), "/tmp/repo");
+    }
+
+    /// NFC normalisation > darwin composes a decomposed path before encoding it
+    #[test]
+    fn darwin_composes_a_decomposed_path() {
+        let decomposed = "/Users/me/re\u{301}po";
+        let composed = "/Users/me/r\u{e9}po";
+        assert_eq!(normalize_path(decomposed, Platform::Darwin), composed);
+        assert_eq!(normalize_path(decomposed, Platform::Other), decomposed);
+        // The encoding is lossy and counts UTF-16 units: the composed letter
+        // becomes one dash, the decomposed letter keeps its base and adds one.
+        assert_eq!(
+            encode_project_path(decomposed, Platform::Other),
+            "-Users-me-re-po"
+        );
+        assert_eq!(
+            encode_project_path(decomposed, Platform::Darwin),
+            "-Users-me-r-po"
+        );
+        assert_eq!(
+            encode_project_path(composed, Platform::Darwin),
+            "-Users-me-r-po"
+        );
+        // A directory name the CLI wrote from the composed path is found.
+        assert!(project_dir_matches(
+            "-Users-me-r-po",
+            decomposed,
+            Platform::Darwin
+        ));
+        assert!(!project_dir_matches(
+            "-Users-me-r-po",
+            decomposed,
+            Platform::Other
+        ));
+        assert!(same_project_path(decomposed, composed, Platform::Darwin));
+        assert!(!same_project_path(decomposed, composed, Platform::Other));
+        assert_eq!(
+            project_dirs_of(decomposed, &["-Users-me-r-po".into()], Platform::Darwin),
+            vec!["-Users-me-r-po".to_string()]
+        );
+    }
+
+    /// NFC normalisation > the projects root is composed on every platform
+    #[test]
+    fn the_projects_root_is_composed() {
+        let env = EnvSnapshot::from_pairs([("CLAUDE_CONFIG_DIR", "/tmp/re\u{301}po")]);
+        assert_eq!(
+            projects_root(&env),
+            PathBuf::from("/tmp/r\u{e9}po/projects")
+        );
+        let env = EnvSnapshot::from_pairs([("CLAUDE_CONFIG_DIR", "/tmp/plain")]);
+        assert_eq!(projects_root(&env), PathBuf::from("/tmp/plain/projects"));
     }
 }

@@ -1,5 +1,7 @@
-//! T5FC STEP 3 (B1/B2/B3): the v2 initialize path end to end over the real
-//! in-process channel, and the post-initialize method-not-found guard.
+//! T5FC STEP 3 (B1/B2/B3) + T6B: the v2 initialize path end to end over the
+//! real in-process channel, and the post-initialize v2 surface. T6B replaced
+//! the T5 guard (every later request -32601) with the real v2 router, so
+//! `session/new` is served now.
 //!
 //! The client replays the captured golden request; the agent runs its real
 //! `serve`/`handle_request` path with the opt-in injected through the env
@@ -102,8 +104,10 @@ async fn t5fc_v2_initialize_matches_golden_then_later_requests_are_method_not_fo
                         "the two terminal auth methods are advertised: {init}"
                     );
 
-                    // 2. After negotiating v2, every other request is the
-                    //    upstream-shaped method-not-found error.
+                    // 2. After negotiating v2, `session/new` is served by the
+                    //    v2 router (T6B), not the T5 method-not-found guard.
+                    //    The configured CLI path does not exist, so the spawn
+                    //    fails with an internal error instead.
                     let err = connection
                         .send_request(UntypedMessage::new(
                             "session/new",
@@ -111,13 +115,8 @@ async fn t5fc_v2_initialize_matches_golden_then_later_requests_are_method_not_fo
                         )?)
                         .block_task()
                         .await
-                        .expect_err("session/new must be refused on v2");
-                    assert_eq!(i32::from(err.code), -32601, "{err:?}");
-                    assert_eq!(err.message, "\"Method not found\": session/new");
-                    assert_eq!(
-                        err.data,
-                        Some(serde_json::json!({ "method": "session/new" }))
-                    );
+                        .expect_err("session/new is served on v2");
+                    assert_ne!(i32::from(err.code), -32601, "{err:?}");
                     Ok::<(), agent_client_protocol::Error>(())
                 },
             ),

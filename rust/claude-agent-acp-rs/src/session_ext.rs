@@ -38,6 +38,8 @@ pub struct SessionExt {
     pub last_published_task_plan: Option<String>,
     /// Whether the auto mode fallback warning has already been emitted in this session.
     pub auto_mode_fallback_warning_shown: bool,
+    /// AG-3: the per-turn native file-change report state (`file-change-audit.ts`).
+    pub file_change_reports: crate::session::FileChangeReports,
     /// Environment snapshot for hermetic reads.
     pub env: crate::env_snapshot::EnvSnapshot,
     /// The root session's latest PostCompact `compact_summary` (acp-agent.ts:11350-11360
@@ -90,6 +92,7 @@ impl SessionExt {
             task_state: Vec::new(),
             last_published_task_plan: None,
             auto_mode_fallback_warning_shown: false,
+            file_change_reports: crate::session::FileChangeReports::default(),
             env,
             last_compaction_summary: None,
             logger: None,

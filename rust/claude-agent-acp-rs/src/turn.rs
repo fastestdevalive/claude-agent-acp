@@ -222,7 +222,7 @@ pub enum ExitPlanVerdict {
 /// internal — ACP emission (session/update, prompt response) is phase 7+.
 /// `prompt_uuid` on every settle/fail/activate tells the actor which `oneshot`
 /// to resolve or reject (review 04 #11).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     /// A turn settled. The actor resolves that prompt's oneshot with this stop
     /// reason and usage.
@@ -257,6 +257,17 @@ pub enum TurnEvent {
     },
     /// A turn was activated / promoted to the queue head.
     Activated { prompt_uuid: String },
+    /// A turn's result arrived while subagents it spawned are live: v1 holds
+    /// its answer (`deferredSettle`), and its foreground work ends here
+    /// (`endForeground`, `acp-agent.ts:5203-5213, 6200-6214`).
+    Held {
+        prompt_uuid: String,
+        end: crate::turn_events::ForegroundEnd,
+    },
+    /// A held turn resumed: a steer of it (`acp-agent.ts:4380-4386`) or the
+    /// plan restart (`acp-agent.ts:7119-7130`) makes its continuation the
+    /// session's foreground work again (`startForeground`).
+    Resumed { prompt_uuid: String },
     /// #453 result-text fallback: assistant text exists only in the `result`
     /// frame (no `stream_event` deltas, no consolidated `assistant` message),
     /// so the actor must forward it as its own message. Emission is phase 7.
@@ -328,6 +339,19 @@ pub struct Turn {
     /// clear-context restart can send it again to the fresh child when the
     /// prompt was still queued behind the plan turn.
     frame: Option<Value>,
+    /// The turn was held for its background subagents when a clear-context
+    /// restart took it: its continuation takes the work over
+    /// (`startForeground`, `acp-agent.ts:7119-7130`).
+    held_at_restart: bool,
+}
+
+impl Turn {
+    /// Whether the turn was held for its background subagents when a
+    /// clear-context restart took it (`startForeground`, `acp-agent.ts:7119-7130`).
+    #[must_use]
+    pub fn held_at_restart(&self) -> bool {
+        self.held_at_restart
+    }
 }
 
 /// The terminal `command_lifecycle` states (`Turn.commandFinished`).
@@ -404,6 +428,7 @@ impl Turn {
             command_result_seen: false,
             carried: None,
             frame: None,
+            held_at_restart: false,
         }
     }
 
@@ -572,6 +597,11 @@ pub struct TurnMachine {
     /// A model cycle that Claude Code started on its own is the session's
     /// foreground work (F16c, `runsAutonomousCycle`).
     autonomous_cycle: bool,
+    /// How the cycle that just ended ended, for its [`TurnEvent::CycleEnded`]
+    /// (F39; `autonomousCycleEnd`, `acp-agent.ts:11999-12032`).
+    cycle_end: Option<crate::turn_events::ForegroundEnd>,
+    /// The turn the last `mark_steered` resumed from its hold (F39).
+    steer_resumed: Option<String>,
     /// `session/cancel` stops the background workflows the interrupt spared.
     stops_workflows_on_cancel: bool,
     /// A transition closed the assistant-text delivery stretch (upstream clears
@@ -579,6 +609,123 @@ pub struct TurnMachine {
     /// and an autonomous result with nothing in flight. The actor owns the flag
     /// itself and reads this through [`Self::take_text_stretch_closed`].
     text_stretch_closed: bool,
+}
+
+/// How a model cycle that Claude Code started on its own ended, read from its
+/// result as a turn's is (`autonomousCycleEnd`, `acp-agent.ts:11999-12032`): a
+/// refusal, the token limit and the turn limit are their stop reasons, an error
+/// result fails the cycle, and a cancel ends it `cancelled`. The usage and
+/// `_meta.quota` are the result's own, `modelUsage` its increment by model,
+/// since autonomous results stay out of the turn tally.
+fn cycle_end_from_result(
+    result: &Value,
+    model_increment: &ModelRows,
+    cancelled: bool,
+) -> crate::turn_events::ForegroundEnd {
+    use crate::turn_events::{ForegroundEnd, JsonRpcError, TurnOutcome, TurnUsage};
+    let usage_field = |key: &str| {
+        result
+            .get("usage")
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let tally = Usage {
+        input_tokens: usage_field("input_tokens"),
+        output_tokens: usage_field("output_tokens"),
+        cached_read_tokens: usage_field("cache_read_input_tokens"),
+        cached_write_tokens: usage_field("cache_creation_input_tokens"),
+    };
+    let total = tally.input_tokens
+        + tally.output_tokens
+        + tally.cached_read_tokens
+        + tally.cached_write_tokens;
+    let usage = TurnUsage {
+        total_tokens: total,
+        input_tokens: tally.input_tokens,
+        output_tokens: tally.output_tokens,
+        thought_tokens: None,
+        cached_read_tokens: Some(tally.cached_read_tokens),
+        cached_write_tokens: Some(tally.cached_write_tokens),
+    };
+    let meta = serde_json::json!({
+        "quota": {
+            "token_count": {
+                "totalTokens": total,
+                "inputTokens": tally.input_tokens,
+                "cachedInputTokens": tally.cached_read_tokens,
+                "cachedWriteTokens": tally.cached_write_tokens,
+                "outputTokens": tally.output_tokens,
+                "reasoningOutputTokens": 0,
+            },
+            "model_usage": model_increment.to_json(),
+        }
+    });
+    let ended = |stop_reason| {
+        ForegroundEnd::Ended(TurnOutcome {
+            stop_reason,
+            usage: Some(usage.clone()),
+            meta: Some(meta.clone()),
+        })
+    };
+    if cancelled {
+        return ended(StopReason::Cancelled);
+    }
+    let stop_reason = result
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if stop_reason == "refusal" {
+        return ended(StopReason::Refusal);
+    }
+    if stop_reason == "max_tokens" {
+        return ended(StopReason::MaxTokens);
+    }
+    let is_error = result
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let subtype = result.get("subtype").and_then(Value::as_str).unwrap_or("");
+    if is_error {
+        let text = if subtype == "success" {
+            result
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            let errors = result
+                .get("errors")
+                .and_then(Value::as_array)
+                .map(|errors| {
+                    errors
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            if errors.is_empty() {
+                subtype.to_string()
+            } else {
+                errors
+            }
+        };
+        // `RequestError.internalError(undefined, text)` writes
+        // `Internal error: text` (`autonomousCycleEnd`, `acp-agent.ts:12033-12040`).
+        return ForegroundEnd::Failed(JsonRpcError {
+            code: -32603,
+            message: format!("Internal error: {text}"),
+            data: None,
+        });
+    }
+    ended(
+        if subtype == "success" || subtype == "error_during_execution" {
+            StopReason::EndTurn
+        } else {
+            StopReason::MaxTurnRequests
+        },
+    )
 }
 
 impl TurnMachine {
@@ -823,7 +970,9 @@ impl TurnMachine {
     /// unsettled", `acp-agent.js:1141`). Adds `uuid` to the turn's pending
     /// `steered_echoes`; if the turn is held for subagents, moves its recorded
     /// `deferred_settle` into the steer lane so one lane owns settlement.
-    /// Returns `false` (and changes nothing) when no target turn exists.
+    /// Returns `false` (and changes nothing) when no target turn exists. When
+    /// it resumed a held turn, [`Self::take_steer_resumed`] names that turn
+    /// (its foreground work starts again, `acp-agent.ts:4380-4386`).
     pub fn mark_steered(&mut self, uuid: &str) -> bool {
         let target = if self.active.as_ref().is_some_and(|t| !t.settled) {
             self.active.as_mut()
@@ -840,8 +989,15 @@ impl TurnMachine {
         turn.steered_uuids.push(uuid.to_string());
         if turn.deferred_settle.is_some() {
             turn.steered_settle = turn.deferred_settle.take();
+            self.steer_resumed = Some(turn.prompt_uuid.clone());
         }
         true
+    }
+
+    /// The turn a [`Self::mark_steered`] call just resumed from its hold, if
+    /// any (`startForeground(sessionId, turnInFlight)`).
+    pub fn take_steer_resumed(&mut self) -> Option<String> {
+        self.steer_resumed.take()
     }
 
     /// Enqueue a prompt turn (it awaits its echo before activation).
@@ -859,6 +1015,7 @@ impl TurnMachine {
         let mut turn = self.active.take().filter(|t| !t.settled)?;
         // The fresh query has none of this one's background tasks, so a hold can
         // never drain there: the continuation's own result settles the turn.
+        turn.held_at_restart = turn.deferred_settle.is_some();
         turn.deferred_settle = None;
         turn.carried = Some((self.accumulated_usage, self.accumulated_models.clone()));
         // Upstream drops the queue here (`oldSession.turnQueue = []`), leaving
@@ -1676,6 +1833,11 @@ impl TurnMachine {
         let continues_plan = exit_plan_interruption == Some(ExitPlanVerdict::ContextReset)
             && self.active.as_ref().is_some_and(is_held_turn);
         if !placeholder && !continues_plan && std::mem::take(&mut self.autonomous_cycle) {
+            self.cycle_end = Some(cycle_end_from_result(
+                result,
+                &model_increment,
+                self.cancelled || exit_plan_interruption.is_some() || is_aborted_result(result),
+            ));
             events.push(TurnEvent::CycleEnded);
         }
         if is_autonomous {
@@ -2046,6 +2208,22 @@ impl TurnMachine {
             })
     }
 
+    /// Whether a `command_lifecycle` `started` for `uuid` is when Claude Code
+    /// took that prompt in: no other turn is active, the active one settled, or
+    /// the active one is this prompt (`reportInserted`'s gate,
+    /// `acp-agent.ts:5855-5860`).
+    pub fn inserted_now(&self, uuid: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.settled || active.prompt_uuid == uuid)
+    }
+
+    /// The outcome of the model cycle that just ended, once
+    /// [`TurnEvent::CycleEnded`] was produced (`autonomousCycleEnd`).
+    pub fn take_cycle_end(&mut self) -> Option<crate::turn_events::ForegroundEnd> {
+        self.cycle_end.take()
+    }
+
     /// A `session_state_changed: idle` frame — the SDK's authoritative turn-over
     /// signal. Absorbs owed trailing idles before failing, in the order
     /// `ADP:2081-2155` (review 04 #3): cancelled → settle; held → absorb debt +
@@ -2059,6 +2237,17 @@ impl TurnMachine {
         // belongs to an earlier result: it can lag past the cycle's first output
         // (`acp-agent.ts:6110-6125`).
         if self.owed_trailing_idles == 0 && std::mem::take(&mut self.autonomous_cycle) {
+            self.cycle_end = Some(crate::turn_events::ForegroundEnd::Ended(
+                crate::turn_events::TurnOutcome {
+                    stop_reason: if self.cancelled {
+                        StopReason::Cancelled
+                    } else {
+                        StopReason::EndTurn
+                    },
+                    usage: None,
+                    meta: None,
+                },
+            ));
             events.push(TurnEvent::CycleEnded);
         }
         if self.cancelled && self.active.as_ref().is_some_and(|t| !t.settled) {
@@ -2103,6 +2292,10 @@ impl TurnMachine {
                 active.steered_echoes = None;
                 active.steered_awaiting_result = false;
             }
+            // A hold delays v1's answer; the steered turn's work ends here.
+            if self.is_held() {
+                self.push_held(&mut events);
+            }
             self.settle_deferred_if_drained(&mut events);
             return events;
         }
@@ -2138,7 +2331,24 @@ impl TurnMachine {
     /// `SESSION_ENDED_MESSAGE` (`ADP:1771-1820`; review 04 #10).
     pub fn on_stream_end(&mut self) -> Vec<TurnEvent> {
         let mut events = Vec::new();
-        self.autonomous_cycle = false;
+        if std::mem::take(&mut self.autonomous_cycle) {
+            // The stream died under a cycle Claude Code started on its own: it
+            // ends `cancelled` after a cancel, else with the stream's error
+            // (`endAutonomousCycle`, `acp-agent.ts:5787-5792`).
+            self.cycle_end = Some(if self.cancelled {
+                crate::turn_events::ForegroundEnd::Ended(crate::turn_events::TurnOutcome {
+                    stop_reason: StopReason::Cancelled,
+                    usage: None,
+                    meta: None,
+                })
+            } else {
+                crate::turn_events::ForegroundEnd::Failed(crate::turn_events::JsonRpcError {
+                    code: -32603,
+                    message: format!("Internal error: {SESSION_ENDED_MESSAGE}"),
+                    data: None,
+                })
+            });
+        }
         if let Some(active) = self.active.take() {
             if !active.settled {
                 if active.deferred_settle.is_some() {
@@ -2211,7 +2421,23 @@ impl TurnMachine {
         message: &str,
     ) -> Vec<TurnEvent> {
         let mut events = Vec::new();
-        self.autonomous_cycle = false;
+        if std::mem::take(&mut self.autonomous_cycle) {
+            // `failAllTurns` ends a cycle `cancelled` after a cancel, else with
+            // the error that killed the stream (`acp-agent.ts:5604-5607`).
+            self.cycle_end = Some(if self.cancelled {
+                crate::turn_events::ForegroundEnd::Ended(crate::turn_events::TurnOutcome {
+                    stop_reason: StopReason::Cancelled,
+                    usage: None,
+                    meta: None,
+                })
+            } else {
+                crate::turn_events::ForegroundEnd::Failed(crate::turn_events::JsonRpcError {
+                    code: -32603,
+                    message: format!("Internal error: {message}"),
+                    data: None,
+                })
+            });
+        }
         if let Some(active) = self.active.take() {
             if !active.settled {
                 let prompt_uuid = active.prompt_uuid.clone();
@@ -2487,6 +2713,29 @@ impl TurnMachine {
                 });
             }
         }
+        // The hold delays v1's answer; the turn's work ended at its result.
+        self.push_held(events);
+    }
+
+    /// The [`TurnEvent::Held`] of the active turn's stored outcome, if it is
+    /// held (`endForeground(…, { outcome })`).
+    fn push_held(&mut self, events: &mut Vec<TurnEvent>) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let Some(deferred) = active.deferred_settle.clone() else {
+            return;
+        };
+        let outcome = crate::turn_events::settle_outcome(
+            deferred.stop_reason,
+            deferred.usage,
+            true,
+            &deferred.models,
+        );
+        events.push(TurnEvent::Held {
+            prompt_uuid: active.prompt_uuid.clone(),
+            end: crate::turn_events::ForegroundEnd::Ended(outcome),
+        });
     }
 
     /// `settleOrDefer({ ...heldTurn.deferredSettle, stopReason: "cancelled" })`:

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -217,7 +217,8 @@ async fn run_watcher(mut cfg: WatcherConfig) {
     let mut watched_paths =
         watched_paths_for(&cfg.current_cwd, &cfg.env, cfg.managed_file.as_deref());
     let mut last_snapshot = take_snapshot(&watched_paths);
-    let mut debounce_deadline: Option<Instant> = None;
+    // Tokio's clock, so a paused-time test can drive the debounce (O-60).
+    let mut debounce_deadline: Option<tokio::time::Instant> = None;
 
     let reload = |cwd: &Path| -> Settings {
         resolve_settings(
@@ -262,11 +263,11 @@ async fn run_watcher(mut cfg: WatcherConfig) {
         if current_snapshot != last_snapshot {
             last_snapshot = current_snapshot;
             // Any detected file change (creation, modification, deletion) sets/resets the 100 ms debounce timer.
-            debounce_deadline = Some(Instant::now() + Duration::from_millis(100));
+            debounce_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(100));
         }
 
         if let Some(deadline) = debounce_deadline {
-            if Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 debounce_deadline = None;
                 let new_settings = reload(&cfg.current_cwd);
                 let _ = cfg.state_tx.send(State {
@@ -286,6 +287,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -299,6 +301,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// O-60 — the debounce coalesces rapid writes under paused time: two writes
+    /// 30 ms apart yield one reload after the 100 ms window.
+    #[tokio::test(start_paused = true)]
+    async fn test_settings_manager_debounce_with_paused_time() {
+        let root = temp_dir("paused");
+        let cwd = root.join("cwd");
+        let claude_dir = cwd.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let env =
+            EnvSnapshot::from_pairs([("CLAUDE_CONFIG_DIR", root.join("config").to_str().unwrap())]);
+        let mgr = SettingsManager::new(
+            cwd.clone(),
+            Some(SettingsManagerOptions {
+                on_change: Some(Arc::new(move || {
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+                })),
+                logger: None,
+                env: Some(env),
+                poll_interval: Some(Duration::from_millis(20)),
+                ..Default::default()
+            }),
+        );
+        // Let the watcher take its initial snapshot.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let file = claude_dir.join("settings.json");
+        std::fs::write(&file, r#"{"model":"claude-3-5-sonnet"}"#).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        std::fs::write(&file, r#"{"model":"claude-3-5-haiku"}"#).unwrap();
+        // Past the debounce: one reload with the last write.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the two writes coalesce into one onChange"
+        );
+        assert_eq!(
+            mgr.get_settings().model.as_deref(),
+            Some("claude-3-5-haiku")
+        );
+        mgr.dispose();
     }
 
     #[tokio::test]

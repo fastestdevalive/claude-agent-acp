@@ -65,24 +65,25 @@ fn shared_resume_recall() {
     run_and_diff("resume_recall");
 }
 
-// =========================================================================
-// Pending shared scenarios whose behaviour is still open in this turn:
-// =========================================================================
+/// Shared scenario: background_after_prompt (F44)
+/// A turn starts a background task; the turn result arrives first and the
+/// background lifecycle is reported on the session stream.
+#[test]
+fn shared_background_after_prompt() {
+    run_and_diff("background_after_prompt");
+}
 
-// owner: F14
-// #[test]
-// fn shared_background_after_prompt() {
-//     run_and_diff("background_after_prompt");
-// }
+/// Shared scenario: session_list_close_delete_fork (F44)
+/// Session lifecycle methods: list, close, fork (after close), delete.
+#[test]
+fn shared_session_list_close_delete_fork() {
+    run_and_diff("session_list_close_delete_fork");
+}
 
-// owner: F27 (Turn 2 lane B session_index)
-// #[test]
-// fn shared_session_list_close_delete_fork() {
-//     run_and_diff("session_list_close_delete_fork");
-// }
-
-// owner: F14 (subagents / child tasks)
-// #[test]
-// fn shared_subagent() {
-//     run_and_diff("subagent");
-// }
+/// Shared scenario: subagent (F44)
+/// A Task tool call launches a child agent; the child lifecycle is reported on
+/// the session stream.
+#[test]
+fn shared_subagent() {
+    run_and_diff("subagent");
+}

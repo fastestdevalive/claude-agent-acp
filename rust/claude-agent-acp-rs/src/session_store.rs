@@ -58,7 +58,12 @@ pub fn projects_root() -> PathBuf {
 
 /// Derive the projects root from an explicit environment snapshot.
 pub fn projects_root_with_env(env: &crate::env_snapshot::EnvSnapshot) -> PathBuf {
-    config_dir_with_env(env).join("projects")
+    // upstream `projectsRoot`: path.join(claudeConfigDir(), "projects").normalize("NFC")
+    let root = config_dir_with_env(env).join("projects");
+    match root.to_str() {
+        Some(text) => PathBuf::from(crate::session_index::nfc::nfc(text)),
+        None => root,
+    }
 }
 
 /// The Claude configuration directory: `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`

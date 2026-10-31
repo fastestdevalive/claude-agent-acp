@@ -53,17 +53,24 @@ nothing here blocks work.
 ## D7 — The version string stays composed (`<crate>+upstream.0.94.0`), not the plain npm pin
 
 - **What:** C-01 (`agentInfo.version`) and O-01 (`--version`/`-v`/`-V`) report
-  `<CARGO_PKG_VERSION>+upstream.0.94.0` (`build.rs`, `agent.rs`), while the Node
-  adapter reports the bare package version `0.94.0`. The differential normalises
-  the fixture side to the composed value; this is a deliberate divergence
-  awaiting a user decision, not a port gap.
+  `0.1.0+upstream.0.94.0` (`build.rs`, `agent.rs`; the exact current value is the
+  crate version `0.1.0` from `Cargo.toml` plus `+upstream.0.94.0`), while the Node
+  adapter prints the bare package version `0.94.0` (`console.log(packageJson.version)`
+  in `src/index.ts:43-45`, for `--version` and `-v` only). The differential
+  normalises the fixture side to the composed value; this is a deliberate
+  divergence awaiting a user decision, not a port gap.
+  The Rust binary also accepts `-V`, which upstream does not treat as a version
+  flag (`src/index.ts:43` tests only `--version`/`-v`); that is an extra
+  convenience, not a wire difference.
 - **Why:** the composed string keeps the Rust crate's own version and the pinned
   upstream tag visible in one place; collapsing it to `0.94.0` would make the
   Rust crate claim the npm package's identity. The Node fixture remains
   authoritative for every other field.
 - **Alternatives:** print the bare pin (`0.94.0`) from the binary and
   `agentInfo.version` to match Node byte-for-byte (one-line change in `build.rs`
-  and the normaliser in `tests/common/mod.rs`).
+  and the normaliser in `tests/common/mod.rs`); drop `-V` from the CLI to match
+  upstream's flag set exactly (one condition in `src/bin/claude-agent-acp-rs.rs`).
+
 
 ## D8 — Unsafe code exemption for Windows Job Object and assignment window limitation
 
@@ -110,3 +117,59 @@ nothing here blocks work.
 - **Cost:** about 420 extra lockfile lines; on Linux the system OpenSSL development libraries are needed at BUILD time (`libssl-dev` / `openssl-devel`), which this repo's own gate (macOS) does not exercise.
 - **Alternatives:** `rustls-tls` (pure Rust TLS but C compiler needed for ring/aws-lc on every target, including the Windows cross-check); shelling out to `curl` (no new crate, but header secrets in argv and a runtime dependency); HTTP-only listing (no TLS: diverges for https gateways). Say so and it is a contained change in `gateway_models.rs` + Cargo.toml.
 - **Guard G10 is unaffected** (it covers only `agent-client-protocol`).
+
+## D11 — Windows liveness of the live CLI registry reader (V-12) needs a new `windows-sys` feature and a wider `unsafe` scope
+
+- **What:** V-12 (`session-index/live-registry.ts`) drops a registry record whose
+  pid is not alive. Upstream's `defaultIsAlive` is `process.kill(pid, 0)`, which
+  works on every platform Node runs on. `session_index/live_registry.rs` reads
+  `<config>/sessions/<pid>.json` and asks `process::pid_alive`: on Unix it sends
+  signal 0 (ESRCH → dead, EPERM → alive), which is exact; on Windows it returns
+  `None` and the registry treats `None` as alive (fail open), so a stale record
+  survives until the 24 h rule expires (`live-registry.ts:152-276`). Matching
+  upstream needs `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` +
+  `GetExitCodeProcess`/`WaitForSingleObject` from `windows-sys` with the
+  `Win32_System_Threading` feature, inside the D8 `unsafe` scope in
+  `src/process.rs` (currently `Win32_Foundation` + `Win32_System_JobObjects`
+  only, inside the `windows_job` module boundary).
+- **Why it is a user decision:** the crate already depends on `windows-sys` (for
+  the D8 Job Object FFI), but adding a feature to its feature list is a
+  `Cargo.toml` change, and lane rules forbid Cargo.toml edits without sign-off;
+  the `unsafe` exemption in D8 is deliberately narrow and every extension of it
+  is a user decision. The change itself is small and stays inside the existing
+  module boundary (one more `#[cfg(windows)]` helper + two FFI calls), but the
+  G8 grep would have to be extended to the new symbol list.
+- **Current status:** V-12 stays PARTIAL with `[pkg:F26b]`: Windows liveness
+  fails open. Unix behaviour is exact and covered by `tests/t2fy_liveness.rs`;
+  nothing else in the registry behaviour changes.
+- **Alternatives:** (a) add `Win32_System_Threading` to the existing
+  `windows-sys` dependency and implement `pid_alive` for Windows inside the
+  scoped `windows_job` module (closes the gap; needs D8 amended and the G8 grep
+  extended); (b) keep the conservative fail-open fallback and leave V-12 PARTIAL
+  on Windows only (no dependency, no `unsafe`); (c) shell out to `tasklist` (no
+  dependency change, but a process spawn per record and locale-dependent
+  output); (d) keep the whole row PARTIAL until Windows coverage is claimed.
+- **Recommendation:** (b) for this program — Windows process-tree coverage is
+  already not claimed (D8), so liveness should follow the same conservative
+  stance; revisit (a) together with the D8 assignment-window decision if Windows
+  becomes a supported target.
+
+## D12 — NFC normalisation ships as generated tables, not the `unicode-normalization` crate
+
+- **What:** M-74/Q-48 need `String.prototype.normalize("NFC")` for darwin paths
+  (`session-index/project-dirs.ts:64-66`, `:26-29` for the projects root). The
+  crate takes no new dependencies, so lane D implements UAX #15 in
+  `src/session_index/nfc.rs` over generated canonical-decomposition,
+  composition and combining-class tables in `src/session_index/nfc_data.rs`
+  (about 3.4k lines of data, generated from the local Node runtime's Unicode 16
+  data plus Python's Unicode 13 combining classes; the generator is kept out of
+  the tree).
+- **Why:** it closes the gap with no dependency change and no `unsafe`; the
+  algorithm is tested against `é`, `Å`, `Ǻ`, singleton decompositions, canonical
+  ordering and Hangul, and cross-checked against Node/Python over every code
+  point. The data is a generated artifact, not hand-maintained code.
+- **Alternatives:** (a) add `unicode-normalization` (or `icu_normalizer`, already
+  in the lockfile through `url`/`reqwest`) to `Cargo.toml` and replace
+  `nfc.rs`/`nfc_data.rs` with one call — smaller source, new direct dependency;
+  (b) keep the tables (recommended for the dependency policy) and regenerate
+  them whenever the Unicode version pinned to the upstream runtime changes.

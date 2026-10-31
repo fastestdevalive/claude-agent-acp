@@ -31,6 +31,8 @@ pub mod first_prompt;
 pub mod js_text;
 pub mod list_subscriptions;
 pub mod live_registry;
+pub mod nfc;
+mod nfc_data;
 pub mod project_dirs;
 pub mod service;
 pub mod session_info;

@@ -83,6 +83,7 @@ impl Actor {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         let actor = Self {
             tx,

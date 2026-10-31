@@ -368,6 +368,7 @@ fn t3a_enter_plan_mode_hook_remembers_the_previous_mode() {
             update_tx: &rig.tx,
             command_tx: &command_tx,
             session_id: "s",
+            live_background: &HashMap::new(),
         },
         reply,
     );

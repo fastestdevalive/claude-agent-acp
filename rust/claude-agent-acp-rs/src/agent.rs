@@ -39,6 +39,7 @@ use crate::session_index::connection::{IndexPaths, LoadedSession, SessionIndexCo
 use crate::session_methods;
 use crate::session_timing::SessionTiming;
 use crate::system_prompt;
+use crate::v2::v1_permission_response;
 
 /// The `agentInfo` returned by `initialize`, matching the Node adapter (the
 /// volatile `version` is composed from `porting/UPSTREAM_VERSION`).
@@ -148,6 +149,30 @@ impl ClaudeAcpAgent {
     ) -> Result<WriteTextFileResponse> {
         self.connection.send_request(params).block_task().await
     }
+}
+
+/// Node `SessionModeManager.initialize`'s clamp diagnostics
+/// (`session-mode.ts:157-177`): the Auto fallback for a model without Auto, or
+/// a requested mode that is not in the catalog. `None` when the mode is kept.
+pub(crate) fn auto_mode_clamp_log(
+    initial_mode: &str,
+    auto_clamped: bool,
+    current_model_id: &str,
+    mode_available: bool,
+) -> Option<String> {
+    if auto_clamped {
+        return Some(format!(
+            "permissions.defaultMode \"auto\" is not available for model \"{current_model_id}\"; \
+             falling back to \"{}\".",
+            crate::session_config::AUTO_MODE_FALLBACK
+        ));
+    }
+    (!mode_available).then(|| {
+        format!(
+            "permissions.defaultMode \"{initial_mode}\" is not available in this session; \
+             falling back to \"default\"."
+        )
+    })
 }
 
 /// The optional file logger for an environment snapshot (`index.ts:73-84`):
@@ -915,7 +940,7 @@ fn parse_async_task_stop_params(params: &Value) -> Result<(String, String), Erro
 /// wiring: the actor maps `AuthRequired` → authRequired, else `internalError`
 /// with `errorKind` data). The message is the full `"Internal error: <detail>"`
 /// wire text; `data` is `None` when upstream omits it (e.g. `session ended`).
-fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
+pub(crate) fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
     use crate::turn::FailureKind::*;
     let (message, data) = match err {
         SessionError::PromptFailed {
@@ -1015,7 +1040,7 @@ fn rpc_error(rpc: (String, Option<Value>)) -> Error {
 
 /// Convert a `SessionError` to the JSON-RPC wire error (`RequestError.authRequired`
 /// code -32000 for `AuthRequired`, else -32603).
-fn session_rpc_error(err: &SessionError) -> Error {
+pub(crate) fn session_rpc_error(err: &SessionError) -> Error {
     if let SessionError::InvalidRequest(message) = err {
         return Error::new(-32600, message.clone());
     }
@@ -1027,6 +1052,27 @@ fn session_rpc_error(err: &SessionError) -> Error {
         return Error::new(-32000, "Authentication required");
     }
     rpc_error(session_error_to_rpc(err))
+}
+
+/// The intake error of a v2 prompt whose session actor is gone (NEW-7): the
+/// session ended before it could take the prompt in, which v1 answers with
+/// `internalError(undefined, SESSION_ENDED_MESSAGE)` (`acp-agent.ts:3805-3807`).
+/// `-32800` stays reserved for a prompt an explicit cancel ended.
+pub(crate) fn dropped_intake_error() -> crate::turn_events::V2IntakeError {
+    crate::turn_events::V2IntakeError::Failed(session_error_jsonrpc(&SessionError::Closed))
+}
+
+/// The error a failed turn reports as a JSON-RPC error object — the form a v2
+/// client reads on its `idle` (`jsonRpcError`, `v2/prompt.ts:114-126`). It is
+/// v1's own wire error (`session_rpc_error`), so both versions report the same
+/// identity (NEW-5).
+pub(crate) fn session_error_jsonrpc(err: &SessionError) -> crate::turn_events::JsonRpcError {
+    let error = session_rpc_error(err);
+    crate::turn_events::JsonRpcError {
+        code: i32::from(error.code),
+        message: error.message,
+        data: error.data,
+    }
 }
 
 /// The JSON-RPC error for a failed `session/set_mode` / `session/set_config_option`.
@@ -1126,9 +1172,12 @@ async fn serve_until(
         guard_states: std::collections::HashMap::new(),
         hide_claude_auth,
         protocol: crate::v2::ProtocolMode::V1,
+        suppress_commands_update: false,
         provider_gate: Arc::new(tokio::sync::Semaphore::new(GATE_PERMITS as usize)),
         provider_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sessions_view: Arc::new(watch::channel(std::collections::HashMap::new()).0),
+        v2_outbound: None,
+        logger: opts.logger.clone(),
     };
     // The connection's handlers only forward: the connection loop also carries
     // the answers to the agent's own requests (permissions, `fs/*`, `terminal/*`),
@@ -1400,21 +1449,6 @@ async fn run_registry_actor(
                 None => break,
                 Some(Incoming::Request { request, served }) => {
                     let (req, responder, connection) = *request;
-                    // B2: a negotiated v2 connection serves only `initialize`
-                    // until Turn 6 wires the v2 surface; every other request
-                    // gets upstream's method-not-found answer, so a v2 client
-                    // never waits on a v1 shape.
-                    if registry.protocol == crate::v2::ProtocolMode::V2
-                        && req.method() != "initialize"
-                    {
-                        let method = req.method().to_string();
-                        let _ = responder.respond_with_error(
-                            Error::new(-32601, format!("\"Method not found\": {method}"))
-                                .data(json!({ "method": method })),
-                        );
-                        let _ = served.send(());
-                        continue;
-                    }
                     let permit = if is_gated(req.method()) {
                         if !parked.is_empty() {
                             parked.push_back((req, responder, connection));
@@ -1490,9 +1524,68 @@ async fn handle_notification(
 /// them, a session request one.
 pub(super) const GATE_PERMITS: u32 = 1 << 16;
 
+/// Where a request's answer goes: the wire responder, or a capture channel when
+/// the v2 surface translates a v1 answer before sending it (M-106, `v2/agent.ts`).
+pub(crate) enum Reply {
+    Wire(agent_client_protocol::Responder<Value>),
+    Capture(mpsc::UnboundedSender<Result<Value, Error>>),
+}
+
+impl Reply {
+    /// Answer the request.
+    pub(crate) fn respond(self, value: Value) -> Result<(), Error> {
+        match self {
+            Reply::Wire(responder) => responder.respond(value),
+            Reply::Capture(tx) => tx.send(Ok(value)).map_err(|_| Error::internal_error()),
+        }
+    }
+
+    /// Answer the request with an error.
+    pub(crate) fn respond_with_error(self, error: Error) -> Result<(), Error> {
+        match self {
+            Reply::Wire(responder) => responder.respond_with_error(error),
+            Reply::Capture(tx) => tx.send(Err(error)).map_err(|_| Error::internal_error()),
+        }
+    }
+
+    /// Answer after every update already queued for the connection's v2 outbound
+    /// task, so a v2 client sees them before the response.
+    pub(crate) fn respond_after(
+        self,
+        v2: &crate::v2::agent::V2OutboundHandle,
+        response: Result<Value, Error>,
+    ) -> Result<(), Error> {
+        match self {
+            Reply::Wire(responder) => {
+                v2.respond(responder, response);
+                Ok(())
+            }
+            Reply::Capture(tx) => tx.send(response).map_err(|_| Error::internal_error()),
+        }
+    }
+
+    /// The wire responder, when this answer goes straight to the client. A
+    /// captured answer has none: only the translated v2 methods capture, and
+    /// none of them hands its responder to a task.
+    pub(crate) fn into_wire(self) -> Option<agent_client_protocol::Responder<Value>> {
+        match self {
+            Reply::Wire(responder) => Some(responder),
+            Reply::Capture(_) => None,
+        }
+    }
+
+    /// The request's cancellation marker (`$/cancel_request`), on the wire.
+    pub(crate) fn cancellation(&self) -> Option<agent_client_protocol::RequestCancellation> {
+        match self {
+            Reply::Wire(responder) => Some(responder.cancellation()),
+            Reply::Capture(_) => None,
+        }
+    }
+}
+
 /// The per-connection session registry, owned by the registry actor (which serves
 /// the requests sequentially, so no lock is needed).
-struct Registry {
+pub(crate) struct Registry {
     sessions: std::collections::HashMap<String, Session>,
     /// Publishes each new session's handle to the notification handler.
     session_tx: mpsc::UnboundedSender<(String, Session)>,
@@ -1543,6 +1636,10 @@ struct Registry {
     /// (`v2::ProtocolMode`): v1 unless experimental v2 was opted into and the
     /// client asked for version 2 or later (B1/B2).
     protocol: crate::v2::ProtocolMode,
+    /// A v2 setup response carries the session's commands, so the v1
+    /// `available_commands_update` that follows it is withheld while the v1
+    /// handler serves it (`v2/agent.ts:150-162`).
+    suppress_commands_update: bool,
     /// The gate of the provider update in flight (`providerUpdate`), a
     /// reader/writer lock over [`GATE_PERMITS`] permits. A provider update runs
     /// off this handler — it waits for the submitted turns and starts every
@@ -1559,6 +1656,14 @@ struct Registry {
     /// off this handler (a provider update recreates every session and cannot
     /// read the registry).
     sessions_view: Arc<watch::Sender<std::collections::HashMap<String, (Session, Value)>>>,
+    /// The outbound translation task of a v2 connection (`V2ClientConnection`):
+    /// it owns the display terminals, the tool-call `_meta` and the replay
+    /// state of the connection. `None` on v1, which sends v1 updates as they
+    /// are.
+    v2_outbound: Option<crate::v2::agent::V2OutboundHandle>,
+    /// The connection's logger, for the v2 outbound task's own diagnostics
+    /// (`Failed to send a … update`, `v2/agent.ts:243-249`; NEW-9).
+    logger: Option<std::sync::Arc<crate::logger::Logger>>,
 }
 
 impl Registry {
@@ -1577,6 +1682,32 @@ impl Registry {
                 routing_active: self.resolve_provider().is_some(),
             });
         }
+    }
+
+    /// Withhold the v1 `available_commands_update` of a setup response: a v2
+    /// client gets the commands in the response itself (`v2/agent.ts:150-162`).
+    pub(crate) fn set_suppress_commands_update(&mut self, suppress: bool) {
+        self.suppress_commands_update = suppress;
+    }
+
+    /// The connection's v2 outbound task, started on the first v2 request
+    /// (`V2ClientConnection`, `v2/agent.ts:174-402`).
+    pub(crate) fn v2_outbound(
+        &mut self,
+        connection: &ConnectionTo<agent_client_protocol::Client>,
+    ) -> crate::v2::agent::V2OutboundHandle {
+        let logger = self.logger.clone();
+        self.v2_outbound
+            .get_or_insert_with(|| crate::v2::agent::spawn_v2_outbound(connection.clone(), logger))
+            .clone()
+    }
+
+    /// The live sessions and their creation params, as published for the tasks
+    /// that run off this handler.
+    pub(crate) fn sessions_view(
+        &self,
+    ) -> watch::Receiver<std::collections::HashMap<String, (Session, Value)>> {
+        self.sessions_view.subscribe()
     }
 
     /// Forgets what the registry keeps of a session that is gone.
@@ -1644,6 +1775,8 @@ impl Registry {
             caps: self.caps.clone(),
             sessions_view: self.sessions_view.clone(),
             cancel,
+            is_v2: self.protocol == crate::v2::ProtocolMode::V2,
+            v2_outbound: self.v2_outbound.clone(),
         }
     }
 }
@@ -1801,9 +1934,15 @@ struct ResumeEnv {
     /// Publishes the started session for a provider update running off this
     /// handler (`sessions_view`).
     sessions_view: Arc<watch::Sender<std::collections::HashMap<String, (Session, Value)>>>,
+    /// Withhold the v1 `available_commands_update` of the setup response: a v2
+    /// client gets the commands in the response itself (`v2/agent.ts:150-162`).
+    suppress_commands_update: bool,
+    /// The connection serves ACP v2 (M-118).
+    is_v2: bool,
+    /// The connection's v2 outbound task, if the connection negotiated v2.
+    v2_outbound: Option<crate::v2::agent::V2OutboundHandle>,
 }
 
-#[allow(dead_code)]
 impl Registry {
     /// The clones a `load`/`resume` start needs.
     fn resume_env(&self, live_mode: Option<String>, opts: &ServeOptions) -> ResumeEnv {
@@ -1820,11 +1959,14 @@ impl Registry {
             provider: self.resolve_provider(),
             auth_env: AuthEnv::of(self, opts),
             sessions_view: self.sessions_view.clone(),
+            suppress_commands_update: self.suppress_commands_update,
+            is_v2: self.protocol == crate::v2::ProtocolMode::V2,
+            v2_outbound: self.v2_outbound.clone(),
         }
     }
 
     /// Apply what tasks running off the request handler left behind.
-    fn apply_deferred(&mut self) {
+    pub(crate) fn apply_deferred(&mut self) {
         while let Ok(msg) = self.deferred_rx.try_recv() {
             match msg {
                 RegistryMsg::Register(update) => {
@@ -1899,14 +2041,6 @@ impl Registry {
             }
         }
         self.publish_sessions();
-    }
-
-    /// Settings manager for a session, if registered.
-    pub fn settings_manager(
-        &self,
-        session_id: &str,
-    ) -> Option<&Arc<crate::settings_manager::SettingsManager>> {
-        self.settings_managers.get(session_id)
     }
 
     /// Effective apiKeyHelper for a session, with precedence (O-61, O-67).
@@ -2215,6 +2349,7 @@ fn initialize_options_for(
     params: &Value,
     caps: &ClientCapabilities,
     air: Option<&AirClient>,
+    v2: bool,
 ) -> Result<InitializeOptions, Error> {
     let (system_prompt, append_system_prompt) = system_prompt::initialize_fields(params)?;
     let opts = crate::sdk_options::claude_options(params);
@@ -2253,7 +2388,11 @@ fn initialize_options_for(
     Ok(InitializeOptions {
         system_prompt,
         append_system_prompt,
-        hooks: Some(crate::hooks::init_hooks_payload()),
+        // T-105: a v2 connection also registers the PreToolUse hook of the
+        // change previews, so an auto-approved Edit or Write shows its exact
+        // patch before it runs (`acp-agent.ts:11284-11291`); a v1 client gets
+        // the input's diff and waits on no hook.
+        hooks: Some(crate::hooks::init_hooks_payload_with_v2(v2)),
         // O-144: `_meta.claudeCode.options.agents` goes to `initialize` verbatim.
         agents: opts.agents,
         prompt_suggestions: Some(prompt_suggestions),
@@ -2315,6 +2454,8 @@ fn register_session(
             deferred_tx: &registry.deferred_tx,
             board: registry.index.board(),
             is_air_client: registry.air.is_some(),
+            is_v2: registry.protocol == crate::v2::ProtocolMode::V2,
+            v2: registry.v2_outbound.as_ref(),
         },
         session_id,
         session,
@@ -2334,6 +2475,12 @@ struct WireTargets<'a> {
     board: &'a crate::session_index::connection::OwnSessionBoard,
     /// An AIR client shows an archived title without its archive prefix.
     is_air_client: bool,
+    /// The connection negotiated ACP v2 (M-118): an extension notification the
+    /// agent sends must start with "_".
+    is_v2: bool,
+    /// The connection's v2 outbound task: every v1 update it forwards is
+    /// translated before it reaches a v2 client.
+    v2: Option<&'a crate::v2::agent::V2OutboundHandle>,
 }
 
 /// Writes a raw `session/update` through `send`; `false` when the client never got
@@ -2367,7 +2514,10 @@ fn wire_session(
         deferred_tx,
         board,
         is_air_client,
+        is_v2,
+        v2,
     } = targets;
+    let v2 = v2.cloned();
     // A title a stored record publishes reads as the client shows it: an AIR
     // client gets an archived title without its archive prefix
     // (`ClaudeAcpAgent.clientTitle`, `acp-agent.ts:3205`).
@@ -2413,6 +2563,7 @@ fn wire_session(
         }
     });
     let connection = connection.clone();
+    let forward_session_id = session_id.to_string();
     tokio::spawn(async move {
         let mut update_rx = update_rx;
         while let Some(item) = update_rx.recv().await {
@@ -2422,6 +2573,14 @@ fn wire_session(
                     if let Some(update) = value.get_mut("update") {
                         crate::map::materialize_tool_call_defaults(update);
                         crate::map::materialize_diff_old_text(update);
+                    }
+                    // C-24: a v2 client gets the update's v2 form, with the
+                    // connection's terminal and `_meta` stores applied.
+                    if let Some(v2) = &v2 {
+                        if let Some(update) = value.get("update") {
+                            v2.translate(&forward_session_id, update.clone());
+                        }
+                        continue;
                     }
                     if let Ok(msg) = UntypedMessage::new("session/update", value) {
                         let _ = connection.send_notification(msg);
@@ -2440,6 +2599,17 @@ fn wire_session(
                             board.note_cost_of(&board_session_id, incarnation, cost);
                         }
                     }
+                    if let Some(v2) = &v2 {
+                        let session_id = value
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or(forward_session_id.as_str())
+                            .to_string();
+                        if let Some(update) = value.get("update") {
+                            v2.translate(&session_id, update.clone());
+                        }
+                        continue;
+                    }
                     // A raw update the client never got (the write failed or the
                     // message could not be built) is reported to the actor, which
                     // rolls back the async-task fields it recorded as published.
@@ -2447,6 +2617,18 @@ fn wire_session(
                         if let Some(tx) = write_failed_tx.upgrade() {
                             let _ = tx.send(crate::session::Command::UpdateSendFailed);
                         }
+                    }
+                }
+                // F39: the intake answer of a v2 prompt, after every update
+                // ahead of it reached the wire (the forwarding task is FIFO).
+                SessionOutbound::V2Intake {
+                    prompt_uuid,
+                    reply,
+                    result,
+                } => {
+                    let _ = reply.send(result.clone());
+                    if let Some(v2) = &v2 {
+                        v2.answer(&prompt_uuid, result);
                     }
                 }
                 // M-65: what the session index shows of this session (the CLI's
@@ -2460,6 +2642,12 @@ fn wire_session(
                 // U-10: the raw SDK message ext notification
                 // (`client.extNotification("_claude/sdkMessage", {...})`).
                 SessionOutbound::ExtNotification { method, params } => {
+                    // M-118: an extension method on v2 must start with "_"
+                    // (`v2/agent.ts:245-250`); an untagged one is a bug and is
+                    // not sent, as the client connection rejects it upstream.
+                    if is_v2 && crate::v2::validate_extension_method(&method).is_err() {
+                        continue;
+                    }
                     if let Ok(msg) = UntypedMessage::new(&method, params) {
                         let _ = connection.send_notification(msg);
                     }
@@ -2495,24 +2683,58 @@ fn wire_session(
                     // is client-kind aware); re-materialising here would add a
                     // non-AIR `locations:[]` to an AIR request.
                     let connection = connection.clone();
+                    let v2 = v2.clone();
+                    // NEW-6: the v2 request is queued to the outbound task HERE,
+                    // synchronously, so it keeps its FIFO position among the
+                    // connection's updates (an update queued behind this arm
+                    // cannot overtake it). P-61: it has a `title` and a `subject`
+                    // that carries the tool call's stored `_meta`.
+                    let queued = v2.as_ref().map(|v2| {
+                        let session_id = params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        v2.permission(&session_id, params.clone())
+                    });
                     tokio::spawn(async move {
                         let mut reply = reply;
-                        let result = match UntypedMessage::new("session/request_permission", params)
-                        {
-                            Ok(msg) => {
-                                let sent = connection.send_request(msg);
-                                // `requestPermission(params, signal)`: when the turn
-                                // is cancelled the actor drops its receiver (it
-                                // aborts the round-trip), which aborts the request —
-                                // dropping the pending `SentRequest` sends
-                                // `$/cancel_request` so the client can dismiss its
-                                // prompt (`acp-agent.ts:2374-2390`, U-107).
-                                tokio::select! {
-                                    res = sent.block_task() => res.map_err(|e| e.to_string()),
-                                    () = reply.closed() => Err("Tool use aborted".to_string()),
+                        let result = match queued {
+                            Some(sent_rx) => match sent_rx.await {
+                                Ok(Ok(sent)) => {
+                                    // `requestPermission(params, signal)`: when the
+                                    // turn is cancelled the actor drops its receiver
+                                    // (it aborts the round-trip), which aborts the
+                                    // request — dropping the pending `SentRequest`
+                                    // sends `$/cancel_request` so the client can
+                                    // dismiss its prompt (`acp-agent.ts:2374-2390`,
+                                    // U-107).
+                                    tokio::select! {
+                                        res = sent.block_task() => res.map_err(|e| e.to_string()),
+                                        () = reply.closed() => Err("Tool use aborted".to_string()),
+                                    }
+                                }
+                                Ok(Err(error)) => Err(error.to_string()),
+                                Err(_) => Err("Tool use aborted".to_string()),
+                            },
+                            None => {
+                                match UntypedMessage::new("session/request_permission", params) {
+                                    Ok(msg) => {
+                                        let sent = connection.send_request(msg);
+                                        tokio::select! {
+                                            res = sent.block_task() => res.map_err(|e| e.to_string()),
+                                            () = reply.closed() => Err("Tool use aborted".to_string()),
+                                        }
+                                    }
+                                    Err(e) => Err(e.to_string()),
                                 }
                             }
-                            Err(e) => Err(e.to_string()),
+                        };
+                        // P-62: any outcome other than `selected` is `cancelled`
+                        // in v1 (`v1PermissionResponse`, `v2/permission.ts:52-66`).
+                        let result = match (result, &v2) {
+                            (Ok(value), Some(_)) => Ok(v1_permission_response(&value)),
+                            (other, _) => other,
                         };
                         let _ = reply.send(result);
                     });
@@ -2641,6 +2863,78 @@ fn recreate_falls_back_to_fresh<T>(
         )
 }
 
+/// The RFD subagent replay context of a load/resume (B-52): a client on the
+/// RFD form whose history has an Agent or Task launch gets its subagents
+/// replayed into their own sessions (`acp-agent.ts:9223-9234`).
+fn rfd_replay_context(
+    messages: &[Value],
+    session_id: &str,
+    env: &ResumeEnv,
+    opts: &ServeOptions,
+) -> Option<crate::subagent_replay::SubagentReplayContext> {
+    if env.caps.subagent_form != Some(crate::client_caps::SubagentForm::Rfd) {
+        return None;
+    }
+    // Only a history with an Agent or Task launch has subagent transcripts to
+    // read; the RFD replay still exists, with an empty history
+    // (`acp-agent.ts:9216-9234`).
+    let history = if has_subagent_launch(messages) {
+        crate::subagent_history::subagent_history(session_id, &opts.env)
+    } else {
+        crate::subagent_history::SubagentHistory::default()
+    };
+    Some(crate::subagent_replay::SubagentReplayContext {
+        history,
+        notices: env.caps.notices,
+        logger: opts.logger.clone(),
+    })
+}
+
+/// Whether the history carries an Agent or Task launch.
+fn has_subagent_launch(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        let content = message
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        !crate::native_subagents::subagent_launch_ids(&content).is_empty()
+    })
+}
+
+/// The RFD subagent replay context of a live `session/load` (B-52): the context
+/// [`rfd_replay_context`] builds for a start, with the history read off the
+/// registry actor (`spawn_blocking`) so the actor never reads transcripts
+/// synchronously.
+async fn live_replay_subagents(
+    messages: &[Value],
+    session_id: &str,
+    subagent_form: Option<crate::client_caps::SubagentForm>,
+    notices: bool,
+    opts: &ServeOptions,
+) -> Option<crate::subagent_replay::SubagentReplayContext> {
+    if subagent_form != Some(crate::client_caps::SubagentForm::Rfd) {
+        return None;
+    }
+    // A history without a launch still has an (empty) RFD replay, as the
+    // start path does (`acp-agent.ts:9226-9234`); only a launch needs the
+    // transcript read.
+    let history = if has_subagent_launch(messages) {
+        let env = opts.env.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || crate::subagent_history::subagent_history(&id, &env))
+            .await
+            .unwrap_or_default()
+    } else {
+        crate::subagent_history::SubagentHistory::default()
+    };
+    Some(crate::subagent_replay::SubagentReplayContext {
+        history,
+        notices,
+        logger: opts.logger.clone(),
+    })
+}
+
 /// Whether the recreate `env` belongs to was cancelled.
 fn recreate_cancelled(env: &ResumeEnv) -> bool {
     env.cancel
@@ -2666,7 +2960,7 @@ async fn start_resumed(
     session_id: String,
     params: &Value,
     opts: &ServeOptions,
-    responder: agent_client_protocol::Responder<Value>,
+    responder: Reply,
     connection: &ConnectionTo<agent_client_protocol::Client>,
     kind: ResumedKind,
 ) -> Result<(), Error> {
@@ -2679,7 +2973,7 @@ async fn start_resumed(
         return responder.respond_with_error(e);
     }
     timing.phase("validate-cwd", "");
-    let initialize = match initialize_options_for(params, &env.caps, env.air.as_ref()) {
+    let initialize = match initialize_options_for(params, &env.caps, env.air.as_ref(), env.is_v2) {
         Ok(initialize) => initialize,
         Err(e) => return responder.respond_with_error(e),
     };
@@ -2699,6 +2993,7 @@ async fn start_resumed(
         let settings_arg = claude.settings_arg.clone();
         let launch_env = claude.env.clone();
         let ask_disallowed = !env.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
+        let additional_directories = claude.additional_directories.clone();
         let mut spawn = session_spawn_options(
             opts,
             cwd.clone(),
@@ -2731,7 +3026,9 @@ async fn start_resumed(
             .with_raw_sdk_messages(raw_sdk_messages)
             .with_env(opts.env.clone())
             .with_logger(opts.logger.clone())
-            .with_gateway_models(providers::gateway_models_of(env.provider.as_ref()));
+            .with_gateway_models(providers::gateway_models_of(env.provider.as_ref()))
+            .with_v2(env.is_v2)
+            .with_additional_directories(additional_directories);
         // PC-2.2 / B-02: the replay runs while the CLI starts (Node
         // `createSessionWhileReplaying`) and reads the transcript off the async
         // runtime; the response waits for both, so the replay frames still
@@ -2750,8 +3047,12 @@ async fn start_resumed(
             let mut yielder = crate::event_loop_yield::EventLoopYielder::with_clock(
                 crate::event_loop_yield::MESSAGE_LOOP_BUDGET_MS,
             );
+            // B-52: an RFD client gets the history's subagents replayed into
+            // their own sessions right after their launches
+            // (`acp-agent.ts:9479-9498`).
+            let subagents = rfd_replay_context(&messages, &session_id, env, opts);
             let (notifications, task_state, last_published) =
-                crate::transcript::replay_session_async(
+                crate::transcript::replay_session_async_with_subagents(
                     &messages,
                     &session_id,
                     air,
@@ -2764,31 +3065,66 @@ async fn start_resumed(
                             .then_some(&mut failure_book),
                         async_tasks: Some(&mut replay_async_tasks),
                         message_ids: Some(&mut replay_message_ids),
+                        // B-50: a client that takes ID-addressed compaction
+                        // updates replays a compact summary as an entity.
+                        compaction: env.caps.compaction,
                     },
                     &mut yielder,
+                    subagents,
                 )
                 .await;
+            let v2 = env.v2_outbound.clone();
+            if let Some(v2) = &v2 {
+                v2.begin_replay(&session_id);
+            }
+            let mut replay_stopped = false;
             for mut value in notifications {
                 // A cancelled recreate stops replaying into a connection that is
                 // ending.
                 if recreate_cancelled(env) {
+                    replay_stopped = true;
                     break;
                 }
                 if let Some(update) = value.get_mut("update") {
                     crate::map::materialize_tool_call_defaults(update);
                     crate::map::materialize_diff_old_text(update);
                 }
+                if let Some(v2) = &v2 {
+                    // B-112: a v2 client gets the history in its v2 form, each
+                    // message cleared before its first replayed chunk.
+                    let replay_session = value
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(session_id.as_str())
+                        .to_string();
+                    if let Some(update) = value.get("update") {
+                        v2.translate(&replay_session, update.clone());
+                    }
+                    continue;
+                }
                 if let Ok(msg) = UntypedMessage::new("session/update", value) {
                     let _ = connection.send_notification(msg);
                 }
             }
+            if let Some(v2) = &v2 {
+                v2.end_replay(&session_id);
+            }
             // B-53: a client with `loadReplayEnd` gets one more update after
             // the whole replay (`acp-agent.ts:9529-9544`). A stopped replay
             // does not get it.
-            if env.caps.load_replay_end && !recreate_cancelled(env) {
+            if env.caps.load_replay_end && !recreate_cancelled(env) && !replay_stopped {
                 let marker = crate::transcript::load_replay_end_marker(&session_id);
-                if let Ok(msg) = UntypedMessage::new("session/update", marker) {
-                    let _ = connection.send_notification(msg);
+                match &v2 {
+                    Some(v2) => {
+                        if let Some(update) = marker.get("update") {
+                            v2.translate(&session_id, update.clone());
+                        }
+                    }
+                    None => {
+                        if let Ok(msg) = UntypedMessage::new("session/update", marker) {
+                            let _ = connection.send_notification(msg);
+                        }
+                    }
                 }
             }
             (task_state, last_published, failure_book, replay_message_ids)
@@ -2932,6 +3268,8 @@ async fn start_resumed(
                     deferred_tx: &env.deferred_tx,
                     board: &env.board,
                     is_air_client: env.air.is_some(),
+                    is_v2: env.is_v2,
+                    v2: env.v2_outbound.as_ref(),
                 },
                 &session_id,
                 session.clone(),
@@ -2953,12 +3291,14 @@ async fn start_resumed(
             );
             // Decision 8: raw JSON with `input: null` for commands without a
             // hint (the typed update would omit the field).
-            let value = json!({
-                "sessionId": session_id.clone(),
-                "update": map::available_commands_json(&update),
-            });
-            if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                let _ = connection.send_notification(msg);
+            if !env.suppress_commands_update {
+                let value = json!({
+                    "sessionId": session_id.clone(),
+                    "update": map::available_commands_json(&update),
+                });
+                if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                    let _ = connection.send_notification(msg);
+                }
             }
             Ok(())
         }
@@ -2968,11 +3308,47 @@ async fn start_resumed(
 
 /// Dispatch one ACP request (8.1). `registry` is owned by the handler closure;
 /// it is mutated sequentially by the connection loop.
+///
+/// A connection that negotiated v2 in `initialize` is served by the v2 agent
+/// surface (M-106, `serve.ts:37-51`): each v2 request becomes the v1 request
+/// that the agent serves, and its answer is translated back. `initialize`
+/// itself stays on the v1 path, which negotiates the version and answers a v2
+/// handshake (B1). Without the opt-in, every request is served v1 exactly as
+/// before (O-139).
 async fn handle_request(
     registry: &mut Registry,
     req: UntypedMessage,
     opts: &ServeOptions,
     responder: agent_client_protocol::Responder<Value>,
+    connection: ConnectionTo<agent_client_protocol::Client>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<(), Error> {
+    let method = req.method().to_string();
+    if registry.protocol == crate::v2::ProtocolMode::V2 && method != "initialize" {
+        let params = req.params().clone();
+        return crate::v2::agent::handle_v2_request(
+            registry, &method, params, opts, responder, connection, permit,
+        )
+        .await;
+    }
+    handle_v1_request(
+        registry,
+        req,
+        opts,
+        Reply::Wire(responder),
+        connection,
+        permit,
+    )
+    .await
+}
+
+/// Serve one request on the v1 protocol. Its answer goes through `responder`:
+/// the wire responder, or a capture channel when the v2 surface translates it.
+pub(crate) async fn handle_v1_request(
+    registry: &mut Registry,
+    req: UntypedMessage,
+    opts: &ServeOptions,
+    responder: Reply,
     connection: ConnectionTo<agent_client_protocol::Client>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), Error> {
@@ -3010,6 +3386,12 @@ async fn handle_request(
             // Parse the full capability set once (ROADMAP F2a): auth methods,
             // notices, config options and the tool-call choices all read it.
             registry.caps = ClientCapabilities::from_value(params.get("clientCapabilities"));
+            // T-102/T-104 (`client-capabilities.ts:45`): a v2 client takes the
+            // terminal extension even though it declares no `_meta` marker; the
+            // v2 surface sends commands' terminals as display terminals.
+            if negotiated.mode == crate::v2::ProtocolMode::V2 {
+                registry.caps.terminal_output = true;
+            }
             // The session index of a client that declared `sessionIndex`.
             let notifier_connection = connection.clone();
             registry.index.set_notifier(Arc::new(move |changes| {
@@ -3065,11 +3447,15 @@ async fn handle_request(
             if let Err(e) = validate_cwd(cwd_str) {
                 return responder.respond_with_error(e);
             }
-            let initialize =
-                match initialize_options_for(&params, &registry.caps, registry.air.as_ref()) {
-                    Ok(initialize) => initialize,
-                    Err(e) => return responder.respond_with_error(e),
-                };
+            let initialize = match initialize_options_for(
+                &params,
+                &registry.caps,
+                registry.air.as_ref(),
+                registry.protocol == crate::v2::ProtocolMode::V2,
+            ) {
+                Ok(initialize) => initialize,
+                Err(e) => return responder.respond_with_error(e),
+            };
             let cwd = cwd_str.map(PathBuf::from);
             let (mut claude, permission_mode, allow_bypass) =
                 match spawn_inputs(&params, cwd.as_deref(), opts, None) {
@@ -3094,6 +3480,7 @@ async fn handle_request(
             let settings_arg = claude.settings_arg.clone();
             let launch_env = claude.env.clone();
             let ask_disallowed = !registry.caps.elicitation_form; // O-135: only a form-capable client keeps AskUserQuestion
+            let additional_directories = claude.additional_directories.clone();
             let mut spawn = session_spawn_options(
                 opts,
                 cwd,
@@ -3121,7 +3508,9 @@ async fn handle_request(
                 .with_raw_sdk_messages(raw_sdk_messages)
                 .with_env(opts.env.clone())
                 .with_logger(opts.logger.clone())
-                .with_gateway_models(providers::gateway_models_of(provider.as_ref()));
+                .with_gateway_models(providers::gateway_models_of(provider.as_ref()))
+                .with_v2(registry.protocol == crate::v2::ProtocolMode::V2)
+                .with_additional_directories(additional_directories);
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
                     let mut guard = crate::hide_claude_auth::GuardState::default();
@@ -3195,12 +3584,14 @@ async fn handle_request(
                     );
                     // Decision 8: raw JSON with `input: null` for commands
                     // without a hint (the typed update would omit the field).
-                    let value = json!({
-                        "sessionId": session_id.clone(),
-                        "update": map::available_commands_json(&update),
-                    });
-                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                        let _ = connection.send_notification(msg);
+                    if !registry.suppress_commands_update {
+                        let value = json!({
+                            "sessionId": session_id.clone(),
+                            "update": map::available_commands_json(&update),
+                        });
+                        if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                            let _ = connection.send_notification(msg);
+                        }
                     }
                     Ok(())
                 }
@@ -3243,9 +3634,12 @@ async fn handle_request(
             let live = registry.sessions.get(&session_id).cloned();
             let mut changed = false;
             if live.is_some() {
-                if let Err(e) =
-                    initialize_options_for(&params, &registry.caps, registry.air.as_ref())
-                {
+                if let Err(e) = initialize_options_for(
+                    &params,
+                    &registry.caps,
+                    registry.air.as_ref(),
+                    registry.protocol == crate::v2::ProtocolMode::V2,
+                ) {
                     return responder.respond_with_error(e);
                 }
                 changed = registry
@@ -3345,22 +3739,55 @@ async fn handle_request(
                     } else {
                         Default::default()
                     };
+                    // B-52: a live `session/load` replays its subagents into
+                    // their own sessions like `start_resumed` does
+                    // (`acp-agent.ts:3156-3160` uses `replaySessionHistory` in
+                    // both branches). The context's history is read off the
+                    // registry actor.
+                    let subagents = live_replay_subagents(
+                        &messages,
+                        &session_id,
+                        registry.caps.subagent_form,
+                        registry.caps.notices,
+                        opts,
+                    )
+                    .await;
                     let (notifications, task_state, last_published) =
-                        crate::transcript::replay_with_failures(
+                        crate::transcript::replay_with_failures_rfd(
                             &messages,
                             &session_id,
                             registry.air.is_some(),
                             registry.caps.plan,
+                            registry.caps.compaction,
                             typed_failures.then_some(&mut failure_book),
+                            subagents,
                         );
+                    let v2 = registry.v2_outbound.clone();
+                    if let Some(v2) = &v2 {
+                        v2.begin_replay(&session_id);
+                    }
                     for mut value in notifications {
                         if let Some(update) = value.get_mut("update") {
                             crate::map::materialize_tool_call_defaults(update);
                             crate::map::materialize_diff_old_text(update);
                         }
+                        if let Some(v2) = &v2 {
+                            let replay_session = value
+                                .get("sessionId")
+                                .and_then(Value::as_str)
+                                .unwrap_or(session_id.as_str())
+                                .to_string();
+                            if let Some(update) = value.get("update") {
+                                v2.translate(&replay_session, update.clone());
+                            }
+                            continue;
+                        }
                         if let Ok(msg) = UntypedMessage::new("session/update", value) {
                             let _ = connection.send_notification(msg);
                         }
+                    }
+                    if let Some(v2) = &v2 {
+                        v2.end_replay(&session_id);
                     }
                     // Node forgets the published plan before a replay and shares
                     // the live `taskState` with it; seed the rebuilt state so the
@@ -3410,12 +3837,14 @@ async fn handle_request(
                         air_cwd.as_deref(),
                         home.as_deref(),
                     );
-                    let value = json!({
-                        "sessionId": session_id.clone(),
-                        "update": map::available_commands_json(&update),
-                    });
-                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                        let _ = connection.send_notification(msg);
+                    if !registry.suppress_commands_update {
+                        let value = json!({
+                            "sessionId": session_id.clone(),
+                            "update": map::available_commands_json(&update),
+                        });
+                        if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                            let _ = connection.send_notification(msg);
+                        }
                     }
                 }
                 return Ok(());
@@ -3441,7 +3870,12 @@ async fn handle_request(
             let _provider_update = permit;
             // Node order: validate the systemPrompt, copy the transcript, then
             // start the new session like a resumed one (`unstable_forkSession`).
-            if let Err(e) = initialize_options_for(&params, &registry.caps, registry.air.as_ref()) {
+            if let Err(e) = initialize_options_for(
+                &params,
+                &registry.caps,
+                registry.air.as_ref(),
+                registry.protocol == crate::v2::ProtocolMode::V2,
+            ) {
                 return responder.respond_with_error(e);
             }
             let fork_session_id = params
@@ -3888,7 +4322,7 @@ async fn handle_request(
                 opts,
                 &connection,
                 Some(config),
-                Some(responder),
+                responder.into_wire(),
             );
             Ok(())
         }
@@ -3901,7 +4335,13 @@ async fn handle_request(
                         registry.sessions.len()
                     ));
                 }
-                recreate::spawn_provider_update(registry, opts, &connection, None, Some(responder));
+                recreate::spawn_provider_update(
+                    registry,
+                    opts,
+                    &connection,
+                    None,
+                    responder.into_wire(),
+                );
                 return Ok(());
             }
             responder.respond(json!({}))
@@ -4056,6 +4496,150 @@ async fn handle_request(
             // The busy refusal is made by the actor (`Command::RemoteControlPrompt`),
             // atomically with the turn queue and the foreground work.
             let uuid = uuid_v4();
+            // M-113/Q-86: a v2 prompt is answered once Claude Code takes it in
+            // (`v2/prompt.ts:30-67`), from a spawned task, so the connection
+            // loop is free while the turn runs.
+            if registry.protocol == crate::v2::ProtocolMode::V2 {
+                let v2 = registry.v2_outbound(&connection);
+                let content = params
+                    .get("_v2Prompt")
+                    .cloned()
+                    .or_else(|| params.get("prompt").cloned())
+                    .unwrap_or(Value::Null);
+                if let Some(command) = remote_command {
+                    // `/remote-control`: the adapter answers it without a model
+                    // turn. NEW-2: the actor decides first, so a refused command
+                    // answers `invalidRequest` BEFORE the `user_message`, as
+                    // upstream refuses it before `events.inserted`
+                    // (`acp-agent.ts:3824-3838`). Only an accepted command sends
+                    // the `user_message` and resolves the prompt; the control
+                    // call's text is a v1 chunk that v2 drops (no messageId), so
+                    // it is only awaited.
+                    let session_id = session_id.clone();
+                    let reply = responder;
+                    let checked = session.remote_control_checked(command);
+                    tokio::spawn(async move {
+                        match checked.accepted.await {
+                            Ok(Ok(())) => {
+                                v2.translate(
+                                    &session_id,
+                                    json!({
+                                        "sessionUpdate": "user_message",
+                                        "messageId": uuid.clone(),
+                                        "content": content,
+                                    }),
+                                );
+                                let _ = reply.respond_after(&v2, Ok(json!({ "messageId": uuid })));
+                                let _ = checked.reply.await;
+                            }
+                            Ok(Err(error)) => {
+                                let _ = reply.respond_after(&v2, Err(session_rpc_error(&error)));
+                            }
+                            // The actor is gone: the session ended
+                            // (`RequestError.internalError(undefined,
+                            // SESSION_ENDED_MESSAGE)`, `acp-agent.ts:3805-3807`).
+                            Err(_) => {
+                                let _ = reply.respond_after(
+                                    &v2,
+                                    Err(session_rpc_error(&SessionError::Closed)),
+                                );
+                            }
+                        }
+                    });
+                    return Ok(());
+                }
+                let frame = prompt_to_claude(&params, &session_id, &uuid);
+                // G12 (Decision 21): record the `/mcp` command on the actor
+                // BEFORE the prompt.
+                if let Some(command) = mcp_command {
+                    session.send_mcp(uuid.clone(), command);
+                }
+                let prompt_text = acp_prompt_text(&params);
+                // The answer is written by the connection's v2 outbound task, in
+                // the position the session reports it, so it cannot be overtaken
+                // by the turn's later updates (`v2Prompt`'s `inserted`).
+                let (wire, capture) = match responder {
+                    Reply::Wire(responder) => (Some(responder), None),
+                    Reply::Capture(tx) => (None, Some(tx)),
+                };
+                if let Some(responder) = wire {
+                    v2.register_answer(&uuid, responder);
+                }
+                // review-T6INT finding 3: a v2 prompt's `_meta` (a file-change
+                // report request) goes to the actor right before the prompt, on
+                // the same channel, exactly like the v1 arm below.
+                session.note_prompt_meta(
+                    uuid.clone(),
+                    params.get("_meta").cloned().unwrap_or(Value::Null),
+                );
+                let (inserted, ended) = session.send_prompt_v2(
+                    uuid.clone(),
+                    frame,
+                    is_local_only,
+                    prompt_text,
+                    content,
+                );
+                // NEW-3: a v2 prompt runs the v1 prompt task's bookkeeping too:
+                // the session-index row starts `running` before the prompt is
+                // sent, and its turn end settles the row (`noteSessionState`,
+                // `acp-agent.ts:5561-5572`). An `auth_required` failure under
+                // `--hide-claude-auth` marks the query for a respawn and closes
+                // it (V-16).
+                let board = registry.index.board().clone();
+                let incarnation = board.turn_started(&session_id);
+                let board_session_id = session_id.clone();
+                let sign_out_auth = registry.auth.clone().filter(|_| registry.hide_claude_auth);
+                tokio::spawn(async move {
+                    // NEW-7: a dropped intake reply means the session ended
+                    // before it took the prompt in, which v1 answers with
+                    // `internalError(undefined, SESSION_ENDED_MESSAGE)`
+                    // (`acp-agent.ts:3805-3807`); only an explicit cancel is
+                    // `-32800`.
+                    let result = match inserted.await {
+                        Ok(result) => result,
+                        Err(_) => Err(dropped_intake_error()),
+                    };
+                    match capture {
+                        Some(tx) => {
+                            let response = match result {
+                                Ok(message_id) => Ok(json!({ "messageId": message_id })),
+                                Err(error) => Err(crate::v2::prompt::intake_error(&error)),
+                            };
+                            let _ = tx.send(response);
+                        }
+                        // The session also reports this at intake; the first
+                        // answer wins, so this only matters when it never did.
+                        None => v2.answer(&uuid, result),
+                    }
+                    // The turn's end, as the v1 prompt task reads it from its
+                    // reply: a dropped end is a session that ended, which is not
+                    // a failed turn (`SessionError::Closed`).
+                    let end = ended.await;
+                    let failed = matches!(&end, Ok(crate::turn_events::V2TurnEnd::Failed { .. }));
+                    if let Some(auth) = &sign_out_auth {
+                        let signed_out = matches!(
+                            &end,
+                            Ok(crate::turn_events::V2TurnEnd::Failed {
+                                kind: crate::turn::FailureKind::AuthRequired,
+                                ..
+                            })
+                        );
+                        if signed_out {
+                            auth.send(AuthCmd::MarkRespawn {
+                                session_id: board_session_id.clone(),
+                            });
+                            // `markSessionForSignOutRespawn` closes the query at
+                            // the sign-out (V-16).
+                            let session = session.clone();
+                            tokio::spawn(async move { session.close().await });
+                        }
+                    }
+                    if let Some(incarnation) = incarnation {
+                        board.turn_settled(&board_session_id, incarnation, failed);
+                    }
+                });
+                return Ok(());
+            }
             // Enqueue the prompt on the actor synchronously so a later
             // `session/cancel` notification (processed on the same single-task
             // connection) is always ordered *after* it — the queued-sweep
@@ -4074,6 +4658,12 @@ async fn handle_request(
                     session.send_mcp(uuid.clone(), command);
                 }
                 let prompt_text = acp_prompt_text(&params);
+                // AG-3: the prompt's `_meta` (a file-change report request) goes
+                // to the actor right before the prompt, on the same channel.
+                session.note_prompt_meta(
+                    uuid.clone(),
+                    params.get("_meta").cloned().unwrap_or(Value::Null),
+                );
                 session.send_prompt(uuid, frame, is_local_only, prompt_text)
             };
             // What the session index shows of a session this connection runs: the
@@ -4088,7 +4678,9 @@ async fn handle_request(
             // records the notification on the request's cancellation marker,
             // so watch that marker and cancel the owning session; the prompt
             // then settles `cancelled` (never a `request_cancelled` error).
-            let cancellation = responder.cancellation();
+            let Some(cancellation) = responder.cancellation() else {
+                return responder.respond_with_error(Error::internal_error());
+            };
             let cancel_session = session.clone();
             let connection = connection.clone();
             let sign_out_auth = registry.auth.clone().filter(|_| registry.hide_claude_auth);
@@ -5230,6 +5822,7 @@ mod tests {
             }}}}),
             &plain,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(init.prompt_suggestions, Some(false));
@@ -5247,7 +5840,7 @@ mod tests {
 
         // A plain client: promptSuggestions defaults on, the other two are
         // absent/false.
-        let bare = initialize_options_for(&json!({}), &plain, None).unwrap();
+        let bare = initialize_options_for(&json!({}), &plain, None, false).unwrap();
         assert_eq!(bare.prompt_suggestions, Some(true));
         assert_eq!(bare.per_task_stop_affordance, None);
         assert!(!bare.forward_subagent_text);
@@ -5256,7 +5849,7 @@ mod tests {
         // The subagents RFD form defaults `perTaskStopAffordance` on and
         // forwards nested text.
         let rfd = ClientCapabilities::from_value(Some(&json!({"subagents": {}})));
-        let rfd_init = initialize_options_for(&json!({}), &rfd, None).unwrap();
+        let rfd_init = initialize_options_for(&json!({}), &rfd, None, false).unwrap();
         assert_eq!(rfd_init.per_task_stop_affordance, Some(true));
         assert!(rfd_init.forward_subagent_text);
 
@@ -5265,6 +5858,7 @@ mod tests {
             &json!({"_meta": {"claudeCode": {"options": {"perTaskStopAffordance": false}}}}),
             &rfd,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(opt_out.per_task_stop_affordance, Some(false));
@@ -5275,7 +5869,7 @@ mod tests {
             "_meta": {"subagent-transcript": true}
         })));
         assert!(
-            initialize_options_for(&json!({}), &transcript, None)
+            initialize_options_for(&json!({}), &transcript, None, false)
                 .unwrap()
                 .forward_subagent_text
         );
@@ -5288,15 +5882,53 @@ mod tests {
                 "capabilities": ["agentFileChangeReport"]
             }}}
         }));
-        let reporter = initialize_options_for(&json!({}), &plain, air.as_ref()).unwrap();
+        let reporter = initialize_options_for(&json!({}), &plain, air.as_ref(), false).unwrap();
         assert!(reporter.enable_file_checkpointing);
         let opted_in = initialize_options_for(
             &json!({"_meta": {"claudeCode": {"options": {"enableFileCheckpointing": true}}}}),
             &plain,
             None,
+            false,
         )
         .unwrap();
         assert!(opted_in.enable_file_checkpointing);
+    }
+
+    /// T-105 (`create-session-options.test.ts`: "registers the PreToolUse hook
+    /// of the change previews only on a v2 connection"): a v1 client gets the
+    /// input's diff and waits on no hook; a v2 client registers the Edit|Write
+    /// preview hook as its first callback id.
+    #[test]
+    fn t6g2_a_v2_connection_registers_the_change_preview_hook() {
+        let plain = ClientCapabilities::default();
+        let v1 = initialize_options_for(&json!({}), &plain, None, false).unwrap();
+        let request = v1.build_request();
+        assert!(
+            request["hooks"].get("PreToolUse").is_none(),
+            "a v1 client registers no PreToolUse hook: {request}"
+        );
+        assert_eq!(
+            request["hooks"]["PostToolUse"],
+            json!([{"hookCallbackIds": ["hook_0"]}]),
+            "the v1 ids stay"
+        );
+
+        let v2 = initialize_options_for(&json!({}), &plain, None, true).unwrap();
+        let request = v2.build_request();
+        assert_eq!(
+            request["hooks"]["PreToolUse"],
+            json!([{"matcher": "Edit|Write", "hookCallbackIds": ["hook_0"]}]),
+            "a v2 client registers the preview hook: {request}"
+        );
+        assert_eq!(
+            request["hooks"]["PostToolUse"],
+            json!([{"hookCallbackIds": ["hook_1"]}]),
+            "v2 numbers the callbacks in registration order"
+        );
+        assert_eq!(
+            request["hooks"]["TaskCompleted"],
+            json!([{"hookCallbackIds": ["hook_5"]}])
+        );
     }
 
     /// O-108/O-119/O-120/O-121/O-126/O-127/O-132/O-136 — the ACP path maps the

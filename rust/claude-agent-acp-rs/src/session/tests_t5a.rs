@@ -52,6 +52,7 @@ fn post_compact(rig: &mut Rig, summary: Value) {
             update_tx: &rig.tx,
             command_tx: &mpsc::unbounded_channel().0,
             session_id: "s",
+            live_background: &HashMap::new(),
         },
         reply,
     );
@@ -493,6 +494,7 @@ impl ActorRig {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         Self {
             tx,

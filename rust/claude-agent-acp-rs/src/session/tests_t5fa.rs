@@ -114,6 +114,7 @@ impl ActorRig {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         Self {
             tx,
@@ -278,6 +279,7 @@ fn t5fa_conversation_reset_closes_the_entity_and_drops_the_pending_summary() {
             update_tx: &rig.tx,
             command_tx: &mpsc::unbounded_channel().0,
             session_id: "s",
+            live_background: &HashMap::new(),
         },
         reply,
     );
@@ -689,6 +691,7 @@ fn t5fa_compaction_update_wire_key_order() {
             update_tx: &rig.tx,
             command_tx: &mpsc::unbounded_channel().0,
             session_id: "s",
+            live_background: &HashMap::new(),
         },
         reply,
     );
@@ -718,6 +721,7 @@ fn post_compact(rig: &mut Rig, input: Value) {
             update_tx: &rig.tx,
             command_tx: &mpsc::unbounded_channel().0,
             session_id: "s",
+            live_background: &HashMap::new(),
         },
         reply,
     );

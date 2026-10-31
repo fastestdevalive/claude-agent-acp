@@ -20,16 +20,143 @@ pub const POST_MODEL_SWITCH_HOOK_ID: &str = "hook_1";
 pub const POST_COMPACT_HOOK_ID: &str = "hook_2";
 pub const TASK_CREATED_HOOK_ID: &str = "hook_3";
 pub const TASK_COMPLETED_HOOK_ID: &str = "hook_4";
+pub const PRE_TOOL_USE_HOOK_ID: &str = "hook_pre_tool_use";
+
+/// Hook roles corresponding to SDK hook registrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HookRole {
+    PreToolUse,
+    PostToolUse,
+    PostModelSwitch,
+    PostCompact,
+    TaskCreated,
+    TaskCompleted,
+}
+
+impl HookRole {
+    /// Returns the callback ID for this hook role given whether the connection is v2.
+    ///
+    /// On v2 the SDK numbers callbacks `hook_${nextCallbackId++}` in registration order
+    /// (sdk303 core.mjs `buildInitializeRequest`): PreToolUse = `hook_0`, PostToolUse = `hook_1`,
+    /// ..., TaskCompleted = `hook_5`. On v1, PreToolUse is not registered and the other hooks
+    /// start at `hook_0`.
+    pub fn id_for(self, v2: bool) -> &'static str {
+        if v2 {
+            match self {
+                HookRole::PreToolUse => "hook_0",
+                HookRole::PostToolUse => "hook_1",
+                HookRole::PostModelSwitch => "hook_2",
+                HookRole::PostCompact => "hook_3",
+                HookRole::TaskCreated => "hook_4",
+                HookRole::TaskCompleted => "hook_5",
+            }
+        } else {
+            match self {
+                HookRole::PreToolUse => PRE_TOOL_USE_HOOK_ID,
+                HookRole::PostToolUse => POST_TOOL_USE_HOOK_ID,
+                HookRole::PostModelSwitch => POST_MODEL_SWITCH_HOOK_ID,
+                HookRole::PostCompact => POST_COMPACT_HOOK_ID,
+                HookRole::TaskCreated => TASK_CREATED_HOOK_ID,
+                HookRole::TaskCompleted => TASK_COMPLETED_HOOK_ID,
+            }
+        }
+    }
+
+    /// Resolves a callback ID to a HookRole given whether the connection is v2.
+    pub fn from_id(id: &str, v2: bool) -> Option<HookRole> {
+        if v2 {
+            match id {
+                "hook_0" => Some(HookRole::PreToolUse),
+                "hook_1" => Some(HookRole::PostToolUse),
+                "hook_2" => Some(HookRole::PostModelSwitch),
+                "hook_3" => Some(HookRole::PostCompact),
+                "hook_4" => Some(HookRole::TaskCreated),
+                "hook_5" => Some(HookRole::TaskCompleted),
+                _ => None,
+            }
+        } else {
+            match id {
+                POST_TOOL_USE_HOOK_ID => Some(HookRole::PostToolUse),
+                POST_MODEL_SWITCH_HOOK_ID => Some(HookRole::PostModelSwitch),
+                POST_COMPACT_HOOK_ID => Some(HookRole::PostCompact),
+                TASK_CREATED_HOOK_ID => Some(HookRole::TaskCreated),
+                TASK_COMPLETED_HOOK_ID => Some(HookRole::TaskCompleted),
+                PRE_TOOL_USE_HOOK_ID => Some(HookRole::PreToolUse),
+                _ => None,
+            }
+        }
+    }
+}
 
 /// The payload sent in the `initialize` control_request's `hooks` field.
 pub fn init_hooks_payload() -> Value {
-    json!({
-        "PostToolUse": [{"hookCallbackIds": [POST_TOOL_USE_HOOK_ID]}],
-        "PostModelSwitch": [{"hookCallbackIds": [POST_MODEL_SWITCH_HOOK_ID]}],
-        "PostCompact": [{"hookCallbackIds": [POST_COMPACT_HOOK_ID]}],
-        "TaskCreated": [{"hookCallbackIds": [TASK_CREATED_HOOK_ID]}],
-        "TaskCompleted": [{"hookCallbackIds": [TASK_COMPLETED_HOOK_ID]}],
-    })
+    init_hooks_payload_with_v2(false)
+}
+
+/// The payload sent in the `initialize` control_request's `hooks` field,
+/// optionally adding the v2 PreToolUse preview hook for Edit/Write (T-105;
+/// `acp-agent.ts:11285-11292`).
+pub fn init_hooks_payload_with_v2(v2: bool) -> Value {
+    let mut map = serde_json::Map::new();
+    if v2 {
+        map.insert(
+            "PreToolUse".to_string(),
+            json!([{"matcher": "Edit|Write", "hookCallbackIds": [HookRole::PreToolUse.id_for(v2)]}]),
+        );
+    }
+    map.insert(
+        "PostToolUse".to_string(),
+        json!([{"hookCallbackIds": [HookRole::PostToolUse.id_for(v2)]}]),
+    );
+    map.insert(
+        "PostModelSwitch".to_string(),
+        json!([{"hookCallbackIds": [HookRole::PostModelSwitch.id_for(v2)]}]),
+    );
+    map.insert(
+        "PostCompact".to_string(),
+        json!([{"hookCallbackIds": [HookRole::PostCompact.id_for(v2)]}]),
+    );
+    map.insert(
+        "TaskCreated".to_string(),
+        json!([{"hookCallbackIds": [HookRole::TaskCreated.id_for(v2)]}]),
+    );
+    map.insert(
+        "TaskCompleted".to_string(),
+        json!([{"hookCallbackIds": [HookRole::TaskCompleted.id_for(v2)]}]),
+    );
+    Value::Object(map)
+}
+
+/// Builds the PreToolUse preview update for Edit or Write under ACP v2 (T-105;
+/// `acp-agent.ts:9958-10031`).
+///
+/// Under v2, a tool call for Edit or Write carries its exact patch before the tool
+/// runs, so auto-approved changes show preview diffs as permission requests do.
+pub fn build_pre_tool_use_preview_update(
+    tool_use_id: &str,
+    tool_name: &str,
+    tool_input: &Value,
+    cwd: Option<&std::path::Path>,
+    parent_tool_use_id: Option<&str>,
+) -> Option<Value> {
+    if tool_name != "Edit" && tool_name != "Write" {
+        return None;
+    }
+    let content =
+        crate::diff::preview_patch_content(tool_name, tool_input, cwd, crate::diff::PatchForm::V2)?;
+    let mut update = json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_use_id,
+        "content": content,
+    });
+    if let Some(parent_id) = parent_tool_use_id {
+        update["_meta"] = json!({
+            "claudeCode": {
+                "parentToolUseId": parent_id
+            }
+        });
+    }
+    Some(update)
 }
 
 /// A successful control_response to a `hook_callback`.
@@ -72,17 +199,49 @@ pub fn hook_control_response_error(request_id: &str) -> Value {
 }
 
 /// Registered callback entry for an active tool use.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookEntry {
     pub tool_name: String,
     pub parent_tool_use_id: Option<String>,
     pub completed_at: Option<Instant>,
+    pub owner_id: Option<String>,
+    pub on_release: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
+impl std::fmt::Debug for HookEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookEntry")
+            .field("tool_name", &self.tool_name)
+            .field("parent_tool_use_id", &self.parent_tool_use_id)
+            .field("completed_at", &self.completed_at)
+            .field("owner_id", &self.owner_id)
+            .field("on_release", &self.on_release.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for HookEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.tool_name == other.tool_name
+            && self.parent_tool_use_id == other.parent_tool_use_id
+            && self.completed_at == other.completed_at
+            && self.owner_id == other.owner_id
+    }
+}
+
+impl Eq for HookEntry {}
+
 /// Actor-owned registry of pending hook callbacks.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct HookRegistry {
     callbacks: HashMap<String, HookEntry>,
+}
+
+impl std::fmt::Debug for HookRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookRegistry")
+            .field("callbacks", &self.callbacks)
+            .finish()
+    }
 }
 
 impl HookRegistry {
@@ -92,28 +251,61 @@ impl HookRegistry {
 
     /// Register a hook callback for `tool_use_id`, replacing any callback already
     /// registered for it (Node `registerHookCallback` unregisters first). Returns the
-    /// replaced entry, which has left the registry and must be released by the caller
-    /// (Node `onRelease`).
+    /// replaced entry, which has left the registry and had its on_release fired.
     pub fn register_once(
         &mut self,
         tool_use_id: String,
         tool_name: String,
         parent_tool_use_id: Option<String>,
     ) -> Option<HookEntry> {
+        self.register_with_owner(tool_use_id, tool_name, parent_tool_use_id, None, None)
+    }
+
+    /// Register a hook callback with owner and optional release callback.
+    pub fn register_with_owner(
+        &mut self,
+        tool_use_id: String,
+        tool_name: String,
+        parent_tool_use_id: Option<String>,
+        owner_id: Option<String>,
+        on_release: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Option<HookEntry> {
+        let prev = self.unregister(&tool_use_id);
         self.callbacks.insert(
             tool_use_id,
             HookEntry {
                 tool_name,
                 parent_tool_use_id,
                 completed_at: None,
+                owner_id,
+                on_release,
             },
-        )
+        );
+        prev
     }
 
     /// Forget every callback (`clearHookCallbacks`): a conversation reset
     /// mounts a fresh transcript whose tool calls the old ones cannot match.
     pub fn clear(&mut self) {
-        self.callbacks.clear();
+        let mut old = std::mem::take(&mut self.callbacks);
+        for (_, mut entry) in old.drain() {
+            if let Some(cb) = entry.on_release.take() {
+                cb();
+            }
+        }
+    }
+
+    /// Clear all callbacks belonging to `owner_id` (`clearHookCallbacks(ownerId)`).
+    pub fn clear_for_owner(&mut self, owner_id: &str) {
+        let matching_ids: Vec<String> = self
+            .callbacks
+            .iter()
+            .filter(|(_, entry)| entry.owner_id.as_deref() == Some(owner_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in matching_ids {
+            self.unregister(&id);
+        }
     }
 
     /// Whether a callback is registered for `tool_use_id`.
@@ -133,11 +325,18 @@ impl HookRegistry {
 
     /// Unregister and return the callback entry for `tool_use_id`.
     pub fn unregister(&mut self, tool_use_id: &str) -> Option<HookEntry> {
-        self.callbacks.remove(tool_use_id)
+        if let Some(mut entry) = self.callbacks.remove(tool_use_id) {
+            if let Some(cb) = entry.on_release.take() {
+                cb();
+            }
+            Some(entry)
+        } else {
+            None
+        }
     }
 
     /// Lazily prune callbacks whose completed_at is 30 seconds or older. Returns the
-    /// released entries, which the caller must release (Node `onRelease`).
+    /// released entries, which have already fired their on_release callbacks.
     pub fn prune_expired(&mut self, now: Instant) -> Vec<(String, HookEntry)> {
         let expired: Vec<String> = self
             .callbacks
@@ -151,7 +350,7 @@ impl HookRegistry {
             .collect();
         expired
             .into_iter()
-            .filter_map(|id| self.callbacks.remove(&id).map(|entry| (id, entry)))
+            .filter_map(|id| self.unregister(&id).map(|entry| (id, entry)))
             .collect()
     }
 
@@ -361,26 +560,30 @@ pub fn post_tool_use_update(
     } else {
         (Vec::new(), Vec::new())
     };
-    let mut claude_code = json!({ "toolName": tool_name });
+    // Node writes `toolResponse` first, then `toolName` (`hookResult`,
+    // `renderer.ts:553-574`); `stampParentToolUseId` appends the parent after
+    // (`acp-agent.ts:1899-1907`). Preserve that key order on the wire.
+    let mut claude_code = serde_json::Map::new();
     if keeps_meta {
         let markers = tool_response_markers(tool_response);
         if markers.is_none() && content.is_empty() && locations.is_empty() {
             return None;
         }
         if let Some(markers) = markers {
-            claude_code["toolResponse"] = markers;
+            claude_code.insert("toolResponse".into(), markers);
         }
     } else {
-        claude_code["toolResponse"] = tool_response.clone();
+        claude_code.insert("toolResponse".into(), tool_response.clone());
     }
+    claude_code.insert("toolName".into(), json!(tool_name));
     if let Some(parent) = parent_tool_use_id {
-        claude_code["parentToolUseId"] = json!(parent);
+        claude_code.insert("parentToolUseId".into(), json!(parent));
     }
     let mut update = json!({
         "sessionUpdate": "tool_call_update",
         "toolCallId": tool_use_id,
         "_meta": {
-            "claudeCode": claude_code,
+            "claudeCode": Value::Object(claude_code),
         }
     });
     if !content.is_empty() {
@@ -905,6 +1108,45 @@ mod tests {
     }
 
     #[test]
+    fn clears_only_callbacks_owned_by_the_cancelled_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let mut reg = HookRegistry::new();
+        let first_released = Arc::new(AtomicBool::new(false));
+        let second_released = Arc::new(AtomicBool::new(false));
+
+        let f_rel = Arc::clone(&first_released);
+        reg.register_with_owner(
+            "owned-first".into(),
+            "Bash".into(),
+            None,
+            Some("session-one".into()),
+            Some(Box::new(move || {
+                f_rel.store(true, Ordering::SeqCst);
+            })),
+        );
+
+        let s_rel = Arc::clone(&second_released);
+        reg.register_with_owner(
+            "owned-second".into(),
+            "Bash".into(),
+            None,
+            Some("session-two".into()),
+            Some(Box::new(move || {
+                s_rel.store(true, Ordering::SeqCst);
+            })),
+        );
+
+        reg.clear_for_owner("session-one");
+
+        assert!(!reg.has("owned-first"));
+        assert!(reg.has("owned-second"));
+        assert!(first_released.load(Ordering::SeqCst));
+        assert!(!second_released.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn inv_64_retention_30s_lazy() {
         let mut reg = HookRegistry::new();
         reg.register_once("toolu_1".into(), "Bash".into(), None);
@@ -1016,6 +1258,35 @@ mod tests {
             "parent_task_1"
         );
         assert_eq!(update["_meta"]["claudeCode"]["toolResponse"], tool_response);
+    }
+
+    /// L11 (`review-T7`): `_meta.claudeCode` serializes `toolResponse` before
+    /// `toolName`, then `parentToolUseId` (`hookResult`,
+    /// `src/tool-calls/renderer.ts:553-574`; `stampParentToolUseId`,
+    /// `src/acp-agent.ts:1899-1907`). Value-equal assertions cannot catch the
+    /// order, so this one compares the serialized object.
+    #[test]
+    fn inv_64_post_tool_use_update_key_order() {
+        let tool_response = json!({"stdout": "hello", "stderr": "", "exitCode": 0});
+        let update = build_post_tool_use_update(
+            "toolu_bash1",
+            "Bash",
+            Some("parent_task_1"),
+            &tool_response,
+        );
+        assert_eq!(
+            serde_json::to_string(&update["_meta"]["claudeCode"]).expect("serialize"),
+            r#"{"toolResponse":{"stdout":"hello","stderr":"","exitCode":0},"toolName":"Bash","parentToolUseId":"parent_task_1"}"#
+        );
+
+        // An AIR client (`keepsMeta`) carries the markers, same order.
+        let markers = json!({"stdout": "", "status": "completed", "isAsync": true});
+        let update = crate::hooks::post_tool_use_update("t1", "Bash", None, &markers, false, true)
+            .expect("markers are reported");
+        assert_eq!(
+            serde_json::to_string(&update["_meta"]["claudeCode"]).expect("serialize"),
+            r#"{"toolResponse":{"status":"completed","isAsync":true},"toolName":"Bash"}"#
+        );
     }
 
     #[test]

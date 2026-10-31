@@ -128,7 +128,7 @@ src/tests/acp-agent.test.ts | task notification replay > sends nothing for a tas
 src/tests/acp-agent.test.ts | task notification replay > takes the output path from the tool result when the notification has none | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task notification replay > sends nothing for a task that a Monitor tool call started | ported:src/transcript.rs::b45_native_subagent_notification_restores_no_async_task | 
 src/tests/acp-agent.test.ts | task notification replay > sends one terminal state for a repeated notification | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | task notification replay > restores the notified state of a background Agent after its launch result | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | task notification replay > restores the notified state of a background Agent after its launch result | ported:tests/t6b_subagent_replay.rs::b52_load_ends_a_background_child_with_its_notification | 
 src/tests/acp-agent.test.ts | task notification replay > keeps a task-notification delivery with a subkind as a prompt | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | meta messages from other agents, sessions and channels > isReplayHiddenMetaMessage matches only meta messages with an inter-agent origin | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | meta messages from other agents, sessions and channels > loadSession replay skips them but keeps the user's own prompt | missing:T-UNCLASSIFIED | 
@@ -143,10 +143,10 @@ src/tests/acp-agent.test.ts | usage-limit failure replay > recognizes a sanitize
 src/tests/acp-agent.test.ts | session/list > returns one page and a cursor while more sessions exist | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/list > rejects a cursor that it did not issue | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent transcript replay > replays a subagent from its own transcript file | ported:src/transcript.rs::b53_load_replay_end_marker_shape | 
-src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > replays a fork child without the launching message and boilerplate it inherited | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > replays each child under its live session id, with its incoming messages, before the response | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > ends a child that the user stopped as cancelled, and one without a known end as idle | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > leaves out a subagent message that the session transcript stores inline | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > replays a fork child without the launching message and boilerplate it inherited | ported:src/transcript.rs::a_fork_child_replays_without_the_launching_message | 
+src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > replays each child under its live session id, with its incoming messages, before the response | ported:tests/t6b_subagent_replay.rs::b52_load_replays_a_subagent_into_its_own_session | 
+src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > ends a child that the user stopped as cancelled, and one without a known end as idle | ported:src/subagent_replay.rs::children_end_before_the_replay_ends | 
+src/tests/acp-agent.test.ts | subagent transcript replay > for a client on the subagents RFD > leaves out a subagent message that the session transcript stores inline | ported:src/transcript.rs::inline_subagent_messages_skipped_on_rfd_form_without_launches | 
 src/tests/acp-agent.test.ts | subagent transcript replay > replays an unattributed sidechain as a deterministic disconnected child | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent transcript replay > reconstructs a persisted Agent launch before child updates | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent transcript replay > restores a persisted $state Agent result | missing:T-UNCLASSIFIED | 
@@ -197,12 +197,12 @@ src/tests/acp-agent.test.ts | tool_call emitted before permission request > prun
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > does not resolve an uncached tool_result that was never surfaced | ported:src/map.rs::f6b_untracked_result_resolves_only_a_surfaced_call | dropped when never emitted; G10a F6b | 
 src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > prompts for asks that survive Claude Code's bypass evaluation | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > prompts the client when the ask was forced by a permissions.ask rule | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > does not promise an ineffective always-allow fallback for a forced ask rule | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > does not promise an ineffective always-allow fallback for a forced ask rule | ported:src/permission.rs::t6a2_matched_ask_rule_presence_test | 
 src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > offers no always-allow option when the CLI suppresses the persistent rule | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | canUseTool in bypassPermissions mode > leads with the reject option and forwards the hint when the CLI defaults to no | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > keeps the legacy child tool call before its root permission request | covered:subagent-child-tool | child tool_call and result carry _meta.claudeCode.parentToolUseId (inv_76_parent_stamped_on_tool_call_and_updates)
-src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > forwards the MCP server provenance on the permission request | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > omits permission _meta for a root tool without MCP provenance | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > keeps the legacy child tool call before its root permission request | ported:src/tests_t6a2.rs::t6a2_keeps_the_legacy_child_tool_call_before_its_root_permission_request | 
+src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > forwards the MCP server provenance on the permission request | ported:src/tests_t6a2.rs::t6a2_forwards_the_mcp_server_provenance_on_the_permission_request | 
+src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > omits permission _meta for a root tool without MCP provenance | ported:src/tests_t6a2.rs::t6a2_omits_permission_meta_for_a_root_tool_without_mcp_provenance | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > forwards child elicitation to the root when native subagents were not negotiated | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > omits the attribution (and logs the miss) when the agent id has no recorded parent | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | subagent permission attribution (issue #851) > restores the attribution via the streamed refinement when the eager emission raced task_started | missing:T-UNCLASSIFIED | 
@@ -336,8 +336,8 @@ src/tests/acp-agent.test.ts | skill commands in available_commands_update > give
 src/tests/acp-agent.test.ts | logout > advertises the logout capability during initialize | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | logout > advertises the agent subagent capability of AIR's draft to AIR alone | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | logout > negotiates subagents through AIR metadata when the SDK strips the draft field | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | logout > advertises canonical AIR sessionFailure support during initialize | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | logout > advertises AIR sessionFailure support even before client negotiation | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | logout > advertises canonical AIR sessionFailure support during initialize | ported:src/tests_t6a2.rs::t6a2_advertises_the_air_capability_list_during_initialize | 
+src/tests/acp-agent.test.ts | logout > advertises AIR sessionFailure support even before client negotiation | ported:src/tests_t6a2.rs::t6a2_advertises_the_air_capability_list_during_initialize | 
 src/tests/acp-agent.test.ts | session/fork > starts the forked session, so the client can prompt it at once | ported:tests/t5b_fork.rs::m32_fork_without_point_copies_latest_transcript | 
 src/tests/acp-agent.test.ts | session/fork > reuses the forked session for a later resume or load with the same settings | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/fork > fails when the forked session cannot start | missing:T-UNCLASSIFIED | 
@@ -713,34 +713,34 @@ src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > drops every update of a 
 src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > gets the Write patch, but no file text in the PostToolUse toolResponse | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > sends no creation patch over a file and no Edit patch before the preview | missing:T-UNCLASSIFIED | 
 src/tests/acp-scenarios.test.ts | ACP scenarios > AIR > sends the Bash output as terminal deltas | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP protocol routing > serves the unchanged v1 handshake to a v1 client | covered:initialize-capabilities-plain | 
-src/tests/acp-v2.test.ts | ACP protocol routing > serves the v2 handshake to a v2 client | ported:tests/t5fc_v2_e2e.rs::t5fc_v2_initialize_matches_golden_then_later_requests_are_method_not_found | 
-src/tests/acp-v2.test.ts | ACP v2 sessions > creates a session with v2 MCP servers, config options, and commands | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 sessions > lists the commands in every setup response: resume, resume with replay, and fork | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 sessions > rejects an MCP transport that v1 cannot express | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 sessions > lists, resumes, closes, and deletes sessions | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 sessions > sets a config option with a v2 value and reports modes only as config options | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 sessions > tells the agent that a v2 client takes notices and compaction updates | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 sessions > forwards the URL elicitation of MCP OAuth to a v2 client | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > answers a prompt once Claude Code takes it in, then reports the turn as state | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > reports waiting on a question as requires_action | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP protocol routing > serves the unchanged v1 handshake to a v1 client | ported:tests/t6b_v2_router.rs::m106_without_opt_in_the_connection_stays_v1 | 
+src/tests/acp-v2.test.ts | ACP protocol routing > serves the v2 handshake to a v2 client | ported:tests/t6b_v2_router.rs::m106_m108_v2_session_new_answers_v2_shape | 
+src/tests/acp-v2.test.ts | ACP v2 sessions > creates a session with v2 MCP servers, config options, and commands | ported:tests/t6b_v2_router.rs::m106_m108_v2_session_new_answers_v2_shape | 
+src/tests/acp-v2.test.ts | ACP v2 sessions > lists the commands in every setup response: resume, resume with replay, and fork | ported:tests/t6b_v2_router.rs::m109_v2_resume_replay_start_replays_history | 
+src/tests/acp-v2.test.ts | ACP v2 sessions > rejects an MCP transport that v1 cannot express | ported:src/v2/agent_tests.rs::rejects_an_mcp_transport_v1_cannot_express | 
+src/tests/acp-v2.test.ts | ACP v2 sessions > lists, resumes, closes, and deletes sessions | ported:tests/t6b_v2_router.rs::m111_v2_list_close_delete | 
+src/tests/acp-v2.test.ts | ACP v2 sessions > sets a config option with a v2 value and reports modes only as config options | ported:tests/t6b_v2_router.rs::m112_v2_set_config_option | 
+src/tests/acp-v2.test.ts | ACP v2 sessions > tells the agent that a v2 client takes notices and compaction updates | ported:src/v2/tests.rs::test_c44_v1_initialize_request_mapping | 
+src/tests/acp-v2.test.ts | ACP v2 sessions > forwards the URL elicitation of MCP OAuth to a v2 client | ported:tests/t7b_v2_elicitation.rs::u87_v2_elicitation_complete_notification | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > answers a prompt once Claude Code takes it in, then reports the turn as state | ported:tests/t6g2_v2_prompt.rs::t6g2_result_only_text_reaches_a_v2_client | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > reports waiting on a question as requires_action | ported:src/session/tests_t6a.rs::t6a_a_request_makes_the_work_wait_then_run_again | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > does not report the next turn as waiting for a question that its client never settled | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > asks for permission with a title of its own, and reads the answer back | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > asks for permission with a title of its own, and reads the answer back | ported:tests/t7b_v2_children.rs::b115_v2_child_announced_and_foreground_request | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > forks a session into one that the client can prompt at once | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > replays a Write without the v1 diff that v2 cannot take | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > replays a subagent's history to its own session, and clears each replayed message there first | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > replays a subagent's history to its own session, and clears each replayed message there first | ported:tests/t6g2_v2_prompt.rs::t6g2_a_live_load_replays_a_background_child | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > ends a resume with replay with one end event for a client with loadReplayEnd | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > replays the plan of an approved ExitPlanMode as a markdown plan | ported:src/transcript.rs::t3a_replay_publishes_the_approved_plan_for_plan_clients | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > reports Claude Code's warnings as live notices | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > replays a compaction as one completed compaction_update at its position | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > replays the history before it answers session/resume, clearing each message first | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > reports the running turn of a live session it resumes, before the response | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > replays the plan of an approved ExitPlanMode as a markdown plan | ported:tests/t7b_v2_replay.rs::b116_v2_resume_replays_an_approved_plan_as_markdown | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > reports Claude Code's warnings as live notices | ported:tests/t7b_v2_replay.rs::b116_v2_live_warning_is_a_notice | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > replays a compaction as one completed compaction_update at its position | ported:tests/t7b_v2_replay.rs::b116_v2_resume_replays_a_compact_summary_before_the_answer | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > replays the history before it answers session/resume, clearing each message first | ported:tests/t6g_v2_prompt.rs::t6g_v2_replay_clears_each_message_before_its_first_chunk | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > reports the running turn of a live session it resumes, before the response | ported:tests/t6b_v2_router.rs::m109_v2_resume_sends_state_snapshot | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > answers a queued prompt once Claude Code takes it in, after the turn before it | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > cancels the running turn after its last output, and a queued prompt with -32800 | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > cancels the running turn after its last output, and a queued prompt with -32800 | ported:tests/t6g_v2_prompt.rs::t6g_v2_cancel_ends_the_turn_and_the_connection_serves_on | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > reports idle cancelled when the stream dies while a cancel stops the turn | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > answers a prompt that a session/close stops before it is queued with -32800 | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > ends a turn with idle cancelled before it answers session/close, when the turn does not end on its own | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > shows an auto-approved Edit's exact patch before the Edit runs, with the hook %s | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > shows an auto-approved Edit's exact patch before the Edit runs, with the hook %s | ported:tests/t6g2_v2_prompt.rs::t6g2_a_v2_pretool_use_hook_shows_the_patch_before_the_edit | .each variants (hook timing): the t6g2 PreToolUse hook test covers the streamed-tool_use ordering
 src/tests/acp-v2.test.ts | ACP v2 prompts > reports a tool call whose run was interrupted as cancelled | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > reports a command whose result says interrupted as cancelled | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > the tool calls that a cancel stops > ends a stopped tool call and its subagent's as cancelled, before it reports idle cancelled | missing:T-UNCLASSIFIED | 
@@ -748,13 +748,13 @@ src/tests/acp-v2.test.ts | ACP v2 prompts > the tool calls that a cancel stops >
 src/tests/acp-v2.test.ts | ACP v2 prompts > the tool calls that a cancel stops > ends a tool call that finished as the cancel landed as completed, not cancelled | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > the tool calls that a cancel stops > ends the tool call of a background subagent as cancelled when the SDK reports it stopped while the root is idle | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > reports a tool call that Claude dropped before it ran as cancelled | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > reports a turn that fails after it was taken in as idle with the error stop reason | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > keeps the auth_required code of a turn that fails for a missing login | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > answers a queued prompt with the error of a turn that failed before it was taken in | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > gives a messageId to the chunks that the agent builds from a command's output and a result | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > reports a turn that fails after it was taken in as idle with the error stop reason | ported:tests/t6g2_v2_prompt.rs::t6g2_a_failed_v2_turn_marks_its_row_error | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > keeps the auth_required code of a turn that fails for a missing login | ported:tests/t6g2_v2_prompt.rs::t6g2_an_auth_failure_marks_the_query_for_a_respawn | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > answers a queued prompt with the error of a turn that failed before it was taken in | ported:src/v2/prompt_tests.rs::t6a_a_turn_that_ended_before_intake_answers_internal_error | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > gives a messageId to the chunks that the agent builds from a command's output and a result | ported:src/session/tests_t6g2.rs::t6g2_the_result_only_text_reaches_a_v2_client | 
 src/tests/acp-v2.test.ts | ACP v2 prompts > gives a refusal explanation the messageId of the refusing result | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 prompts > rejects a prompt with a content block that v1 cannot express | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > reports a cycle after the turn ended as running, then idle with the cycle's usage | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 prompts > rejects a prompt with a content block that v1 cannot express | ported:src/v2/prompt_tests.rs::t6a_rejects_a_content_block_that_v1_cannot_express | 
+src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > reports a cycle after the turn ended as running, then idle with the cycle's usage | ported:src/session/tests_t6a.rs::t6a_a_cycle_reports_running_then_idle_with_its_usage | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > closes a tool call that Claude dropped before it ran in a cycle as cancelled, before the cycle's idle | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends the tool call that a cancelled cycle runs with Claude Code's result, before idle cancelled | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > the tool calls that a cancelled cycle leaves open > ends the command of a foreground subagent that the cycle runs, which Claude Code sends no result for, before idle cancelled | missing:T-UNCLASSIFIED | 
@@ -762,8 +762,8 @@ src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its ow
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > the tool calls that a cancelled cycle leaves open > ends the tool calls of a cycle that the cancel ends at the idle, when no result comes | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > the tool calls that a cancelled cycle leaves open > leaves the tool call of a cycle that the SDK aborted without a cancel to Claude Code's result | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > the tool calls that a cancelled cycle leaves open > closes the calls of a held turn's follow-up before idle cancelled, and leaves a running background subagent's open | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends a cycle that the client cancels with idle cancelled | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > lets a prompt that Claude Code takes in during a cycle take the cycle over | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends a cycle that the client cancels with idle cancelled | ported:src/session/tests_t6a.rs::t6a_a_cancelled_cycle_reports_idle_cancelled | 
+src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > lets a prompt that Claude Code takes in during a cycle take the cycle over | ported:src/session/tests_t6a.rs::t6a_a_turn_takes_a_running_cycle_over | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends a cycle at its own result, not at a placeholder result or an idle owed to the turn | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends a cycle at an idle when its result never comes | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > reports a cycle that waits on a question as requires_action | missing:T-UNCLASSIFIED | 
@@ -771,7 +771,7 @@ src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its ow
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends a cycle with an error when the stream %s during it | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > leaves output that comes before a queued prompt's echo to that prompt | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > leaves a subagent's output after the turn to the session's background | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > reports idle at the result of a turn that v1 holds for its background subagent, and the follow-up as a cycle | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > reports idle at the result of a turn that v1 holds for its background subagent, and the follow-up as a cycle | ported:src/session/tests_t6g.rs::t6g_a_held_turn_ends_its_work_at_its_result | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > starts a cycle at output before a queued prompt that Claude Code reports it has not started | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends a cycle with idle cancelled before it answers session/close | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > ends a cancelled turn at its result and reports the follow-up after it as a cycle | missing:T-UNCLASSIFIED | 
@@ -785,60 +785,60 @@ src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its ow
 src/tests/acp-v2.test.ts | ACP v2 model cycles that Claude Code starts on its own > drops the output of a held turn's follow-up that a cancel stopped before it showed any | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > reports a subagent as a child session, with its work state also on the child's stream | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > stops a child's task when the client cancels the child session, and reports the child idle cancelled on both streams | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > keeps the turn running while a background subagent's request is open | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > keeps the turn running while a background subagent's request is open | ported:src/session/tests_t6a.rs::t6a_a_background_subagents_request_does_not_block_the_work | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > keeps the turn running while a background subagent's question is open | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > reports requires_action while a foreground subagent's request is open | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > reports requires_action while a foreground subagent's request is open | ported:tests/t7b_v2_children.rs::b115_v2_child_announced_and_foreground_request | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > keeps the turn running for a foreground subagent that a background subagent launched | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > waits for a request once its subagent, which asked before its task_started, turns out to run in the foreground | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > stops waiting for a request once its foreground subagent settles | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > stops waiting for a request once Claude Code moves its subagent to the background | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > reports no running before idle cancelled for a child's request that a cancel withdraws, and for the turn that waits on it | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > reports no running before idle cancelled for a child's request that a cancel withdraws, and for the turn that waits on it | ported:tests/t7b_v2_children.rs::b115_v2_cancel_withdraws_a_foreground_child_request | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > reports nothing for a background subagent's request that a cancel withdraws | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that subagents make > reports no running for a turn's request that a cancel withdraws along with a background subagent's | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports no running before idle cancelled for %s that a cancel withdraws | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports no running before idle cancelled for %s that a cancel withdraws | ported:src/session/tests_t6g2.rs::t6g2_a_cancel_withdraws_the_open_permission_before_the_idle | .each variants (permission, question, elicitation): the t6g2 cancel test covers the permission variant, the others share the close_input path .each variants (permission, question, elicitation): the t6g2 cancel test covers the permission variant, the others share the close_input path
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports no running before idle cancelled for %s that a session/close withdraws | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports running when Claude Code withdraws %s without a cancel, since the work goes on | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports running when the user answers the request after the cancel | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports running when the user answers the request after the cancel | ported:src/session/tests_t6g.rs::t6g_an_answer_after_a_cancel_reports_running | 
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports running when Claude Code withdraws a request that opened after the cancel | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > two requests that are open together > reports no running when a cancel withdraws both | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > two requests that are open together > reports running when the user answers the one that the cancel did not withdraw | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > two requests that are open together > reports no running when a cancel withdraws the one that ends last, after the user answered the other | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 requests that a cancel withdraws > reports no running before idle cancelled for a request of a cycle that Claude Code started, which a cancel withdraws | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 terminal of a command in the background > keeps the terminal running after the Bash call, and ends it when the command's task ends | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 terminal of a command in the background > ends the terminal at the Bash result when the command's task ended before it | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 terminal of a command in the background > keeps the terminal running after the Bash call, and ends it when the command's task ends | ported:tests/t7b_v2_terminal.rs::t104_v2_background_terminal_keeps_running_until_its_task_ends | 
+src/tests/acp-v2.test.ts | ACP v2 terminal of a command in the background > ends the terminal at the Bash result when the command's task ended before it | ported:tests/t7b_v2_terminal.rs::t104_v2_background_terminal_ends_at_the_result_when_the_task_ended | 
 src/tests/acp-v2.test.ts | ACP v2 session translation > renames the group id of grouped select options | ported:src/v2/tests.rs::test_o86_v2_config_options | 
 src/tests/acp-v2.test.ts | ACP v2 session translation > passes systemPrompt to every v1 session lifecycle request | ported:src/v2/tests.rs::test_v2_session_lifecycle_helpers | 
 src/tests/acp-v2.test.ts | ACP v2 session translation > rejects a config option value type that v1 cannot express | ported:src/v2/tests.rs::test_o86_v1_set_session_config_option_request | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > fails on session updates that it does not translate yet | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > passes the subagent updates through, which v1 and v2 share | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > reports a subagent's work state on the child's stream as well | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a subagent state that the subagents RFD does not define | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > sends compaction updates as they are, which v1 and v2 share | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > reports the plan of the session as one v2 plan | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > passes the agent's plan operations through, which have v2's shape | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > reports a new tool call with an upserting tool_call_update | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > leaves out the null fields of a tool call update, which v2 would clear | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > sends the diffs that the agent built for v2 as they are | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > turns the terminal extension of a command into a display terminal | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > leaves an exit code that the agent does not know out of the terminal's exit | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > forgets the terminals of a closed session | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > gives the tool's name as name, once, and leaves it out of _meta | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > sends the earlier claudeCode keys again with a key that changes | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > sends only the top-level keys that change, each whole | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > removes a key that a v1 report sets to null | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > sends no _meta on a report that changes nothing | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > gives a permission request's subject the whole _meta, also when it changes nothing | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > keeps the tool calls of each session apart, and forgets a closed session's | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > removes what an earlier tool call with the same id stored, when one starts | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > clears the _meta that the client may hold when a replay starts a tool call | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a permission request without the title that v2 requires | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > reads an unknown permission outcome as cancelled, never as approval | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a v1 diff, and passes a display terminal as it is | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > keeps the audience roles of a prompt block that v1 knows | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a message chunk without a messageId, which v2 requires | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 providers > lists, sets, and disables the provider | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 auth > pushes the auth status of the connection after initialize | missing:T-UNCLASSIFIED | 
-src/tests/acp-v2.test.ts | ACP v2 auth > logs in to a gateway with auth/login and out with auth/logout | missing:T-UNCLASSIFIED | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > fails on session updates that it does not translate yet | ported:src/v2/translate_tests.rs::test_v2_session_update_fails_on_untranslated_kinds | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > passes the subagent updates through, which v1 and v2 share | ported:src/v2/translate_tests.rs::test_v2_session_update_subagent_update_passthrough | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > reports a subagent's work state on the child's stream as well | ported:src/v2/e2e_tests.rs::t6g_a_replayed_subagent_state_goes_out_after_the_replay | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a subagent state that the subagents RFD does not define | ported:src/v2/translate_tests.rs::test_v2_session_update_fails_on_undefined_subagent_state | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > sends compaction updates as they are, which v1 and v2 share | ported:src/v2/translate_tests.rs::test_v2_session_update_compaction_passthrough | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > reports the plan of the session as one v2 plan | ported:src/v2/e2e_tests.rs::t6g_a_plan_becomes_a_plan_update | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > passes the agent's plan operations through, which have v2's shape | ported:src/v2/translate_tests.rs::test_v2_session_update_plan_operations_passthrough | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > reports a new tool call with an upserting tool_call_update | ported:tests/t6g_v2_prompt.rs::t6g_v2_tool_calls_and_plan_are_translated | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > leaves out the null fields of a tool call update, which v2 would clear | ported:src/v2/translate_tests.rs::test_v2_tool_call_update_drops_null_fields | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > sends the diffs that the agent built for v2 as they are | ported:src/v2/translate_tests.rs::test_v2_tool_call_update_v2_diff_passthrough | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > turns the terminal extension of a command into a display terminal | ported:tests/t7b_v2_terminal.rs::u104_v2_terminal_output_chunks_for_a_delta_client | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > leaves an exit code that the agent does not know out of the terminal's exit | ported:src/v2/translate_tests.rs::test_v2_terminal_exit_omits_unknown_exit_code | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > forgets the terminals of a closed session | ported:src/v2/translate_tests.rs::test_v2_terminal_forgets_closed_session | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > gives the tool's name as name, once, and leaves it out of _meta | ported:src/v2/e2e_tests.rs::t6g_a_tool_call_becomes_a_tool_call_update | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > sends the earlier claudeCode keys again with a key that changes | ported:src/v2/translate_tests.rs::test_v2_tool_call_meta_replays_claudecode_keys | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > sends only the top-level keys that change, each whole | ported:src/v2/translate_tests.rs::test_v2_tool_call_meta_sends_only_changed_toplevel_keys | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > removes a key that a v1 report sets to null | ported:src/v2/translate_tests.rs::test_v2_tool_call_meta_removes_null_keys | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > sends no _meta on a report that changes nothing | ported:src/v2/translate_tests.rs::test_v2_tool_call_meta_sends_no_meta_when_unchanged | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > gives a permission request's subject the whole _meta, also when it changes nothing | ported:src/v2/e2e_tests.rs::t6g_a_permission_subject_carries_the_stored_meta | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > keeps the tool calls of each session apart, and forgets a closed session's | ported:src/v2/e2e_tests.rs::t6g_forget_drops_a_sessions_stores | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > removes what an earlier tool call with the same id stored, when one starts | ported:src/v2/translate_tests.rs::test_v2_tool_call_meta_resets_on_start | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > the _meta that the client stores for a tool call > clears the _meta that the client may hold when a replay starts a tool call | ported:src/v2/translate_tests.rs::test_v2_tool_call_meta_clears_on_replaying_start | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a permission request without the title that v2 requires | ported:src/v2/e2e_tests.rs::t6g_a_permission_subject_carries_the_stored_meta | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > reads an unknown permission outcome as cancelled, never as approval | ported:src/v2/translate_tests.rs::test_v2_permission_response_non_selected_becomes_cancelled | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a v1 diff, and passes a display terminal as it is | ported:src/v2/translate_tests.rs::test_v2_tool_call_rejects_v1_diff_and_passes_terminal | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > keeps the audience roles of a prompt block that v1 knows | ported:src/v2/prompt_tests.rs::t6a_keeps_the_audience_roles_of_a_prompt_block_that_v1_knows | 
+src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a message chunk without a messageId, which v2 requires | ported:src/v2/prompt_tests.rs::t6a_requires_a_message_id_on_a_chunk | 
+src/tests/acp-v2.test.ts | ACP v2 providers > lists, sets, and disables the provider | ported:tests/t7b_v2_providers.rs::m115_v2_providers_set | 
+src/tests/acp-v2.test.ts | ACP v2 auth > pushes the auth status of the connection after initialize | ported:tests/conc_race_v2_hooks.rs::t7a_u88_v2_pushes_the_auth_status_after_initialize | 
+src/tests/acp-v2.test.ts | ACP v2 auth > logs in to a gateway with auth/login and out with auth/logout | ported:tests/t7b_v2_providers.rs::m116_v2_auth_login | 
 src/tests/additional-roots.test.ts | additionalRoots > passes through relative roots as provided | ported:tests/t1b_roots.rs::passes_through_relative_roots_as_provided | argv effect: corpus spawn-additional-directories
 src/tests/additional-roots.test.ts | additionalRoots > merges additionalRoots with user additionalDirectories without normalization | ported:tests/t1b_roots.rs::merges_additional_roots_with_user_directories_without_normalization | 
 src/tests/additional-roots.test.ts | additionalRoots > prefers the official ACP additionalDirectories field over _meta.additionalRoots | ported:tests/t1b_roots.rs::prefers_the_official_field_over_meta_additional_roots | 
@@ -1045,7 +1045,7 @@ src/tests/context-compaction.test.ts | ContextCompactionLifecycle (tool_call) > 
 src/tests/create-session-options.test.ts | createSession options merging > [dynamic#1] | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > [dynamic#2] | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > allowDangerouslySkipPermissions > requests bypass capability by default and mirrors it in the mode catalog | missing:T-UNCLASSIFIED | 
-src/tests/create-session-options.test.ts | createSession options merging > registers the PreToolUse hook of the change previews only on a v2 connection | missing:T-UNCLASSIFIED | 
+src/tests/create-session-options.test.ts | createSession options merging > registers the PreToolUse hook of the change previews only on a v2 connection | ported:src/agent.rs::t6g2_a_v2_connection_registers_the_change_preview_hook | 
 src/tests/create-session-options.test.ts | createSession options merging > merges user-provided disallowedTools with ACP internal list | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > works when user provides no disallowedTools | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > works when user provides empty disallowedTools | missing:T-UNCLASSIFIED | 
@@ -1231,9 +1231,9 @@ src/tests/event-loop-yield.test.ts | EventLoopYielder > lets a loop run on withi
 src/tests/event-loop-yield.test.ts | EventLoopYielder > yields to the event loop past its budget | ported:src/event_loop_yield.rs::yields_to_the_event_loop_past_its_budget | 
 src/tests/event-loop-yield.test.ts | EventLoopYielder > starts a new budget once the event loop has turned | ported:src/event_loop_yield.rs::starts_a_new_budget_once_the_event_loop_has_turned | 
 src/tests/event-loop-yield.test.ts | EventLoopYielder > does not yield for a loop that waits on I/O between items | ported:src/event_loop_yield.rs::does_not_yield_for_a_loop_that_waits_on_io | 
-src/tests/event-loop-yield.test.ts | consumer under a buffered backlog > lets timers run while it drains, and keeps every update in order | missing:T-UNCLASSIFIED | 
-src/tests/event-loop-yield.test.ts | consumer under a buffered backlog > runs a cancel that arrives mid-backlog before the backlog ends | missing:T-UNCLASSIFIED | 
-src/tests/event-loop-yield.test.ts | consumer teardown under a buffered backlog > settles the turn when the session closes mid-backlog | missing:T-UNCLASSIFIED | 
+src/tests/event-loop-yield.test.ts | consumer under a buffered backlog > lets timers run while it drains, and keeps every update in order | ported:src/session/tests_t7a.rs::t7a_b17_the_pause_lets_a_cancel_task_run_mid_backlog | 
+src/tests/event-loop-yield.test.ts | consumer under a buffered backlog > runs a cancel that arrives mid-backlog before the backlog ends | ported:src/session/tests_t7a.rs::t7a_b63_cancel_settles_behind_a_5000_frame_backlog | 
+src/tests/event-loop-yield.test.ts | consumer teardown under a buffered backlog > settles the turn when the session closes mid-backlog | ported:src/session/tests_t7a.rs::t7a_b63_close_settles_behind_a_5000_frame_backlog | 
 src/tests/event-loop-yield.test.ts | nodeToWebWritable > writes the bytes of each chunk, including a view into a larger buffer | missing:T-UNCLASSIFIED | 
 src/tests/event-loop-yield.test.ts | nodeToWebWritable > gives an object-mode stream a Buffer copy | missing:T-UNCLASSIFIED | 
 src/tests/event-loop-yield.test.ts | nodeToWebWritable > rejects the write that fails | missing:T-UNCLASSIFIED | 
@@ -1266,38 +1266,38 @@ src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes
 src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > updates the description when only the reason changes | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_reason_only_and_no_option_preserve_intent | 
 src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > drops a retained reason once fast mode comes back on | ported:src/session_config.rs::t5a2_reconcile_fast_mode_matches_upstream_guards | 
 src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > preserves the retained setting (no clobber) when the model has no Fast mode option | ported:src/session/tests_t5a2.rs::t5a2_fast_mode_reason_only_and_no_option_preserve_intent | 
-src/tests/field-tracker.test.ts | ToolCallFieldTracker > removes unchanged fields and drops an update with nothing new | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | ToolCallFieldTracker > keeps an update whose _meta carries more than claudeCode | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | ToolCallFieldTracker > merges _meta.jetbrains.air keys like claudeCode keys | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | ToolCallFieldTracker > keeps pinned content until the final result replaces it | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | ToolCallFieldTracker > ends an entry after both the tool_result and the hook | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | tool call refinements > sends only the fields that each streamed refinement changes | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | tool call refinements > sends the file text of a Write once, in the hook patch | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | tool call refinements > lets the error of a rejected Edit replace a pinned approval patch | missing:T-UNCLASSIFIED | 
-src/tests/field-tracker.test.ts | tool call refinements > keeps an approval patch against the snippet refinement until the hook | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit-integration.test.ts | native file-change report integration > enables native checkpointing and reports its dry-run paths | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit-integration.test.ts | native file-change report integration > does not inspect a checkpoint when the prompt did not request a report | missing:T-UNCLASSIFIED | 
+src/tests/field-tracker.test.ts | ToolCallFieldTracker > removes unchanged fields and drops an update with nothing new | ported:src/tests_t7c.rs::t7c_removes_unchanged_fields_and_drops_an_update_with_nothing_new | 
+src/tests/field-tracker.test.ts | ToolCallFieldTracker > keeps an update whose _meta carries more than claudeCode | ported:src/tests_t7c.rs::t7c_keeps_an_update_whose_meta_carries_more_than_claudecode | 
+src/tests/field-tracker.test.ts | ToolCallFieldTracker > merges _meta.jetbrains.air keys like claudeCode keys | ported:src/tests_t7c.rs::t7c_merges_meta_jetbrains_air_keys_like_claudecode_keys | 
+src/tests/field-tracker.test.ts | ToolCallFieldTracker > keeps pinned content until the final result replaces it | ported:src/tests_t7c.rs::t7c_keeps_pinned_content_until_the_final_result_replaces_it | 
+src/tests/field-tracker.test.ts | ToolCallFieldTracker > ends an entry after both the tool_result and the hook | ported:src/tests_t7c.rs::t7c_ends_an_entry_after_both_the_tool_result_and_the_hook | 
+src/tests/field-tracker.test.ts | tool call refinements > sends only the fields that each streamed refinement changes | ported:src/tests_t7c.rs::t7c_sends_only_the_fields_that_each_streamed_refinement_changes | 
+src/tests/field-tracker.test.ts | tool call refinements > sends the file text of a Write once, in the hook patch | ported:src/tests_t7c.rs::t7c_sends_the_file_text_of_a_write_once_in_the_hook_patch | 
+src/tests/field-tracker.test.ts | tool call refinements > lets the error of a rejected Edit replace a pinned approval patch | ported:src/tests_t7c.rs::t7c_lets_the_error_of_a_rejected_edit_replace_a_pinned_approval_patch | 
+src/tests/field-tracker.test.ts | tool call refinements > keeps an approval patch against the snippet refinement until the hook | ported:src/tests_t7c.rs::t7c_keeps_an_approval_patch_against_the_snippet_refinement_until_the_hook | 
+src/tests/file-change-audit-integration.test.ts | native file-change report integration > enables native checkpointing and reports its dry-run paths | ported:tests/t6a2_file_change_report.rs::t6a2_prompt_report_publishes_the_checkpoint_paths_before_the_response | 
+src/tests/file-change-audit-integration.test.ts | native file-change report integration > does not inspect a checkpoint when the prompt did not request a report | ported:tests/t6a2_file_change_report.rs::t6a2_prompt_without_a_report_request_inspects_no_checkpoint | 
 src/tests/file-change-audit-integration.test.ts | native file-change report integration > publishes providerError without attempting checkpoint inspection | missing:T-UNCLASSIFIED | 
 src/tests/file-change-audit-integration.test.ts | native file-change report integration > publishes cancelled without attempting checkpoint inspection | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit-integration.test.ts | native file-change report integration > lets cancellation settle a turn while checkpoint inspection is pending | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit-integration.test.ts | native file-change report integration > reports files that only a subagent edited alongside the checkpoint paths | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit-integration.test.ts | native file-change report integration > does not report a subagent edit that failed | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > accepts only the versioned prompt request shape | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > owns request-id deduplication for the session | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > uses Claude checkpoint dry-run and normalizes its paths | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > publishes unavailable when Claude cannot preview the checkpoint | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > times out fail-open and publishes only one terminal | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > lets cancellation win a race with a late checkpoint response | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > caps path count and serialized report bytes | missing:T-UNCLASSIFIED | 
+src/tests/file-change-audit-integration.test.ts | native file-change report integration > lets cancellation settle a turn while checkpoint inspection is pending | ported:src/tests_t6a2.rs::t6a2_lets_cancellation_win_a_race_with_a_late_checkpoint_response | 
+src/tests/file-change-audit-integration.test.ts | native file-change report integration > reports files that only a subagent edited alongside the checkpoint paths | ported:src/tests_t6a2.rs::t6a2_adds_subagent_edited_paths_to_the_checkpoint_paths | 
+src/tests/file-change-audit-integration.test.ts | native file-change report integration > does not report a subagent edit that failed | ported:src/tests_t6a2.rs::t6a2_skips_error_results_and_root_agent_messages | 
+src/tests/file-change-audit.test.ts | native agent file-change report > accepts only the versioned prompt request shape | ported:src/tests_t6a2.rs::t6a2_accepts_only_the_versioned_prompt_request_shape | 
+src/tests/file-change-audit.test.ts | native agent file-change report > owns request-id deduplication for the session | ported:src/tests_t6a2.rs::t6a2_owns_request_id_deduplication_for_the_session | 
+src/tests/file-change-audit.test.ts | native agent file-change report > uses Claude checkpoint dry-run and normalizes its paths | ported:src/tests_t6a2.rs::t6a2_uses_claude_checkpoint_dry_run_and_normalizes_its_paths | 
+src/tests/file-change-audit.test.ts | native agent file-change report > publishes unavailable when Claude cannot preview the checkpoint | ported:src/tests_t6a2.rs::t6a2_publishes_unavailable_when_claude_cannot_preview_the_checkpoint | 
+src/tests/file-change-audit.test.ts | native agent file-change report > times out fail-open and publishes only one terminal | ported:src/tests_t6a2.rs::t6a2_times_out_fail_open_and_publishes_only_one_terminal | 
+src/tests/file-change-audit.test.ts | native agent file-change report > lets cancellation win a race with a late checkpoint response | ported:src/tests_t6a2.rs::t6a2_lets_cancellation_win_a_race_with_a_late_checkpoint_response | 
+src/tests/file-change-audit.test.ts | native agent file-change report > caps path count and serialized report bytes | ported:src/tests_t6a2.rs::t6a2_caps_path_count_and_serialized_report_bytes | 
 src/tests/file-change-audit.test.ts | native agent file-change report > fails open when report publication fails | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > adds subagent edited paths to the checkpoint paths | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > reports subagent edited paths when the checkpoint cannot be previewed | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > reports subagent edited paths when the checkpoint preview times out | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > reports subagent edited paths when the checkpoint preview throws | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | native agent file-change report > stays unavailable when there are no subagent edited paths | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | recordSubagentFileEdits > collects the paths of subagent file-tool edits | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | recordSubagentFileEdits > skips error results | missing:T-UNCLASSIFIED | 
-src/tests/file-change-audit.test.ts | recordSubagentFileEdits > skips root-agent messages | missing:T-UNCLASSIFIED | 
+src/tests/file-change-audit.test.ts | native agent file-change report > adds subagent edited paths to the checkpoint paths | ported:src/tests_t6a2.rs::t6a2_adds_subagent_edited_paths_to_the_checkpoint_paths | 
+src/tests/file-change-audit.test.ts | native agent file-change report > reports subagent edited paths when the checkpoint cannot be previewed | ported:src/tests_t6a2.rs::t6a2_reports_subagent_edited_paths_when_the_checkpoint_cannot_be_previewed | 
+src/tests/file-change-audit.test.ts | native agent file-change report > reports subagent edited paths when the checkpoint preview times out | ported:src/tests_t6a2.rs::t6a2_reports_subagent_edited_paths_when_the_checkpoint_cannot_be_previewed | 
+src/tests/file-change-audit.test.ts | native agent file-change report > reports subagent edited paths when the checkpoint preview throws | ported:src/tests_t6a2.rs::t6a2_reports_subagent_edited_paths_when_the_checkpoint_cannot_be_previewed | 
+src/tests/file-change-audit.test.ts | native agent file-change report > stays unavailable when there are no subagent edited paths | ported:src/tests_t6a2.rs::t6a2_reports_subagent_edited_paths_when_the_checkpoint_cannot_be_previewed | 
+src/tests/file-change-audit.test.ts | recordSubagentFileEdits > collects the paths of subagent file-tool edits | ported:src/tests_t6a2.rs::t6a2_collects_the_paths_of_subagent_file_tool_edits | 
+src/tests/file-change-audit.test.ts | recordSubagentFileEdits > skips error results | ported:src/tests_t6a2.rs::t6a2_skips_error_results_and_root_agent_messages | 
+src/tests/file-change-audit.test.ts | recordSubagentFileEdits > skips root-agent messages | ported:src/tests_t6a2.rs::t6a2_skips_error_results_and_root_agent_messages | 
 src/tests/file-change-audit.test.ts | recordSubagentFileEdits > skips turns that are settled or have no report | missing:T-UNCLASSIFIED | 
 src/tests/folded-prompt-scenario.test.ts | folded prompt (%s) > answers every prompt | missing:T-UNCLASSIFIED | 
 src/tests/folded-prompt-scenario.test.ts | folded prompt (%s) > answers the folded prompt with the background cycle's result | missing:T-UNCLASSIFIED | 
@@ -1496,7 +1496,7 @@ src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume af
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > routes the first update after a SendMessage resume to the new generation | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > sends the SendMessage text as the prompt of the new generation | ported:src/session/tests_t4a2.rs::t4a2_a_send_message_result_resumes_the_child | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > omits the prompt of a new generation without a SendMessage text | missing:T-UNCLASSIFIED | 
-src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > finds the SendMessage text that resumed the agent | ported:src/session/tests_t4a2.rs::t4a2_a_resumed_task_carries_the_send_message_text | 
+src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > finds the SendMessage text that resumed the agent | ported:src/native_subagents/tests.rs::finds_the_send_message_text_that_resumed_the_agent | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > names the SendMessage call that resumed the agent even without a text | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > keeps the work of a child tool call in the generation that started it | ported:src/session/tests_t4a2.rs::t4a2_a_late_async_task_update_reaches_the_finished_child | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > resume after a terminal state > ignores a late update of a completed child without a resume signal | ported:src/native_subagents/tests.rs::air_keeps_work_of_a_child_tool_call_in_its_generation_and_async_tasks_reach_it_late | 
@@ -1551,18 +1551,18 @@ src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > restores the agent from a task_started under a SendMessage id | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > does not read the history for a task_started without a subagent type | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > opens a new Agent whose task_started comes before its frame as the bare id, unannounced | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > applies the native Skill effect for %s | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > applies a generated WebFetch effect and an exact MCP provider effect | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > applies the native Skill effect for %s | ported:src/permission_effects.rs::t6a2_applies_the_native_skill_effect | .each over the Skill selection branches: covered by the t6a2 effect tests in src/permission_effects.rs
+src/tests/permission-effects.test.ts | Claude permission response effects > applies a generated WebFetch effect and an exact MCP provider effect | ported:src/permission_effects.rs::t6a2_applies_a_generated_webfetch_effect_and_an_exact_mcp_provider_effect | 
 src/tests/permission-effects.test.ts | Claude permission response effects > applies the exact provider filesystem effect for %s | missing:F10 | permission response effects owned by Turn 6
 src/tests/permission-effects.test.ts | Claude permission response effects > suppresses generated durable effects when an ask rule forced the prompt | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > allows EnterPlanMode temporarily without changing mode before the tool runs | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > applies the selected ExitPlanMode mode and maps rejection | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > interrupts the old query when ExitPlanMode clears context | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > returns clear-context semantics with the decoded permission decision | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > maps one-time allow without remembered updates | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > maps durable allow to the snapshotted provider effect | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > distinguishes explicit reject from cancellation | missing:F10 | permission response effects owned by Turn 6
-src/tests/permission-effects.test.ts | Claude permission response effects > fails closed for an unavailable or unknown selection | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > allows EnterPlanMode temporarily without changing mode before the tool runs | ported:src/permission_effects.rs::t6a2_allows_enter_plan_mode_temporarily | 
+src/tests/permission-effects.test.ts | Claude permission response effects > applies the selected ExitPlanMode mode and maps rejection | ported:src/permission_effects.rs::t6a2_applies_the_selected_exit_plan_mode_and_maps_rejection | 
+src/tests/permission-effects.test.ts | Claude permission response effects > interrupts the old query when ExitPlanMode clears context | ported:src/permission_effects.rs::t6a2_interrupts_the_old_query_when_exit_plan_mode_clears_context | 
+src/tests/permission-effects.test.ts | Claude permission response effects > returns clear-context semantics with the decoded permission decision | ported:src/permission_response.rs::t6a2_returns_clear_context_semantics_with_the_decoded_permission_decision | 
+src/tests/permission-effects.test.ts | Claude permission response effects > maps one-time allow without remembered updates | ported:src/permission_effects.rs::t6a2_maps_one_time_allow_without_remembered_updates | 
+src/tests/permission-effects.test.ts | Claude permission response effects > maps durable allow to the snapshotted provider effect | ported:src/permission_effects.rs::t6a2_maps_durable_allow_to_the_snapshotted_provider_effect | 
+src/tests/permission-effects.test.ts | Claude permission response effects > distinguishes explicit reject from cancellation | ported:src/permission_response.rs::t6a2_distinguishes_explicit_reject_from_cancellation | 
+src/tests/permission-effects.test.ts | Claude permission response effects > fails closed for an unavailable or unknown selection | ported:src/permission_response.rs::t6a2_fails_closed_for_an_unavailable_or_unknown_selection | 
 src/tests/permission-normalization.test.ts | durable permission normalization safety > fails closed when validation reads a throwing update accessor | missing:F10 | permission normalization safety owned by Turn 6
 src/tests/permission-normalization.test.ts | durable permission normalization safety > fails closed when validation reads a throwing suggestions proxy | missing:F10 | permission normalization safety owned by Turn 6
 src/tests/permission-normalization.test.ts | durable permission normalization safety > rejects strings whose untrimmed value exceeds the wire limit | missing:F10 | permission normalization safety owned by Turn 6
@@ -1606,23 +1606,23 @@ src/tests/permission-presentation.test.ts | Claude permission suggestion normali
 src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > fails closed for an unknown or invalid change set | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > fails closed when an otherwise valid provider update is not cloneable | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > suppresses every durable option for a forced ask | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses the provider-built patch for an edit confirmation | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses Approve Plan as the tool title and keeps the question in permission metadata | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > forwards the CLI's defaultToNo hint in the permission record | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps command descriptions and decision reasons in their presentation fields | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses the provider-built patch for an edit confirmation | ported:src/tests_t6a2.rs::t6a2_uses_the_provider_built_patch_for_an_edit_confirmation | 
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses Approve Plan as the tool title and keeps the question in permission metadata | ported:src/tests_t6a2.rs::t6a2_uses_approve_plan_as_the_tool_title_and_keeps_the_question_in_permission_metadata | 
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > forwards the CLI's defaultToNo hint in the permission record | ported:src/tests_t6a2.rs::t6a2_forwards_the_cli_default_to_no_hint | 
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps command descriptions and decision reasons in their presentation fields | ported:src/tests_t6a2.rs::t6a2_decision_reason_is_the_permission_description | 
 src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses the Terminal fallback for %s when no command is available yet | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > shows the exact %s command instead of its model-authored description | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > shows the exact %s command instead of its model-authored description | ported:src/tests_t6a2.rs::t6a2_permission_title_and_description_subjects | .each over the shell tools (Bash, PowerShell): covered by the t6a2 presentation tests in src/tests_t6a2.rs
 src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > %s command fidelity > preserves $label in the approval title | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps the WebFetch URL in structured tool input | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps the WebSearch query out of the permission description | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses the %s tool-call title | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses tool-call titles and temporarily exposes decisionReason | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses tool-call titles and temporarily exposes decisionReason | ported:src/tests_t6a2.rs::t6a2_reuses_tool_call_titles_and_temporarily_exposes_decision_reason | 
 src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > does not use the %s operation subtitle as a permission explanation | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > adds a non-duplicated blocked path to standard locations | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses the standard title for an unknown tool | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > repeats the whole tool call and sends no AIR key | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > keeps the Write file text in rawInput and adds a blocked path | missing:F10 | permission presentation owned by Turn 6
-src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > shows the input of a network request that has no content | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > adds a non-duplicated blocked path to standard locations | ported:src/tests_t6a2.rs::t6a2_adds_a_non_duplicated_blocked_path_to_standard_locations | 
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses the standard title for an unknown tool | ported:src/tests_t6a2.rs::t6a2_reuses_the_standard_title_for_an_unknown_tool | 
+src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > repeats the whole tool call and sends no AIR key | ported:src/tests_t6a2.rs::t6a2_repeats_the_whole_tool_call_and_sends_no_air_key | 
+src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > keeps the Write file text in rawInput and adds a blocked path | ported:src/tests_t6a2.rs::t6a2_keeps_the_write_file_text_in_rawinput_and_adds_a_blocked_path | 
+src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > shows the input of a network request that has no content | ported:src/tests_t6a2.rs::t6a2_shows_the_input_of_a_network_request_that_has_no_content | 
 src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > gives the prompt a title and description of its own, apart from the tool call | missing:F10 | permission presentation owned by Turn 6
 src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > shows the exact preview patch, which the tool call does not show | missing:F10 | permission presentation owned by Turn 6
 src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > drops a prediction that says nothing | ported:src/prompt_suggestions.rs::drops_a_prediction_that_says_nothing | 
@@ -1681,7 +1681,7 @@ src/tests/remote-control.test.ts | /remote-control > reconnects and renames on e
 src/tests/remote-control.test.ts | /remote-control > disconnects with `off` | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_off | 
 src/tests/remote-control.test.ts | /remote-control > reports the failure of %s to the user | ported:src/control.rs::test_format_remote_control_result | .each variants covered by the t4a3_remote_control_* tests in tests/t4a3_remote_control.rs
 src/tests/remote-control.test.ts | /remote-control > refuses %s while a turn is still running | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_refused_while_working | .each variants covered by the t4a3_remote_control_* tests in tests/t4a3_remote_control.rs
-src/tests/remote-control.test.ts | /remote-control > refuses the command while Claude Code runs a cycle of its own | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_refused_during_an_autonomous_cycle | 
+src/tests/remote-control.test.ts | /remote-control > refuses the command while Claude Code runs a cycle of its own | ported:tests/t6g2_v2_prompt.rs::t6g2_a_busy_session_refuses_remote_control_before_the_user_message | 
 src/tests/remote-control.test.ts | /remote-control > answers while only settled turns remain in the queue | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_connect | 
 src/tests/remote-control.test.ts | /remote-control > leaves %s to Claude Code | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_not_intercepted_when_cli_offers_it | .each variants covered by the t4a3_remote_control_* tests in tests/t4a3_remote_control.rs
 src/tests/remote-control.test.ts | /remote-control > handles the command when Claude Code lists it as terminal-only | ported:tests/t4a3_remote_control.rs::t4a3_remote_control_connect | 
@@ -2009,7 +2009,7 @@ src/tests/session-mode.test.ts | session mode > warns about the Auto fallback as
 src/tests/session-mode.test.ts | session mode > handles setSessionMode and publishes the updated config option | covered:config-set-mode | current_mode_update + config_option_update
 src/tests/session-mode.test.ts | session mode > rejects missing and closed sessions | ported:tests/t5a2_fast_mode.rs::t5a2_a_husk_session_rejects_config_and_mode_changes | 
 src/tests/session-mode.test.ts | session mode > omits bypassPermissions from the catalog when bypass capability is disabled | ported:src/session_config.rs::inv_62_mode_catalog | 
-src/tests/session-mode.test.ts | session mode > initializes the stable mode catalog and falls unsupported Auto back | covered:config-set-mode-auto-config | 
+src/tests/session-mode.test.ts | session mode > initializes the stable mode catalog and falls unsupported Auto back | ported:src/tests_t6a2.rs::t6a2_initializes_the_stable_mode_catalog_and_falls_unsupported_auto_back | 
 src/tests/session-mode.test.ts | session mode > keeps mode state and its config option synchronized | covered:config-set-mode | 
 src/tests/session-mode.test.ts | session mode > remembers the mode the session left when it entered plan mode | ported:src/session/exit_plan.rs::t3a_pre_plan_mode_tracks_entry_and_exit | also t3a_enter_plan_mode_hook_remembers_the_previous_mode
 src/tests/session-mode.test.ts | session mode > reconciles Auto after a model switch | ported:src/session/tests_t5a2.rs::t5a2_external_switch_reconciles_mode_effort_fast_and_notifies | 
@@ -2025,7 +2025,7 @@ src/tests/session-notices.test.ts | session notices > strips inline markdown tha
 src/tests/session-notices.test.ts | session notices > normalizes whitespace for repeat detection and capitalizes fragments | ported:src/notices.rs::normalizes_whitespace_for_repeat_detection_and_capitalizes_fragments | |
 src/tests/session-notices.test.ts | session notices > shapes free-form text into a standalone title | ported:src/notices.rs::shapes_free_form_text_into_a_standalone_title | |
 src/tests/session-permission.test.ts | session permission updates > maps an ExitPlanMode choice to the selected session mode effect | missing:T-UNCLASSIFIED | 
-src/tests/session-permission.test.ts | session permission updates > falls an Auto permission effect back when the current model cannot use Auto | missing:T-UNCLASSIFIED | 
+src/tests/session-permission.test.ts | session permission updates > falls an Auto permission effect back when the current model cannot use Auto | ported:src/session.rs::auto_fallback_uses_the_model_current_when_the_client_answers | 
 src/tests/session-timing.test.ts | SessionTiming > includes work completed before construction when given a start time | ported:src/session_timing.rs::inv_timing_line_includes_preconstruction_work | exact line format |
 src/tests/session-titles.test.ts | sanitizeTitle > gives a long text the same title as a scan of the whole text | ported:src/session_store.rs::t2b_sanitize_title_gives_a_long_text_the_title_of_a_full_scan | 
 src/tests/session-titles.test.ts | SDK title generation contract > SDK still ships generateSessionTitle and its control subtype | missing:T-UNCLASSIFIED | 
@@ -2047,37 +2047,37 @@ src/tests/settings.test.ts | SettingsManager > settings merging > should merge p
 src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > drops %s when set in project-tier settings | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | project-tier escalating defaultMode dropped | 
 src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > preserves non-escalating %s from project-tier settings | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | non-escalating project mode preserved | 
 src/tests/settings.test.ts | SettingsManager > escalating defaultMode trust filter > preserves escalating defaultMode when it comes from local-tier settings | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | local-tier escalating mode dropped for auto, preserved for acceptEdits | 
-src/tests/subagent-history.test.ts | subagentLineage > places an agent that the session launched under the root | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > places a nested agent under the agent whose transcript has its launch, root first | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > places an agent whose launch the root made before a compaction | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > places a nested agent whose launch its parent agent made before a compaction | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > does not take a launch in a sidechain record of the root file for the root's | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > is empty for an agent whose launch no transcript has, since its parent is unknown | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > is empty for a nested agent when an ancestor's launch is in no transcript | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > does not take the launches copied into a fork's transcript for the fork's | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | subagentLineage > is empty for an agent without metadata | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | stripForkPrefix > drops the copy of the launching message and keeps only the directive's prompt | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | stripForkPrefix > drops the inherited history of a fork launched from inside a subagent | missing:T-UNCLASSIFIED | 
-src/tests/subagent-history.test.ts | stripForkPrefix > returns a transcript without a fork directive unchanged | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | ClientCapabilities > reads the AIR capabilities only from _meta.jetbrains.air.capabilities | missing:T-UNCLASSIFIED | 
+src/tests/subagent-history.test.ts | subagentLineage > places an agent that the session launched under the root | ported:src/subagent_history.rs::places_an_agent_that_the_session_launched_under_the_root | 
+src/tests/subagent-history.test.ts | subagentLineage > places a nested agent under the agent whose transcript has its launch, root first | ported:src/subagent_history.rs::places_a_nested_agent_root_first | 
+src/tests/subagent-history.test.ts | subagentLineage > places an agent whose launch the root made before a compaction | ported:src/subagent_history.rs::places_an_agent_whose_launch_came_before_a_compaction | 
+src/tests/subagent-history.test.ts | subagentLineage > places a nested agent whose launch its parent agent made before a compaction | ported:src/subagent_history.rs::places_a_nested_agent_whose_launch_came_before_a_compaction | 
+src/tests/subagent-history.test.ts | subagentLineage > does not take a launch in a sidechain record of the root file for the root's | ported:src/subagent_history.rs::ignores_a_sidechain_launch_in_the_root_file | 
+src/tests/subagent-history.test.ts | subagentLineage > is empty for an agent whose launch no transcript has, since its parent is unknown | ported:src/subagent_history.rs::is_empty_when_no_transcript_has_the_launch | 
+src/tests/subagent-history.test.ts | subagentLineage > is empty for a nested agent when an ancestor's launch is in no transcript | ported:src/subagent_history.rs::is_empty_when_an_ancestor_has_no_transcript | 
+src/tests/subagent-history.test.ts | subagentLineage > does not take the launches copied into a fork's transcript for the fork's | ported:src/subagent_history.rs::ignores_launches_copied_into_a_fork_transcript | 
+src/tests/subagent-history.test.ts | subagentLineage > is empty for an agent without metadata | ported:src/subagent_history.rs::is_empty_for_an_agent_without_metadata | 
+src/tests/subagent-history.test.ts | stripForkPrefix > drops the copy of the launching message and keeps only the directive's prompt | ported:src/subagent_history.rs::strip_drops_the_launching_copy_and_keeps_the_prompt | 
+src/tests/subagent-history.test.ts | stripForkPrefix > drops the inherited history of a fork launched from inside a subagent | ported:src/subagent_history.rs::strip_drops_the_inherited_history | 
+src/tests/subagent-history.test.ts | stripForkPrefix > returns a transcript without a fork directive unchanged | ported:src/subagent_history.rs::strip_returns_a_transcript_without_a_directive_unchanged | 
+src/tests/tool-call-contract.test.ts | ClientCapabilities > reads the AIR capabilities only from _meta.jetbrains.air.capabilities | ported:src/client_caps.rs::air_capabilities_are_read_from_the_declared_list | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > Bash > keeps the Zed terminal conventions for AIR | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > Bash > appends output deltas for AIR | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > Bash > shows one display copy of the description without a terminal | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > Bash > shows one display copy of the description without a terminal | ported:src/tests_t7c.rs::t7c_shows_one_display_copy_of_the_description_without_a_terminal | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > leaves the Read text out for AIR, which shows the viewed file | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > leaves the Grep text out for AIR only when the input names a path | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reads the Grep file_path alias like path | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reads the Grep -l and -c flags like output_mode | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reads the Bash command_description alias like description | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the Read error text for AIR | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the Write file text only in the diff | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the Write file text of an alias key only in the diff | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the Edit text only in the diff | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the NotebookEdit source in rawInput with one display copy for Zed | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the Write file text only in the diff | ported:src/tests_t7c.rs::t7c_keeps_the_write_file_text_only_in_the_diff | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the Write file text of an alias key only in the diff | ported:src/tests_t7c.rs::t7c_keeps_the_write_file_text_of_an_alias_key_only_in_the_diff | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the Edit text only in the diff | ported:src/tests_t7c.rs::t7c_keeps_the_edit_text_only_in_the_diff | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the NotebookEdit source in rawInput with one display copy for Zed | ported:src/tests_t7c.rs::t7c_keeps_the_notebookedit_source_in_rawinput_with_one_display_copy_for_zed | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports Grep and Glob hits without a path as content | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows the WebFetch prompt once to Zed and never to AIR | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows the WebFetch prompt once to Zed and never to AIR | ported:src/tests_t7c.rs::t7c_shows_the_webfetch_prompt_once_to_zed_and_never_to_air | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows the WebFetch offset in the title | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports WebSearch hits from the structured result | covered:search-agent-results | WebSearch hits from the structured result
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > marks an Agent as a subagent and shows its prompt only to Zed | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > marks an Agent as a subagent and shows its prompt only to Zed | ported:src/tests_t7c.rs::t7c_marks_an_agent_as_a_subagent_and_shows_its_prompt_only_to_zed | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > shows a requested Agent effort in the title | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > does not show an effort for a fork, which runs at the parent's effort | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports TodoWrite as a plan, not as a tool call | covered:todo-write-result | plan only; G10a F6b | 
@@ -2085,17 +2085,17 @@ src/tests/tool-call-contract.test.ts | the ACP tool call contract > agent contro
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > agent control tools > sends the exact SendMessage and TaskStop JSON to AIR | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > agent control tools > sends an error result to AIR without a fence | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > agent control tools > keeps the fenced error result for a client that is not AIR | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > shows the plan once and sends no approval text | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > sends the rejection reason once, unfenced, in rawOutput | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan file path and no plan text to a planFile client | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > clears the plan file for AIR in a call of its own when the plan is approved | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > keeps the plan file when the plan is rejected | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan file path with the rejection reason | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan file of the structured result when the input names none | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan text when the plan file does not exist | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan text to an AIR client without planFile | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the whole input to a client that is not AIR | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the AskUserQuestion question out of the title | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > shows the plan once and sends no approval text | ported:src/tests_t7c.rs::t7c_shows_the_plan_once_and_sends_no_approval_text | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > sends the rejection reason once, unfenced, in rawOutput | ported:src/tests_t7c.rs::t7c_sends_the_rejection_reason_once_unfenced_in_rawoutput | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan file path and no plan text to a planFile client | ported:src/tests_t7c.rs::t7c_sends_the_plan_file_path_and_no_plan_text_to_a_planfile_client | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > clears the plan file for AIR in a call of its own when the plan is approved | ported:src/tests_t7c.rs::t7c_clears_the_plan_file_for_air_in_a_call_of_its_own_when_the_plan_is_approved | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > keeps the plan file when the plan is rejected | ported:src/tests_t7c.rs::t7c_keeps_the_plan_file_when_the_plan_is_rejected | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan file path with the rejection reason | ported:src/tests_t7c.rs::t7c_sends_the_plan_file_path_with_the_rejection_reason | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan file of the structured result when the input names none | ported:src/tests_t7c.rs::t7c_sends_the_plan_file_of_the_structured_result_when_the_input_names_none | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan text when the plan file does not exist | ported:src/tests_t7c.rs::t7c_sends_the_plan_text_when_the_plan_file_does_not_exist | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the plan text to an AIR client without planFile | ported:src/tests_t7c.rs::t7c_sends_the_plan_text_to_an_air_client_without_planfile | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > ExitPlanMode > with a plan file > sends the whole input to a client that is not AIR | ported:src/tests_t7c.rs::t7c_sends_the_whole_input_to_a_client_that_is_not_air | 
+src/tests/tool-call-contract.test.ts | the ACP tool call contract > keeps the AskUserQuestion question out of the title | ported:src/tests_t7c.rs::t7c_keeps_the_askuserquestion_question_out_of_the_title | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > sends the Skill under jetbrains.air.skill and its confirmation as rawOutput | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > marks an MCP tool call and shows its text result once | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > sends the MCP server and tool under jetbrains.air.mcp for AIR only | missing:T-UNCLASSIFIED | 
@@ -2103,7 +2103,7 @@ src/tests/tool-call-contract.test.ts | the ACP tool call contract > does not rep
 src/tests/tool-call-contract.test.ts | the ACP tool call contract > reports %s through the generic reporter | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | tool call reports outside the tool_use stream > reports a memory recall as a completed read | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | tool call reports outside the tool_use stream > sends the denial reason once | missing:T-UNCLASSIFIED | 
-src/tests/tool-call-contract.test.ts | tool call reports outside the tool_use stream > sends the in_progress status of progress beats once | missing:T-UNCLASSIFIED | 
+src/tests/tool-call-contract.test.ts | tool call reports outside the tool_use stream > sends the in_progress status of progress beats once | ported:src/tests_t7c.rs::t7c_sends_the_in_progress_status_of_progress_beats_once | 
 src/tests/tool-call-contract.test.ts | mcpToolName > parses %s | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | mcpToolName > rejects %s | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | ChangedMetaFilter > sends each _meta key of a tool call only when it changes | missing:T-UNCLASSIFIED | 
@@ -2114,7 +2114,7 @@ src/tests/tool-call-contract.test.ts | background Bash > marks only a tool call 
 src/tests/tool-call-contract.test.ts | background Bash > sends no marker to a client without the asyncTasks capability | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | background Bash > keeps the terminal of a command in the background running | missing:T-UNCLASSIFIED | 
 src/tests/tool-call-contract.test.ts | background Bash > leaves out a `_meta` that held only the terminal's exit, which v2 would store as empty | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | PostToolUse callback ownership > clears only callbacks owned by the cancelled session | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | PostToolUse callback ownership > clears only callbacks owned by the cancelled session | ported:src/hooks.rs::clears_only_callbacks_owned_by_the_cancelled_session | 
 src/tests/tools.test.ts | tool output in tool call updates > sends Bash output once, in content, without rawOutput | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | tool output in tool call updates > leaves the Read output of a file out for AIR | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | tool output in tool call updates > sends MCP string output once, in content, without rawOutput | missing:T-UNCLASSIFIED | 
@@ -2169,7 +2169,7 @@ src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff c
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > should include multiple diff blocks for replaceAll with multiple hunks | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > sends no hook update without a diff or a marker for non-Edit tools | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > should not include content/locations for non-Edit tools | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > keeps only the async launch markers of a tool_response | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > keeps only the async launch markers of a tool_response | ported:src/tests_t7c.rs::t7c_keeps_only_the_async_launch_markers_of_a_tool_response | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Edit tool > should not log an error when no callback is registered for the tool use | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Write tool > should emit a real diff for Write of an existing file (type: update) | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Bash terminal output > post-tool-use hook sends diff content for Write tool > should still emit a sensible diff for Write of a brand-new file (type: create) | missing:T-UNCLASSIFIED | 
@@ -2318,8 +2318,8 @@ src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a name below the frontmatter | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a file with no frontmatter | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | Skill tool rendering > _meta.jetbrains.air.skill.path > frontmatter > ignores a name past the frontmatter the reader covers | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | NotebookEdit > shows the notebook, the cell, and the new source | missing:T-UNCLASSIFIED | 
-src/tests/tools.test.ts | NotebookEdit > does not send the result text that repeats the cell source | missing:T-UNCLASSIFIED | 
+src/tests/tools.test.ts | NotebookEdit > shows the notebook, the cell, and the new source | ported:src/tests_t7c.rs::t7c_shows_the_notebook_the_cell_and_the_new_source | 
+src/tests/tools.test.ts | NotebookEdit > does not send the result text that repeats the cell source | ported:src/tests_t7c.rs::t7c_does_not_send_the_result_text_that_repeats_the_cell_source | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the structured result, which includes the user's edits | ported:src/session/exit_plan.rs::t3a_approved_plan_prefers_output_and_skips_subagent_and_empty | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the input, trimmed, when there is no structured result, as on replay | ported:src/session/exit_plan.rs::t3a_approved_plan_prefers_output_and_skips_subagent_and_empty | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows the plan of the input when the structured result has none | missing:T-UNCLASSIFIED | 
@@ -2329,14 +2329,14 @@ src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanM
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows nothing for a subagent's plan | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows nothing for a plan that waits for its team lead | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows nothing for an empty plan | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > reports a turn as inserted under the uuid of its user message, then ended | missing:B-113 | v2 turn events
+src/tests/turn-events.test.ts | turn events > reports a turn as inserted under the uuid of its user message, then ended | ported:src/turn_events.rs::t6a_inserted_is_reported_once_before_the_end | 
 src/tests/turn-events.test.ts | turn events > reports a turn inserted when Claude Code starts it, before output that comes before its echo | missing:B-113 | v2 turn events
 src/tests/turn-events.test.ts | turn events > reports a turn inserted only after a held turn before it ended | missing:B-113 | v2 turn events
-src/tests/turn-events.test.ts | turn events > reports waiting on a permission request, then resuming | missing:B-113 | v2 state events
+src/tests/turn-events.test.ts | turn events > reports waiting on a permission request, then resuming | ported:src/turn_events.rs::t6a_waiting_then_resuming_after_a_request_is_answered | 
 src/tests/turn-events.test.ts | turn events > reports waiting on a request that Claude Code opens for a started turn before its echo | missing:B-113 | v2 state events
-src/tests/turn-events.test.ts | turn events > reports work that starts while a request is open as waiting at once | missing:B-113 | v2 state events
+src/tests/turn-events.test.ts | turn events > reports work that starts while a request is open as waiting at once | ported:src/turn_events.rs::t6a_work_that_starts_while_a_request_is_open_waits_at_once | 
 src/tests/turn-events.test.ts | turn events > awaits the user while any request in the session is open, also one opened before the turn | missing:B-113 | v2 state events
-src/tests/turn-events.test.ts | turn events > ends a queued turn that is cancelled before it is inserted, without inserting it | ported:src/turn/turn_tests.rs::cancelled_queued_sweep_reports_no_usage | v1 equivalent: a swept queued turn settles cancelled without usage
+src/tests/turn-events.test.ts | turn events > ends a queued turn that is cancelled before it is inserted, without inserting it | ported:src/session/tests_t6a.rs::t6a_a_queued_prompt_cancelled_before_intake_answers_32800 | 
 src/tests/turn-events.test.ts | turn events > drops a queued prompt that a cancel ends from Claude Code's queue, so it does not run | ported:src/turn/turn_tests.rs::inv_38_cancel_async_message_sequence_precedes_interrupt | 
 src/tests/turn-events.test.ts | turn events > ends a cancelled turn when the force-cancel fires while an update is being sent | ported:src/session.rs::inv_17_force_cancel_floor | 
 src/tests/turn-events.test.ts | turn events > ends a held turn cancelled mid-followup after the output its interrupt flushes | covered:cancel-held-live-followup | 

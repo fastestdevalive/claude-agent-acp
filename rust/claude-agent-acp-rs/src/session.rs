@@ -61,8 +61,16 @@ use crate::process::{self, SpawnOptions, Timings};
 use crate::session_ext::SessionExt;
 use crate::turn::{FailureKind, StoppedWorkVerdict, Turn, TurnEvent, TurnMachine};
 
+/// The two answers of [`Session::remote_control_checked`] (NEW-2).
+pub struct RemoteControlChecked {
+    /// Whether the actor took the command, before it spawns the control call.
+    pub accepted: oneshot::Receiver<Result<(), SessionError>>,
+    /// The prompt's reply, once the control call returned.
+    pub reply: oneshot::Receiver<Result<PromptReply, PromptFailure>>,
+}
+
 /// Errors produced by the session actor.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SessionError {
     #[error("session closed")]
     Closed,
@@ -136,6 +144,67 @@ impl std::ops::Deref for PromptFailure {
 /// (`sdk.mjs` `readMessages`).
 pub(crate) const CHILD_EXIT_PREFIX: &str = "Claude Code returned an error result: ";
 
+/// The [`SessionError`] a failed turn is answered with — the one identity that
+/// both v1's rejection and v2's `idle error` read (NEW-5): the auth rejection
+/// when `auth` (the derived failure category or the kind itself is
+/// `auth_required`), the child-exit rewrite (F3a (f)), the worker-shutdown
+/// failure, else the turn's own failure.
+fn failed_turn_error(
+    kind: FailureKind,
+    message: &str,
+    auth: bool,
+    air_session_failure: bool,
+    assistant_had_error: bool,
+) -> SessionError {
+    if auth {
+        return SessionError::PromptFailed {
+            kind: FailureKind::AuthRequired,
+            message: message.to_string(),
+            assistant_had_error,
+        };
+    }
+    match message.strip_prefix(CHILD_EXIT_PREFIX) {
+        // An AIR client reads the queued turns' rejection as
+        // `internalErrorForClient({errorKind:"transport_lost"})`
+        // (`acp-agent.ts:8325-8330`).
+        Some(_) if air_session_failure => SessionError::TransportLost,
+        Some(text) => SessionError::ChildErrorResult {
+            text: text.to_string(),
+        },
+        // `internalErrorForClient({errorKind:"worker_shutdown"})`.
+        None if kind == FailureKind::WorkerShutdown => SessionError::WorkerShutdown,
+        None => SessionError::PromptFailed {
+            kind,
+            message: message.to_string(),
+            assistant_had_error,
+        },
+    }
+}
+
+/// Record the AIR `sessionFailure` of a failed turn (`createSessionFailure` ->
+/// `prepare`, `recordActive`, `acp-agent.ts:5591-5593`) and return the
+/// `jetbrains.air` meta that carries it on the turn's answer/idle.
+fn record_air_session_failure(
+    failures: &mut failures::SessionFailures,
+    session_id: &str,
+    prompt_uuid: &str,
+    kind: crate::session_failure::ClaudeFailureKind,
+    title: &str,
+) -> Value {
+    let prepared = failures.prepare(
+        session_id,
+        kind,
+        &failures::FailureOptions {
+            turn_id: Some(prompt_uuid.to_string()),
+            title: Some(title.to_string()),
+            ..failures::FailureOptions::default()
+        },
+    );
+    let meta = crate::session_failure::session_failure_meta(&prepared.failure);
+    failures.record_active(prepared);
+    meta
+}
+
 /// One item on the session → agent outbound channel (phase 9 flush barrier).
 ///
 /// The agent forwards `Update`s to the client as notifications and uses a
@@ -196,6 +265,15 @@ pub enum SessionOutbound {
     /// What the session index learns of this session (M-65): the forwarding task
     /// applies it to the connection's board.
     Board(BoardEvent),
+    /// The intake answer of an ACP v2 prompt (F39): the forwarding task resolves
+    /// `reply` only after every update ahead of it reached the wire, so the
+    /// client sees the prompt's `user_message` and `running` state before the
+    /// response (upstream's `send` then `resolve`).
+    V2Intake {
+        prompt_uuid: String,
+        reply: crate::turn_events::V2InsertedSender,
+        result: Result<String, crate::turn_events::V2IntakeError>,
+    },
 }
 
 /// A fact about a session this connection runs that its row in the session index
@@ -325,6 +403,23 @@ pub(crate) enum Command {
         prompt_text: String,
         reply: oneshot::Sender<Result<PromptReply, PromptFailure>>,
     },
+    /// The `_meta` of a prompt that is about to be enqueued (AG-3).
+    PromptMeta { uuid: String, meta: Value },
+    /// Enqueue an ACP v2 prompt (F39): the same turn machinery, but the client
+    /// is answered at intake with the prompt's message id instead of at its
+    /// settle, and the turn's work is reported as `state_update`s. `content` is
+    /// the v2 `prompt` array, echoed back as the `user_message`.
+    PromptV2 {
+        uuid: String,
+        frame: Value,
+        is_local_only: bool,
+        prompt_text: String,
+        content: Value,
+        inserted: crate::turn_events::V2InsertedSender,
+        /// The turn's end, for the v1 bookkeeping the v2 prompt task runs
+        /// (`turn_settled`, the sign-out respawn; NEW-3).
+        ended: oneshot::Sender<crate::turn_events::V2TurnEnd>,
+    },
     /// Register a `/mcp` prompt (rust-air-gaps G12, Decision 21) before the
     /// `Prompt` it belongs to. The actor spawns the control run after pushing
     /// the prompt frame, then replaces the CLI text with the produced Markdown.
@@ -358,6 +453,12 @@ pub(crate) enum Command {
     /// The close's `interrupt` was written (or timed out): settle what is left,
     /// resolve `reply` behind a flush barrier and end the actor.
     CloseDone { reply: oneshot::Sender<()> },
+    /// The session's foreground state now (F39; `foregroundState`,
+    /// `acp-agent.ts:9636-9640`), for a v2 `session/resume` that must report the
+    /// work it resumes before its response.
+    ForegroundState {
+        reply: oneshot::Sender<crate::turn_events::ForegroundState>,
+    },
     /// The `interrupt` control_response receipt came back (phase 11): carry its
     /// `still_queued` (or `None` for a bare `{}` receipt) so the actor can
     /// reconcile the orphan-credit count (`machine.reconcile_orphan_receipt`,
@@ -430,10 +531,13 @@ pub(crate) enum Command {
     /// unless Claude Code offers its own `remote-control` command.
     RemoteControlAvailability { reply: oneshot::Sender<bool> },
     /// A `/remote-control` prompt (F24/S-03): run `enableRemoteControl` off the
-    /// actor and answer the prompt with its text.
+    /// actor and answer the prompt with its text. `accepted` reports whether the
+    /// actor took the command, before the control call starts, so a v2 answer
+    /// can refuse it before the prompt's `user_message` (NEW-2).
     RemoteControlPrompt {
         command: crate::control::RemoteControlCommand,
         reply: oneshot::Sender<Result<PromptReply, PromptFailure>>,
+        accepted: Option<oneshot::Sender<Result<(), SessionError>>>,
     },
     /// The spawned `/remote-control` control call finished.
     RemoteControlDone {
@@ -445,6 +549,9 @@ pub(crate) enum Command {
     /// Whether `session/cancel` also stops the background `local_workflow` tasks
     /// the interrupt spared (`Session.stopsWorkflowsOnCancel`, F16c / B-42).
     StopsWorkflowsOnCancel(bool),
+    /// The connection serves ACP v2 (F39): the session reports its foreground
+    /// work as `state_update`s and answers prompts at intake.
+    V2Reporting(bool),
     /// Where the actor leaves its final modes + config options when it ends, so
     /// the handle can still answer for a session whose stream died (Node's
     /// `Session` object outlives its query stream).
@@ -749,6 +856,15 @@ pub struct SessionOptions {
     /// picked from them (O-74): the model picker offers only the SDK models they
     /// match. `None`: nothing is narrowed.
     pub gateway_models: Option<(Vec<String>, Option<String>)>,
+    /// The connection serves ACP v2 (F39): the session reports its foreground
+    /// work as `state_update`s, echoes a prompt as a `user_message`, and answers
+    /// it at intake. Off on v1, whose wire stays unchanged.
+    pub v2: bool,
+    /// The workspace roots of the session besides `cwd` (ACP
+    /// `additionalDirectories`, legacy `_meta.additionalRoots`): the file-change
+    /// report validates reported paths against this same set
+    /// (`file-change-audit.ts:250-266`, AG-3).
+    pub additional_directories: Vec<std::path::PathBuf>,
 }
 
 impl SessionOptions {
@@ -764,7 +880,23 @@ impl SessionOptions {
             env: crate::env_snapshot::EnvSnapshot::default(),
             logger: None,
             gateway_models: None,
+            v2: false,
+            additional_directories: Vec::new(),
         }
+    }
+
+    /// Set the workspace roots besides `cwd` (AG-3 file-change reports).
+    #[must_use]
+    pub fn with_additional_directories(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.additional_directories = dirs;
+        self
+    }
+
+    /// Serve this session to an ACP v2 connection (F39).
+    #[must_use]
+    pub fn with_v2(mut self, v2: bool) -> Self {
+        self.v2 = v2;
+        self
     }
 
     /// Narrow the model picker to the models a gateway listed (O-74).
@@ -936,6 +1068,7 @@ impl Session {
             opts.raw_sdk_messages.clone(),
             opts.env.clone(),
             opts.logger.clone(),
+            opts.additional_directories.clone(),
         ));
         // `stopsWorkflowsOnCancel` (`acp-agent.ts:11687`): a client with the
         // per-task stop affordance and no async tasks of its own gets the
@@ -952,6 +1085,7 @@ impl Session {
         // keep it from ever seeing the channel close.
         let mut guard = StartGuard(Some(tx.clone()));
         let _ = tx.send(Command::StopsWorkflowsOnCancel(stops_workflows));
+        let _ = tx.send(Command::V2Reporting(opts.v2));
         let (final_tx, final_state) = watch::channel(None);
         let _ = tx.send(Command::FinalStateSink(final_tx));
 
@@ -1112,6 +1246,18 @@ impl Session {
         } else {
             initial_mode.to_string()
         };
+        // `SessionModeManager.initialize` (`session-mode.ts:157-177`) logs the
+        // clamp: the model cannot honour Auto, or the mode is not in the catalog.
+        if let Some(message) = crate::agent::auto_mode_clamp_log(
+            initial_mode,
+            auto_clamped,
+            current_model_id.as_str(),
+            available_modes.iter().any(|m| m.id == effective_mode),
+        ) {
+            if let Some(logger) = &opts.logger {
+                logger.error(&message);
+            }
+        }
         if !available_modes.iter().any(|m| m.id == effective_mode) {
             effective_mode = "default".to_string();
         }
@@ -1305,6 +1451,13 @@ impl Session {
             .map_err(|_| PromptFailure::from(SessionError::Closed))?
     }
 
+    /// Record the ACP `session/prompt` params' `_meta` of a prompt about to be
+    /// enqueued (AG-3: `agentFileChangeReportRequest`). Sent on the same
+    /// unbounded channel right before the prompt, so the actor sees it first.
+    pub fn note_prompt_meta(&self, uuid: String, meta: Value) {
+        let _ = self.tx.send(Command::PromptMeta { uuid, meta });
+    }
+
     /// Enqueue a `session/prompt` on the actor, returning the `oneshot` that
     /// resolves when the turn settles. This is synchronous: the connection's
     /// single-task handler can send it immediately, so a later `session/cancel`
@@ -1326,6 +1479,50 @@ impl Session {
             reply: reply_tx,
         });
         reply_rx
+    }
+
+    /// Enqueue an ACP v2 `session/prompt` (F39, M-113), returning the `oneshot`
+    /// that resolves once Claude Code takes the prompt in, with the id of the
+    /// user message it became. The actor sends the prompt's `user_message` and
+    /// the `running` state before it resolves, so the v2 answer never overtakes
+    /// them (`v2Prompt`, `v2/prompt.ts:30-67`).
+    /// Enqueue a v2 prompt. The first receiver answers at intake with the
+    /// message id it became; the second reports the turn's end, so the caller
+    /// runs the v1 bookkeeping (`turn_settled`, the sign-out respawn) for it
+    /// too (NEW-3). A dropped end receiver means the session ended before the
+    /// turn settled.
+    pub fn send_prompt_v2(
+        &self,
+        uuid: String,
+        frame: Value,
+        is_local_only: bool,
+        prompt_text: String,
+        content: Value,
+    ) -> (
+        oneshot::Receiver<Result<String, crate::turn_events::V2IntakeError>>,
+        oneshot::Receiver<crate::turn_events::V2TurnEnd>,
+    ) {
+        let (inserted_tx, inserted_rx) = oneshot::channel();
+        let (ended_tx, ended_rx) = oneshot::channel();
+        let _ = self.tx.send(Command::PromptV2 {
+            uuid,
+            frame,
+            is_local_only,
+            prompt_text,
+            content,
+            inserted: inserted_tx,
+            ended: ended_tx,
+        });
+        (inserted_rx, ended_rx)
+    }
+
+    /// The session's foreground state now (F39), for a v2 `session/resume` that
+    /// reports the work it resumes before its response (`foregroundState`,
+    /// `acp-agent.ts:9636-9640`).
+    pub async fn foreground_state(&self) -> Option<crate::turn_events::ForegroundState> {
+        let (reply, done) = oneshot::channel();
+        let _ = self.tx.send(Command::ForegroundState { reply });
+        done.await.ok()
     }
 
     /// Register a `/mcp` prompt with the actor (rust-air-gaps G12). Sent before
@@ -1369,8 +1566,30 @@ impl Session {
         let _ = self.tx.send(Command::RemoteControlPrompt {
             command,
             reply: reply_tx,
+            accepted: None,
         });
         reply_rx
+    }
+
+    /// [`Self::remote_control`] with the actor's acceptance reported through its
+    /// own oneshot before the control call starts (NEW-2), so a v2 answer can
+    /// refuse the command before the prompt's `user_message`
+    /// (`acp-agent.ts:3824-3838`). `reply` answers the prompt.
+    pub fn remote_control_checked(
+        &self,
+        command: crate::control::RemoteControlCommand,
+    ) -> RemoteControlChecked {
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(Command::RemoteControlPrompt {
+            command,
+            reply: reply_tx,
+            accepted: Some(accepted_tx),
+        });
+        RemoteControlChecked {
+            accepted: accepted_rx,
+            reply: reply_rx,
+        }
     }
 
     /// Steer the session (12.1): inject a message into the running turn at
@@ -1722,21 +1941,27 @@ fn build_permission_request_handler(
                 .unwrap_or("");
             if subtype == "can_use_tool" {
                 let (reply_tx, reply_rx) = oneshot::channel();
-                // 2.11 (E-11): the fallback deny carries the tool_use_id; read
-                // it before `frame` is moved into the command.
-                let tool_use_id = frame
-                    .pointer("/request/tool_use_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
                 let guard = WithdrawOnDrop::new(command_tx.clone(), &request_id);
-                let _ = command_tx.send(Command::Permission {
+                let sent = command_tx.send(Command::Permission {
                     frame,
                     reply: reply_tx,
                 });
-                let answer = reply_rx.await.unwrap_or_else(|_| {
-                    permission::deny_control_response(&request_id, &tool_use_id)
-                });
+                let answer = match sent {
+                    // No session actor: Node's `canUseTool` early return
+                    // (`acp-agent.ts:10030-10035`) is a plain deny without a
+                    // toolUseID or a classification.
+                    Err(_) => session_not_found_response(&request_id),
+                    // The actor dropped the reply: a cancel or the session close
+                    // aborted the round-trip, and Node throws "Tool use aborted"
+                    // (`acp-agent.ts:9791`, `9833-9835`) — an error verdict, not
+                    // the R28 deny (P-36).
+                    Ok(()) => reply_rx.await.unwrap_or_else(|_| {
+                        crate::permission_response::error_control_response(
+                            &request_id,
+                            crate::permission_response::TOOL_USE_ABORTED,
+                        )
+                    }),
+                };
                 guard.disarm();
                 Some(answer)
             } else if subtype == "hook_callback" {
@@ -1867,6 +2092,7 @@ async fn run(
     raw_sdk_messages: crate::sdk_options::RawSdkMessages,
     env: crate::env_snapshot::EnvSnapshot,
     logger: Option<std::sync::Arc<crate::logger::Logger>>,
+    additional_directories: Vec<PathBuf>,
 ) {
     // The `process` handle owns the child and kills it on drop; the actor loop
     // itself never touches it, so the core loop is factored into `run_loop` and
@@ -1906,6 +2132,7 @@ async fn run(
         raw_sdk_messages,
         env,
         logger,
+        additional_directories,
     ));
     let mut stop_first = stop_first;
     tokio::select! {
@@ -2417,6 +2644,247 @@ const TOOL_USE_WAIT: Duration = Duration::from_millis(2_000);
 /// A `can_use_tool` request parked until the consumer reaches its tool use.
 type ParkedPermission = (String, Value, oneshot::Sender<Value>);
 
+/// The per-session native file-change report state (AG-3,
+/// `createNativeFileChangeReporter`). The actor owns it; a spawned task runs the
+/// bounded checkpoint preview of one turn.
+/// One report job that left `FileChangeReports::requests` to run: the cancel
+/// flag the actor sets when a cancel/close finished it, and the done flag the
+/// task sets so the actor can prune it.
+pub(crate) struct CollectingReport {
+    pub request_id: String,
+    pub handle: crate::file_change_audit::ReportHandle,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+pub struct FileChangeReports {
+    /// `None` for a client that did not negotiate `agentFileChangeReport`.
+    reporter: Option<crate::file_change_audit::Reporter>,
+    /// `prompt uuid -> (request id, handle)` of a turn that asked for a report.
+    requests: HashMap<String, (String, crate::file_change_audit::ReportHandle)>,
+    /// `prompt uuid -> (request id, handle, cancelled, done)` of a report job
+    /// that is already running: taken out of `requests`, but kept here so a
+    /// cancel or close can still finish it `cancelled` and mark the forwarded
+    /// reply (`review-T6INT` finding 2). `done` lets the next prompt prune it.
+    collecting: HashMap<String, CollectingReport>,
+    /// `prompt uuid -> raw file paths of the file-tool edits its subagents made`
+    /// (`NativeFileChangeReportTurn.editedPaths`).
+    edited: HashMap<String, std::collections::BTreeSet<String>>,
+    /// The control channel, for `rewindFiles(userMessageId, {dryRun:true})`.
+    control: Option<Control>,
+    /// The client update channel the report is published on.
+    update_tx: Option<mpsc::UnboundedSender<SessionOutbound>>,
+    session_id: String,
+    logger: Option<std::sync::Arc<crate::logger::Logger>>,
+}
+
+impl std::fmt::Debug for FileChangeReports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileChangeReports")
+            .field("enabled", &self.reporter.is_some())
+            .field("requests", &self.requests.len())
+            .field("edited", &self.edited.len())
+            .finish()
+    }
+}
+
+impl FileChangeReports {
+    /// The number of report jobs still in `collecting` (M8 test).
+    #[cfg(test)]
+    pub(crate) fn collecting_len(&self) -> usize {
+        self.collecting.len()
+    }
+
+    pub(crate) fn new(
+        enabled: bool,
+        cwd: &std::path::Path,
+        additional_directories: &[std::path::PathBuf],
+        control: Option<&Control>,
+        update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+        session_id: &str,
+        logger: Option<std::sync::Arc<crate::logger::Logger>>,
+    ) -> Self {
+        Self {
+            reporter: enabled
+                .then(|| crate::file_change_audit::Reporter::new(cwd, additional_directories)),
+            requests: HashMap::new(),
+            collecting: HashMap::new(),
+            edited: HashMap::new(),
+            control: enabled.then(|| control.cloned()).flatten(),
+            update_tx: Some(update_tx.clone()),
+            session_id: session_id.to_string(),
+            logger,
+        }
+    }
+
+    /// `session.fileChangeReporter?.request(params._meta)` at prompt intake
+    /// (`acp-agent.ts:3881`): the request is accepted once per session.
+    pub(crate) fn note_prompt(&mut self, prompt_uuid: &str, meta: &Value) {
+        // Prune report jobs that already finished: their cancel flag is moot
+        // and the entry must not outlive the report.
+        self.collecting
+            .retain(|_, job| !job.done.load(std::sync::atomic::Ordering::SeqCst));
+        let Some(reporter) = self.reporter.as_mut() else {
+            return;
+        };
+        if let Some((request_id, handle)) = reporter.request(meta) {
+            self.requests
+                .insert(prompt_uuid.to_string(), (request_id, handle));
+        }
+    }
+
+    /// `recordSubagentFileEdits` (`acp-agent.ts:8016-8024`): a subagent message's
+    /// successful file-tool edits, recorded before the tool-use cache is dropped.
+    pub(crate) fn note_subagent_edits(
+        &mut self,
+        prompt_uuid: Option<&str>,
+        parent_tool_use_id: Option<&str>,
+        content: &Value,
+        map_state: &MapState,
+    ) {
+        let Some(prompt_uuid) = prompt_uuid.filter(|uuid| self.requests.contains_key(*uuid)) else {
+            return;
+        };
+        if parent_tool_use_id.is_none() {
+            return;
+        }
+        // Node reads `session.toolUseCache` (`{name, input}` by id).
+        let mut tool_uses: HashMap<String, (String, Value)> = HashMap::new();
+        if let Some(blocks) = content.as_array() {
+            for block in blocks {
+                if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                    if let Some(tool_use) = map_state.tool_use_from_cache(id) {
+                        tool_uses.insert(
+                            id.to_string(),
+                            (
+                                tool_use
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                tool_use.get("input").cloned().unwrap_or(Value::Null),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        let edited = self.edited.entry(prompt_uuid.to_string()).or_default();
+        crate::file_change_audit::record_subagent_file_edits(
+            parent_tool_use_id,
+            content,
+            &tool_uses,
+            edited,
+        );
+    }
+
+    /// Take the settled turn's report request and its recorded edits. The job
+    /// is registered as `collecting` until it finishes, so a cancel/close can
+    /// still finish it `cancelled` (`review-T6INT` finding 2).
+    pub(crate) fn take(&mut self, prompt_uuid: &str) -> Option<DeferredReportJob> {
+        let (request_id, handle) = self.requests.remove(prompt_uuid)?;
+        let edited = self
+            .edited
+            .remove(prompt_uuid)
+            .map(|paths| paths.into_iter().collect())
+            .unwrap_or_default();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.collecting.insert(
+            prompt_uuid.to_string(),
+            CollectingReport {
+                request_id: request_id.clone(),
+                handle: handle.clone(),
+                cancelled: std::sync::Arc::clone(&cancelled),
+                done: std::sync::Arc::clone(&done),
+            },
+        );
+        Some(DeferredReportJob {
+            request_id,
+            handle,
+            edited,
+            cancelled,
+            done,
+        })
+    }
+
+    /// A cancel/close that lands while a report is previewing finishes it
+    /// `cancelled` and marks the reply (`review-T6INT` finding 2).
+    pub(crate) fn cancel_collecting(&mut self) {
+        let jobs: Vec<CollectingReport> = self.collecting.drain().map(|(_, job)| job).collect();
+        for job in jobs {
+            job.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.finish(&job.handle, &job.request_id, "cancelled");
+        }
+    }
+
+    /// Finish a cancelled/failed job's report and mark it done, so
+    /// [`Self::note_prompt`]'s prune can drop the `collecting` entry (M8).
+    pub(crate) fn finish_job(&self, job: &DeferredReportJob, reason: &str) {
+        self.finish(&job.handle, &job.request_id, reason);
+        job.done.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `finish(state, reason)`: publish the `unavailable` report unless a
+    /// terminal outcome already went out.
+    pub(crate) fn finish(
+        &self,
+        handle: &crate::file_change_audit::ReportHandle,
+        request_id: &str,
+        reason: &str,
+    ) {
+        let publish = self.publish();
+        if let Some(reporter) = &self.reporter {
+            reporter.finish(handle, request_id, reason, &publish);
+        }
+    }
+
+    /// Finish every open request (`cancelled`): the session closed or was torn
+    /// down before its turns settled (`acp-agent.ts:3911`). A report job that is
+    /// already previewing is finished too (`review-T6INT` finding 2).
+    pub(crate) fn finish_all(&mut self, reason: &str) {
+        let open: Vec<(String, crate::file_change_audit::ReportHandle)> =
+            self.requests.drain().map(|(_, v)| v).collect();
+        for (request_id, handle) in open {
+            self.finish(&handle, &request_id, reason);
+        }
+        self.edited.clear();
+        if reason == "cancelled" {
+            self.cancel_collecting();
+        } else {
+            self.collecting.clear();
+        }
+    }
+
+    pub(crate) fn publish(&self) -> crate::file_change_audit::Publish {
+        let update_tx = self.update_tx.clone();
+        let session_id = self.session_id.clone();
+        std::sync::Arc::new(move |meta: Value| {
+            let Some(update_tx) = &update_tx else {
+                return;
+            };
+            let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": meta,
+                },
+            })));
+        })
+    }
+
+    pub(crate) fn log_error(&self) -> crate::file_change_audit::LogError {
+        let logger = self.logger.clone();
+        std::sync::Arc::new(move |message: &str| {
+            if let Some(logger) = &logger {
+                logger.error(message);
+            }
+        })
+    }
+}
+
 /// The `tool_use_id` of a `can_use_tool` control request.
 fn can_use_tool_id(frame: &Value) -> String {
     frame
@@ -2446,6 +2914,24 @@ fn ask_allow_response(request_id: &str, tool_use_id: &str, updated_input: &Value
                 "behavior": "allow",
                 "updatedInput": updated_input,
                 "toolUseID": tool_use_id,
+            },
+        },
+    })
+}
+
+/// The answer to a `can_use_tool` that reached no session: Node's `canUseTool`
+/// early return `{behavior:"deny", message:"Session not found"}`
+/// (`acp-agent.ts:10030-10035`), which carries no `toolUseID` and no
+/// `decisionClassification`.
+fn session_not_found_response(request_id: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "deny",
+                "message": "Session not found",
             },
         },
     })
@@ -2673,10 +3159,24 @@ async fn run_loop(
     raw_sdk_messages: crate::sdk_options::RawSdkMessages,
     env: crate::env_snapshot::EnvSnapshot,
     logger: Option<std::sync::Arc<crate::logger::Logger>>,
+    additional_directories: Vec<PathBuf>,
 ) {
+    let workspace_cwd = cwd.clone();
     let mut ext = SessionExt::new(air, cwd, env)
         .with_caps(caps)
         .with_logger(logger);
+    // AG-3: the native file-change report state of the session. A client that
+    // negotiated `agentFileChangeReport` gets the per-turn checkpoint report;
+    // every other client never builds a reporter (`acp-agent.ts:11149-11160`).
+    ext.file_change_reports = FileChangeReports::new(
+        crate::file_change_audit::supports_agent_file_change_report(ext.air.as_ref()),
+        &workspace_cwd,
+        &additional_directories,
+        Some(&control),
+        &update_tx,
+        &session_id,
+        ext.logger.clone(),
+    );
     ext.t2a.command_tx = Some(command_tx.clone());
     // F20: the per-session compaction lifecycle. The presentation is the ACP
     // compaction contract for a client that advertises `session.compaction`,
@@ -2701,7 +3201,13 @@ async fn run_loop(
     // advertised the AIR `asyncTasks` capability.
     let mut tasks = AsyncTaskRuntime::new(ext.air_supports("asyncTasks"))
         // T4B hook 1: the native subagent runtime lives beside the task runtime.
-        .with_subagent_form(ext.caps.subagent_form, &session_id);
+        // T6B (B-98): with the real history lookups, so an agent that ran before
+        // this load/resume is restored from its transcript (`subagentLineage`).
+        .with_subagents(crate::subagent_history::native_runtime_with_history(
+            ext.caps.subagent_form,
+            &session_id,
+            &ext.env,
+        ));
     // uuid -> prompt reply oneshot (8.7).
     let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, PromptFailure>>> =
         HashMap::new();
@@ -2725,6 +3231,9 @@ async fn run_loop(
     // subagent's `can_use_tool` is attributed to the Agent/Task tool call that
     // spawned it.
     let mut live_background: HashMap<String, String> = HashMap::new();
+    // AG-3: the ACP `session/prompt` `_meta` of each prompt about to be
+    // enqueued (sent as `Command::PromptMeta` right before `Command::Prompt`).
+    let mut prompt_metas: HashMap<String, Value> = HashMap::new();
     // Pending permission round-trips (phase 10): `request_id -> JoinHandle`.
     // `Command::Cancel` aborts every one so a pending permission resolves as
     // `Cancelled` (R28 deny written back to the control writer, INV-21 / 27;
@@ -2845,6 +3354,7 @@ async fn run_loop(
                 &mut ext.titles,
                 &mut ext.t2a.failures,
                 &mut ext.t2a.usage_turns,
+                &mut ext.file_change_reports,
             );
         }};
         ($plan:expr, failed $message:expr) => {{
@@ -2861,6 +3371,15 @@ async fn run_loop(
         }};
     }
 
+    // B-17 (`messageLoopYielder`, `acp-agent.ts:5651-5660`, `utils.ts:114-145`):
+    // a backlog of buffered frames drains without an I/O wait between items, so
+    // a stretch that ran past its budget gives the runtime a turn before the
+    // next frame is processed. Messages keep their order: the next one is
+    // processed only after the pause. A loop that waits on the stream between
+    // items accepts at most one no-op pause per budget.
+    let mut message_loop_yielder = crate::event_loop_yield::EventLoopYielder::with_clock(
+        crate::event_loop_yield::MESSAGE_LOOP_BUDGET_MS,
+    );
     loop {
         // The force-cancel sleep: armed -> wait until the deadline; otherwise
         // park (far future). Rebuilt each iteration from the absolute deadline,
@@ -2892,6 +3411,7 @@ async fn run_loop(
                                 &mut ext.titles,
         &mut ext.t2a.failures,
         &mut ext.t2a.usage_turns,
+                            &mut ext.file_change_reports,
                             );
                             // The cancelled turn's result may never come (that is why the
                             // backstop fired): close its delivery stretch here so partial
@@ -2910,6 +3430,7 @@ async fn run_loop(
                             && matches!(
                                 cmd,
                                 Command::Prompt { .. }
+                                    | Command::PromptV2 { .. }
                                     | Command::McpPrompt { .. }
                                     | Command::Steer { .. }
                             )
@@ -2919,7 +3440,12 @@ async fn run_loop(
                         }
                         // F24/S-03: a prompt that follows a `/remote-control`
                         // command waits for its reply (`acp-agent.ts:3904`).
-                        if remote_control_pending && matches!(cmd, Command::Prompt { .. }) {
+                        if remote_control_pending
+                            && matches!(
+                                cmd,
+                                Command::Prompt { .. } | Command::PromptV2 { .. }
+                            )
+                        {
                             held_remote_control.push_back(cmd);
                             continue;
                         }
@@ -2976,6 +3502,9 @@ async fn run_loop(
                                 stops_workflows_on_cancel = stops;
                                 machine.set_stops_workflows_on_cancel(stops);
                             }
+                            Command::V2Reporting(v2) => {
+                                map_state.v2.set_reporting(v2);
+                            }
                             Command::FinalStateSink(sink) => {
                                 final_state_sink = Some(sink);
                             }
@@ -3021,19 +3550,35 @@ async fn run_loop(
                                             forward_subagent_text,
                                             stops_workflows_on_cancel,
                                         );
+                                        // F39: the v2 session state is the
+                                        // session's, not the old child's: the
+                                        // foreground work and the queued prompt
+                                        // replies survive the fresh context.
+                                        let v2_state = std::mem::take(&mut map_state.v2);
                                         map_state = fresh_map_state(&ext, forward_subagent_text);
+                                        map_state.v2 = v2_state;
                                         tasks = AsyncTaskRuntime::new(ext.air_supports("asyncTasks"))
         // T4B hook 1: the native subagent runtime lives beside the task runtime.
-        .with_subagent_form(ext.caps.subagent_form, &session_id);
+        .with_subagents(crate::subagent_history::native_runtime_with_history(
+            ext.caps.subagent_form,
+            &session_id,
+            &ext.env,
+        ));
                                         live_background.clear();
                                         // The old context's open client forms are gone
                                         // with its control channel: withdraw them and
                                         // forget its awaiting-user tokens.
-                                        abort_pending_elicitations(&mut pending_elicitations);
+                                        let _ = abort_pending_elicitations(&mut pending_elicitations);
                                         for (_, (reply, response)) in pending_ask.drain() {
                                             let _ = reply.send(response);
                                         }
                                         pending_await_tokens.clear();
+                                        // F39: the old context's open requests and
+                                        // task placements are gone with its control
+                                        // channel; the fresh context carries none
+                                        // (finding A-5).
+                                        map_state.v2.reset_for_fresh_context();
+                                        drain_v2(&mut map_state, &update_tx, &session_id);
                                         // F3 (B-109): the old context's lifecycle is
                                         // closed `cancelled` — dropping a pending hook
                                         // summary — and replaced by a brand-new one,
@@ -3052,6 +3597,9 @@ async fn run_loop(
                                         force_cancel_deadline = None;
                                         let state::RestartPlan { reset, turn, queued } = plan;
                                         let prompt_uuid = turn.prompt_uuid().to_string();
+                                        // A held turn's continuation takes the work
+                                        // over (`startForeground`, `acp-agent.ts:7119-7130`).
+                                        let held_at_restart = turn.held_at_restart();
                                         publish_restart_state(&mut ext, &reset, &update_tx, &session_id);
                                         publish_compaction_updates(
                                             &mut ext,
@@ -3061,6 +3609,13 @@ async fn run_loop(
                                             &session_id,
                                         );
                                         machine.adopt_restarted_turn(turn);
+                                        resume_held_turn_after_restart(
+                                            &mut map_state,
+                                            &update_tx,
+                                            &session_id,
+                                            held_at_restart,
+                                            &prompt_uuid,
+                                        );
                                         // The prompts queued behind it keep their place:
                                         // their frames never reached this child, so they
                                         // are sent after the continuation, in order.
@@ -3103,6 +3658,9 @@ async fn run_loop(
                                     replay_commands.extend(deferred_commands.drain(..));
                                 }
                             }
+                            Command::PromptMeta { uuid, meta } => {
+                                prompt_metas.insert(uuid, meta);
+                            }
                             Command::Prompt {
                                 uuid,
                                 frame,
@@ -3126,6 +3684,13 @@ async fn run_loop(
                                         ));
                                     }
                                 }
+                                // AG-3 (`acp-agent.ts:3881`): the prompt may ask
+                                // for a per-turn file-change report in its `_meta`.
+                                let prompt_meta = prompt_metas.remove(&uuid);
+                                ext.file_change_reports.note_prompt(
+                                    &uuid,
+                                    prompt_meta.as_ref().unwrap_or(&Value::Null),
+                                );
                                 // The title context comes from the plain ACP text
                                 // chunks (Node `onPrompt(params.prompt)`), never from
                                 // the converted frame, whose blocks carry embedded
@@ -3185,6 +3750,61 @@ async fn run_loop(
                                             prepared,
                                         });
                                     });
+                                }
+                            }
+                            Command::PromptV2 {
+                                uuid,
+                                frame,
+                                is_local_only,
+                                prompt_text,
+                                content,
+                                inserted,
+                                ended,
+                            } => {
+                                // Same first-prompt bookkeeping as v1 (P-06).
+                                if ext.config.pending_auto_fallback_warning {
+                                    ext.config.pending_auto_fallback_warning = false;
+                                    if !ext.auto_mode_fallback_warning_shown {
+                                        ext.auto_mode_fallback_warning_shown = true;
+                                        let _ = update_tx.send(SessionOutbound::RawUpdate(
+                                            auto_mode_fallback_update(
+                                                &session_id,
+                                                ext.supports_notices(),
+                                            ),
+                                        ));
+                                    }
+                                }
+                                ext.titles.on_prompt(&prompt_text);
+                                // AG-3 (review-T6INT finding 3): a v2 prompt may
+                                // ask for the same per-turn file-change report as
+                                // v1 (`acp-agent.ts:3881`, one shared prompt path).
+                                let prompt_meta = prompt_metas.remove(&uuid);
+                                ext.file_change_reports.note_prompt(
+                                    &uuid,
+                                    prompt_meta.as_ref().unwrap_or(&Value::Null),
+                                );
+                                prompt_preamble(
+                                    &uuid,
+                                    &frame,
+                                    &mut ext,
+                                    &update_tx,
+                                    &session_id,
+                                );
+                                let first_text = crate::goal::first_prompt_text(&frame).to_string();
+                                let kept_frame = frame.clone();
+                                let _ = control.send_user(frame).await;
+                                machine.enqueue(
+                                    Turn::new(uuid.clone(), is_local_only).with_frame(kept_frame),
+                                );
+                                // F39: the client is answered at intake; the
+                                // session emits the user_message and the
+                                // state updates on its ordered channel.
+                                map_state.v2.register(uuid.clone(), content, inserted);
+                                // NEW-3: the turn's end goes to the task that
+                                // runs the v1 bookkeeping for this prompt.
+                                map_state.v2.set_turn_end(&uuid, ended);
+                                if let Some(goal) = ext.goal.note_prompt(&first_text, &uuid) {
+                                    publish_goal(ext.air.is_some(), &goal, &update_tx, &session_id);
                                 }
                             }
                             Command::McpPrompt { uuid, command } => {
@@ -3265,6 +3885,11 @@ async fn run_loop(
                                 // the requests of a child that can keep running after a
                                 // parent cancel (`agentclientprotocol/agent-client-protocol#2308`,
                                 // `native-subagents.ts:570-580`).
+                                // F39/B-60: the interrupt withdraws the requests open
+                                // now, so their end reports no `running`
+                                // (`cancelTurns` marks them first,
+                                // `acp-agent.ts:8446-8449`).
+                                map_state.v2.cancel_inputs();
                                 cancel_parent_round_trips(
                                     &mut tasks,
                                     &mut map_state,
@@ -3283,6 +3908,9 @@ async fn run_loop(
                                 parked_permissions.clear();
                                 // `cancelTurns` forgets the pending ExitPlanMode lanes.
                                 ext.t2a.exit_plan.clear();
+                                // A file-change report still previewing is
+                                // finished `cancelled` (`review-T6INT` finding 2).
+                                ext.file_change_reports.cancel_collecting();
                                 // G12: a cancelled `/mcp` turn publishes nothing, and its
                                 // spawned control run's late result is dropped. What waited
                                 // for that run goes on (the cancelled result is dropped).
@@ -3335,6 +3963,7 @@ async fn run_loop(
                                 &mut ext.titles,
         &mut ext.t2a.failures,
         &mut ext.t2a.usage_turns,
+                            &mut ext.file_change_reports,
                             );
                                 // Arm the force-cancel backstop at most once per turn
                                 // (11.2, INV-22): if the interrupt below doesn't make the
@@ -3413,6 +4042,9 @@ async fn run_loop(
                                     &mut pending_permissions,
                                     &mut parked_permissions,
                                 );
+                                // AG-3 (`acp-agent.ts:3911`): a close ends every open
+                                // report request as `cancelled`.
+                                ext.file_change_reports.finish_all("cancelled");
                                 // Close is the session's abort (`signal.aborted`):
                                 // the close-only latch stops an OAuth flow.
                                 let _ = elicit_cancel_tx.send(true);
@@ -3452,6 +4084,7 @@ async fn run_loop(
                                     &mut ext.titles,
         &mut ext.t2a.failures,
         &mut ext.t2a.usage_turns,
+                                &mut ext.file_change_reports,
                                 );
                                 for uuid in machine.take_abandoned() {
                                     if control
@@ -3483,8 +4116,16 @@ async fn run_loop(
                                     let _ = command_tx.send(Command::CloseDone { reply });
                                 });
                             }
+                            Command::ForegroundState { reply } => {
+                                let _ = reply.send(map_state.v2.foreground_state());
+                            }
                             Command::CloseDone { reply } => {
                                 let events = machine.on_stream_end();
+                                // F39: a cycle the stream death ended reports its
+                                // end with this batch.
+                                if let Some(end) = machine.take_cycle_end() {
+                                    map_state.v2.set_cycle_end(end);
+                                }
                                 settle_events(
                                     events,
                                     &mut tasks,
@@ -3500,6 +4141,7 @@ async fn run_loop(
                                     &mut ext.titles,
         &mut ext.t2a.failures,
         &mut ext.t2a.usage_turns,
+                                &mut ext.file_change_reports,
                                 );
                                 finish_async_tasks(&mut tasks, &mut map_state, "stopped", &update_tx, &session_id, ext.logger.as_deref());
                                 let (flush_tx, flush_rx) = oneshot::channel();
@@ -3541,6 +4183,12 @@ async fn run_loop(
                                 // model can change while the dialog is open
                                 // (`acp-agent.ts:10219`).
                                 let home_dir = ext.env.get_path("HOME");
+                                // F39/B-60: an open request that blocks the
+                                // foreground work makes it `requires_action`
+                                // (`withPendingUserInput`, `acp-agent.ts:9588-9606`).
+                                // NEW-6: `handle_permission` opens and drains it
+                                // before it spawns the round-trip, so the state
+                                // precedes the request.
                                 handle_permission(
                                     &mut tasks,
                                     frame,
@@ -3587,6 +4235,10 @@ async fn run_loop(
                                         "response": { "action": "cancel" },
                                     },
                                 });
+                                // B-60: the elicitation blocks the work while
+                                // its form is open (`withPendingUserInput`).
+                                map_state.v2.open_input(request_id.clone(), None);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                                 let update_tx = update_tx.clone();
                                 let command_tx = command_tx.clone();
                                 let session_id = session_id.clone();
@@ -3635,6 +4287,8 @@ async fn run_loop(
                                 {
                                     let _ = reply.send(response);
                                 }
+                                map_state.v2.close_input(&request_id, false);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                             }
                             Command::UserDialogControl { frame, reply } => {
                                 // F23b/R-08: the refusal-fallback consent dialog,
@@ -3656,6 +4310,10 @@ async fn run_loop(
                                         "response": { "behavior": "cancelled" },
                                     },
                                 });
+                                // B-60: the dialog blocks the work while its
+                                // form is open (`withPendingUserInput`).
+                                map_state.v2.open_input(request_id.clone(), None);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                                 let update_tx = update_tx.clone();
                                 let command_tx = command_tx.clone();
                                 let session_id = session_id.clone();
@@ -3702,6 +4360,8 @@ async fn run_loop(
                                 {
                                     let _ = reply.send(response);
                                 }
+                                map_state.v2.close_input(&request_id, false);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                             }
                             Command::AskUserQuestionAnswered {
                                 request_id,
@@ -3723,6 +4383,10 @@ async fn run_loop(
                                 if let Some((reply, _)) = pending_ask.remove(&request_id) {
                                     let _ = reply.send(response);
                                 }
+                                // F39/B-60: the question was answered, so the
+                                // work reports `running` again.
+                                map_state.v2.close_input(&request_id, false);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                             }
                             Command::ElicitationWithdrawn { request_id } => {
                                 // The CLI withdrew the request (`control_cancel_request`,
@@ -3753,6 +4417,12 @@ async fn run_loop(
                                     &session_id,
                                     &request_id,
                                 );
+                                // F39/B-60: Claude Code withdrew the request
+                                // (its signal aborted), which is not an answer:
+                                // the work reports no `running` when a cancel
+                                // marked it (`withdrawnByCancel`).
+                                map_state.v2.close_input(&request_id, true);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                             }
                             Command::AwaitEnded { request_id } => {
                                 // The permission round trip ended without an answer
@@ -3767,6 +4437,11 @@ async fn run_loop(
                                     &session_id,
                                     &request_id,
                                 );
+                                // F39/B-60: a request that ended without an
+                                // answer was not withdrawn by a cancel, so the
+                                // work goes on (`running`).
+                                map_state.v2.close_input(&request_id, false);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                             }
                             Command::StartMcpAuth {
                                 servers,
@@ -3845,7 +4520,11 @@ async fn run_loop(
                             Command::SeedMessageIds { map } => {
                                 map_state.seed_message_ids(map);
                             }
-                            Command::RemoteControlPrompt { command, reply } => {
+                            Command::RemoteControlPrompt {
+                                command,
+                                reply,
+                                accepted,
+                            } => {
                                 // F24/S-03: answer the prompt without a model turn.
                                 // The control call runs off the actor (the reply
                                 // bypasses the turn queue, as upstream's
@@ -3856,16 +4535,28 @@ async fn run_loop(
                                 if let Some(error) =
                                     remote_control_busy_error(&machine, restart.is_some())
                                 {
+                                    if let Some(accepted) = accepted {
+                                        let _ = accepted.send(Err(error.clone()));
+                                    }
                                     let _ = reply.send(Err(error.into()));
                                     continue;
                                 }
                                 if remote_control_pending {
-                                    let _ = reply.send(Err(SessionError::InvalidRequest(
+                                    let error = SessionError::InvalidRequest(
                                         "Remote Control is already being changed. Try again in a moment."
                                             .to_string(),
-                                    )
-                                    .into()));
+                                    );
+                                    if let Some(accepted) = accepted {
+                                        let _ = accepted.send(Err(error.clone()));
+                                    }
+                                    let _ = reply.send(Err(error.into()));
                                     continue;
+                                }
+                                // NEW-2: the acceptance is reported before the
+                                // control call is spawned, so the adapter's
+                                // answer follows it (`acp-agent.ts:3836-3858`).
+                                if let Some(accepted) = accepted {
+                                    let _ = accepted.send(Ok(()));
                                 }
                                 remote_control_pending = true;
                                 let control = control.clone();
@@ -3983,7 +4674,14 @@ async fn run_loop(
                                         // R2: mark the running turn steered so the
                                         // injected echo feeds `machine.on_echo`'s steer
                                         // lane instead of settling the turn outright.
+                                        // A turn held for its background subagents
+                                        // resumes its work on the steer
+                                        // (`startForeground`, `acp-agent.ts:4380-4386`).
                                         machine.mark_steered(&uuid);
+                                        if let Some(resumed) = machine.take_steer_resumed() {
+                                            map_state.v2.note_resumed(&resumed);
+                                            drain_v2(&mut map_state, &update_tx, &session_id);
+                                        }
                                         let _ = control.send_user(injected).await;
                                         if let Some(goal) = ext.goal.note_prompt(&first_text, &uuid) {
                                             publish_goal(ext.air.is_some(), &goal, &update_tx, &session_id);
@@ -4413,6 +5111,10 @@ async fn run_loop(
                                     &session_id,
                                 );
                                 let _ = reply.send(response);
+                                // F39/B-60: the answered request no longer blocks
+                                // the work (`withPendingUserInput`'s finally).
+                                map_state.v2.close_input(&request_id, false);
+                                drain_v2(&mut map_state, &update_tx, &session_id);
                             }
                             Command::SetConfigOption {
                                 config_id,
@@ -5084,6 +5786,7 @@ async fn run_loop(
                                         update_tx: &update_tx,
                                         command_tx: &command_tx,
                                         session_id: &session_id,
+                                        live_background: &live_background,
                                     },
                                     reply,
                                 );
@@ -5092,6 +5795,11 @@ async fn run_loop(
                     }
                     msg = next_stream_line(&mut replay, &mut stream),
                         if !(eof_seen && inline_external_switches_in_flight > 0) => {
+                        // B-17: give the runtime a turn when this stretch of the
+                        // backlog has run past the message-loop budget, so a
+                        // cancel, close or permission answer is never starved
+                        // behind a long backlog (`acp-agent.ts:5651-5660`).
+                        message_loop_yielder.maybe_yield().await;
                         let Some(line) = msg else {
                             // An inline external switch still in flight at EOF: its
                             // control round trips can never be answered (the child
@@ -5270,6 +5978,11 @@ async fn run_loop(
                             };
                             shutdown_events.extend(events);
                             let events = shutdown_events;
+                            // F39: a cycle the stream death ended (or failed)
+                            // reports its end with this batch.
+                            if let Some(end) = machine.take_cycle_end() {
+                                map_state.v2.set_cycle_end(end);
+                            }
                             settle_events(
                                 events,
                                 &mut tasks,
@@ -5285,6 +5998,7 @@ async fn run_loop(
                                 &mut ext.titles,
         &mut ext.t2a.failures,
         &mut ext.t2a.usage_turns,
+                            &mut ext.file_change_reports,
                             );
                             // 3.5: close every live async task at teardown (`finish_all`).
                             // A cancel ends them `stopped` (and their children
@@ -5413,7 +6127,7 @@ async fn run_loop(
                                     // withdrawn (upstream's per-request signal aborts
                                     // on rebind), and the old runtime's awaiting-user
                                     // tokens are stale.
-                                    abort_pending_elicitations(&mut pending_elicitations);
+                                    let _ = abort_pending_elicitations(&mut pending_elicitations);
                                     for (_, (reply, response)) in pending_ask.drain() {
                                         let _ = reply.send(response);
                                     }
@@ -5516,7 +6230,7 @@ async fn run_loop(
     // CANCEL outcome; aborting the task drops the client request's reply, so the
     // forwarding side sends `$/cancel_request`.
     let _ = elicit_cancel_tx.send(true);
-    abort_pending_elicitations(&mut pending_elicitations);
+    let _ = abort_pending_elicitations(&mut pending_elicitations);
     for (_, (reply, response)) in pending_ask.drain() {
         let _ = reply.send(response);
     }
@@ -5572,10 +6286,30 @@ struct PendingClientRequests<'a> {
 /// request's CANCEL outcome.
 fn abort_pending_elicitations(
     pending: &mut HashMap<String, (oneshot::Sender<Value>, Value, tokio::task::JoinHandle<()>)>,
-) {
-    for (_, (reply, response, handle)) in pending.drain() {
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (id, (reply, response, handle)) in pending.drain() {
         handle.abort();
         let _ = reply.send(response);
+        ids.push(id);
+    }
+    ids
+}
+
+/// The v2 state of a clear-context restart: a turn that was held for its
+/// background subagents when the restart took it keeps the work, so its
+/// continuation takes it over (`startForeground`, `acp-agent.ts:7119-7130`;
+/// M5 of `review-T6G`).
+fn resume_held_turn_after_restart(
+    map_state: &mut MapState,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+    held_at_restart: bool,
+    prompt_uuid: &str,
+) {
+    if held_at_restart {
+        map_state.v2.note_resumed(prompt_uuid);
+        drain_v2(map_state, update_tx, session_id);
     }
 }
 
@@ -5603,25 +6337,35 @@ fn cancel_parent_round_trips(
     } else {
         std::collections::HashSet::new()
     };
+    let mut withdrawn: Vec<String> = Vec::new();
     pending.permissions.retain(|id, handle| {
         if keep.contains(id) {
             true
         } else {
             handle.abort();
+            withdrawn.push(id.clone());
             false
         }
     });
     // An MCP elicitation or dialog is not a child permission request: it is
     // always withdrawn with its CANCEL outcome.
-    abort_pending_elicitations(pending.elicitations);
+    withdrawn.extend(abort_pending_elicitations(pending.elicitations));
     let drained: Vec<(String, (oneshot::Sender<Value>, Value))> = pending.ask.drain().collect();
     for (id, (reply, response)) in drained {
         if keep.contains(&id) {
             pending.ask.insert(id, (reply, response));
         } else {
             let _ = reply.send(response);
+            withdrawn.push(id);
         }
     }
+    // The interrupt withdrew these requests: their forms close as withdrawn by
+    // a cancel, so the work reports no `running` before its `idle`
+    // (`withPendingUserInput`'s finally).
+    for id in withdrawn {
+        map_state.v2.close_input(&id, true);
+    }
+    drain_v2(map_state, update_tx, session_id);
     // B-40/B-96 (`acp-agent.ts:8485-8502`): AIR's draft ends every child here
     // as cancelled, so a later update of an ended child's tool call is dropped
     // instead of reaching that child's session. The RFD form only counts the
@@ -5687,15 +6431,23 @@ fn end_await_request(
 /// the close ends a queued turn (`acp-agent.ts:3906-3912`).
 fn cancel_held_remote_control_prompts(held: &mut std::collections::VecDeque<Command>) {
     for command in held.drain(..) {
-        if let Command::Prompt { reply, .. } = command {
-            let _ = reply.send(Ok(PromptReply {
-                stop_reason: "cancelled".to_string(),
-                usage: None,
-                quota: None,
-                updates: Vec::new(),
-                flush_rx: None,
-                ack: None,
-            }));
+        match command {
+            Command::Prompt { reply, .. } => {
+                let _ = reply.send(Ok(PromptReply {
+                    stop_reason: "cancelled".to_string(),
+                    usage: None,
+                    quota: None,
+                    updates: Vec::new(),
+                    flush_rx: None,
+                    ack: None,
+                }));
+            }
+            // A v2 prompt never inserted answers `-32800`
+            // (`RequestError.requestCancelled()`).
+            Command::PromptV2 { inserted, .. } => {
+                let _ = inserted.send(Err(crate::turn_events::V2IntakeError::Cancelled));
+            }
+            _ => {}
         }
     }
 }
@@ -6419,6 +7171,7 @@ fn suppressed_result_resolution(
 }
 
 /// One inbound `hook_callback` request's fields.
+#[derive(Clone, Copy)]
 struct HookCall<'a> {
     request_id: &'a str,
     callback_id: &'a str,
@@ -6441,10 +7194,113 @@ fn js_truthy(value: Option<&Value>) -> bool {
 
 /// The channels a hook callback may use: session output, the actor's own command
 /// queue (re-entry, e.g. PostModelSwitch), and the session id.
+#[derive(Clone, Copy)]
 struct HookIo<'a> {
     update_tx: &'a mpsc::UnboundedSender<SessionOutbound>,
     command_tx: &'a mpsc::UnboundedSender<Command>,
     session_id: &'a str,
+    /// `liveBackgroundTasks`: the parent Agent/Task call of each subagent, for
+    /// the v2 change preview's `parentToolUseId` (`toolUseOwner`,
+    /// `acp-agent.ts:9940-9956`).
+    live_background: &'a HashMap<String, String>,
+}
+
+/// The v2 PreToolUse preview of an Edit or Write (T-105, `previewFileChange`,
+/// `acp-agent.ts:9958-10031`): the tool call shows the exact patch of the change
+/// before the tool runs, so an auto-approved change is visible before it is done.
+///
+/// Claude Code runs the tool only after the hook returns, so the file is still
+/// as it was before the change — the same patch the approval of a permission
+/// request shows. A tool call the client has not seen yet goes out with the
+/// patch; one it holds gets a `tool_call_update` whose content is pinned so the
+/// streamed input cannot replace it.
+fn preview_file_change(
+    tasks: &mut AsyncTaskRuntime,
+    map_state: &mut MapState,
+    ext: &SessionExt,
+    io: HookIo<'_>,
+    input: &Value,
+    tool_use_id: &str,
+) {
+    let HookIo {
+        update_tx,
+        session_id,
+        live_background,
+        ..
+    } = io;
+    let tool_name = input
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
+    let agent_id = input.get("agent_id").and_then(Value::as_str);
+    // `toolUseOwner`: the parent Agent/Task call of the subagent that runs the
+    // tool, and the session of the child that was announced for it.
+    let parent = agent_id.and_then(|id| live_background.get(id).cloned());
+    let tool_call_session_id = agent_id
+        .filter(|_| tasks.subagents().form().is_some())
+        .and_then(|agent_id| tasks.subagents().child(agent_id))
+        .filter(|child| child.announced)
+        .map(|child| child.session_id.clone())
+        .unwrap_or_else(|| session_id.to_string());
+    let cwd = Some(ext.cwd.as_path());
+    let Some(content) =
+        crate::diff::preview_patch_content(tool_name, &tool_input, cwd, crate::diff::PatchForm::V2)
+    else {
+        return;
+    };
+    // Hook callbacks bypass the stream, so the hook can come before the
+    // streamed tool_use, as `canUseTool` can: then the tool call goes out with
+    // the patch. A v2 client takes the v2 patch, not the v1 input diff that the
+    // typed shape carries (`v2ToolCallContent`), so the call's content is
+    // replaced before it is sent.
+    if !map_state.has_emitted(tool_use_id) {
+        let mut surfaced = crate::permission::ensure_tool_call_emitted(
+            tool_name,
+            &tool_input,
+            tool_use_id,
+            parent.as_deref(),
+            map_state,
+            cwd,
+        );
+        if let Some(update) = surfaced.take() {
+            let mut value = serde_json::to_value(&update).unwrap_or(Value::Null);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("content".to_string(), Value::Array(content.clone()));
+            }
+            map_state.record_eager_session(tool_use_id, &tool_call_session_id);
+            // Raw: the typed `SessionNotification` parse skips a content item
+            // that is not a v1 block (`VecSkipError`), so a v2 patch would be
+            // dropped on the typed channel.
+            let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                "sessionId": tool_call_session_id,
+                "update": value,
+            })));
+        }
+        return;
+    }
+    let Some(mut update) = crate::hooks::build_pre_tool_use_preview_update(
+        tool_use_id,
+        tool_name,
+        &tool_input,
+        cwd,
+        parent.as_deref(),
+    ) else {
+        return;
+    };
+    // `fields.apply(update)`: nothing to send when the client already holds the
+    // patch. A v2 patch is not a v1 content block, so the field tracker keeps
+    // the v1 input diff it holds: the streamed refinement compares equal to it
+    // and is filtered, and the v2 translation would drop a v1 diff anyway.
+    map_state.filter_hook_tool_call_update(tool_use_id, &mut update);
+    if update.get("content").is_none() {
+        return;
+    }
+    // Raw, as above: the typed channel would drop the v2 patch.
+    let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+        "sessionId": tool_call_session_id,
+        "update": update,
+    })));
 }
 
 fn handle_hook_callback(
@@ -6465,9 +7321,29 @@ fn handle_hook_callback(
         update_tx,
         command_tx,
         session_id,
+        ..
     } = io;
-    match callback_id {
-        crate::hooks::POST_TOOL_USE_HOOK_ID => {
+    // N5 (`review-T6FBFC`): the callback ids depend on the connection's
+    // version. A v2 connection registers PreToolUse first, so its ids are
+    // `hook_0` (PreToolUse), `hook_1` (PostToolUse), …; a v1 connection never
+    // registers PreToolUse and its ids start at `hook_0` with PostToolUse.
+    // Dispatching on the v1 constants ran the wrong handler as soon as the v2
+    // payload was sent.
+    match crate::hooks::HookRole::from_id(callback_id, map_state.v2.reporting()) {
+        Some(crate::hooks::HookRole::PreToolUse) => {
+            // T-105 (`acp-agent.ts:9958-10031`): an Edit or Write shows its
+            // exact patch before it runs, so an auto-approved change is not
+            // invisible until it is done. The hook makes no permission
+            // decision; a failure only leaves the preview out.
+            if let Some(tool_use_id) = tool_use_id {
+                // As in `canUseTool`: the work a cancel stopped shows nothing.
+                if !map_state.is_stopped_work() {
+                    preview_file_change(tasks, map_state, ext, io, input, tool_use_id);
+                }
+            }
+            let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
+        }
+        Some(crate::hooks::HookRole::PostToolUse) => {
             // `onEnterPlanMode` -> `updateConfigOption` -> `syncConfig`: the mode
             // the session left is remembered for the ExitPlanMode options.
             let previous_mode = ext.config.modes.current_mode_id.clone();
@@ -6527,7 +7403,7 @@ fn handle_hook_callback(
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
-        crate::hooks::POST_MODEL_SWITCH_HOOK_ID => {
+        Some(crate::hooks::HookRole::PostModelSwitch) => {
             if input.get("source").and_then(Value::as_str) != Some("sdk")
                 && input.get("source").and_then(Value::as_str) != Some("resume")
             {
@@ -6539,7 +7415,7 @@ fn handle_hook_callback(
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
-        crate::hooks::POST_COMPACT_HOOK_ID => {
+        Some(crate::hooks::HookRole::PostCompact) => {
             // PC-1.1 (acp-agent.ts:11350-11360): a root-session PostCompact records the
             // compaction summary; subagent compactions (with a TRUTHY agent_id) do
             // not. JS truthiness (`!input.agent_id`): null, "", 0 and false do not
@@ -6555,7 +7431,7 @@ fn handle_hook_callback(
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
-        crate::hooks::TASK_CREATED_HOOK_ID => {
+        Some(crate::hooks::HookRole::TaskCreated) => {
             // T-77 (tools.ts:467, 470): an empty task_id or task_subject is rejected
             // before the state is touched or a plan published.
             if let Some(task_id) = input
@@ -6587,7 +7463,7 @@ fn handle_hook_callback(
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
-        crate::hooks::TASK_COMPLETED_HOOK_ID => {
+        Some(crate::hooks::HookRole::TaskCompleted) => {
             if let Some(task_id) = input
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -6602,7 +7478,7 @@ fn handle_hook_callback(
             }
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
-        _ => {
+        None => {
             let _ = reply.send(crate::hooks::unknown_hook_callback_response(
                 request_id,
                 callback_id,
@@ -6692,6 +7568,13 @@ async fn dispatch_stream(
                     ),
                 });
             }
+        }
+        // F39: with `msg_lifecycle_v1`, a fresh turn's `started` is when Claude
+        // Code takes its prompt in, before its output and its echo
+        // (`reportInserted`, `acp-agent.ts:5855-5860`).
+        if state == "started" && machine.inserted_now(uuid) {
+            map_state.v2.note_inserted(uuid);
+            drain_v2(map_state, update_tx, session_id);
         }
         return false;
     }
@@ -6803,6 +7686,7 @@ fn handle_session_frame(
                     &mut ext.titles,
                     &mut ext.t2a.failures,
                     &mut ext.t2a.usage_turns,
+                    &mut ext.file_change_reports,
                 );
             }
             // Phase 15 (Item 3): a `user` frame also carries tool results. When
@@ -6841,6 +7725,15 @@ fn handle_session_frame(
             // published a second time.
             let replay_echo =
                 uuid_opt.is_some() && line.get("isReplay").and_then(Value::as_bool) == Some(true);
+            // AG-3/T-89 (`acp-agent.ts:8016-8024`): a subagent's successful
+            // file-tool edits are recorded for the turn's report before the
+            // tool-use cache entries are dropped.
+            ext.file_change_reports.note_subagent_edits(
+                machine.active_prompt_uuid(),
+                line.get("parent_tool_use_id").and_then(Value::as_str),
+                &content,
+                map_state,
+            );
             // The work a cancel stopped ends its tools with error results. Until the
             // client is told that the work ended, they close the tool calls it
             // opened; everything else that work sends is dropped, and so is
@@ -7071,6 +7964,7 @@ fn handle_session_frame(
                     &mut ext.titles,
                     &mut ext.t2a.failures,
                     &mut ext.t2a.usage_turns,
+                    &mut ext.file_change_reports,
                 );
             }
 
@@ -7277,6 +8171,11 @@ fn handle_session_frame(
                 compaction_delivered,
                 begin,
             );
+            // F39: how a cycle that Claude Code started on its own ended goes
+            // out with its `CycleEnded` in the batch below.
+            if let Some(end) = machine.take_cycle_end() {
+                map_state.v2.set_cycle_end(end);
+            }
             // A result closes the compaction lifecycle (`compaction.reset()`,
             // `acp-agent.ts:7477-7489`): an in-progress `compaction_update`
             // entity gets its `cancelled` terminal before the prompt response,
@@ -7332,6 +8231,7 @@ fn handle_session_frame(
                 &mut ext.titles,
                 &mut ext.t2a.failures,
                 &mut ext.t2a.usage_turns,
+                &mut ext.file_change_reports,
             );
             // An `end_turn` result the gate turned into an `IncompleteToolCall`
             // failure is `failActiveWithSessionFailure` upstream, which
@@ -7459,6 +8359,16 @@ fn handle_session_frame(
                     if let Some(parent) = parent.filter(|parent| !parent.is_empty()) {
                         map_state.books.forget_foreground(parent);
                     }
+                    // F39/B-60: the task's placement decides whether its
+                    // requests block the foreground work (`blocksForeground`).
+                    map_state.v2.note_task(
+                        task_id,
+                        line.get("is_backgrounded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        line.get("parent_task_id").and_then(Value::as_str),
+                    );
+                    drain_v2(map_state, update_tx, session_id);
                     sync_live_tasks(machine, live_background, map_state);
                     // 3.5: async-task runtime for AIR `asyncTasks` clients.
                     // Subagent / monitor tasks are ignored inside the runtime.
@@ -7554,6 +8464,7 @@ fn handle_session_frame(
                             &mut ext.titles,
                             &mut ext.t2a.failures,
                             &mut ext.t2a.usage_turns,
+                            &mut ext.file_change_reports,
                         );
                     }
                 }
@@ -7570,6 +8481,11 @@ fn handle_session_frame(
                         // `runsInBackground` reads the live set at use: a cancel
                         // closes only the calls of foreground subagents.
                         sync_live_tasks(machine, live_background, map_state);
+                        // F39/B-60: the move changes what the work waits on.
+                        map_state
+                            .v2
+                            .set_task_backgrounded(task_id, backgrounded == &Value::Bool(true));
+                        drain_v2(map_state, update_tx, session_id);
                     }
                     // T4B hook 5 (`acp-agent.ts:6531-6575`): upstream ends the
                     // child after `asyncTasks.taskUpdated` and the backgrounded
@@ -7596,6 +8512,9 @@ fn handle_session_frame(
                         // (the notification is deduplicated), so it prunes too.
                         Some("completed" | "failed" | "killed") => {
                             let parent = machine.live_task_parent(task_id).map(str::to_string);
+                            // F39/B-60: a settled subagent's request no longer
+                            // blocks the foreground work.
+                            map_state.v2.remove_task(task_id);
                             if let Some(parent) = parent.as_deref().filter(|p| !p.is_empty()) {
                                 forget_subagent_streams(parent, machine, map_state);
                             }
@@ -7627,6 +8546,7 @@ fn handle_session_frame(
                                 &mut ext.titles,
                                 &mut ext.t2a.failures,
                                 &mut ext.t2a.usage_turns,
+                                &mut ext.file_change_reports,
                             );
                         }
                         // The SDK can resume a finished subagent under the same
@@ -7714,6 +8634,11 @@ fn handle_session_frame(
                     }
                     if state == "idle" {
                         let events = machine.on_idle();
+                        // F39: a cycle that ends at this idle (its result will not
+                        // come) reports its end with the batch below.
+                        if let Some(end) = machine.take_cycle_end() {
+                            map_state.v2.set_cycle_end(end);
+                        }
                         // A held turn drained here, or a turn failed for the idle
                         // without a result, closes the stretch too.
                         if machine.take_text_stretch_closed() {
@@ -7764,6 +8689,7 @@ fn handle_session_frame(
                             &mut ext.titles,
                             &mut ext.t2a.failures,
                             &mut ext.t2a.usage_turns,
+                            &mut ext.file_change_reports,
                         );
                     }
                 }
@@ -8086,6 +9012,12 @@ fn handle_session_frame(
             // foreground work at its first main-conversation output
             // (`startAutonomousCycle`, run before the message switch).
             machine.start_autonomous_cycle(&line);
+            // F39: on a v2 connection the cycle is the session's foreground work,
+            // reported as `running` before its output.
+            if machine.runs_autonomous_cycle() {
+                map_state.v2.start_cycle();
+                drain_v2(map_state, update_tx, session_id);
+            }
             // N-32 (`acp-agent.ts:7493-7510`): the API's compaction block streams
             // the retained summary text. `content` is null on the opening block
             // and on a failed compaction, but the block itself still opens the
@@ -8433,6 +9365,7 @@ fn handle_session_frame(
                     &mut ext.titles,
                     &mut ext.t2a.failures,
                     &mut ext.t2a.usage_turns,
+                    &mut ext.file_change_reports,
                 );
                 return;
             }
@@ -8646,6 +9579,12 @@ fn resolve_permission_answer(
         answer.tool_use_id,
         answer.tool_input,
     );
+    // A decoded answer that threw (non-selected, unoffered or unknown id) is the
+    // SDK's error verdict: Node never reaches the fallback, the ExitPlanMode
+    // mode publishing or the pending lanes, so neither does this path.
+    if crate::permission_response::is_error_control_response(&response) {
+        return response;
+    }
     // `publishFallbackWarning` (`session-mode.ts:287-308`) runs whenever the
     // rewrite happened, for any tool, and only once per session.
     if fallback && !ext.auto_mode_fallback_warning_shown {
@@ -8877,6 +9816,12 @@ fn handle_permission(
         );
         let aborted = ask_aborted_response(&can.request_id);
         pending_ask.insert(request_id.clone(), (reply, aborted));
+        // B-60: a question blocks the foreground work like a permission
+        // request (`withPendingUserInput`, `acp-agent.ts:10276-10290`).
+        map_state
+            .v2
+            .open_input(request_id.clone(), can.agent_id.clone());
+        drain_v2(map_state, update_tx, session_id);
         let update_tx = update_tx.clone();
         let command_tx = command_tx.clone();
         let mut cancel = elicit_cancel.clone();
@@ -8947,38 +9892,43 @@ fn handle_permission(
 
     // Build the `request_permission` params (10.1) before moving `can` into the
     // spawned round-trip task.
-    let mut tool_call = permission::build_tool_call(
-        &can.tool_name,
-        &can.tool_input,
-        &can.tool_use_id,
-        parent.as_deref(),
-        Some(cwd),
-        map_state.is_air(),
-    );
-    if let Some(preview) = preview {
-        tool_call["content"] = Value::Array(preview);
-    }
-    // A sandbox network request or a computer-use call is named by its subject,
-    // not by the tool; a client that is not AIR also sees the input when the call
-    // has no content of its own (`permissions/presentation.ts:70-125`).
+    //
+    // `buildClaudePermissionPresentation` (`permissions/presentation.ts:60-136`):
+    // the tool call's own heading is reused as the permission heading, a sandbox
+    // network request or a computer-use call is named by its subject instead, and
+    // a client that is not AIR also sees the JSON input when the call has no
+    // content of its own. AIR gets the minimal tool call; a `diffPatch` client's
+    // approval carries the exact patch (P-16).
     let subject = crate::tools::permission_subject(
         &can.tool_name,
         &can.tool_input,
         can.display_name.as_deref(),
     );
-    if let Some(subject) = &subject {
-        tool_call["title"] = Value::String(subject.clone());
-    }
-    if !map_state.is_air()
-        && (subject.is_some() || can.tool_name.starts_with("mcp__computer-use__"))
-        && tool_call["content"].as_array().is_none_or(Vec::is_empty)
-    {
+    let is_computer_use = can.tool_name.starts_with("mcp__computer-use__");
+    let fallback_content = if subject.is_some() || is_computer_use {
         let input = serde_json::to_string_pretty(&can.tool_input).unwrap_or_default();
-        tool_call["content"] = json!([{
+        Some(json!([{
             "type": "content",
             "content": {"type": "text", "text": format!("```json\n{input}\n```")},
-        }]);
-    }
+        }]))
+    } else {
+        None
+    };
+    let tool_call = permission::build_permission_tool_call(&permission::PermissionToolCall {
+        tool_name: can.tool_name.clone(),
+        tool_input: can.tool_input.clone(),
+        tool_use_id: can.tool_use_id.clone(),
+        parent_tool_use_id: parent.clone(),
+        cwd: Some(cwd.to_path_buf()),
+        air: map_state.is_air(),
+        plan_file: map_state.plan_file(),
+        terminal_output: map_state.has_terminal(&can.tool_name),
+        title: subject,
+        preview_content: preview.map(Value::Array),
+        blocked_path: can.blocked_path.clone(),
+        fallback_content,
+        mcp_server: can.mcp_server.clone(),
+    });
     // 3.6 (Decision 7): build the ACP options from the P7 permission_option
     // module (Node's `buildClaudePermissionOptions`), and the request params.
     let ctx = permission_options::OptionsContext {
@@ -9025,6 +9975,24 @@ fn handle_permission(
             ),
         );
     }
+    // P-51: a v2 permission request has its own `title` and `description`
+    // (`AcpPermissionRequest`, `permissions/presentation.ts:12-17`), computed
+    // once from the tool call (`v2/permission.ts:12-25`).
+    if map_state.v2.reporting() {
+        let (title, description) = crate::v2::permission::v2_permission_presentation(
+            &can.tool_name,
+            &can.tool_input,
+            can.display_name.as_deref(),
+            tool_call["title"].as_str().unwrap_or_default(),
+            frame
+                .pointer("/request/decision_reason")
+                .and_then(Value::as_str),
+        );
+        params.insert("title".into(), Value::String(title));
+        if let Some(description) = description {
+            params.insert("description".into(), Value::String(description));
+        }
+    }
     params.insert("toolCall".into(), tool_call);
     let params = Value::Object(params);
 
@@ -9046,12 +10014,24 @@ fn handle_permission(
     // The command carries `reply`, so a `Cancel` that aborts this task after the
     // client answered still delivers the allow (INV-27); the handle is registered
     // so a Cancel before the answer aborts the round-trip (CUJ 2).
-    let update_tx = update_tx.clone();
+    // B-60/NEW-6: the request blocks the foreground work from the moment it is
+    // open (`withPendingUserInput`, `v2/agent.ts:338-349`), and its
+    // `requires_action` must precede the request on the wire, so the state is
+    // drained here — before the round-trip task sends it.
+    map_state
+        .v2
+        .open_input(request_id.clone(), can.agent_id.clone());
+    drain_v2(map_state, update_tx, session_id);
     let ctx = Arc::new(ctx);
     let command_tx = command_tx.clone();
+    // F3 (`review-T6G2`): the request is queued HERE, synchronously, before the
+    // round-trip task is spawned, so no update the actor sends after the spawn
+    // can overtake it (upstream sends `requires_action` and the request
+    // synchronously, `v2/agent.ts:338-357`). Only the client's answer is awaited
+    // in the task.
+    let (ptx, prx) = oneshot::channel();
+    let _ = update_tx.send(SessionOutbound::RequestPermission { params, reply: ptx });
     let handle = tokio::spawn(async move {
-        let (ptx, prx) = oneshot::channel();
-        let _ = update_tx.send(SessionOutbound::RequestPermission { params, reply: ptx });
         match prx.await {
             Ok(Ok(value)) => {
                 let _ = command_tx.send(Command::PermissionAnswered {
@@ -9064,15 +10044,23 @@ fn handle_permission(
                 });
             }
             // The request errored or the round-trip was dropped (e.g. the client
-            // closed / cancelled): refuse the tool (R28 deny) so the turn settles
-            // on the next `result` (INV-21). The child's awaiting-user token ends
-            // here too: nobody will answer this request, so `PermissionAnswered`
-            // never runs (`awaitingUser`'s finally reports `running` when the
-            // signal was not aborted).
-            Ok(Err(_)) | Err(_) => {
-                let _ = reply.send(permission::deny_control_response(
+            // closed / cancelled). Node's `requestPermissionFromClient` throws
+            // "Tool use aborted" when the signal aborted and rethrows the client
+            // error otherwise (`acp-agent.ts:9790-9836`); the SDK writes the
+            // throw as an error `control_response`, never a deny (P-36).
+            Ok(Err(message)) => {
+                let _ = reply.send(crate::permission_response::error_control_response(
                     &can.request_id,
-                    &can.tool_use_id,
+                    &message,
+                ));
+                let _ = command_tx.send(Command::AwaitEnded {
+                    request_id: can.request_id.clone(),
+                });
+            }
+            Err(_) => {
+                let _ = reply.send(crate::permission_response::error_control_response(
+                    &can.request_id,
+                    crate::permission_response::TOOL_USE_ABORTED,
                 ));
                 let _ = command_tx.send(Command::AwaitEnded {
                     request_id: can.request_id.clone(),
@@ -9101,10 +10089,13 @@ fn handle_events(
     air: Option<&AirClient>,
     final_message_id: Option<&str>,
     failures: &mut failures::SessionFailures,
+    v2: &mut crate::turn_events::V2State,
 ) {
     // A `FinalText` precedes its turn's `Settled` in the same batch; collect it
     // and hand it to the prompt task so it can forward the chunk before the
-    // response (deterministic, review-04 wiring).
+    // response (deterministic, review-04 wiring). A v2 prompt has no prompt
+    // task: it is answered at intake, so its texts go out on the session's
+    // ordered channel instead (NEW-1, `acp-agent.ts:5301`).
     let mut final_texts: Vec<SessionNotification> = Vec::new();
     for event in events {
         match event {
@@ -9215,6 +10206,16 @@ fn handle_events(
                         flush_rx: Some(flush_rx),
                         ack: Some(ack_tx),
                     }));
+                } else if v2.reporting() {
+                    // NEW-1: a v2 prompt was answered at intake, so it has no
+                    // `pending` entry; the result-only text (#453) and a
+                    // local-only command's output still reach the client as a
+                    // chunk (`sendUpdate`, `acp-agent.ts:5301`). It goes out
+                    // here, before the turn's `idle` that `after_events` queues
+                    // next, so the client sees the text ahead of the state.
+                    for notif in std::mem::take(&mut final_texts) {
+                        let _ = update_tx.send(SessionOutbound::Update(notif));
+                    }
                 }
             }
             TurnEvent::Failed {
@@ -9225,70 +10226,91 @@ fn handle_events(
                 model_rows,
                 is_structured_output_retries,
             } => {
-                if let Some(reply) = pending.remove(prompt_uuid) {
-                    let (claude_kind, title) = match kind {
-                        FailureKind::ProviderError if *is_structured_output_retries => (
-                            crate::session_failure::ClaudeFailureKind::ProviderError,
-                            message.clone(),
-                        ),
-                        FailureKind::ProviderError => {
-                            let ck = crate::session_failure::provider_failure_category(
-                                failure_ctx.error.as_deref(),
-                                failure_ctx.was_usage_limit,
-                            );
-                            let t = failure_ctx.title.clone().unwrap_or_else(|| message.clone());
-                            (ck, t)
-                        }
-                        FailureKind::BudgetExhausted => (
-                            crate::session_failure::ClaudeFailureKind::BudgetExhausted,
-                            message.clone(),
-                        ),
-                        FailureKind::ContextExhausted => (
-                            crate::session_failure::ClaudeFailureKind::ContextExhausted,
-                            message.clone(),
-                        ),
-                        FailureKind::IncompleteToolCall | FailureKind::NoResult => (
-                            crate::session_failure::ClaudeFailureKind::InternalError,
-                            message.clone(),
-                        ),
-                        FailureKind::AuthRequired => (
-                            crate::session_failure::ClaudeFailureKind::AuthRequired,
-                            message.clone(),
-                        ),
-                        // No title: the policy's fallback title speaks
-                        // (`failActiveWithSessionFailure("transport_lost")`).
-                        FailureKind::TransportLost => (
-                            crate::session_failure::ClaudeFailureKind::TransportLost,
-                            String::new(),
-                        ),
-                        FailureKind::WorkerShutdown => (
-                            crate::session_failure::ClaudeFailureKind::WorkerShutdown,
-                            String::new(),
-                        ),
-                        _ => (
-                            crate::session_failure::ClaudeFailureKind::InternalError,
-                            message.clone(),
-                        ),
-                    };
-
-                    let air_session_failure =
-                        air.as_ref().is_some_and(|a| a.supports("sessionFailure"));
-
-                    // Finding 3: assistant `error` mapping to auth_required (authentication_failed /
-                    // oauth_org_not_allowed) must reject with RequestError.authRequired() -32000 for
-                    // ALL clients (AIR included). Check the derived claude_kind, not only *kind.
-                    if claude_kind == crate::session_failure::ClaudeFailureKind::AuthRequired
-                        || *kind == FailureKind::AuthRequired
-                    {
-                        reply_error_after_flush(
-                            update_tx,
-                            reply,
-                            SessionError::PromptFailed {
-                                kind: FailureKind::AuthRequired,
-                                message: message.clone(),
-                                assistant_had_error: failure_ctx.has_error(),
-                            },
+                let (claude_kind, title) = match kind {
+                    FailureKind::ProviderError if *is_structured_output_retries => (
+                        crate::session_failure::ClaudeFailureKind::ProviderError,
+                        message.clone(),
+                    ),
+                    FailureKind::ProviderError => {
+                        let ck = crate::session_failure::provider_failure_category(
+                            failure_ctx.error.as_deref(),
+                            failure_ctx.was_usage_limit,
                         );
+                        let t = failure_ctx.title.clone().unwrap_or_else(|| message.clone());
+                        (ck, t)
+                    }
+                    FailureKind::BudgetExhausted => (
+                        crate::session_failure::ClaudeFailureKind::BudgetExhausted,
+                        message.clone(),
+                    ),
+                    FailureKind::ContextExhausted => (
+                        crate::session_failure::ClaudeFailureKind::ContextExhausted,
+                        message.clone(),
+                    ),
+                    FailureKind::IncompleteToolCall | FailureKind::NoResult => (
+                        crate::session_failure::ClaudeFailureKind::InternalError,
+                        message.clone(),
+                    ),
+                    FailureKind::AuthRequired => (
+                        crate::session_failure::ClaudeFailureKind::AuthRequired,
+                        message.clone(),
+                    ),
+                    // No title: the policy's fallback title speaks
+                    // (`failActiveWithSessionFailure("transport_lost")`).
+                    FailureKind::TransportLost => (
+                        crate::session_failure::ClaudeFailureKind::TransportLost,
+                        String::new(),
+                    ),
+                    FailureKind::WorkerShutdown => (
+                        crate::session_failure::ClaudeFailureKind::WorkerShutdown,
+                        String::new(),
+                    ),
+                    _ => (
+                        crate::session_failure::ClaudeFailureKind::InternalError,
+                        message.clone(),
+                    ),
+                };
+
+                let air_session_failure =
+                    air.as_ref().is_some_and(|a| a.supports("sessionFailure"));
+                // Finding 3: assistant `error` mapping to auth_required (authentication_failed /
+                // oauth_org_not_allowed) must reject with RequestError.authRequired() -32000 for
+                // ALL clients (AIR included). Check the derived claude_kind, not only *kind.
+                let auth = claude_kind == crate::session_failure::ClaudeFailureKind::AuthRequired
+                    || *kind == FailureKind::AuthRequired;
+                // NEW-5: the ONE mapping of a failed turn. The error v1
+                // answers the prompt with is also the error a v2 client
+                // reads on its `idle` (`jsonRpcError`, `v2/prompt.ts:114-126`),
+                // so it is built once here and handed to the v2 state; the
+                // copy that re-derived `(kind, message)` is gone.
+                let err = failed_turn_error(
+                    *kind,
+                    message,
+                    auth,
+                    air_session_failure,
+                    failure_ctx.has_error(),
+                );
+                if v2.reporting() {
+                    // F1: the effective kind travels with the error, so the v2
+                    // bookkeeping respawns a session whose assistant error said
+                    // auth. F5: AIR `sessionFailure` settles the turn end_turn
+                    // (no error), as v1 does.
+                    let settle_end_turn =
+                        air_session_failure && *kind != FailureKind::SessionEnded && !auth;
+                    v2.set_failure_rpc(
+                        prompt_uuid,
+                        (!settle_end_turn).then(|| crate::agent::session_error_jsonrpc(&err)),
+                        if auth {
+                            FailureKind::AuthRequired
+                        } else {
+                            *kind
+                        },
+                    );
+                }
+
+                if let Some(reply) = pending.remove(prompt_uuid) {
+                    if auth {
+                        reply_error_after_flush(update_tx, reply, err);
                     } else if air_session_failure && *kind != FailureKind::SessionEnded {
                         // The one failure controller: an `api_retry` warning of
                         // this turn already holds revision 1 of `<turn>:error`
@@ -9298,18 +10320,13 @@ fn handle_events(
                         // `acp-agent.ts:5558-5562`).
                         let _ =
                             update_tx.send(SessionOutbound::Board(BoardEvent::TurnFailed(true)));
-                        let prepared = failures.prepare(
+                        let sf_meta = record_air_session_failure(
+                            failures,
                             session_id,
+                            prompt_uuid,
                             claude_kind,
-                            &failures::FailureOptions {
-                                turn_id: Some(prompt_uuid.clone()),
-                                title: Some(title),
-                                ..failures::FailureOptions::default()
-                            },
+                            &title,
                         );
-                        let failure = prepared.failure.clone();
-                        failures.record_active(prepared);
-                        let sf_meta = crate::session_failure::session_failure_meta(&failure);
                         let (u_i, u_o, u_cr, u_cw) = (
                             usage.input_tokens,
                             usage.output_tokens,
@@ -9359,33 +10376,40 @@ fn handle_events(
                             ack: Some(ack_tx),
                         }));
                     } else {
-                        // F3a (f): the end-of-stream rejection rewritten from
-                        // `lastErrorResultText` keeps its own SDK error identity.
-                        let err = match message.strip_prefix(CHILD_EXIT_PREFIX) {
-                            // An AIR client reads the queued turns' rejection as
-                            // `internalErrorForClient({errorKind:"transport_lost"})`
-                            // (`acp-agent.ts:8325-8330`).
-                            Some(_) if air_session_failure => SessionError::TransportLost,
-                            Some(text) => SessionError::ChildErrorResult {
-                                text: text.to_string(),
-                            },
-                            // `internalErrorForClient({errorKind:"worker_shutdown"})`.
-                            None if *kind == FailureKind::WorkerShutdown => {
-                                SessionError::WorkerShutdown
-                            }
-                            None => SessionError::PromptFailed {
-                                kind: *kind,
-                                message: message.clone(),
-                                assistant_had_error: failure_ctx.has_error(),
-                            },
-                        };
                         reply_error_after_flush(update_tx, reply, err);
+                    }
+                } else if v2.reporting() {
+                    // H2: a v2 prompt has no parked v1 reply, but its AIR
+                    // `sessionFailure` still records the failure (the list row
+                    // shows `error`) and hands `sessionFailureMeta` to the
+                    // `idle` `after_events` queues next
+                    // (`failActiveWithSessionFailure`, `acp-agent.ts:5591-5593`).
+                    if air_session_failure && *kind != FailureKind::SessionEnded && !auth {
+                        let _ =
+                            update_tx.send(SessionOutbound::Board(BoardEvent::TurnFailed(true)));
+                        let sf_meta = record_air_session_failure(
+                            failures,
+                            session_id,
+                            prompt_uuid,
+                            claude_kind,
+                            &title,
+                        );
+                        v2.set_failure_meta(prompt_uuid, sf_meta);
+                    }
+                    // NEW-1: a v2 prompt is answered at intake, so its
+                    // result text still goes out, ahead of the `idle error`
+                    // that `after_events` queues next.
+                    for notif in std::mem::take(&mut final_texts) {
+                        let _ = update_tx.send(SessionOutbound::Update(notif));
                     }
                 }
             }
             TurnEvent::Activated { .. } => {
                 high_water.fetch_max(1, Ordering::Relaxed);
             }
+            // The foreground work of a held turn ended at its result, and a
+            // resumed hold starts it again: v2's state only, no prompt answer.
+            TurnEvent::Held { .. } | TurnEvent::Resumed { .. } => {}
             // Consumed by the unfinished-tool gate before this point.
             TurnEvent::CycleEnded => {}
         }
@@ -9849,6 +10873,28 @@ fn note_tool_updates(
 
 /// Run the unfinished-tool post-filter (3.7, Decision 7) over a batch of turn
 /// events, send its closing `tool_call_update`s, then hand the (possibly
+/// One report job a settled turn left to run (see [`FileChangeReports::take`]).
+pub(crate) struct DeferredReportJob {
+    pub request_id: String,
+    pub handle: crate::file_change_audit::ReportHandle,
+    pub edited: Vec<String>,
+    /// Set by a cancel/close that finished the report: the forwarded reply then
+    /// reports `cancelled` (`review-T6INT` finding 2).
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the job when it finished, so the actor can prune the entry.
+    pub done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A settled turn's prompt reply parked until its file-change report published:
+/// the proxy receiver, the real reply sender, the prompt uuid (the checkpoint's
+/// user message id) and the report job.
+struct DeferredReport {
+    rx: oneshot::Receiver<Result<PromptReply, PromptFailure>>,
+    reply: oneshot::Sender<Result<PromptReply, PromptFailure>>,
+    prompt_uuid: String,
+    job: DeferredReportJob,
+}
+
 /// rewritten) events to [`handle_events`].
 #[allow(clippy::too_many_arguments)]
 fn settle_events(
@@ -9866,6 +10912,7 @@ fn settle_events(
     titles: &mut crate::session_titles::SessionTitles,
     failures: &mut failures::SessionFailures,
     usage_turns: &mut crate::usage::UsageTurns,
+    reports: &mut FileChangeReports,
 ) -> bool {
     // Node's `activateTurn` clears `session.cancelled`, ending the stopped-work
     // window whenever a turn activates (whether by user echo or ensure_active_turn).
@@ -9910,6 +10957,57 @@ fn settle_events(
             usage_turns.remove(prompt_uuid);
         }
     }
+    // AG-3: `settleActive` publishes the turn's file-change report before the
+    // prompt response (`acp-agent.ts:5486-5493`). A cancelled or failed turn's
+    // `unavailable` report is fire-and-forget (`finish`, `acp-agent.ts:2805`,
+    // `2811`); a reported turn's prompt reply is parked until the bounded
+    // checkpoint preview has published, then forwarded after a flush barrier so
+    // the `session_info_update` precedes the response.
+    let mut deferred_reports: Vec<DeferredReport> = Vec::new();
+    // review-T6INT finding 3: a v2 prompt has no reply to park, but its report
+    // still has to publish before the turn's `idle`.
+    let mut v2_reports: Vec<(String, DeferredReportJob)> = Vec::new();
+    for event in &events {
+        let TurnEvent::Settled {
+            prompt_uuid,
+            stop_reason,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(job) = reports.take(prompt_uuid) else {
+            continue;
+        };
+        if stop_reason.as_str() == "cancelled" {
+            // M8: the job is finished, so mark it done or `note_prompt`'s
+            // prune keeps it in `collecting` for the session's lifetime.
+            reports.finish_job(&job, "cancelled");
+            continue;
+        }
+        if let Some(reply) = pending.remove(prompt_uuid) {
+            let (tx, rx) = oneshot::channel();
+            pending.insert(prompt_uuid.clone(), tx);
+            deferred_reports.push(DeferredReport {
+                rx,
+                reply,
+                prompt_uuid: prompt_uuid.clone(),
+                job,
+            });
+        } else if map_state.v2.reporting() {
+            v2_reports.push((prompt_uuid.clone(), job));
+        } else {
+            job.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    for event in &events {
+        if let TurnEvent::Failed { prompt_uuid, .. } = event {
+            if let Some(job) = reports.take(prompt_uuid) {
+                // M8: finished, so `note_prompt`'s prune can drop the entry.
+                reports.finish_job(&job, "providerError");
+            }
+        }
+    }
     handle_events(
         &events,
         pending,
@@ -9920,8 +11018,258 @@ fn settle_events(
         air,
         final_message_id,
         failures,
+        &mut map_state.v2,
     );
+    if !deferred_reports.is_empty() {
+        let workspace = reports.reporter.as_ref().map(|r| r.workspace().clone());
+        let timeout = reports
+            .reporter
+            .as_ref()
+            .map_or(crate::file_change_audit::REPORT_TIMEOUT, |r| r.timeout());
+        let control = reports.control.clone();
+        let publish = reports.publish();
+        let log_error = reports.log_error();
+        let update_tx = update_tx.clone();
+        for deferred in deferred_reports {
+            let workspace = workspace.clone();
+            let control = control.clone();
+            let publish = publish.clone();
+            let log_error = log_error.clone();
+            let update_tx = update_tx.clone();
+            tokio::spawn(async move {
+                let DeferredReport {
+                    rx,
+                    reply,
+                    prompt_uuid,
+                    job,
+                } = deferred;
+                let answer = rx.await;
+                let Ok(mut answer) = answer else {
+                    job.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                };
+                // `review-T6INT` finding 1: release the stale barrier
+                // `handle_events` queued for this reply first. The forwarder is
+                // blocked on its ack, and the report's own barrier would queue
+                // behind it: without this the turn's response stalls for the
+                // 1 s ack timeout.
+                if let Ok(ok) = &mut answer {
+                    if let Some(ack) = ok.ack.take() {
+                        let _ = ack.send(());
+                    }
+                }
+                if let (Some(workspace), Some(control)) = (workspace, control) {
+                    let user_message_id = prompt_uuid.clone();
+                    let preview = async move {
+                        control
+                            .send_request(json!({
+                                "subtype": "rewind_files",
+                                "user_message_id": user_message_id,
+                                "dry_run": true,
+                            }))
+                            .await
+                            .map(|frame| {
+                                // `Query.rewindFiles` resolves the response's own
+                                // `response` body (`RewindFilesResult`).
+                                frame
+                                    .get("response")
+                                    .and_then(|response| response.get("response"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            })
+                            .map_err(|error| error.to_string())
+                    };
+                    crate::file_change_audit::run_report(
+                        crate::file_change_audit::ReportJob {
+                            workspace,
+                            handle: job.handle.clone(),
+                            request_id: job.request_id.clone(),
+                            edited_paths: job.edited.clone(),
+                            publish,
+                            log_error,
+                            timeout,
+                        },
+                        preview,
+                    )
+                    .await;
+                    // A fresh barrier for the report: the prompt task awaits it
+                    // and the forwarder is never blocked by this task, so the
+                    // report precedes the response without a second 1 s stall.
+                    let (done_tx, done_rx) = oneshot::channel();
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    let _ = update_tx.send(SessionOutbound::FlushAcked {
+                        done: done_tx,
+                        ack: ack_rx,
+                    });
+                    if let Ok(ok) = &mut answer {
+                        // A cancel that landed during the preview wins: its
+                        // `unavailable/cancelled` report already went out and
+                        // the turn answers `cancelled` (`review-T6INT` finding 2).
+                        if job.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                            ok.stop_reason = "cancelled".to_string();
+                        }
+                        ok.flush_rx = Some(done_rx);
+                        ok.ack = Some(ack_tx);
+                    }
+                }
+                job.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = reply.send(answer);
+            });
+        }
+    }
+    // F39: the v2 states of the gated events, after the gate closed the tool
+    // calls they report and after the v1 responses were ordered, so the client
+    // sees the work's output before its state.
+    map_state.v2.after_events(&events, failure_ctx.has_error());
+    if v2_reports.is_empty() {
+        drain_v2(map_state, update_tx, session_id);
+    } else {
+        // review-T6INT finding 3: the report publishes before the turn's
+        // `idle`. The batch's v2 emissions are held until every report job of
+        // the batch has run (Node awaits the preview inside `settleActive`).
+        let mut emissions = map_state.v2.take_out();
+        let workspace = reports.reporter.as_ref().map(|r| r.workspace().clone());
+        let timeout = reports
+            .reporter
+            .as_ref()
+            .map_or(crate::file_change_audit::REPORT_TIMEOUT, |r| r.timeout());
+        let control = reports.control.clone();
+        let publish = reports.publish();
+        let log_error = reports.log_error();
+        let update_tx = update_tx.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            if let (Some(workspace), Some(control)) = (workspace, control) {
+                for (prompt_uuid, job) in v2_reports {
+                    let preview_uuid = prompt_uuid.clone();
+                    let preview = {
+                        let control = control.clone();
+                        async move {
+                            control
+                                .send_request(json!({
+                                    "subtype": "rewind_files",
+                                    "user_message_id": preview_uuid,
+                                    "dry_run": true,
+                                }))
+                                .await
+                                .map(|frame| {
+                                    frame
+                                        .get("response")
+                                        .and_then(|response| response.get("response"))
+                                        .cloned()
+                                        .unwrap_or(Value::Null)
+                                })
+                                .map_err(|error| error.to_string())
+                        }
+                    };
+                    crate::file_change_audit::run_report(
+                        crate::file_change_audit::ReportJob {
+                            workspace: workspace.clone(),
+                            handle: job.handle.clone(),
+                            request_id: job.request_id.clone(),
+                            edited_paths: job.edited.clone(),
+                            publish: publish.clone(),
+                            log_error: log_error.clone(),
+                            timeout,
+                        },
+                        preview,
+                    )
+                    .await;
+                    // H1 (`review-T6INT` finding 2): a cancel that landed
+                    // during the preview wins the turn, as `cancel()` settles
+                    // the settling turn `cancelled` (`acp-agent.ts:8627-8685`).
+                    // Its `unavailable/cancelled` report already went out; the
+                    // held idle must not still say `end_turn`.
+                    if job.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                        for emission in emissions.iter_mut() {
+                            if let crate::turn_events::V2Emission::Ended {
+                                prompt_uuid: ended,
+                                outcome,
+                            } = emission
+                            {
+                                if *ended == prompt_uuid {
+                                    outcome.stop_reason = crate::turn::StopReason::Cancelled;
+                                }
+                            }
+                        }
+                    }
+                    job.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            } else {
+                for (_, job) in v2_reports {
+                    job.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            emit_v2_emissions(emissions, &update_tx, &session_id);
+        });
+    }
     incomplete_tool_call
+}
+
+/// Send the v2 messages the session owes its client (F39), in order: the
+/// prompt's `user_message`, the `state_update`s of its foreground work, and the
+/// intake answers (after every update ahead of them, like upstream's `send`
+/// then `resolve`).
+fn drain_v2(
+    map_state: &mut MapState,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    let emissions = map_state.v2.take_out();
+    emit_v2_emissions(emissions, update_tx, session_id);
+}
+
+fn emit_v2_emissions(
+    emissions: Vec<crate::turn_events::V2Emission>,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) {
+    for emission in emissions {
+        match emission {
+            crate::turn_events::V2Emission::Inserted {
+                message_id,
+                content,
+            } => {
+                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "user_message",
+                        "messageId": message_id,
+                        "content": content,
+                    }
+                })));
+            }
+            crate::turn_events::V2Emission::Foreground(event) => {
+                let update = crate::v2::prompt::state_update(&event);
+                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                    "sessionId": session_id,
+                    "update": update,
+                })));
+            }
+            crate::turn_events::V2Emission::Ended { outcome, .. } => {
+                let update = crate::v2::prompt::state_update(
+                    &crate::turn_events::ForegroundEvent::Ended(outcome),
+                );
+                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                    "sessionId": session_id,
+                    "update": update,
+                })));
+            }
+            crate::turn_events::V2Emission::Answer {
+                prompt_uuid,
+                reply,
+                result,
+            } => {
+                if let Some(reply) = reply {
+                    let _ = update_tx.send(SessionOutbound::V2Intake {
+                        prompt_uuid,
+                        reply,
+                        result,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Emit a `commands_changed` / `system/init` command list as an
@@ -10474,6 +11822,42 @@ mod tests_t5fa5;
 mod tests_t5fa6;
 
 #[cfg(test)]
+mod tests_t6a;
+
+#[cfg(test)]
+mod tests_t6g;
+
+#[cfg(test)]
+mod tests_t6g2;
+
+#[cfg(test)]
+mod tests_t7a;
+
+#[cfg(test)]
+mod tests_t7a_race_common;
+
+#[cfg(test)]
+mod tests_t7a_race_s1;
+
+#[cfg(test)]
+mod tests_t7a_race_s2;
+
+#[cfg(test)]
+mod tests_t7a_race_s3;
+
+#[cfg(test)]
+mod tests_t7a_race_s4;
+
+#[cfg(test)]
+mod tests_t7a_race_s5;
+
+#[cfg(test)]
+mod tests_t7a_race_s6;
+
+#[cfg(test)]
+mod tests_t7a_race_s7;
+
+#[cfg(test)]
 mod tests_t1ga;
 
 #[cfg(test)]
@@ -10912,6 +12296,7 @@ mod tests {
                     update_tx: &update_tx,
                     command_tx: &command_tx,
                     session_id: "s",
+                    live_background: &HashMap::new(),
                 },
                 reply,
             );
@@ -10993,6 +12378,7 @@ mod tests {
                     update_tx: &update_tx,
                     command_tx: &command_tx,
                     session_id: "s",
+                    live_background: &HashMap::new(),
                 },
                 reply,
             );
@@ -11069,6 +12455,7 @@ mod tests {
             None,
             None,
             &mut failures::SessionFailures::default(),
+            &mut crate::turn_events::V2State::new(),
         );
 
         // p2 queued + echoed (next echo).
@@ -11187,6 +12574,7 @@ mod tests {
                 None,
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             reply_rx.await.expect("reply sent").expect("prompt ok")
         }
@@ -11270,6 +12658,7 @@ mod tests {
             None,
             None,
             &mut failures::SessionFailures::default(),
+            &mut crate::turn_events::V2State::new(),
         );
         let reply = reply_rx.await.expect("reply sent").expect("prompt ok");
         let quota = reply.quota.expect("quota present");
@@ -11324,6 +12713,7 @@ mod tests {
             None,
             Some("result-uuid-1"),
             &mut failures::SessionFailures::default(),
+            &mut crate::turn_events::V2State::new(),
         );
         let reply = reply_rx.await.expect("reply sent").expect("prompt ok");
         let chunk = match &reply.updates[0].update {
@@ -11368,6 +12758,7 @@ mod tests {
             None,
             None,
             &mut failures::SessionFailures::default(),
+            &mut crate::turn_events::V2State::new(),
         );
         let reply = reply_rx.await.expect("reply sent").expect("prompt ok");
         let chunk = match &reply.updates[0].update {
@@ -11427,6 +12818,7 @@ mod tests {
                 air.as_ref(),
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             let reply = reply_rx.await.expect("channel recv").expect("reply is Ok");
             assert_eq!(reply.stop_reason, "end_turn");
@@ -11466,6 +12858,7 @@ mod tests {
                 None,
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             let reply = reply_rx.await.expect("channel recv");
             assert!(matches!(
@@ -11498,6 +12891,7 @@ mod tests {
                 air.as_ref(),
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             let reply = reply_rx.await.expect("channel recv");
             assert!(matches!(
@@ -11536,6 +12930,7 @@ mod tests {
                 air.as_ref(),
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             let reply = reply_rx.await.expect("channel recv");
             assert!(matches!(
@@ -11580,6 +12975,7 @@ mod tests {
                 air.as_ref(),
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             let reply = reply_rx.await.expect("channel recv").expect("reply is Ok");
             let meta = reply.quota.expect("meta is present");
@@ -11616,6 +13012,7 @@ mod tests {
                 air.as_ref(),
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             let reply = reply_rx.await.expect("channel recv").expect("reply is Ok");
             let sf = &reply.quota.unwrap()["jetbrains"]["air"]["sessionFailure"];
@@ -11681,6 +13078,7 @@ mod tests {
                 air.as_ref(),
                 None,
                 &mut failures::SessionFailures::default(),
+                &mut crate::turn_events::V2State::new(),
             );
             let reply = reply_rx.await.expect("channel recv").expect("reply is Ok");
             assert_eq!(reply.stop_reason, "end_turn");
@@ -11739,6 +13137,15 @@ mod tests {
             &mut titles,
             &mut failures::SessionFailures::default(),
             &mut crate::usage::UsageTurns::default(),
+            &mut FileChangeReports::new(
+                false,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                &update_tx,
+                "s1",
+                None,
+            ),
         );
         assert_eq!(
             titles.context.as_deref(),
@@ -12559,6 +13966,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
@@ -12722,6 +14130,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
 
         // Reader: turn the duplex "stdin" (b) into whole lines.
@@ -12797,19 +14206,14 @@ mod tests {
         tx.send(Command::Cancel).unwrap();
 
         // (a) + (b) The actor processes the cancel: it aborts the pending
-        // permission round-trip, so control.rs's on-request handler resolves with
-        // the R28 deny payload and writes it back to the control writer (stdin).
-        let denied = find_deny_response(&mut lrx).await;
-        assert_eq!(denied["type"], "control_response");
-        assert_eq!(denied["response"]["response"]["behavior"], "deny");
-        assert_eq!(
-            denied["response"]["response"]["message"],
-            "User refused permission to run tool"
-        );
-        assert!(
-            denied["response"]["response"]["interrupt"].is_null(),
-            "the R28 deny must not carry an interrupt"
-        );
+        // permission round-trip, so the control handler answers with the SDK's
+        // error verdict "Tool use aborted" (Node throws it for an aborted
+        // signal, `acp-agent.ts:9791`) — not the R28 deny (P-36).
+        let answer = find_control_response(&mut lrx).await;
+        assert_eq!(answer["type"], "control_response");
+        assert_eq!(answer["response"]["subtype"], "error");
+        assert_eq!(answer["response"]["error"], json!("Tool use aborted"));
+        assert!(answer["response"]["response"].is_null());
 
         // The actor remains responsive after the cancel: drive the trailing idle
         // so the active prompt turn settles `cancelled`.
@@ -12999,6 +14403,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         tokio::spawn(async move {
             let mut reader = BufReader::new(b);
@@ -13174,6 +14579,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
@@ -13503,8 +14909,12 @@ mod tests {
             "s1",
         );
         assert_eq!(
-            response["response"]["response"]["behavior"], "deny",
-            "an option that was never offered is refused, so no silent Auto rewrite"
+            response["response"]["subtype"], "error",
+            "an option that was never offered is the SDK's error verdict, so no silent Auto rewrite"
+        );
+        assert_eq!(
+            response["response"]["error"],
+            json!("Permission option was not offered: allow-with-updates")
         );
     }
 
@@ -13544,6 +14954,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
 
         // Reader: turn the duplex "stdin" (b) into whole lines.
@@ -13642,7 +15053,8 @@ mod tests {
     }
 
     /// Read stdin lines until the R28 deny `control_response` is seen.
-    async fn find_deny_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
+    /// The next `control_response` on the child's stdin, whatever its verdict.
+    async fn find_control_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
         use std::time::Duration;
         use tokio::time::timeout;
         loop {
@@ -13651,11 +15063,7 @@ mod tests {
                 .expect("a control_response is written to stdin")
                 .expect("stream open");
             let v: Value = serde_json::from_str(&line).expect("line is JSON");
-            if v.get("type").and_then(Value::as_str) == Some("control_response")
-                && v.pointer("/response/response/behavior")
-                    .and_then(Value::as_str)
-                    == Some("deny")
-            {
+            if v.get("type").and_then(Value::as_str) == Some("control_response") {
                 return v;
             }
         }
@@ -13781,6 +15189,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         // Drain the child stdin so the duplex never fills up (the actor writes
         // the prompt user frame and the interrupt request to it).
@@ -15017,6 +16426,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         (tx, update_rx, stream_tx, control_in_tx)
     }
@@ -15830,6 +17240,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         let prompt = |uuid: &str| {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -15927,6 +17338,7 @@ mod tests {
                 crate::sdk_options::RawSdkMessages::Off,
                 crate::env_snapshot::EnvSnapshot::empty(),
                 None,
+                Vec::new(),
             ));
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(Command::Prompt {
@@ -16013,6 +17425,7 @@ mod tests {
             crate::sdk_options::RawSdkMessages::Off,
             crate::env_snapshot::EnvSnapshot::empty(),
             None,
+            Vec::new(),
         ));
         let (ltx, mut lrx) = mpsc::unbounded_channel::<Value>();
         tokio::spawn(async move {

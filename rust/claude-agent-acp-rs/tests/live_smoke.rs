@@ -65,13 +65,14 @@ struct LiveClient {
 }
 
 impl LiveClient {
-    async fn start(_claude_bin: &PathBuf, cwd: &std::path::Path) -> Result<Self, String> {
+    async fn start(claude_bin: &PathBuf, cwd: &std::path::Path) -> Result<Self, String> {
         let bin = rust_agent_binary();
         if !bin.exists() {
             return Err(format!("agent binary not found at {}", bin.display()));
         }
         let mut cmd = Command::new(&bin);
         cmd.current_dir(cwd)
+            .env("CLAUDE_CODE_EXECUTABLE", claude_bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -334,6 +335,57 @@ async fn parity_live_tiny_prompt() {
             .frames
             .iter()
             .any(|f| f.get("method").and_then(Value::as_str) == Some("session/update")));
+        client.close().await;
+        let _ = std::fs::remove_dir_all(&cwd);
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn parity_live_tool_permission() {
+    tokio::time::timeout(TIMEOUT, async {
+        let Some(claude) = enabled() else { return };
+        let cwd = scratch("tool");
+        let mut client = LiveClient::start(&claude, &cwd)
+            .await
+            .expect("start client");
+        init(&mut client).await.expect("initialize");
+        let session = new_session(&mut client, &cwd).await.expect("session/new");
+        let resp = client
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId": session,
+                    "prompt": [{
+                        "type": "text",
+                        "text": "Run the shell command `printf hi > live-tool.txt` and then reply with the single word done"
+                    }]
+                }),
+            )
+            .await
+            .expect("prompt");
+        assert_eq!(resp["stopReason"], json!("end_turn"));
+        // The default permission mode must have asked the client before the
+        // command ran, and request() answers it with allow_once.
+        assert!(
+            client
+                .frames
+                .iter()
+                .any(|f| f.get("method").and_then(Value::as_str)
+                    == Some("session/request_permission")),
+            "expected a permission request for the Bash tool"
+        );
+        assert!(
+            client
+                .frames
+                .iter()
+                .any(|f| f.get("method").and_then(Value::as_str) == Some("session/update")
+                    && f.pointer("/params/update/sessionUpdate")
+                        .and_then(Value::as_str)
+                        .is_some_and(|k| k == "tool_call" || k == "tool_call_update")),
+            "expected a tool call update on the session stream"
+        );
         client.close().await;
         let _ = std::fs::remove_dir_all(&cwd);
     })

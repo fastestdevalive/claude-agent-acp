@@ -1185,6 +1185,7 @@ impl Rig {
             &mut self.ext.titles,
             &mut self.ext.t2a.failures,
             &mut self.ext.t2a.usage_turns,
+            &mut crate::session::FileChangeReports::default(),
         );
     }
 
@@ -1654,6 +1655,7 @@ fn t2a_force_cancel_closes_every_open_tool_call() {
         &mut rig.ext.titles,
         &mut rig.ext.t2a.failures,
         &mut rig.ext.t2a.usage_turns,
+        &mut crate::session::FileChangeReports::default(),
     );
     let updates = rig.updates();
     assert_eq!(updates.len(), 1, "{updates:?}");
@@ -1904,6 +1906,7 @@ fn spawn_title_actor() -> (
         crate::sdk_options::RawSdkMessages::Off,
         crate::env_snapshot::EnvSnapshot::empty(),
         None,
+        Vec::new(),
     ));
     (tx, update_rx, far_end)
 }

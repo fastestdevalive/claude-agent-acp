@@ -21,21 +21,24 @@ Under Rust and Tokio:
       biased;
       _ = force_cancel_sleep => { ... }
       cmd = commands.recv() => { ... }
-      msg = stream.recv() => { ... }
+      msg = next_stream_line(&mut replay, &mut stream) => { ... }
   }
   ```
 - **Cooperative points**: Every iteration of `tokio::select!` polls the branches. Because the branches are `biased;`, Tokio evaluates them in strict syntactic order:
   1. `force_cancel_sleep` (deadline check)
   2. `cmd = commands.recv()` (command channel carrying `Command::Cancel`, `Command::Prompt`, `Command::Steer`)
-  3. `msg = stream.recv()` (inbound frame stream from the child process stdout codec)
-- **Starvation impossibility**: Even if `stream` contains an unbounded backlog of 10,000 buffered frames, on the very next iteration after `Command::Cancel` is enqueued into `commands`, branch (2) is polled **before** branch (3). The actor processes the cancel immediately, settling the active turn and aborting permissions. At most **1 frame** can be processed between cancel enqueue and cancel handling.
-- **Decision**: `EventLoopYielder` and `messageLoopYielder.maybeYield()` are **NOT ported as code** in Rust. The Tokio runtime's channel primitives and `biased; select!` provide a stronger, deterministic non-starvation guarantee without artificial timers, sleep budgets, or runtime overhead.
+  3. `msg = next_stream_line(...)` (replay queue, then the inbound frame stream from the child process stdout codec)
+- **Command priority**: Even if `stream` contains an unbounded backlog of 10,000 buffered frames, on the very next iteration after `Command::Cancel` is enqueued into `commands`, branch (2) is polled **before** branch (3). The actor processes the cancel immediately, settling the active turn and aborting permissions. At most **1 frame** can be processed between cancel enqueue and cancel handling.
+- **Decision 19 (Turn 1, revised in Turn 7 — decision 26)**: the yielder IS ported and wired. Turn 1 concluded it was unnecessary (the biased select is stronger for a command arriving from another task), but upstream's `messageLoopYielder.maybeYield()` is a *behaviour* row (B-17) and the master plan decided to port it: the stream branch of `run_loop` calls `message_loop_yielder.maybe_yield().await` (`session.rs:3346,5768`) with the same 8 ms `MESSAGE_LOOP_BUDGET_MS` slice. The two guarantees compose:
+  - a command from another task is still handled before the next frame (biased select),
+  - a stretch of frames that ran past 8 ms now gives the whole runtime a turn, exactly like Node's check phase, so timer/IO tasks are not starved by a pure in-memory drain either.
+- **Decision 26**: the replay loops of `transcript.rs` and `agent.rs` keep their own `EventLoopYielder` instances (B-55, DONE); the session actor uses one instance for its stream branch. No shared global yielder (upstream shares one across message-forwarding loops; the Rust loops never interleave on one task).
 
-### 1.3 Verification & Proof (`inv_74_cancel_not_starved_by_backlog`)
-The non-starvation guarantee is verified by integration and actor tests in `rust/claude-agent-acp-rs/tests/concurrency.rs`:
-- `inv_74_cancel_not_starved_by_backlog`: Runs an end-to-end ACP agent over duplex channels against `fake-claude`. The child emits an immediate backlog of 10,000 `stream_event` chunks upon prompt receipt. While streaming is actively underway, the client sends `session/cancel`.
-- **Result**: The prompt is settled with `stopReason: "cancelled"` in < 250ms (well under the 2,500ms bound) without waiting for the 10,000 frame backlog to drain. 10 consecutive executions passed 10/10 with zero flakes.
-- Because frames drained before cancel is measured as 0, no synthetic `tokio::task::yield_now()` every K frames is needed.
+### 1.3 Verification & Proof
+- `inv_74_cancel_not_starved_by_backlog` (`tests/concurrency.rs`): 10,000-frame backlog + `session/cancel`, settles `cancelled` in < 250 ms.
+- `t7a_b63_cancel_settles_behind_a_5000_frame_backlog` and `t7a_b63_close_settles_behind_a_5000_frame_backlog` (`src/session/tests_t7a.rs`): a 5,000-frame backlog with a cancel/close settles the turn within < 1,000 processed frames.
+- `t7a_b17_the_pause_lets_a_cancel_task_run_mid_backlog` (`src/session/tests_t7a.rs`): a synchronous drain that never pauses starves the cancel task for the whole 5,000-frame backlog; with the yielder's pause the task runs after < 50 frames. This is the loop-level test that fails without the yield.
+
 
 ---
 
@@ -130,4 +133,104 @@ The following audit skeleton categorizes every mutable state location across the
 | **Child Process PGID / Reaper** | Node child process tracking | `process.rs` reaper pipe & supervisor PGID | Managed via separate supervisor process (`--reaper`) on Unix (INV-6, F41); on Windows via Job Object with `KILL_ON_JOB_CLOSE` (with documented post-spawn assignment race window, Decision D8). |
 | **Auth & Provider State** | `currentAuthStatus: AuthStatus \| null`, `authEpoch: number` | `Registry.auth: Option<AuthStatus>`, `auth_status.rs` | Stored in `Registry`; probed per-prompt and cached. |
 
-*(Note: In CONC-2, this skeleton will be populated with field-level cross-references, line numbers, and the >=200-iteration race suite results across all shared state transitions).*
+CONC-2 result: every row above is either owned exclusively by the `run_loop`
+actor task, a lock-free `mpsc` channel, or an atomic; no `std`/`tokio` mutex is
+held across an `await` in `src/` (guarded by
+`tests/conc_no_lock_across_await.rs::test_no_lock_across_await_in_src`). The
+>=200-iteration race results across the shared state transitions are in §5.
+
+---
+
+## 5. CONC-2 race suite (Turn 7, lane A) — results
+
+### 5.1 Harness (`src/session/tests_t7a_race_common.rs`)
+
+The suite drives the real session actor in-process (`run_loop`) over unbounded
+channels — no child process, no network, no `claude` — and perturbs the
+scheduler deterministically:
+
+- **Seed**: every iteration runs with `CONC_SEED + i` (default base `0x5eed5eed`).
+  The seed drives `Rng` (xorshift64) for the number of `yield_now` jitters, a
+  sub-5 ms sleep (one in eight iterations) and which side of a race goes first.
+- **Iterations**: `CONC_ITERS` (default 200), each bounded by a 10 s
+  `tokio::time::timeout`; failures are aggregated with the seed that reproduces
+  them.
+- **Turn scripts**: `TurnScript` builds the frame sequence a fake CLI would
+  print for a turn (echo, deltas, tool use, usage, result); the test feeds it to
+  the actor's stream exactly as the relay would.
+- **Rerun one failure**:
+  `CONC_SEED=<seed> CONC_ITERS=1 cargo test -p claude-agent-acp-rs --lib <fn>`.
+  The panic message prints the seed and that exact command.
+
+### 5.2 Scenarios, iteration counts and observed results
+
+| # | File / test | Scenario | Iters (default) | Runtime | Result |
+|---|---|---|---|---|---|
+| 1 | `tests_t7a_race_s1.rs::t7a_race_1_cancel_vs_result` | `session/cancel` vs the result frame | 200 | ~0.6 s | one settle (one flush barrier), stopReason `cancelled` or `end_turn`, never both |
+| 2 | `tests_t7a_race_s2.rs::t7a_race_2_steer_vs_end` | steer vs turn end | 200 | ~0.2 s | outcome `injected` or `startedNewTurn`, never lost; one settle for an injected steer, two for a new turn |
+| 3 | `tests_t7a_race_s3.rs::t7a_race_3_close_during_prompt` | `session/close` vs a running prompt | 200 | ~0.3 s | prompt settles, close answers, the actor is gone |
+| 4 | `tests_t7a_race_s4.rs::t7a_race_4_permission_reply_timing` | permission answer vs cancel / turn end / a second request | 200 | ~5 s | exactly one `control_response` per request, none twice, a second request still served |
+| 5 | `tests_t7a_race_s5.rs::t7a_race_5_notification_order` | emission order over a long turn with interleaved usage/tool updates, across a turn boundary | 200 | ~0.2 s | every marker in emission order; the next turn's updates follow the previous turn's usage |
+| 6 | `tests_t7a_race_s6.rs::t7a_race_6_duplicate_and_late_replies` | duplicate / late permission answers (after the turn, after close) | 200 | ~0.8 s | ignored, no second control response, the actor still answers commands |
+| 7 | `tests_t7a_race_s7.rs::t7a_race_7_child_exit_mid_turn` | child exit at a random point of the script | 200 | ~0.2 s | clean exit `end_turn`, abnormal exit `PromptFailed`, no hang |
+| 7p | `tests/conc_race_child_exit.rs::conc_race_child_exit_mid_turn_leaves_no_process` | the same over a real `fake-claude`, process side | 10 (cap 25) | ~1-2 s | the child pid is gone after every run (`FAKE_CLAUDE_PID_OUT` + `wait_pid_gone`) |
+
+All seven in-process files together: **21.9 s** with `--test-threads=1`
+(200 iterations each), under the 90 s budget.
+
+### 5.3 Failures found and fixed while writing the suite
+
+1. **Steer-vs-end script, not a product bug**: an injected steer's turn settles
+   only at the idle *after the steered cycle's own result*
+   (`steered_awaiting_result`). The scenario now feeds echo → result → idle; it
+   passes 200/200.
+2. **Turn settlement visibility**: a successful v1 settle hands the reply to the
+   prompt task with a `flush_rx` barrier; the harness must await that barrier
+   (as the agent layer does) before counting updates, or the observation races
+   the forwarder. Fixed in the harness (`settle`), not in `src/`.
+3. **Second permission request after a cancel**: a request that arrives in the
+   stopped-work window is parked for `TOOL_USE_WAIT` (2 s) before it is denied;
+   the scenario now opens the second request concurrently with the first, so the
+   race is real and the run stays fast. No product change.
+4. **Review-T6INT findings** (fixed in `session.rs` / `file_change_audit.rs`):
+   the reported-turn stall (two flush barriers), cancel/close during the report
+   preview, a v2 prompt never registering the report request, and a non-string
+   `filesChanged` entry. See §6.
+
+No real product race was found by scenarios 1-7: every iteration of the final
+suite passes. The one product-level race the program did surface was the
+1 s report stall (review-T6INT finding 1), which is a latency bug, not a
+correctness one, and is fixed.
+
+### 5.4 Report-path decisions (review-T6INT)
+
+- **Decision 27**: a reported turn releases the `handle_events` barrier's `ack`
+  before running the preview, then queues a fresh `FlushAcked` for the report
+  and hands the reply on without waiting. The forwarder is never blocked by the
+  report task; the prompt task still awaits `flush_rx`, so the report precedes
+  the response. Measured: `t6a2_prompt_report_publishes_the_checkpoint_paths_before_the_response`
+  1.02 s → 0.01-0.06 s (asserted < 300 ms).
+- **Decision 28**: `FileChangeReports.collecting` keeps a running report's
+  handle (and a cancel flag) so `session/cancel`/`session/close` can finish it
+  `unavailable/cancelled` and rewrite the forwarded stop reason to `cancelled`;
+  a done flag prunes the entry at the next prompt. Covered by
+  `tests/conc_race_report_cancel.rs`.
+- **Decision 29**: a v2 prompt registers its `_meta` report request (the agent
+  hook is in `lane-A-wiring.patch`), and the batch's v2 emissions are held until
+  the report job runs, so the report precedes the turn's `idle`. Covered by
+  `tests/conc_race_v2_hooks.rs::t7a_v2_report_publishes_before_idle`.
+- **Decision 30**: a non-string `filesChanged` entry sets `truncated: true`
+  (`preview_files_changed` returns the flag); covered by
+  `src/file_change_audit.rs::tests::a_non_string_files_changed_entry_marks_the_report_truncated`.
+
+### 5.5 Decision (CONC-2)
+
+The session actor model is kept: each session's mutable state is owned by its
+`run_loop` task and reached only through `Command`s over unbounded channels, so
+the adapter has no shared-lock hazard (the audit table in §4 lists every state
+location and its mechanism; no lock is held across an `await`). The evidence is
+the race suite in §5.1-5.2 (seven in-process scenarios plus the real-child exit
+scenario, 200 seeded iterations each, 21.9 s, all green), the no-lock grep test
+(`conc_no_lock_across_await`) and `conc_adapter_death`; the only defect the
+program found was the 1 s report stall (latency, not correctness), fixed under
+Decisions 27-30. No further concurrency work is claimed for T7.
