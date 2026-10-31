@@ -12,11 +12,13 @@ tests (see "Evidence" below). `C` = `rust/claude-agent-acp-rs`.
 
 ```
 timeout 300 cargo test --manifest-path rust/Cargo.toml -p claude-agent-acp-rs   # lib + all integration binaries
-  -> test result: ok. 77 passed   (lib, includes the inv_* unit tests)
-  -> test result: ok. 17 passed   (tests/differential.rs, incl. inv_24_full_corpus)
+  -> test result: ok. 93 passed   (lib, includes the inv_* unit tests)
+  -> test result: ok. 22 passed   (tests/differential.rs, incl. inv_24_full_corpus)
   -> test result: ok.  5 passed   (tests/process_transport.rs)
-  -> test result: ok.  5 passed   (tests/agent.rs)
-  -> test result: ok.  3 passed   (tests/control_transport.rs, transport_parity.rs, shutdown.rs, recorder.rs)
+  -> test result: ok.  6 passed   (tests/agent.rs)
+  -> test result: ok.  1 passed   (tests/control_transport.rs)
+  -> test result: ok.  3 passed   (tests/shutdown.rs)
+  -> test result: ok.  1 passed   (tests/transport_parity.rs)
 timeout 800 bash rust/scripts/rust-gate.sh                                        # full gate (13.T5)
   -> gate OK (fmt, clippy, build, test, cross-target x86_64-pc-windows-gnu + aarch64-apple-darwin, G9, G10)
 ```
@@ -48,7 +50,7 @@ timeout 800 bash rust/scripts/rust-gate.sh                                      
 | INV-21 | A permission deny sends the exact deny payload; the turn continues and settles on the next result; a client `cancelled` outcome cancels it | `inv_21_deny_payload_and_continue` | `C/src/permission.rs:494` | PASS |
 | INV-22 | Cancel is idempotent; repeated cancels arm the force-cancel deadline once | `inv_22_cancel_idempotent` | `C/src/session.rs:1662` | PASS |
 | INV-23 | Orphaned queued turns are reconciled, not double-counted; a bare `{}` receipt is not "all dropped" | `inv_23_receipt_field_guard` | `C/src/turn/turn_tests.rs:1078` | PASS |
-| INV-24 | Rust ordered ACP frames == Node's for every corpus script (normalized, D13) | `inv_24_full_corpus` (all 16 scripts) + `inv_24_text_only`, `inv_24_tools`, `inv_24_permissions`, `inv_24_cancel`, `inv_24_eof_mid_turn`, `inv_24_lagging_idle`, `inv_24_context_echo_less`, `inv_24_subagent_followup`, `inv_24_cancel_queued_echo_less`, `inv_24_recorder_initialize_order`, `inv_24_tool_shapes_table`, `inv_24_unknown_tool_falls_back`, `inv_24_order_sensitive`, `inv_24_normalize_ids_and_timestamps`, `inv_24_ignore_paths`, `inv_24_tool_call_*` | `C/tests/differential.rs:18-408`, `C/src/tools.rs:580,749`, `C/acp-recorder/tests/recorder.rs:31` | PASS |
+| INV-24 | Rust ordered ACP frames == Node's for every corpus script (normalized, D13) | `inv_24_full_corpus` (all 21 scripts) + `inv_24_text_only`, `inv_24_tools`, `inv_24_permissions`, `inv_24_cancel`, `inv_24_eof_mid_turn`, `inv_24_lagging_idle`, `inv_24_steer_mid_turn`, `inv_24_steer_error_result`, `inv_24_context_echo_less`, `inv_24_subagent_followup`, `inv_24_cancel_queued_echo_less`, `inv_24_recorder_initialize_order`, `inv_24_tool_shapes_table`, `inv_24_unknown_tool_falls_back`, `inv_24_order_sensitive`, `inv_24_normalize_ids_and_timestamps`, `inv_24_ignore_paths`, `inv_24_tool_call_*`, `inv_24_commands_proactive` | `C/tests/differential.rs:18-470`, `C/src/tools.rs:580,749`, `C/acp-recorder/tests/recorder.rs:31` | PASS |
 | INV-25 | Windows and macOS targets compile (gate-proven by G8, no test fn) | gate-proven (G8); `inv_25_text_only_argv_and_env`, `inv_25_resolve_binary_platform_names` are related unit/integration checks, not the compile proof | `C/tests/process_transport.rs:25`, `C/src/process.rs:600` | PASS (G8) |
 | INV-26 | `Channel::duplex()` and stdio yield identical ordered frames | `inv_26_transport_parity` | `C/tests/transport_parity.rs:278` | PASS |
 | INV-27 | No actor awaits a client round-trip inline: a cancel during a pending permission resolves it within the timeout | `inv_27_no_inline_await` | `C/src/session.rs:1330` | PASS |
@@ -58,6 +60,7 @@ timeout 800 bash rust/scripts/rust-gate.sh                                      
 | INV-31 | #825: `session_state_changed` idle without a `result` fails the active turn instead of hanging | `inv_31_idle_without_result_fails` | `C/src/turn/turn_tests.rs:203` | PASS |
 | INV-32 | Codec cancel-safety: `select!` only awaits `recv()` on an `mpsc` fed by the codec task | `inv_32_codec_cancel_safe` | `C/src/codec.rs:204` | PASS |
 | INV-33 | `tokio::sync::broadcast` is not used in `src/` (clippy ban, G5) | gate-proven by 0.T4 selftest-gate (no test fn) | `rust/clippy.toml`, `rust/scripts/selftest-gate.sh` | PASS (G5/0.T4) |
+| INV-34 | #749: a relative / nonexistent / non-directory `cwd` on `session/new`/`session/load` returns `invalidParams` (-32602) with the adapter's message + `data:{cwd}`, before any spawn; an absent `cwd` (or an existing absolute dir) is accepted | `inv_validate_cwd_rejects_relative_and_missing`, `inv_validate_cwd_accepts_absent_and_existing_dir` | `C/src/agent.rs` | PASS |
 
 ## Findings resolved in phase 13
 

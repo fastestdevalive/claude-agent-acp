@@ -1049,6 +1049,61 @@ async fn held_cancel_reports_deferred_usage() {
     );
 }
 
+/// Phase 15 (Item 2) — an ACTIVE turn cancelled before any tokens accumulate
+/// still reports a zero `usage` object (`had_usage: true`): upstream always
+/// settles an active turn via `settleActive({ ..., usage: sessionUsage(session)
+/// })`, present even when genuinely all-zero. The origin is the settle PATH,
+/// not the numeric usage value.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_active_turn_with_no_tokens_reports_zero_usage() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    // Cancel while active with NO accumulated tokens (no result was ever
+    // recorded); the turn settles `cancelled` at the trailing idle.
+    machine.cancel();
+    let events = machine.on_idle();
+    let settled = events.iter().find_map(|e| match e {
+        TurnEvent::Settled {
+            prompt_uuid,
+            usage,
+            had_usage,
+            ..
+        } if prompt_uuid == "pA" => Some((*usage, *had_usage)),
+        _ => None,
+    });
+    assert_eq!(
+        settled,
+        Some((Usage::default(), true)),
+        "an active turn cancelled before any tokens accumulate must still report an (all-zero) usage object"
+    );
+}
+
+/// Phase 15 (Item 2) — a turn swept from the QUEUE by `cancel()` never ran, so
+/// it reports no `usage` (`had_usage: false`), matching upstream
+/// `turn.resolve({ stopReason: "cancelled" })`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_queued_sweep_reports_no_usage() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("pA".into(), false));
+    machine.on_echo("pA");
+    machine.enqueue(Turn::new("pB".into(), false));
+    let events = machine.cancel();
+    let settled = events.iter().find_map(|e| match e {
+        TurnEvent::Settled {
+            prompt_uuid,
+            had_usage,
+            ..
+        } if prompt_uuid == "pB" => Some(*had_usage),
+        _ => None,
+    });
+    assert_eq!(
+        settled,
+        Some(false),
+        "a queued turn swept by cancel never ran, so it must report no usage"
+    );
+}
+
 /// Set up the orphan-reconciliation base state for INV-23: p1 active, p2
 /// queued, then `cancel()` sweeps p2 into an orphan credit (`orphaned_uuids =
 /// ["p2"]`) and p1 settles `cancelled` at idle. Returns the machine with no
@@ -1159,5 +1214,375 @@ fn has_unsettled_tracks_in_flight_turns() {
     assert!(
         !machine.has_unsettled(),
         "a fully-settled machine has no turn in flight"
+    );
+}
+
+/// Steering R3/R5/R6 — a steered turn's result records its outcome without
+/// settling and owes no trailing idle; the single idle spanning the interrupted
+/// + steered cycles settles it with the SUM of both results' usage.
+#[test]
+fn steer_settles_at_idle_not_result() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    assert!(machine.mark_steered("s1"));
+
+    // 1st result (the interrupted cycle): records steered_settle, no settle.
+    let events = machine.on_result(
+        &result_frame_usage(
+            "success",
+            false,
+            serde_json::json!({"output_tokens": 5, "input_tokens": 3}),
+        ),
+        false,
+    );
+    assert!(
+        settled_events(&events).is_empty(),
+        "a steered result must not settle"
+    );
+    assert_eq!(
+        machine.owed_trailing_idles, 0,
+        "steered results owe no trailing idle"
+    );
+
+    // The steered echo drains the steer set; 2nd result overwrites steered_settle.
+    machine.on_echo("s1");
+    let events = machine.on_result(
+        &result_frame_usage(
+            "success",
+            false,
+            serde_json::json!({"output_tokens": 2, "input_tokens": 1}),
+        ),
+        false,
+    );
+    assert!(
+        settled_events(&events).is_empty(),
+        "the second steered result must not settle either"
+    );
+
+    let events = machine.on_idle();
+    assert_eq!(
+        settled_events(&events),
+        vec![("p1", StopReason::EndTurn)],
+        "the idle spanning both cycles settles the steered turn"
+    );
+    assert!(!machine.has_active());
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Settled { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(usage.input_tokens, 4, "usage sums both results (3 + 1)");
+    assert_eq!(usage.output_tokens, 7, "usage sums both results (5 + 2)");
+}
+
+/// Steering R6 — an idle before the steered echo means the answer is still
+/// ahead: swallowed, never settled, never #825-failed.
+#[test]
+fn steer_idle_before_echo_is_swallowed() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.mark_steered("s1");
+    machine.on_result(&result_frame("success", false), false);
+
+    let events = machine.on_idle();
+    assert!(
+        events.is_empty(),
+        "idle before the steered echo is swallowed, not settled"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, TurnEvent::Failed { .. })),
+        "must not #825-fail while the steered echo is pending"
+    );
+    assert!(machine.has_active(), "turn still active");
+}
+
+/// Steering R6 — an idle before ANY result was recorded is also swallowed
+/// (steered_settle is None): the steered cycle is still running, never #825.
+#[test]
+fn steer_idle_before_any_result_is_swallowed() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.mark_steered("s1");
+    machine.on_echo("s1");
+
+    let events = machine.on_idle();
+    assert!(
+        events.is_empty(),
+        "idle before any result is swallowed, never reaches #825"
+    );
+    assert!(machine.has_active(), "p1 still active");
+}
+
+/// Steering R4 — an error-shaped result on a steered turn with a pending echo
+/// is the interrupted cycle's diagnostic, kept on the steer lane (no fail);
+/// the cycle after the pending echo decides the turn, settling at idle.
+#[test]
+fn steer_error_result_with_pending_echo_stays_on_lane() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.mark_steered("s1");
+
+    let err = serde_json::json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "stop_reason": null,
+        "errors": ["interrupted"],
+        "usage": { "output_tokens": 1, "input_tokens": 1 },
+    });
+    let events = machine.on_result(&err, false);
+    assert!(
+        settled_events(&events).is_empty(),
+        "the error result stays on the steer lane"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, TurnEvent::Failed { .. })),
+        "the interrupted cycle's error must not fail the turn"
+    );
+    assert!(machine.has_active());
+
+    // Echo before idle is required, else the idle is swallowed.
+    machine.on_echo("s1");
+    let events = machine.on_result(&result_frame("success", false), false);
+    assert!(
+        settled_events(&events).is_empty(),
+        "the non-error steered result does not settle yet"
+    );
+
+    let events = machine.on_idle();
+    assert_eq!(
+        settled_events(&events),
+        vec![("p1", StopReason::EndTurn)],
+        "the post-echo idle settles the steered turn end_turn"
+    );
+}
+
+/// Steering R6 ordering — a lagged idle owed by an EARLIER settled turn is
+/// absorbed by the owed-idle lane BEFORE the steer lane, so a steered turn
+/// whose cycle is still running is not prematurely settled (INV-31).
+#[test]
+fn steer_owed_idle_absorbed_before_lane() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    let events = machine.on_result(&result_frame("success", false), false);
+    assert!(settled_events(&events).contains(&("p1", StopReason::EndTurn)));
+    assert_eq!(
+        machine.owed_trailing_idles, 1,
+        "p1's normal result owes a trailing idle"
+    );
+
+    machine.enqueue(Turn::new("p2".into(), false));
+    machine.on_echo("p2");
+    machine.mark_steered("s1");
+    assert!(machine.has_active(), "p2 active and steering");
+
+    let events = machine.on_idle();
+    assert!(
+        events.is_empty(),
+        "p1's lagged idle is absorbed, no steer settlement"
+    );
+    assert_eq!(
+        machine.owed_trailing_idles, 0,
+        "the owed-idle lane runs before the steer lane"
+    );
+    assert!(machine.has_active(), "p2 still active & unsettled");
+}
+
+/// Steering R2/R6/R8 — a held turn marked steered moves its deferred outcome
+/// into the steer lane; the steer idle re-applies the hold through the subagent
+/// gate (no settle while t1 is live); draining t1 then settling at idle carries
+/// the last result's stop reason and usage.
+#[test]
+fn steer_held_turn_moves_to_steer_lane_and_reholds() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.on_task_started("t1", true);
+    let events = machine.on_result(&result_frame("success", false), false);
+    assert!(settled_events(&events).is_empty(), "held by live subagent");
+    assert_eq!(
+        machine.owed_trailing_idles, 1,
+        "a held result owed its trailer"
+    );
+    assert!(machine.active.as_ref().unwrap().deferred_settle.is_some());
+
+    let _ = machine.on_idle();
+    assert_eq!(
+        machine.owed_trailing_idles, 0,
+        "idle pays the held turn's trailer"
+    );
+    assert!(machine.has_active(), "still held while t1 is live");
+
+    assert!(
+        machine.mark_steered("s1"),
+        "mark_steered targets the active held turn"
+    );
+    let active = machine.active.as_ref().unwrap();
+    assert!(
+        active.deferred_settle.is_none(),
+        "held outcome moved into the steer lane"
+    );
+    assert!(
+        active.steered_settle.is_some(),
+        "steer lane now owns the held outcome"
+    );
+
+    machine.on_echo("s1");
+    let events = machine.on_result(
+        &result_frame_usage(
+            "success",
+            false,
+            serde_json::json!({"output_tokens": 9, "input_tokens": 7}),
+        ),
+        false,
+    );
+    assert!(
+        settled_events(&events).is_empty(),
+        "2nd result records, does not settle"
+    );
+
+    let events = machine.on_idle();
+    assert!(
+        settled_events(&events).is_empty(),
+        "t1 still live — the steer idle re-holds, no Settled"
+    );
+    let active = machine.active.as_ref().unwrap();
+    assert!(
+        active.deferred_settle.is_some(),
+        "re-held via the subagent gate"
+    );
+    assert!(
+        active.steered_echoes.is_none(),
+        "steer echo lane cleared after settling"
+    );
+
+    // Draining t1 lets a later idle settle with the 2nd result's snapshot.
+    let _ = machine.on_task_ended("t1");
+    let events = machine.on_idle();
+    assert_eq!(
+        settled_events(&events),
+        vec![("p1", StopReason::EndTurn)],
+        "the held turn settles end_turn once its subagent drains"
+    );
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Settled { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(usage.input_tokens, 10, "usage sums both results (3 + 7)");
+    assert_eq!(usage.output_tokens, 14, "usage sums both results (5 + 9)");
+}
+
+/// Steering R9 — cancel seeds one orphan per pending steered echo and counts
+/// the steer lane's trailer; the cancelled turn settles `cancelled` at the next
+/// idle (cancelled lane first).
+#[test]
+fn steer_cancel_seeds_orphans_and_owes_trailer() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.mark_steered("s1");
+    machine.on_result(&result_frame("success", false), false);
+    assert!(machine.active.as_ref().unwrap().steered_settle.is_some());
+
+    let _ = machine.cancel();
+    assert_eq!(
+        machine.pending_orphan_results, 1,
+        "one orphan credit per pending steered echo"
+    );
+    assert_eq!(
+        machine.owed_trailing_idles, 1,
+        "the steer lane's trailer is counted at cancel"
+    );
+
+    let events = machine.on_idle();
+    assert_eq!(
+        settled_events(&events),
+        vec![("p1", StopReason::Cancelled)],
+        "a cancelled steered turn settles cancelled at idle"
+    );
+}
+
+/// Steering R8 — the echo hand-off of a steered previous turn with a recorded
+/// outcome uses the steered_settle snapshot (stop reason + usage) and counts
+/// the trailer, then activates the next turn.
+#[test]
+fn steer_echo_handoff_uses_steered_settle() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+    machine.mark_steered("s1");
+    machine.on_echo("s1");
+    // A `max_tokens` stop reason with a distinct usage: the R8 hand-off must
+    // settle p1 with THIS recorded stop reason + usage (the steered_settle
+    // snapshot), not the accumulated end_turn total — so these asserts can tell
+    // the R8 branch from the end_turn fallback (the fallback would settle with
+    // `EndTurn`, never `MaxTokens`).
+    machine.on_result(
+        &serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": "max_tokens",
+            "usage": { "output_tokens": 4, "input_tokens": 2 },
+        }),
+        false,
+    );
+
+    machine.enqueue(Turn::new("p2".into(), false));
+    let events = machine.on_echo("p2");
+    assert_eq!(
+        settled_events(&events),
+        vec![("p1", StopReason::MaxTokens)],
+        "the steered previous turn hands off with its recorded stop reason"
+    );
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Settled { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(usage.input_tokens, 2, "steered settle usage handed off");
+    assert_eq!(usage.output_tokens, 4, "steered settle usage handed off");
+    assert_eq!(
+        machine.owed_trailing_idles, 1,
+        "the hand-off counts the steer trailer"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Activated { prompt_uuid } if prompt_uuid == "p2")),
+        "the next turn activates"
+    );
+}
+
+/// Steering regression — an UN-steered active turn's idle still fails #825
+/// (NoResult); the steering lanes must not change un-steered behaviour.
+#[test]
+fn steer_unsteered_idle_still_fails_825() {
+    let mut machine = TurnMachine::new();
+    machine.enqueue(Turn::new("p1".into(), false));
+    machine.on_echo("p1");
+
+    let events = machine.on_idle();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TurnEvent::Failed {
+                kind: FailureKind::NoResult,
+                ..
+            }
+        )),
+        "an un-steered idle without a result still #825-fails"
     );
 }

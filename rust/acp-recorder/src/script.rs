@@ -50,6 +50,15 @@ pub enum Step {
         #[serde(default)]
         no_wait: bool,
     },
+    /// `session/steer` — inject a `_session/steering` message into the running
+    /// turn (item 2.4). `after_updates` is counted RELATIVE to the last
+    /// prompt's start, so the steer cannot race the prompt's streamed updates.
+    #[serde(rename = "session/steer")]
+    Steer {
+        text: String,
+        #[serde(default)]
+        after_updates: Option<usize>,
+    },
     /// `session/cancel` notification on the current session.
     #[serde(rename = "session/cancel")]
     Cancel,
@@ -180,6 +189,32 @@ mod tests {
             Step::LoadSession {
                 session_id: "sess-123".to_string(),
                 cwd: Some(PathBuf::from("/tmp"))
+            }
+        );
+    }
+
+    #[test]
+    fn parses_steer_step() {
+        let script = Script::parse(
+            r#"{"steps": [
+                {"call": "session/prompt", "text": "write a long essay", "no_wait": true},
+                {"call": "session/steer", "text": "actually be brief", "after_updates": 2},
+                {"call": "session/steer", "text": "no count"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.steps[1],
+            Step::Steer {
+                text: "actually be brief".to_string(),
+                after_updates: Some(2)
+            }
+        );
+        assert_eq!(
+            script.steps[2],
+            Step::Steer {
+                text: "no count".to_string(),
+                after_updates: None
             }
         );
     }

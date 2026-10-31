@@ -28,7 +28,10 @@
 //!   `task_notification` / terminal `task_updated` →
 //!   `on_task_started`/`on_task_ended`; `session_state_changed` →
 //!   record state, `idle` → `on_idle()`; `stream_event` / `assistant` → the
-//!   phase-7 mapper + `emitted_assistant_text` tracking).
+//!   phase-7 mapper + `emitted_assistant_text` tracking). Steered echoes
+//!   (replayed `user` frames carrying a steer's uuid) feed `machine.on_echo`,
+//!   and injected `_session/steering` steers call `machine.mark_steered`
+//!   before the frame is pushed (R2).
 //! - **`FinalText{text}`** is emitted as an `agent_message_chunk` *before* the
 //!   same batch's `Settled` resolves the prompt.
 //! - The one-active-turn high-water counter (INV-14) is keyed on
@@ -50,7 +53,7 @@ use crate::dispatch::{self, Route, StreamMsg};
 use crate::map::{self, MapState, MsgRole};
 use crate::permission;
 use crate::process::{self, SpawnOptions, Timings};
-use crate::turn::{FailureKind, StopReason, Turn, TurnEvent, TurnMachine};
+use crate::turn::{FailureKind, Turn, TurnEvent, TurnMachine};
 
 /// Errors produced by the session actor.
 #[derive(Debug, thiserror::Error)]
@@ -204,6 +207,11 @@ pub struct Session {
     tx: mpsc::UnboundedSender<Command>,
     high_water: Arc<AtomicUsize>,
     session_id: String,
+    /// The `commands` array from the `initialize` control_response handshake
+    /// (phase 15, Item 1): the source for the proactive `available_commands_update`
+    /// sent right after `session/new` / `session/load` (upstream
+    /// `sendAvailableCommandsUpdate` → `session.query.supportedCommands()`).
+    commands: Vec<Value>,
 }
 
 impl Session {
@@ -266,8 +274,9 @@ impl Session {
         // Phase-4 initialize handshake. The actor loop is already running so it
         // routes the child's control_response back to the control task. The
         // fake-claude transcript expects the initialize control_request; parse
-        // the response.
-        let _info = control
+        // the response. The `commands` (phase 15, Item 1) feed the proactive
+        // `available_commands_update` the agent layer sends after session/new.
+        let info = control
             .initialize(&opts.initialize)
             .await
             .map_err(|e| SessionError::Start(format!("initialize handshake: {e}")))?;
@@ -277,6 +286,7 @@ impl Session {
                 tx,
                 high_water,
                 session_id,
+                commands: info.commands,
             },
             update_rx,
         ))
@@ -285,6 +295,12 @@ impl Session {
     /// The ACP `sessionId` this session is known by.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The `commands` array from the `initialize` handshake — the source for
+    /// the proactive `available_commands_update` (phase 15, Item 1).
+    pub fn commands(&self) -> &[Value] {
+        &self.commands
     }
 
     /// Send a `session/prompt` request to the actor and await its settlement.
@@ -622,6 +638,10 @@ async fn run_loop(
                                 // (D6), pre-empting the current generation (R32).
                                 let mut injected = frame;
                                 injected["priority"] = json!("now");
+                                // R2: mark the running turn steered so the
+                                // injected echo feeds `machine.on_echo`'s steer
+                                // lane instead of settling the turn outright.
+                                machine.mark_steered(&uuid);
                                 let _ = control.send_user(injected).await;
                             }
                             Some("startedNewTurn") => {
@@ -749,6 +769,30 @@ fn handle_session_frame(
                     high_water,
                     *assistant_had_error,
                 );
+            }
+            // Phase 15 (Item 3): a `user` frame also carries tool results. When
+            // a tool (e.g. Read) executes, the CLI emits a `user` message whose
+            // content holds `tool_result` blocks; Node maps those to the
+            // terminal `tool_call_update{status:"completed"}` (+ tool output
+            // content) via `toAcpNotifications`. The Rust mapper was only ever
+            // fed `stream_event`/`assistant` frames, never this user content,
+            // so the completing update was dropped. Mirror upstream's echo-skip
+            // (`acp-agent.js:3165-3171`): a user frame whose content is a plain
+            // string or a single text block is the turn's own echo and is NOT
+            // forwarded; anything else (the `tool_result` blocks) is mapped and
+            // emitted.
+            let content = line
+                .pointer("/message/content")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let is_echo = match &content {
+                Value::String(_) => true,
+                Value::Array(blocks) => blocks.len() == 1 && blocks[0]["type"] == "text",
+                _ => false,
+            };
+            if !is_echo {
+                let updates = map::map_consolidated(&content, MsgRole::User, map_state);
+                emit_updates(&updates, update_tx, session_id);
             }
         }
         "result" => {
@@ -977,6 +1021,7 @@ fn handle_events(
                 prompt_uuid,
                 stop_reason,
                 usage,
+                had_usage,
             } => {
                 high_water.fetch_max(1, Ordering::Relaxed);
                 if let Some(reply) = pending.remove(prompt_uuid) {
@@ -984,11 +1029,17 @@ fn handle_events(
                         + usage.output_tokens
                         + usage.cached_read_tokens
                         + usage.cached_write_tokens;
-                    let usage = if *stop_reason == StopReason::Cancelled && total_tokens == 0 {
-                        // A queued turn swept by cancel never ran, so upstream
-                        // reports no usage for it (`turn.resolve({ stopReason:
-                        // "cancelled" })`, no `usage`); a cancelled ACTIVE turn
-                        // carries its accumulated spend instead.
+                    // Phase 15 (Item 2): upstream distinguishes the two cancel
+                    // settlements by WHICH CODE PATH produced them, not by
+                    // whether the accumulated usage happens to be zero. A turn
+                    // swept from the queue by `cancel()` never ran, so it
+                    // reports no `usage` (`turn.resolve({ stopReason:
+                    // "cancelled" })`); an ACTIVE or held turn's cancel always
+                    // reports `usage` via `settleActive({ ..., usage:
+                    // sessionUsage(session) })` — present even when genuinely
+                    // all-zero. `had_usage` carries that origin from `turn.rs`;
+                    // only the pure queued-sweep is false.
+                    let usage = if !had_usage {
                         None
                     } else {
                         Some(PromptUsage {
@@ -1213,6 +1264,53 @@ mod tests {
         );
     }
 
+    /// Phase 15 (Item 2) — `handle_events` keys the presence of `usage` in the
+    /// prompt reply off the `had_usage` origin flag, not the numeric token sum.
+    /// An active turn cancelled before any tokens accumulate reports an all-zero
+    /// `usage` object; a queued turn swept by cancel reports no `usage`.
+    #[tokio::test]
+    async fn item2_cancel_usage_keys_off_had_usage_origin() {
+        let (update_tx, _update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+
+        async fn settle(
+            update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+            hw: &Arc<AtomicUsize>,
+            had_usage: bool,
+        ) -> PromptReply {
+            let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+                HashMap::new();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            pending.insert("p1".to_string(), reply_tx);
+            let events = vec![TurnEvent::Settled {
+                prompt_uuid: "p1".to_string(),
+                stop_reason: crate::turn::StopReason::Cancelled,
+                usage: crate::turn::Usage::default(),
+                had_usage,
+            }];
+            handle_events(&events, &mut pending, update_tx, "s1", hw, false);
+            reply_rx.await.expect("reply sent").expect("prompt ok")
+        }
+
+        // Active turn cancelled with zero tokens: `had_usage = true` -> Some(zero).
+        let active = settle(&update_tx, &hw, true).await;
+        let u = active
+            .usage
+            .expect("an active turn's cancel must report an all-zero usage object");
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cached_read_tokens, 0);
+        assert_eq!(u.cached_write_tokens, 0);
+        assert_eq!(u.total_tokens, 0);
+
+        // Queued turn swept by cancel: `had_usage = false` -> None.
+        let queued = settle(&update_tx, &hw, false).await;
+        assert!(
+            queued.usage.is_none(),
+            "a queued turn swept by cancel must report no usage"
+        );
+    }
+
     /// 8.T11-style unit: stream end settles the active turn and rejects queued
     /// prompts; then the machine is closed.
     #[tokio::test]
@@ -1316,6 +1414,110 @@ mod tests {
             "the owed trailing idle must be absorbed, not fail B"
         );
         assert!(machine.has_active(), "B must remain active");
+    }
+
+    /// Phase 15 (Item 3) — a plain top-level `Read` tool turn ends with a
+    /// terminal `tool_call_update{status:"completed"}` on the wire. The CLI
+    /// delivers the tool result in a `user` frame whose `message.content` holds
+    /// `tool_result` blocks; previously the `"user"` arm only promoted the echo
+    /// and dropped this content, so the completing update never reached the
+    /// client. Drives the real actor frame path (`handle_session_frame`).
+    #[tokio::test]
+    async fn item3_read_tool_turn_ends_with_completed_tool_call_update() {
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (utx, mut urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted_assistant_text = false;
+        let mut assistant_had_error = false;
+        let mut live_background: HashMap<String, String> = HashMap::new();
+
+        // A prompt turn is active so the frames route normally.
+        machine.enqueue(Turn::new("p1".into(), false));
+        machine.on_echo("p1");
+
+        // The assistant streams the `Read` tool_use via a stream_event
+        // content_block_start — this surfaces the `tool_call` and caches the
+        // block so the later tool_result can resolve it.
+        handle_session_frame(
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_01ABC",
+                        "name": "Read",
+                        "input": {},
+                    }
+                }
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+        );
+
+        // The tool executes and the CLI emits a `user` frame carrying the
+        // `tool_result` block — the terminal completion must be emitted.
+        handle_session_frame(
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01ABC",
+                        "content": "This is the first line of the scratch file."
+                    }]
+                }
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted_assistant_text,
+            &mut assistant_had_error,
+            &utx,
+            "s",
+            &hw,
+        );
+
+        // Read the outbound updates and find the terminal completing update.
+        let mut completed_seen = false;
+        while let Ok(item) = urx.try_recv() {
+            let SessionOutbound::Update(notif) = item else {
+                continue;
+            };
+            let json = serde_json::to_value(&notif.update).unwrap();
+            if json["sessionUpdate"] == "tool_call_update"
+                && json["toolCallId"] == "toolu_01ABC"
+                && json["status"] == "completed"
+            {
+                assert!(
+                    json["content"].is_array() && !json["content"].as_array().unwrap().is_empty(),
+                    "the completing tool_call_update must carry the tool output content"
+                );
+                assert_eq!(
+                    json["_meta"]["claudeCode"]["toolName"],
+                    json!("Read"),
+                    "the completing update must keep the tool name meta"
+                );
+                completed_seen = true;
+            }
+        }
+        assert!(
+            completed_seen,
+            "a plain top-level Read tool turn must emit a terminal tool_call_update{{status:completed}}"
+        );
     }
 
     /// 10.T3 (INV-27, Unit — `session`): a permission round-trip is spawned, not
@@ -1648,6 +1850,97 @@ mod tests {
             "the force-cancel backstop must wait the grace before settling \
              (elapsed {elapsed:?}, grace {GRACE:?})"
         );
+    }
+
+    /// 2.7 — a `_session/steering` steer marked on the active turn defers p1's
+    /// settlement to the steer idle lane: the first result alone does NOT settle
+    /// p1 (it is steered), and it only resolves `end_turn` after the steered
+    /// echo, a second result and the idle. The assertion that p1 is still
+    /// pending after the first result FAILS if the `mark_steered` call in the
+    /// actor is removed, because then the un-steered first result settles p1
+    /// `end_turn` immediately.
+    #[tokio::test]
+    async fn steer_injected_settles_at_idle() {
+        use tokio::time::timeout;
+        let (tx, stream_tx, _hw) = spawn_actor(Duration::from_secs(60));
+        let (preply_tx, mut preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type": "user", "uuid": "p1", "message": {}}),
+            is_local_only: false,
+            reply: preply_tx,
+        })
+        .unwrap();
+        // p1 becomes active once echoed.
+        stream_tx
+            .send(json!({"type": "user", "uuid": "p1", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}))
+            .unwrap();
+        // Drain: let the actor process the prompt + echo so p1 is active.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Inject a steer; the actor marks p1 steered and replies `injected`.
+        let (sreply_tx, sreply_rx) = oneshot::channel();
+        tx.send(Command::Steer {
+            uuid: "s1".into(),
+            frame: json!({"type": "user", "uuid": "s1", "message": {}}),
+            is_local_only: false,
+            is_prompt_required: false,
+            reply: sreply_tx,
+        })
+        .unwrap();
+        let sreply = timeout(Duration::from_secs(5), sreply_rx)
+            .await
+            .expect("the steer reply must resolve")
+            .expect("steer reply sent");
+        assert_eq!(sreply["outcome"], json!("injected"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First result while steered must NOT settle p1 `end_turn` yet.
+        stream_tx
+            .send(
+                json!({"type": "result", "subtype": "success", "is_error": false,
+                         "stop_reason": "end_turn",
+                         "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            preply_rx.try_recv().is_err(),
+            "p1 must still be pending after the first (steered) result — this \
+             fails if the mark_steered call is removed, because the un-steered \
+             result would settle p1 end_turn immediately"
+        );
+
+        // Steered echo, then a second result carrying the winning usage.
+        stream_tx
+            .send(json!({"type": "user", "uuid": "s1", "isReplay": true,
+                         "message": {"role": "user", "content": [{"type": "text", "text": "be brief"}]}}))
+            .unwrap();
+        stream_tx
+            .send(
+                json!({"type": "result", "subtype": "success", "is_error": false,
+                         "stop_reason": "end_turn",
+                         "usage": {"input_tokens": 2, "output_tokens": 2}}),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            preply_rx.try_recv().is_err(),
+            "p1 must still be pending after the steered echo and second result \
+             (it settles at the idle)"
+        );
+
+        // The idle settles the steer lane and p1 resolves end_turn.
+        stream_tx
+            .send(json!({"type": "system", "subtype": "session_state_changed", "state": "idle"}))
+            .unwrap();
+        let r = timeout(Duration::from_secs(5), preply_rx)
+            .await
+            .expect("p1 must settle at the steer idle")
+            .expect("p1 resolved")
+            .expect("p1 Ok");
+        assert_eq!(r.stop_reason, "end_turn");
     }
 
     /// 11.T2 (INV-22) — cancel is idempotent: repeated cancels SPACED across the

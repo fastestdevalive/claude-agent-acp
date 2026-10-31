@@ -130,6 +130,14 @@ pub fn load_transcript(path: &Path) -> Result<Transcript, TranscriptError> {
 /// The only environment variables `fake-claude` may ever persist to
 /// `$FAKE_CLAUDE_ARGV_OUT`. Everything else in the process environment
 /// (tokens, sockets, paths, credentials) is discarded — never written to disk.
+///
+/// This is a test-fixture hygiene rule ONLY: it governs what gets written into
+/// the committed fixture JSON (so live secrets never reach git), NOT what env
+/// vars the spawned `claude` process receives at runtime. `fake-claude` itself
+/// is launched via a [`std::process::Command`] that inherits the full parent
+/// env (no `.env_clear()`), matching the crate's `apply_claude_env`
+/// (`process.rs`) and the Node adapter's `{ ...process.env, ...providerEnv }`.
+/// Do not read this list as the set of env vars forwarded to `claude`.
 const ARGV_ENV_ALLOWLIST: [&str; 2] = [
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS",

@@ -437,6 +437,11 @@ async fn signal_group_impl(child: &mut Child, _signal: Signal) -> Result<(), Spa
 /// Apply the fixed `claude` environment (B2): merge `extra_env`, set
 /// `CLAUDE_CODE_ENTRYPOINT`, set `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`,
 /// remove `NODE_OPTIONS`. Cross-platform; no `cfg` needed here.
+///
+/// Note: this only ADDS/overrides environment variables. The [`Command`] is
+/// never `.env_clear()`ed, so the child inherits the full parent process env by
+/// default — exactly the Node adapter's `{ ...process.env, ...providerEnv }`
+/// (`acp-agent.js:4851`). It does NOT restrict which env vars reach `claude`.
 fn apply_claude_env(cmd: &mut Command, extra_env: &[(String, String)]) {
     for (k, v) in extra_env {
         cmd.env(k, v);

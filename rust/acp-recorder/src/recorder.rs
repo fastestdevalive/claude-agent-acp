@@ -16,7 +16,10 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{AcpAgent, Client, ConnectionTo, LineDirection, SentRequest};
+use agent_client_protocol::{
+    AcpAgent, Client, ConnectionTo, LineDirection, SentRequest, UntypedMessage,
+};
+use serde_json::json;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -179,6 +182,11 @@ async fn run_script(
     let mut session_id: Option<agent_client_protocol::schema::v1::SessionId> = None;
     // In-flight `no_wait` prompts awaited by a later `session/wait` step.
     let mut pending: Vec<SentRequest<PromptResponse>> = Vec::new();
+    // Update counter at the start of the last `session/prompt`. `Step::Steer`'s
+    // `after_updates` is counted RELATIVE to this (item 2.5), never from
+    // process start, so the steer cannot race the prompt's streamed updates
+    // (a `session/new` itself emits an `available_commands_update`).
+    let mut last_prompt_started_at: usize = 0;
 
     for step in &script.steps {
         match step {
@@ -230,6 +238,7 @@ async fn run_script(
                     vec![ContentBlock::Text(TextContent::new(text.clone()))],
                 );
                 let started_at = update_count.load(Ordering::SeqCst);
+                last_prompt_started_at = started_at;
                 let sent = connection.send_request(request);
                 if let Some(n) = cancel_after_updates {
                     let target = started_at + n;
@@ -253,6 +262,35 @@ async fn run_script(
                         .data("session/cancel before any session/new"));
                 };
                 connection.send_notification(CancelNotification::new(sid.clone()))?;
+            }
+            Step::Steer {
+                text,
+                after_updates,
+            } => {
+                let Some(sid) = session_id.as_ref() else {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data("session/steer before any session/new"));
+                };
+                // `after_updates` is counted RELATIVE to the last prompt's start
+                // (item 2.5), so the steer cannot race the prompt's streamed
+                // updates (a `session/new` itself emits an
+                // `available_commands_update`, so absolute counts would be wrong).
+                if let Some(n) = after_updates {
+                    let target = last_prompt_started_at + n;
+                    if !wait_for_updates(&update_count, target, UPDATE_WAIT_TIMEOUT).await {
+                        return Err(agent_client_protocol::Error::internal_error()
+                            .data(format!("timed out waiting for {n} updates before steer")));
+                    }
+                }
+                let params = json!({
+                    "sessionId": sid,
+                    "prompt": [ { "type": "text", "text": text } ],
+                });
+                // Response ignored; the debug tap already captured the frame.
+                let _ = connection
+                    .send_request(UntypedMessage::new("_session/steering", params)?)
+                    .block_task()
+                    .await?;
             }
             Step::WaitPrompts => {
                 for sent in pending.drain(..) {

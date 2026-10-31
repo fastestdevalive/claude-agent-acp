@@ -12,6 +12,14 @@ use common::{
 };
 use serde_json::json;
 
+/// Per-call unique temp-dir suffix. `inv_24_full_corpus` and the per-corpus
+/// `inv_24_*` tests share the same `{name}` (e.g. `text-only`, `resume-load`)
+/// and the same process id, so `{pid}`-only temp dirs collide when those tests
+/// run concurrently in one binary — one test's `remove_dir_all` deletes another's
+/// `out.jsonl` mid-read (flaky NotFound). A monotonic per-binary counter keeps
+/// each `run_and_diff` call's scratch dir disjoint.
+static NEXT_DIFF_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 1.T1 — the differ is order-sensitive: two frames swapped fails; the same
 /// set in order passes.
 #[test]
@@ -328,7 +336,11 @@ fn run_and_diff_with(name: &str, ignore: &[JsonPath]) {
     assert!(transcript.exists(), "missing transcript {transcript:?}");
     assert!(fixture.exists(), "missing fixture {fixture:?}");
 
-    let tmp = std::env::temp_dir().join(format!("acp-diff-{name}-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!(
+        "acp-diff-{name}-{}-{}",
+        std::process::id(),
+        NEXT_DIFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp dir");
     let out = tmp.join("out.jsonl");
@@ -357,11 +369,100 @@ fn inv_24_text_only() {
     run_and_diff("resume-load");
 }
 
+/// Phase 15 (Item 1) — a `session/new` against fake-claude emits a PROACTIVE
+/// `available_commands_update` carrying the REAL command list (from the
+/// initialize response's `commands`) right after session/new, WITHOUT any
+/// `commands_changed` frame. Diffs the Rust output against the Node fixture
+/// (Node's `sendAvailableCommandsUpdate` reads the same initialize `commands`
+/// via `supportedCommands()`), and additionally asserts the update is non-empty
+/// on the wire.
+#[test]
+fn inv_24_commands_proactive() {
+    let root = repo_root();
+    let script = root.join("porting/corpus/commands-proactive.acp.json");
+    let transcript = root.join("porting/corpus/commands-proactive.transcript.jsonl");
+    let fixture = root.join("porting/fixtures/commands-proactive.frames.jsonl");
+    let tmp = std::env::temp_dir().join(format!(
+        "acp-diff-commands-proactive-{}-{}",
+        std::process::id(),
+        NEXT_DIFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let out = tmp.join("out.jsonl");
+
+    let agent_cmd = rust_agent_binary();
+    let frames = run_recorder(&agent_cmd.to_string_lossy(), &script, &transcript, &out);
+    let frames = normalize_root_paths(frames, &root);
+    let expected = parse_fixture_frames(&fixture);
+    if let Err(diff) = diff_frames(&frames, &expected, &differential_ignore()) {
+        panic!("commands-proactive differential failed:\n{diff}");
+    }
+
+    // The wire must carry a non-empty available_commands_update emitted
+    // proactively after session/new, without a commands_changed frame.
+    let mut saw_non_empty = false;
+    for frame in &frames {
+        if frame.json["method"] == "session/update" {
+            let u = &frame.json["params"]["update"];
+            if u["sessionUpdate"] == "available_commands_update" {
+                let cmds = u["availableCommands"].as_array().expect("array");
+                assert!(
+                    !cmds.is_empty(),
+                    "available_commands_update must carry a non-empty availableCommands"
+                );
+                saw_non_empty = true;
+            }
+        }
+    }
+    assert!(
+        saw_non_empty,
+        "a proactive non-empty available_commands_update must be emitted after session/new"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// rust-parity-tests Phase 1 — the full tool loop including the return `user`
+/// frame carrying `tool_result` content blocks (emitted by fake-claude as part
+/// of the prompt step's emit array, with a distinct literal uuid and no
+/// `isReplay`). Diffs the Rust output against the Node fixture; this is the
+/// regression guard for the phase 15 `map_consolidated(MsgRole::User, ...)`
+/// fix in `session.rs` `handle_session_frame`.
+#[test]
+fn inv_24_tool_result_echo() {
+    run_and_diff("tool-result-echo");
+}
+
+/// rust-parity-tests Phase 2 — two sequential prompts where the first turn uses
+/// a tool (distinct from `lagging-idle` which is text→text). The second prompt
+/// re-enters the activation path after the tool-using turn settles; also covers
+/// the lagging `session_state_changed` idle emit inside the second prompt step.
+#[test]
+fn inv_24_tool_then_text() {
+    run_and_diff("tool-then-text");
+}
+
 /// 8.T7 — lagging trailing idle after the next echo is absorbed, not a false
 /// #825 fail.
 #[test]
 fn inv_24_lagging_idle() {
     run_and_diff("lagging-idle");
+}
+
+/// rust-steering-lanes Phase 3 — a `_session/steering` injected mid-turn settles
+/// the steered turn at the idle (steer idle lane, R6), never at the first
+/// result, with the summed usage.
+#[test]
+fn inv_24_steer_mid_turn() {
+    run_and_diff("steer-mid-turn");
+}
+
+/// rust-steering-lanes Phase 3 — an error-shaped result while steering with a
+/// pending steered echo stays on the lane (R4), then settles `end_turn` at the
+/// idle.
+#[test]
+fn inv_24_steer_error_result() {
+    run_and_diff("steer-error-result");
 }
 
 /// 8.T8 — `/context` (echo-less local-only) promotes and settles at its own

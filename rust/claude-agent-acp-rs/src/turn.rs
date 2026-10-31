@@ -37,6 +37,19 @@
 //! `session_state_changed: idle` so it is not misread as the next turn being
 //! abandoned (#825 false-fail, ADP:2108-2118).
 //!
+//! ## Steering (`_session/steering`)
+//!
+//! A steered `priority:"now"` message injected mid-turn marks the active (or
+//! queue-head) turn via [`TurnMachine::mark_steered`], which records the steer's
+//! uuid in `steered_echoes` and moves any held `deferred_settle` into the steer
+//! lane (`steered_settle`). The steer lane then owns settlement (R1-R9,
+//! `acp-agent.js:129-132, 1141, 1166-1180, 1560-1564, 2081-2140, 2618-2625,
+//! 2756-2764, 3059-3079, 3092-3101, 3459-3463, 3577-3586`): steered results
+//! record their outcome without settling, owe no trailing idle, and the single
+//! idle spanning the interrupted + steered cycles settles the turn through the
+//! subagent gate. Wire parity is gated by `inv_24_steer_mid_turn` /
+//! `inv_24_steer_error_result` (`tests/differential.rs`).
+//!
 //! ## Known unfixable hole: pre-echo abandonment (#825)
 //!
 //! Idle deliberately fails only the ACTIVE turn. A queued turn that was never
@@ -49,9 +62,6 @@
 //!
 //! ## Known omissions (deliberate, deferred to their own phases — review 04 #14)
 //!
-//! - **Steering** (`steeredEchoes`/`steeredSettle`, `_session/steering`):
-//!   the idle lane treats every turn as un-steered; `isSteering` is always
-//!   false. Phase that ports R32/steering must add the steer lanes.
 //! - **`msg_lifecycle_v1` orphan map** (`session.orphanCommands`): orphan
 //!   accounting uses only the coarse `pending_orphan_results` count, not the
 //!   per-uuid `command_lifecycle` lane. Coalescing of N queued commands into
@@ -60,7 +70,7 @@
 //!   sweep at activation (`ADP:1366-1390`) is likewise omitted: `live_subagents`
 //!   entries are removed only by their terminal frames.
 //!
-//! All three are recorded in the plan under Decision D4 and `PARITY.md` as
+//! Both are recorded in the plan under Decision D4 and `PARITY.md` as
 //! pending, so their absence is intentional, not a silent drift.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -176,10 +186,21 @@ struct DeferredSettle {
 pub enum TurnEvent {
     /// A turn settled. The actor resolves that prompt's oneshot with this stop
     /// reason and usage.
+    ///
+    /// `had_usage` distinguishes the two structurally-different upstream cancel
+    /// settlements (phase 15, Item 2): a turn **swept from the queue** by
+    /// `cancel()` never activated, so upstream reports NO `usage` field
+    /// (`turn.resolve({ stopReason: "cancelled" })`); every other settlement —
+    /// an active/held turn's cancel (`settleActive({ ..., usage:
+    /// sessionUsage(session) })`) — reports `usage` even when it is genuinely
+    /// all-zero. `session.rs` keys off this origin flag, never the numeric
+    /// `usage` value, so a real cancel that lands before any tokens accumulate
+    /// still reports an all-zero `usage` object.
     Settled {
         prompt_uuid: String,
         stop_reason: StopReason,
         usage: Usage,
+        had_usage: bool,
     },
     /// A turn failed. The actor rejects that prompt's oneshot with the mapped
     /// JSON-RPC error.
@@ -210,6 +231,14 @@ pub struct Turn {
     deferred_settle: Option<DeferredSettle>,
     /// Task ids of the subagents this turn spawned (`spawnedTaskIds`).
     spawned_task_ids: HashSet<String>,
+    /// The steer uuids whose echoes are still pending for this turn — `Some`
+    /// when a `_session/steering` injected a `priority:"now"` message mid-turn
+    /// (`Turn.steeredEchoes`). `is_steering_turn` is the R1 predicate.
+    steered_echoes: Option<HashSet<String>>,
+    /// The outcome (and usage snapshot) recorded by a steered turn's result,
+    /// settled by the steer idle lane rather than by the result itself
+    /// (`Turn.steeredSettle`). Later results overwrite it.
+    steered_settle: Option<DeferredSettle>,
 }
 
 impl Turn {
@@ -221,6 +250,8 @@ impl Turn {
             settled: false,
             deferred_settle: None,
             spawned_task_ids: HashSet::new(),
+            steered_echoes: None,
+            steered_settle: None,
         }
     }
 
@@ -302,6 +333,32 @@ impl TurnMachine {
         self.has_active() || self.queue.iter().any(|t| !t.settled)
     }
 
+    /// Mark a `_session/steering` injected `priority:"now"` message as steered
+    /// (R2, `acp-agent.js:1166-1180`). Targets the active turn if there is an
+    /// unsettled one, else the first unsettled turn in the queue ("first
+    /// unsettled", `acp-agent.js:1141`). Adds `uuid` to the turn's pending
+    /// `steered_echoes`; if the turn is held for subagents, moves its recorded
+    /// `deferred_settle` into the steer lane so one lane owns settlement.
+    /// Returns `false` (and changes nothing) when no target turn exists.
+    pub fn mark_steered(&mut self, uuid: &str) -> bool {
+        let target = if self.active.as_ref().is_some_and(|t| !t.settled) {
+            self.active.as_mut()
+        } else {
+            let idx = self.queue.iter().position(|t| !t.settled);
+            idx.map(|i| &mut self.queue[i])
+        };
+        let Some(turn) = target else {
+            return false;
+        };
+        turn.steered_echoes
+            .get_or_insert_with(HashSet::new)
+            .insert(uuid.to_string());
+        if turn.deferred_settle.is_some() {
+            turn.steered_settle = turn.deferred_settle.take();
+        }
+        true
+    }
+
     /// Enqueue a prompt turn (it awaits its echo before activation).
     pub fn enqueue(&mut self, turn: Turn) {
         self.queue.push_back(turn);
@@ -318,6 +375,17 @@ impl TurnMachine {
         let mut events = Vec::new();
         self.cancelled = true;
 
+        // R9: a steered active turn's pending echoes are interrupts whose
+        // messages were already pushed — seed one orphan per pending steered
+        // echo so their late results are skipped, not attributed to the next
+        // head (count lane; `acp-agent.js:3459-3463`). Do NOT push these uuids
+        // into `orphaned_uuids` — reconcile touches only swept turns (INV-23).
+        if self.active.as_ref().is_some_and(is_steering_turn) {
+            if let Some(echoes) = self.active.as_ref().and_then(|t| t.steered_echoes.as_ref()) {
+                self.pending_orphan_results += echoes.len();
+            }
+        }
+
         // Sweep queued turns that haven't started yet (no echo): settle them
         // now and seed an orphan per turn so their late results are skipped,
         // not attributed to the next head (`ADP:3471-3526`).
@@ -332,6 +400,7 @@ impl TurnMachine {
                     prompt_uuid: turn.prompt_uuid,
                     stop_reason: StopReason::Cancelled,
                     usage: Usage::default(),
+                    had_usage: false,
                 });
             }
         }
@@ -360,9 +429,24 @@ impl TurnMachine {
                         prompt_uuid,
                         stop_reason: StopReason::Cancelled,
                         usage,
+                        had_usage: true,
                     });
                 }
             }
+        }
+        // R9: a steered active turn with a recorded outcome settles `cancelled`
+        // at the interrupt's trailing idle, like any live turn. But the steer
+        // lane pays for its last result's trailer by settling on it, which this
+        // cancel pre-empts — count that trailer here or it arrives un-owed
+        // against the next prompt and false-fails it (#825) (`acp-agent.js:3577-3586`).
+        if self.active.as_ref().is_some_and(is_steering_turn)
+            && self
+                .active
+                .as_ref()
+                .and_then(|t| t.steered_settle)
+                .is_some()
+        {
+            self.owed_trailing_idles += 1;
         }
         events
     }
@@ -382,6 +466,7 @@ impl TurnMachine {
                     prompt_uuid: active.prompt_uuid.clone(),
                     stop_reason: StopReason::Cancelled,
                     usage: self.accumulated_usage,
+                    had_usage: true,
                 });
             }
         }
@@ -461,6 +546,17 @@ impl TurnMachine {
         let Some(idx) = queued_idx else {
             // A replayed echo with no matching queued turn — unrelated replay,
             // dropped (a steered message's echo; see isReplay handling).
+            // R7: a steered message's echo matches no turn (mark_steered creates
+            // none) but marks the steered cycle as running — delete the uuid so
+            // the idle lane can tell "the answer is still ahead" from "the turn
+            // is over" (`acp-agent.js:3092-3101`).
+            if self.active.as_ref().is_some_and(is_steering_turn) {
+                if let Some(active) = self.active.as_mut() {
+                    if let Some(echoes) = active.steered_echoes.as_mut() {
+                        echoes.remove(uuid);
+                    }
+                }
+            }
             return events;
         };
         // `idx` came from `position` above, so the removal cannot fail; handle
@@ -483,6 +579,15 @@ impl TurnMachine {
                     // A held turn hands off with its recorded outcome and usage
                     // snapshot, not a guessed end_turn (`ADP:3051-3060`).
                     (deferred.stop_reason, deferred.usage)
+                } else if let Some(steered) = prev.steered_settle {
+                    // R8: the user moving on outranks a steered continuation, but
+                    // its last result's stop reason stands. The steer lane normally
+                    // pays for that result's trailing idle by settling on it; this
+                    // hand-off settles instead, so count the trailer here or it
+                    // arrives un-owed against the fresh turn and false-fails it
+                    // (#825) (`acp-agent.js:3062-3079`).
+                    self.owed_trailing_idles += 1;
+                    (steered.stop_reason, steered.usage)
                 } else {
                     (StopReason::EndTurn, self.accumulated_usage)
                 };
@@ -493,6 +598,7 @@ impl TurnMachine {
                     prompt_uuid,
                     stop_reason: outcome,
                     usage,
+                    had_usage: true,
                 });
             }
         }
@@ -542,7 +648,14 @@ impl TurnMachine {
         // the next turn being abandoned (#825). The one exclusion: the cancelled
         // ACTIVE turn's own result, which is dropped below and settles at idle
         // (or the echo hand-off) instead (`ADP:2622-2626`).
-        if !(self.cancelled && self.active.is_some()) {
+        //
+        // R5: a steered turn's results owe no trailing idle — one idle covers
+        // the whole interrupted + steered sequence and that idle settles the
+        // turn, so counting either result would leave a debt that swallows it
+        // (`acp-agent.js:2618-2625`).
+        if !(self.cancelled && self.active.is_some())
+            && !self.active.as_ref().is_some_and(is_steering_turn)
+        {
             self.owed_trailing_idles += 1;
         }
 
@@ -577,6 +690,19 @@ impl TurnMachine {
         // handle it before the subtype switch (`ADP:2736-2753`).
         if stop_reason == "refusal" {
             self.settle_or_defer(StopReason::Refusal, &mut events);
+            return events;
+        }
+
+        // R4: an error-shaped result on a steered turn with a pending echo is the
+        // interrupted cycle's diagnostic, not the steered command's outcome —
+        // keep it on the steer lane and let the cycle after the pending echo
+        // decide the turn (`acp-agent.js:2756-2764`).
+        if is_error
+            && self.active.as_ref().is_some_and(|t| {
+                is_steering_turn(t) && t.steered_echoes.as_ref().is_some_and(|s| !s.is_empty())
+            })
+        {
+            self.settle_or_defer(StopReason::EndTurn, &mut events);
             return events;
         }
 
@@ -724,6 +850,33 @@ impl TurnMachine {
             self.owed_trailing_idles -= 1;
             return events;
         }
+        if self.active.as_ref().is_some_and(is_steering_turn) {
+            // R6: a steered turn settles here, not at a result — this idle is
+            // the only signal spanning the interrupted and steered cycles
+            // (`acp-agent.js:2119-2140`). An idle before the steered echo, or
+            // before any result was recorded, means the answer is still ahead —
+            // swallow it, and never let it reach the #825 fail below (INV-31).
+            let ready = self.active.as_ref().and_then(|t| {
+                let echoes_empty = t.steered_echoes.as_ref().is_some_and(|s| s.is_empty());
+                let has_settle = t.steered_settle.is_some();
+                if echoes_empty && has_settle {
+                    Some(())
+                } else {
+                    None
+                }
+            });
+            if ready.is_some() {
+                // Via the subagent gate, not settle_active: a steered turn can
+                // also have spawned background subagents, which own it from here
+                // (settles now if none is live, holds otherwise).
+                if let Some(active) = self.active.as_mut() {
+                    active.deferred_settle = active.steered_settle.take();
+                    active.steered_echoes = None;
+                }
+                self.settle_deferred_if_drained(&mut events);
+            }
+            return events;
+        }
         if !self.cancelled && self.active.as_ref().is_some_and(|t| !t.settled) {
             // #825: idle without a result — the model stream dropped mid-turn.
             self.fail_active(
@@ -757,6 +910,7 @@ impl TurnMachine {
                     prompt_uuid,
                     stop_reason: outcome,
                     usage,
+                    had_usage: true,
                 });
             }
         }
@@ -786,6 +940,7 @@ impl TurnMachine {
                         prompt_uuid,
                         stop_reason: deferred.stop_reason,
                         usage,
+                        had_usage: true,
                     });
                 } else {
                     events.push(TurnEvent::Failed {
@@ -878,6 +1033,19 @@ impl TurnMachine {
     /// are still live, in which case store the outcome and hold it open
     /// (`settleOrDefer`, `#866`).
     fn settle_or_defer(&mut self, outcome: StopReason, events: &mut Vec<TurnEvent>) {
+        // R3: a steered turn's result never settles here — the steer aborted the
+        // cycle this result may belong to, and the steered one is still to come.
+        // Record the outcome for the steer idle lane; later results overwrite it,
+        // so the last result and its usage win (`acp-agent.js:1560-1564`).
+        if self.active.as_ref().is_some_and(is_steering_turn) {
+            if let Some(active) = self.active.as_mut() {
+                active.steered_settle = Some(DeferredSettle {
+                    stop_reason: outcome,
+                    usage: self.accumulated_usage,
+                });
+            }
+            return;
+        }
         let awaiting = self
             .active
             .as_ref()
@@ -927,6 +1095,7 @@ impl TurnMachine {
             prompt_uuid,
             stop_reason: outcome,
             usage,
+            had_usage: true,
         });
     }
 
@@ -976,6 +1145,12 @@ fn is_autonomous_result(result: &Value) -> bool {
 /// Whether `turn` is held open (has a stored outcome, not yet settled).
 fn is_held_turn(turn: &Turn) -> bool {
     turn.deferred_settle.is_some() && !turn.settled
+}
+
+/// Whether `turn` is steering — a `_session/steering` injected a `priority:"now"`
+/// message and its echo is still pending (`isSteering`, `acp-agent.js:129-132`).
+fn is_steering_turn(turn: &Turn) -> bool {
+    turn.steered_echoes.is_some() && !turn.settled
 }
 
 /// The error message for an `is_error` result — `message.errors.join(", ")`

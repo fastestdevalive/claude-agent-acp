@@ -320,7 +320,9 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
             (
                 f.0,
                 normalize(
-                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
+                    normalize_request_permission_id(normalize_available_commands_input(
+                        normalize_tool_call_defaults(f.1),
+                    )),
                     &mut norm_a,
                 ),
             )
@@ -332,7 +334,9 @@ pub fn diff_frames(a: &[Frame], b: &[Frame], ignore: &[JsonPath]) -> Result<(), 
             (
                 f.0,
                 normalize(
-                    normalize_request_permission_id(normalize_tool_call_defaults(f.1)),
+                    normalize_request_permission_id(normalize_available_commands_input(
+                        normalize_tool_call_defaults(f.1),
+                    )),
                     &mut norm_b,
                 ),
             )
@@ -424,6 +428,40 @@ fn normalize_tool_call_defaults(value: Value) -> Value {
             items
                 .into_iter()
                 .map(normalize_tool_call_defaults)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Phase 15 (Item 1): the pinned schema's `AvailableCommand` carries
+/// `#[skip_serializing_none]`, so the Rust side omits `input` (and `meta`) when
+/// unset, while the Node adapter always emits `input: null` on every
+/// `available_commands_update`. Materialise `input: null` on each
+/// `availableCommands` entry on BOTH sides so the proactive command-list
+/// differential is byte-comparable.
+fn normalize_available_commands_input(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            for (_, v) in map.iter_mut() {
+                *v = normalize_available_commands_input(std::mem::take(v));
+            }
+            if map.get("sessionUpdate").and_then(Value::as_str) == Some("available_commands_update")
+            {
+                if let Some(Value::Array(cmds)) = map.get_mut("availableCommands") {
+                    for cmd in cmds.iter_mut() {
+                        if let Value::Object(cmd_map) = cmd {
+                            cmd_map.entry("input").or_insert(Value::Null);
+                        }
+                    }
+                }
+            }
+            Value::Object(map)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(normalize_available_commands_input)
                 .collect(),
         ),
         other => other,
