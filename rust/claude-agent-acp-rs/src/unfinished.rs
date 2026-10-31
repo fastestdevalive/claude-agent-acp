@@ -125,6 +125,8 @@ pub fn gate_events(
             TurnEvent::Settled {
                 ref prompt_uuid,
                 stop_reason: StopReason::EndTurn,
+                usage,
+                ref model_rows,
                 ..
             } => {
                 let held = state.books.take_turn(prompt_uuid);
@@ -154,6 +156,9 @@ pub fn gate_events(
                         "Claude ended the turn without returning results for tool calls: {}",
                         stuck.join(", ")
                     ),
+                    usage,
+                    model_rows: model_rows.clone(),
+                    is_structured_output_retries: false,
                 });
             }
             // Cancelled / other settles and failures never run the check, but
@@ -228,6 +233,9 @@ mod tests {
                 kind: FailureKind::IncompleteToolCall,
                 message: "Claude ended the turn without returning results for tool calls: toolu_a"
                     .into(),
+                usage: Usage::default(),
+                model_rows: Default::default(),
+                is_structured_output_retries: false,
             }]
         );
         assert!(!state.has_emitted("toolu_a"), "the call is closed");

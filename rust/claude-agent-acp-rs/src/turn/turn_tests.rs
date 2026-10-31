@@ -27,6 +27,7 @@ fn autonomous_result(subtype: &str) -> Value {
         "is_error": false,
         "stop_reason": "end_turn",
         "origin": { "kind": "task-notification" },
+        "num_turns": 1,
         "usage": { "output_tokens": 1 },
     })
 }
@@ -213,6 +214,7 @@ async fn inv_31_idle_without_result_fails() {
             prompt_uuid,
             kind,
             message,
+            ..
         } => Some((prompt_uuid.as_str(), *kind, message.clone())),
         _ => None,
     });
@@ -367,6 +369,7 @@ async fn autonomous_followup_settles_held_with_stored_outcome() {
         "is_error": true,
         "result": "some provider error",
         "origin": { "kind": "task-notification" },
+        "num_turns": 1,
         "usage": { "output_tokens": 1 },
     });
     let events = machine.on_result(&followup, true);
@@ -883,15 +886,18 @@ async fn orphan_late_result_never_activates_echo_less() {
     // Cancel sweeps B -> orphan credit.
     machine.cancel();
 
-    // A's own result arrives (dropped, cancelled), then idle settles A.
-    machine.on_result(&result_frame("success", false), false);
-    let events = machine.on_idle();
+    // A's own result arrives: the cancelled turn ends at the result of the work
+    // the interrupt stopped (T1 F16a, `acp-agent.ts:7060-7083`), outcome dropped;
+    // the trailing idle is then absorbed by the debt that result owes.
+    let events = machine.on_result(&result_frame("success", false), false);
     assert!(
         events
             .iter()
             .any(|e| matches!(e, TurnEvent::Settled { prompt_uuid, .. } if prompt_uuid == "pA")),
-        "A settles at idle"
+        "A settles at its interrupted result"
     );
+    let events = machine.on_idle();
+    assert!(events.is_empty(), "A's trailing idle is absorbed");
 
     // p3 (echo-less local-only) enqueued.
     machine.enqueue(Turn::new("p3".into(), true));

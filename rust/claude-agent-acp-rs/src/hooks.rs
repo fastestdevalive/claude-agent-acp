@@ -251,6 +251,57 @@ pub fn tool_update_from_diff_tool_response(
     (content, locations)
 }
 
+/// The standard diff of a file that a Write created, for a client with
+/// `diffPatch` whose created file has no exact patch (`createdFileDiff`,
+/// `reporters/file-edit.ts:158-173`): that client's Write tool call shows no
+/// diff, so without it the created file would never be shown.
+fn created_file_diff(tool_response: &Value) -> Option<(Vec<Value>, Vec<Value>)> {
+    if tool_response.get("type").and_then(Value::as_str) != Some("create") {
+        return None;
+    }
+    let path = tool_response.get("filePath").and_then(Value::as_str)?;
+    let content = tool_response.get("content").and_then(Value::as_str)?;
+    Some((
+        vec![json!({"type": "diff", "path": path, "oldText": Value::Null, "newText": content})],
+        vec![json!({"path": path})],
+    ))
+}
+
+/// The final change of an Edit or Write for the `PostToolUse` update
+/// (`finalChange`, `reporters/file-edit.ts:139-150`): a client with `diffPatch`
+/// gets the exact git patch of the written file, else the created file's
+/// standard diff, else the `structuredPatch` diff; every other client gets the
+/// `structuredPatch` diff. The ACP v2 branch of upstream is Turn 7 (T-44).
+pub fn final_change(tool_response: &Value, diff_patch: bool) -> (Vec<Value>, Vec<Value>) {
+    if diff_patch {
+        if let Some(patch) = crate::diff::patch_update_from_diff_tool_response(
+            tool_response,
+            crate::diff::PatchForm::Air,
+        ) {
+            let locations = patch
+                .locations
+                .iter()
+                .filter_map(|location| serde_json::to_value(location).ok())
+                .collect();
+            return (patch.content, locations);
+        }
+        if let Some(created) = created_file_diff(tool_response) {
+            return created;
+        }
+    }
+    let (content, locations) = tool_update_from_diff_tool_response(tool_response);
+    (
+        content
+            .iter()
+            .filter_map(|block| serde_json::to_value(block).ok())
+            .collect(),
+        locations
+            .iter()
+            .filter_map(|location| serde_json::to_value(location).ok())
+            .collect(),
+    )
+}
+
 /// Builds the `tool_call_update` payload for a `PostToolUse` event.
 pub fn build_post_tool_use_update(
     tool_use_id: &str,
@@ -258,10 +309,64 @@ pub fn build_post_tool_use_update(
     parent_tool_use_id: Option<&str>,
     tool_response: &Value,
 ) -> Value {
-    let mut claude_code = json!({
-        "toolName": tool_name,
-        "toolResponse": tool_response,
-    });
+    post_tool_use_update(
+        tool_use_id,
+        tool_name,
+        parent_tool_use_id,
+        tool_response,
+        false,
+        false,
+    )
+    .unwrap_or(Value::Null)
+}
+
+/// The `status` and `isAsync` markers of a `tool_response` (`toolResponseMarkers`,
+/// `tool-calls/content.ts:282-294`).
+fn tool_response_markers(tool_response: &Value) -> Option<Value> {
+    let object = tool_response.as_object()?;
+    let mut markers = serde_json::Map::new();
+    if let Some(status) = object.get("status").filter(|status| status.is_string()) {
+        markers.insert("status".into(), status.clone());
+    }
+    if let Some(is_async) = object.get("isAsync").filter(|flag| flag.is_boolean()) {
+        markers.insert("isAsync".into(), is_async.clone());
+    }
+    (!markers.is_empty()).then_some(Value::Object(markers))
+}
+
+/// The report of a `PostToolUse` hook (`AcpToolCallRenderer.hookResult`,
+/// `renderer.ts:542-575`), with the final change of an Edit or Write through
+/// [`final_change`] (T-40/T-43).
+///
+/// A client that keeps a tool call's `_meta` across reports (`keeps_meta`, AIR)
+/// gets only the `status`/`isAsync` markers of the `tool_response`, and no
+/// update at all when there is neither a marker nor a change. Every other
+/// client gets the whole `tool_response` on every hook.
+pub fn post_tool_use_update(
+    tool_use_id: &str,
+    tool_name: &str,
+    parent_tool_use_id: Option<&str>,
+    tool_response: &Value,
+    diff_patch: bool,
+    keeps_meta: bool,
+) -> Option<Value> {
+    let (content, locations) = if tool_name == "Edit" || tool_name == "Write" {
+        final_change(tool_response, diff_patch)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut claude_code = json!({ "toolName": tool_name });
+    if keeps_meta {
+        let markers = tool_response_markers(tool_response);
+        if markers.is_none() && content.is_empty() && locations.is_empty() {
+            return None;
+        }
+        if let Some(markers) = markers {
+            claude_code["toolResponse"] = markers;
+        }
+    } else {
+        claude_code["toolResponse"] = tool_response.clone();
+    }
     if let Some(parent) = parent_tool_use_id {
         claude_code["parentToolUseId"] = json!(parent);
     }
@@ -272,18 +377,13 @@ pub fn build_post_tool_use_update(
             "claudeCode": claude_code,
         }
     });
-
-    if tool_name == "Edit" || tool_name == "Write" {
-        let (content, locations) = tool_update_from_diff_tool_response(tool_response);
-        if !content.is_empty() {
-            update["content"] = serde_json::to_value(&content).unwrap_or(Value::Null);
-        }
-        if !locations.is_empty() {
-            update["locations"] = serde_json::to_value(&locations).unwrap_or(Value::Null);
-        }
+    if !content.is_empty() {
+        update["content"] = Value::Array(content);
     }
-
-    update
+    if !locations.is_empty() {
+        update["locations"] = Value::Array(locations);
+    }
+    Some(update)
 }
 
 /// An entry in the session's task state snapshot.

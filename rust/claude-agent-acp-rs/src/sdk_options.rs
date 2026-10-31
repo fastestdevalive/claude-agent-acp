@@ -173,6 +173,9 @@ pub struct ClaudeOptions {
     pub max_budget_usd: Option<f64>,
     pub fallback_model: Option<String>,
     pub agent: Option<String>,
+    /// `agents` (O-144): custom subagent definitions, passed to the SDK's
+    /// `initialize` request verbatim. Only a truthy value is sent.
+    pub agents: Option<Value>,
     pub include_hook_events: bool,
     pub additional_directories: Vec<PathBuf>,
     /// `persistSession`; only an explicit `false` emits `--no-session-persistence`.
@@ -891,6 +894,11 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         max_budget_usd: opts.get("maxBudgetUsd").and_then(Value::as_f64),
         fallback_model: opt_str(&opts, "fallbackModel"),
         agent: opt_str(&opts, "agent"),
+        // The SDK sends `...A.agents && {agents: A.agents}`.
+        agents: opts
+            .get("agents")
+            .filter(|value| js_truthy(Some(value)))
+            .cloned(),
         include_hook_events: opts
             .get("includeHookEvents")
             .and_then(Value::as_bool)
@@ -1148,6 +1156,32 @@ mod tests {
             Some(vec!["user".to_string(), "project".to_string()])
         );
         assert_eq!(o.resume.as_deref(), Some("abc"));
+    }
+
+    /// O-144 — `_meta.claudeCode.options.agents` rides to `initialize` verbatim,
+    /// and only when truthy (the SDK's `...A.agents && {agents}`).
+    #[test]
+    fn o144_agents_option_passthrough() {
+        let defs = serde_json::json!({
+            "reviewer": {"description": "Reviews code", "prompt": "You review.", "tools": ["Read"]}
+        });
+        let with = claude_options(&serde_json::json!({
+            "_meta": {"claudeCode": {"options": {"agents": defs.clone()}}}
+        }));
+        assert_eq!(with.agents, Some(defs));
+        for absent in [
+            serde_json::json!({}),
+            serde_json::json!({"_meta": {"claudeCode": {"options": {"agents": null}}}}),
+            serde_json::json!({"_meta": {"claudeCode": {"options": {"agents": false}}}}),
+            serde_json::json!({"_meta": {"claudeCode": {"options": {"agents": 0}}}}),
+        ] {
+            assert_eq!(claude_options(&absent).agents, None, "{absent}");
+        }
+        // An empty object is truthy in JavaScript and is sent as `{}`.
+        let empty = claude_options(&serde_json::json!({
+            "_meta": {"claudeCode": {"options": {"agents": {}}}}
+        }));
+        assert_eq!(empty.agents, Some(serde_json::json!({})));
     }
 
     #[test]

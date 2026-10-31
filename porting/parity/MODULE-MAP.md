@@ -35,7 +35,7 @@ into its 17 anchor-keyed sections) mapped to the Rust module(s) in
 | client-system-prompt.ts | system_prompt.rs | 1:1 | client system prompt merge |
 | context-compaction-meta.ts | - | missing:F20 | compaction meta lifecycle |
 | context-compaction.ts | - | missing:F20 | compaction engine |
-| diff.ts | - | missing:F8 | diff engine (only partial patch metadata in hooks.rs, T-43) |
+| diff.ts | diff.rs | 1:1 | line diff (Myers, context 3, budget), diff memo, git patch formatting and ACP v2 diff content ported (T1C, F8) |
 | elicitation.ts | - | missing:F23a | ACP elicitation mapping |
 | exit-plan.ts | - | missing:F21 | ExitPlanMode hand-off |
 | file-change-audit.ts | - | missing:AG-3 | file-change audit report |

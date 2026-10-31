@@ -617,6 +617,147 @@ fn normalize_write_input(input: &Value) -> NormalizedWriteInput<'_> {
     NormalizedWriteInput { file_path, content }
 }
 
+/// JS `\s` (the characters `trim` and `/\s+/` match). Rust's
+/// `char::is_whitespace` omits U+FEFF and adds U+0085.
+pub(crate) fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | ' '
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Node's `humanText` (`permissions/presentation.ts:35-52`): control
+/// characters removed, trimmed (all whitespace runs folded when `single_line`),
+/// and `None` when empty or longer than `max_len` UTF-16 units.
+fn human_text(value: &str, max_len: usize, single_line: bool) -> Option<String> {
+    let without_controls: String = value
+        .chars()
+        .filter(|c| {
+            let code = *c as u32;
+            !(code <= 0x08
+                || code == 0x0b
+                || code == 0x0c
+                || (0x0e..=0x1f).contains(&code)
+                || code == 0x7f)
+        })
+        .collect();
+    let normalized = if single_line {
+        without_controls
+            .split(is_js_space)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        without_controls.trim_matches(is_js_space).to_string()
+    };
+    (!normalized.is_empty() && normalized.encode_utf16().count() <= max_len).then_some(normalized)
+}
+
+/// The AIR-only permission presentation `_meta` of a `session/request_permission`
+/// (`buildClaudePermissionPresentation`, `permissions/presentation.ts:70-136`):
+/// the heading and the explanation of the prompt. `tool_call_title` is the
+/// title of the request's tool call.
+pub fn air_permission_meta(
+    tool_name: &str,
+    input: &Value,
+    display_name: Option<&str>,
+    tool_call_title: &str,
+    decision_reason: Option<&str>,
+    default_to_no: bool,
+) -> Value {
+    let compact = |value: Option<&str>| value.and_then(|text| human_text(text, 160, true));
+    let host = if tool_name == "SandboxNetworkAccess" {
+        compact(input.get("host").and_then(Value::as_str))
+    } else {
+        None
+    };
+    let subject = host.or_else(|| {
+        tool_name
+            .starts_with("mcp__computer-use__")
+            .then(|| compact(display_name))
+            .flatten()
+    });
+    let call_title = subject.unwrap_or_else(|| tool_call_title.to_string());
+    let permission_title = if tool_name == "ExitPlanMode" {
+        "Ready to code?".to_string()
+    } else {
+        call_title
+    };
+    // Shell titles are executable input: compacting whitespace changes quoted
+    // arguments and comment boundaries, so they go out as they are.
+    let title = if tool_name == "Bash" || tool_name == "PowerShell" {
+        permission_title
+    } else {
+        human_text(&permission_title, 4_000, true).unwrap_or_else(|| "Use tool?".to_string())
+    };
+    let description = decision_reason
+        .and_then(|reason| human_text(reason, 4_000, false))
+        .map(|reason| format!("Reason: {reason}"));
+    let mut payload = serde_json::Map::new();
+    payload.insert("version".into(), Value::from(1));
+    payload.insert("title".into(), Value::String(title));
+    if let Some(description) = description {
+        payload.insert("description".into(), Value::String(description));
+    }
+    if default_to_no {
+        payload.insert("defaultToNo".into(), Value::Bool(true));
+    }
+    crate::air::with_air_meta(None, "permission", Value::Object(payload))
+}
+
+/// The `rawInput` an AIR client gets for a tool use (`AcpToolCallRenderer.rawInput`,
+/// `renderer.ts:729-743`): without the file text that the tool call's diff
+/// already holds (`fileTextKeys` of the Write and Edit reporters,
+/// `reporters/file-edit.ts:55,119`). Every other tool, and every other client,
+/// gets the input as it is.
+pub fn air_raw_input(name: &str, input: &Value) -> Value {
+    let Some(obj) = input.as_object() else {
+        return input.clone();
+    };
+    let mut stripped = obj.clone();
+    match name {
+        "Write" => {
+            let file_path = normalize_write_input(input).file_path;
+            if file_path.is_some_and(|path| !path.is_empty()) {
+                // The first present non-null alias holds the text.
+                if let Some(key) = ["content", "file_text", "file_content"]
+                    .into_iter()
+                    .find(|key| obj.get(*key).is_some_and(|value| !value.is_null()))
+                {
+                    stripped.remove(key);
+                }
+            }
+        }
+        "Edit" => {
+            let has_path = obj
+                .get("file_path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.is_empty());
+            let has_text = ["old_string", "new_string"].into_iter().any(|key| {
+                obj.get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            });
+            if has_path && has_text {
+                stripped.remove("old_string");
+                stripped.remove("new_string");
+            }
+        }
+        _ => {}
+    }
+    Value::Object(stripped)
+}
+
 /// Per-tool ACP shape from a tool name + input (port of `toolInfoFromToolUse`,
 /// `src/tools.ts:131-502`). `cwd` relativises the displayed file paths
 /// (`toDisplayPath`, Decision 6); `supportsTerminalOutput` is always `false`.
@@ -628,6 +769,29 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
 /// facts (`AskUserQuestion`'s fixed title). The permission path keeps the
 /// three-argument [`tool_shape`]; the streamed path passes the map's AIR flag.
 pub fn tool_shape_with(name: &str, input: &Value, cwd: Option<&Path>, air: bool) -> ToolShape {
+    tool_shape_full(name, input, cwd, air, false, false)
+}
+
+/// Full tool shape port of `toolInfoFromToolUse` (`src/tools.ts:131-502`).
+pub fn tool_info_from_tool_use_facts(
+    name: &str,
+    input: &Value,
+    replay: bool,
+    cwd: Option<&Path>,
+    diff_patch: bool,
+) -> ToolShape {
+    tool_shape_full(name, input, cwd, false, replay, diff_patch)
+}
+
+/// [`tool_shape_with`] with replay and diff_patch options (T-40).
+pub fn tool_shape_full(
+    name: &str,
+    input: &Value,
+    cwd: Option<&Path>,
+    air: bool,
+    replay: bool,
+    diff_patch: bool,
+) -> ToolShape {
     match name {
         "Agent" | "Task" => {
             let description = input
@@ -693,6 +857,7 @@ pub fn tool_shape_with(name: &str, input: &Value, cwd: Option<&Path>, air: bool)
         "Write" => {
             let write = normalize_write_input(input);
             let file_path = write.file_path.filter(|path| !path.is_empty());
+            let input_diff = !diff_patch || replay;
             let content = if let Some(path) = file_path {
                 // A client that negotiated diff patches gets the exact patch
                 // from the approval preview / PostToolUse hook; the input does
@@ -700,7 +865,11 @@ pub fn tool_shape_with(name: &str, input: &Value, cwd: Option<&Path>, air: bool)
                 // no diff (`reporters/file-edit.ts:33-55`). This crate serves
                 // no v2 client and `diffPatch` only reaches AIR through the
                 // session wiring; a non-AIR client always gets the input diff.
-                vec![diff_content(path, None, write.content.unwrap_or(""))]
+                if input_diff {
+                    vec![diff_content(path, None, write.content.unwrap_or(""))]
+                } else {
+                    Vec::new()
+                }
             } else if let Some(content) = write.content.filter(|content| !content.is_empty()) {
                 vec![text_content(content)]
             } else {
@@ -3181,5 +3350,102 @@ mod tests {
         let content =
             tool_result_content("PowerShell", &json!({}), None, &json!("files"), false).unwrap();
         assert_eq!(content_text(&content[0]), "```console\nfiles\n```");
+    }
+}
+
+/// The AIR permission presentation and the AIR `rawInput` (`presentation.ts`,
+/// `renderer.ts:729`).
+#[cfg(test)]
+mod air_presentation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn payload(meta: &Value) -> &Value {
+        &meta["jetbrains"]["air"]["permission"]
+    }
+
+    #[test]
+    fn permission_meta_title_description_and_default_to_no() {
+        let meta = air_permission_meta(
+            "Edit",
+            &json!({}),
+            None,
+            "Edit  src/a.rs\n",
+            Some("  rule\tmatched \u{7}here "),
+            true,
+        );
+        assert_eq!(meta["jetbrains"]["air"]["version"], 1);
+        assert_eq!(payload(&meta)["version"], 1);
+        // Whitespace folded, as `humanText(..., singleLine)`.
+        assert_eq!(payload(&meta)["title"], "Edit src/a.rs");
+        // The description keeps its inner whitespace, drops control bytes.
+        assert_eq!(payload(&meta)["description"], "Reason: rule\tmatched here");
+        assert_eq!(payload(&meta)["defaultToNo"], true);
+
+        let plain = air_permission_meta("Edit", &json!({}), None, "Edit a", None, false);
+        assert!(payload(&plain).get("description").is_none());
+        assert!(payload(&plain).get("defaultToNo").is_none());
+    }
+
+    #[test]
+    fn permission_meta_special_titles() {
+        let title = |name: &str, input: Value, display: Option<&str>, call: &str| {
+            air_permission_meta(name, &input, display, call, None, false)["jetbrains"]["air"]
+                ["permission"]["title"]
+                .clone()
+        };
+        assert_eq!(
+            title("ExitPlanMode", json!({}), None, "Ready?"),
+            "Ready to code?"
+        );
+        // A shell command is executable text: not folded.
+        assert_eq!(
+            title("Bash", json!({}), None, "echo  'a  b'"),
+            "echo  'a  b'"
+        );
+        assert_eq!(
+            title(
+                "SandboxNetworkAccess",
+                json!({"host": "example.com"}),
+                None,
+                "x"
+            ),
+            "example.com"
+        );
+        assert_eq!(
+            title(
+                "mcp__computer-use__click",
+                json!({}),
+                Some("Click  here"),
+                "x"
+            ),
+            "Click here"
+        );
+        // Blank or over-long titles fall back.
+        assert_eq!(title("Read", json!({}), None, "   "), "Use tool?");
+        assert_eq!(
+            title("Read", json!({}), None, &"a".repeat(4_001)),
+            "Use tool?"
+        );
+    }
+
+    #[test]
+    fn air_raw_input_drops_the_file_text_a_diff_holds() {
+        let write = json!({"file_path": "/a", "file_text": "t", "content": null, "extra": 1});
+        assert_eq!(
+            air_raw_input("Write", &write),
+            json!({"file_path": "/a", "content": null, "extra": 1})
+        );
+        // No path: no diff is built, so the text stays.
+        let no_path = json!({"content": "t"});
+        assert_eq!(air_raw_input("Write", &no_path), no_path);
+        let edit =
+            json!({"file_path": "/a", "old_string": "o", "new_string": "n", "replace_all": true});
+        assert_eq!(
+            air_raw_input("Edit", &edit),
+            json!({"file_path": "/a", "replace_all": true})
+        );
+        let bash = json!({"command": "ls"});
+        assert_eq!(air_raw_input("Bash", &bash), bash);
     }
 }

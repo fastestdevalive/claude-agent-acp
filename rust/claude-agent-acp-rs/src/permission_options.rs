@@ -19,7 +19,7 @@
 //! context-reset variants are intentionally out of scope (they need a
 //! fresh-query hand-off inside the turn machine — Decision 7 / Open question 4).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use serde_json::{json, Value};
 
@@ -226,7 +226,130 @@ fn with_generated_update(name: &str) -> Vec<Value> {
 /// Normalize a rule path for label display (Node `permissionPath`).
 fn permission_path(rule_content: Option<&Value>) -> Option<String> {
     let value = plain_string(rule_content)?;
-    Some(value.replace("/**", "").replace("\\**", ""))
+    let stripped = if let Some(s) = value.strip_suffix("/**") {
+        s
+    } else if let Some(s) = value.strip_suffix("\\**") {
+        s
+    } else {
+        &value
+    };
+    Some(stripped.to_string())
+}
+
+/// Lexically resolve a path relative to a base directory (port of Node `path.resolve(base, candidate)`),
+/// without touching the filesystem.
+/// Handles `.` and `..` (normalized lexically), Windows drive letters, and prefixes.
+pub fn resolve_lexical(base: &Path, candidate: &str) -> PathBuf {
+    // A drive-relative candidate (`C:foo`) only means that when the base is a
+    // drive path, which std parses only on Windows; elsewhere `C:foo` is a name.
+    if let Some(Component::Prefix(prefix)) = base.components().next() {
+        if let Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) = prefix.kind() {
+            match anchor_drive_relative(char::from(letter), candidate) {
+                Some(DriveRelative::SameDrive(rest)) => return resolve_lexical(base, rest),
+                Some(DriveRelative::OtherDrive(absolute)) => {
+                    return resolve_lexical(base, &absolute);
+                }
+                None => {}
+            }
+        }
+    }
+    let p = Path::new(candidate);
+    let mut resolved = PathBuf::new();
+
+    let candidate_is_abs = p.is_absolute();
+    let candidate_has_root = p.has_root();
+
+    if candidate_is_abs {
+        // Fully absolute candidate (e.g. `/foo` on Unix, or `C:\foo`, `\\server\share\foo` on Windows).
+        // Discards base entirely.
+    } else if candidate_has_root {
+        // Rooted without drive prefix on Windows (e.g. `\foo` or `/foo` on Windows).
+        // Preserves the prefix (drive / UNC) from base if present, then applies candidate root.
+        for comp in base.components() {
+            if let Component::Prefix(pref) = comp {
+                resolved.push(pref.as_os_str());
+            }
+        }
+    } else {
+        // Relative candidate (e.g. `foo/bar`, `../sibling`, or empty candidate `""`).
+        // Starts with all components of base, normalizing `..` and `.`.
+        for comp in base.components() {
+            push_lexical_component(&mut resolved, comp);
+        }
+    }
+
+    if !candidate.is_empty() {
+        for comp in p.components() {
+            push_lexical_component(&mut resolved, comp);
+        }
+    }
+
+    if resolved.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        resolved
+    }
+}
+
+/// What a drive-relative candidate (`C:foo`, `D:`) means next to a base on
+/// `base_drive`, as in Node's win32 `path.resolve`.
+#[derive(Debug, PartialEq, Eq)]
+enum DriveRelative<'a> {
+    /// The base's own drive: the rest is relative to the base (`C:\repo` + `C:foo`).
+    SameDrive(&'a str),
+    /// Another drive: the rest hangs off that drive's root (`D:foo` -> `D:\foo`;
+    /// Node would use that drive's own cwd, which the adapter never knows).
+    OtherDrive(String),
+}
+
+/// `None` unless `candidate` is `<letter>:` followed by nothing or by a
+/// character that is neither `\` nor `/` (a rooted or absolute form).
+fn anchor_drive_relative(base_drive: char, candidate: &str) -> Option<DriveRelative<'_>> {
+    let mut chars = candidate.chars();
+    let letter = chars.next().filter(char::is_ascii_alphabetic)?;
+    if chars.next() != Some(':') {
+        return None;
+    }
+    let rest = &candidate[2..];
+    if rest.starts_with(['\\', '/']) {
+        return None;
+    }
+    Some(if letter.eq_ignore_ascii_case(&base_drive) {
+        DriveRelative::SameDrive(rest)
+    } else {
+        DriveRelative::OtherDrive(format!("{letter}:\\{rest}"))
+    })
+}
+
+fn push_lexical_component(buf: &mut PathBuf, comp: Component<'_>) {
+    match comp {
+        Component::Prefix(prefix) => {
+            buf.push(prefix.as_os_str());
+        }
+        Component::RootDir => {
+            buf.push(Component::RootDir);
+        }
+        Component::CurDir => {}
+        Component::ParentDir => {
+            match buf.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    buf.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {
+                    // Cannot escape above root in an absolute or rooted path.
+                }
+                Some(Component::ParentDir) | None => {
+                    buf.push(Component::ParentDir);
+                }
+                Some(Component::CurDir) => {
+                    buf.pop();
+                }
+            }
+        }
+        Component::Normal(name) => {
+            buf.push(name);
+        }
+    }
 }
 
 /// Node's `isInside` (`options/filesystem.js`).
@@ -260,12 +383,20 @@ fn build_unsorted_options(ctx: &OptionsContext) -> Vec<Value> {
     match ctx.tool_name.as_str() {
         "Bash" => build_shell_options(ctx, "Bash"),
         "PowerShell" => build_shell_options(ctx, "PowerShell"),
-        "Read" => build_file_options(ctx, "file_path", "read"),
-        "Glob" => build_file_options(ctx, "path", "read"),
-        "Grep" => build_file_options(ctx, "path", "read"),
-        "Edit" => build_file_options(ctx, "file_path", "write"),
-        "Write" => build_file_options(ctx, "file_path", "write"),
-        "NotebookEdit" => build_file_options(ctx, "notebook_path", "write"),
+        "Read" => build_file_options(ctx, input_path(ctx, "file_path"), "read"),
+        "Glob" => build_file_options(
+            ctx,
+            input_path(ctx, "path").or_else(|| Some(ctx.cwd.to_string_lossy().to_string())),
+            "read",
+        ),
+        "Grep" => build_file_options(
+            ctx,
+            input_path(ctx, "path").or_else(|| Some(ctx.cwd.to_string_lossy().to_string())),
+            "read",
+        ),
+        "Edit" => build_file_options(ctx, input_path(ctx, "file_path"), "write"),
+        "Write" => build_file_options(ctx, input_path(ctx, "file_path"), "write"),
+        "NotebookEdit" => build_file_options(ctx, input_path(ctx, "notebook_path"), "write"),
         "WebFetch" => build_webfetch_options(ctx),
         "Skill" => build_skill_options(ctx),
         "EnterPlanMode" => build_enter_plan_mode_options(),
@@ -275,8 +406,12 @@ fn build_unsorted_options(ctx: &OptionsContext) -> Vec<Value> {
     }
 }
 
-fn build_file_options(ctx: &OptionsContext, input_key: &str, operation: &str) -> Vec<Value> {
-    let label = file_session_label(ctx, input_key, operation);
+fn build_file_options(
+    ctx: &OptionsContext,
+    file_path: Option<String>,
+    operation: &str,
+) -> Vec<Value> {
+    let label = file_session_label(ctx, file_path.as_deref(), operation);
     with_optional_update(ctx.change_set.as_ref(), label.as_deref())
 }
 
@@ -500,32 +635,15 @@ fn build_fallback_options(ctx: &OptionsContext) -> Vec<Value> {
 }
 
 /// Extract a URL's hostname, mirroring Node `new URL(input).hostname`.
-/// Requires an absolute URL with a `scheme://host` authority; returns `None`
-/// when Node would throw (no scheme / invalid).
+/// Requires an absolute URL with a non-empty hostname; returns `None`
+/// when Node would throw (no scheme / invalid / empty host).
 fn url_hostname(url: &str) -> Option<String> {
-    // Find the authority after `scheme://`.
-    let after_scheme = url.find("://")?;
-    let authority = &url[after_scheme + 3..];
-    // Cut at the first path/query/fragment delimiter.
-    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
-    if authority.is_empty() {
-        return None;
-    }
-    // Strip userinfo (`user:pass@`).
-    let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    // Strip port (`:port`). Keep a bracketed IPv6 host intact (`[::1]:8080` ->
-    // `[::1]`), matching Node's `new URL(url).hostname` which keeps the brackets.
-    let host = if let Some(rest) = hostport.strip_prefix('[') {
-        let end = rest.find(']')?;
-        format!("[{}]", &rest[..end])
-    } else {
-        hostport.split(':').next().unwrap_or(hostport).to_string()
-    };
-    let host = host.to_ascii_lowercase();
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
     if host.is_empty() {
         None
     } else {
-        Some(host)
+        Some(host.to_string())
     }
 }
 
@@ -641,7 +759,7 @@ fn has_accept_edits_mode(change_set: &ChangeSet) -> bool {
 fn effect_covers_file_path(ctx: &OptionsContext, file_path: &Path, operation: &str) -> bool {
     let directory = file_path.parent().unwrap_or(Path::new(""));
     let comparable = |candidate: &str| -> bool {
-        let resolved = ctx.cwd.join(candidate);
+        let resolved = resolve_lexical(&ctx.cwd, candidate);
         resolved == directory || is_inside(&resolved, file_path)
     };
     let Some(change_set) = ctx.change_set.as_ref() else {
@@ -689,26 +807,30 @@ fn effect_covers_file_path(ctx: &OptionsContext, file_path: &Path, operation: &s
 
 /// Node `fileSessionLabel` (`options/filesystem.js`): the durable label for
 /// read/write tools, or `None` when the change set is not a file session set.
-fn file_session_label(ctx: &OptionsContext, input_key: &str, operation: &str) -> Option<String> {
+fn file_session_label(
+    ctx: &OptionsContext,
+    file_path_raw: Option<&str>,
+    operation: &str,
+) -> Option<String> {
     let change_set = ctx.change_set.as_ref()?;
     if !is_file_session_change_set(change_set, operation) {
         return None;
     }
-    let file_path = input_path(ctx, input_key).map(|p| ctx.cwd.join(&p));
-    let resolved_file_path = file_path.as_deref();
+    let resolved_file_path = file_path_raw.map(|p| resolve_lexical(&ctx.cwd, p));
     let is_claude_path = operation == "write"
         && resolved_file_path
+            .as_deref()
             .map(|p| {
-                let cwd_claude = ctx.cwd.join(".claude");
-                let home_claude = ctx.home_dir.clone().unwrap_or_default().join(".claude");
-                is_inside(&cwd_claude, p) || is_inside(&home_claude, p)
+                let cwd_claude = resolve_lexical(&ctx.cwd, ".claude");
+                let home_claude = ctx.home_dir.as_ref().map(|h| resolve_lexical(h, ".claude"));
+                is_inside(&cwd_claude, p) || home_claude.as_ref().is_some_and(|h| is_inside(h, p))
             })
             .unwrap_or(false);
     let broad_rule = has_broad_session_allow_rule_for(
         change_set,
         if operation == "read" { "Read" } else { "Edit" },
     );
-    if let Some(p) = resolved_file_path {
+    if let Some(p) = resolved_file_path.as_deref() {
         let covers = effect_covers_file_path(ctx, p, operation)
             || broad_rule
             || (operation == "write" && !is_claude_path && has_accept_edits_mode(change_set));
@@ -725,8 +847,10 @@ fn file_session_label(ctx: &OptionsContext, input_key: &str, operation: &str) ->
     {
         return Some("Yes, and allow Claude to edit its own settings for this session".to_string());
     }
+    let resolved_cwd = resolve_lexical(&ctx.cwd, "");
     let in_cwd = resolved_file_path
-        .map(|p| is_inside(&ctx.cwd, p))
+        .as_deref()
+        .map(|p| is_inside(&resolved_cwd, p))
         .unwrap_or(false);
     if resolved_file_path.is_none() || in_cwd {
         return Some(if operation == "read" {
@@ -736,6 +860,7 @@ fn file_session_label(ctx: &OptionsContext, input_key: &str, operation: &str) ->
         });
     }
     let directory = resolved_file_path
+        .as_deref()
         .and_then(|p| p.parent())
         .unwrap_or(Path::new(""));
     let directory_name = directory
@@ -769,10 +894,106 @@ fn display_list(values: &[&str]) -> String {
     }
 }
 
+fn normalize_path_for_display(p: &str) -> String {
+    let has_trailing_slash = p.ends_with('/');
+    let is_abs = p.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in p.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        } else if comp == ".." {
+            if !parts.is_empty() && parts.last() != Some(&"..") {
+                parts.pop();
+            } else if !is_abs {
+                parts.push("..");
+            }
+        } else {
+            parts.push(comp);
+        }
+    }
+    let base = if is_abs {
+        if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
+    } else if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    };
+    if has_trailing_slash && !base.ends_with('/') {
+        format!("{base}/")
+    } else {
+        base
+    }
+}
+
+fn display_paths(paths: &[String]) -> String {
+    let mut normalized_paths: Vec<String> = Vec::new();
+    for p in paths {
+        let norm = normalize_path_for_display(p);
+        if !normalized_paths.contains(&norm) {
+            normalized_paths.push(norm);
+        }
+    }
+    if normalized_paths.is_empty() {
+        return String::new();
+    }
+    let segments: Vec<Vec<String>> = normalized_paths
+        .iter()
+        .map(|p| {
+            p.split('/')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .collect();
+
+    let suffix = |idx: usize, depth: usize| -> String {
+        let segs = &segments[idx];
+        if depth <= segs.len() && !segs.is_empty() {
+            segs[segs.len() - depth..].join("/")
+        } else {
+            normalized_paths[idx].clone()
+        }
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    for index in 0..normalized_paths.len() {
+        let parts = &segments[index];
+        let mut name = parts
+            .last()
+            .cloned()
+            .unwrap_or_else(|| normalized_paths[index].clone());
+        for depth in 1..=parts.len() {
+            let candidate = suffix(index, depth);
+            let is_unique = (0..normalized_paths.len())
+                .all(|other| other == index || suffix(other, depth) != candidate);
+            if is_unique {
+                name = candidate;
+                break;
+            }
+            if depth == parts.len() {
+                name = normalized_paths[index].clone();
+            }
+        }
+        if !name.ends_with('/') {
+            name.push('/');
+        }
+        names.push(name);
+    }
+
+    if names.len() <= 2 {
+        let name_strs: Vec<&str> = names.iter().map(String::as_str).collect();
+        display_list(&name_strs)
+    } else {
+        format!("{}, {} and {} more", names[0], names[1], names.len() - 2)
+    }
+}
+
 /// Plain-text port of Claude Code's `generateShellSuggestionsLabel`
-/// (`options/shell.js`). Only the commands-only form (no read paths /
-/// directories) is reproduced; the path-shortening forms fall back to `None`
-/// (Yes/No) as the existing `durable_bash` port documented (PARITY C).
+/// (`options/shell.js`).
 fn shell_suggestions_label(tool_name: &str, change_set: &ChangeSet) -> Option<String> {
     let representable = change_set.updates.iter().all(|update| {
         if update.get("type").and_then(Value::as_str) == Some("addDirectories") {
@@ -808,17 +1029,20 @@ fn shell_suggestions_label(tool_name: &str, change_set: &ChangeSet) -> Option<St
                 .unwrap_or_default()
         })
         .collect();
-    let has_read_paths = rules
+
+    let mut read_paths: Vec<String> = Vec::new();
+    for rule in rules
         .iter()
-        .any(|rule| rule.get("toolName").and_then(Value::as_str) == Some("Read"));
-    let has_directories = change_set
-        .updates
-        .iter()
-        .any(|u| u.get("type").and_then(Value::as_str) == Some("addDirectories"));
-    if has_read_paths || has_directories {
-        // Path forms are not reproduced (PARITY C): Yes/No fallback.
-        return None;
+        .filter(|rule| rule.get("toolName").and_then(Value::as_str) == Some("Read"))
+    {
+        if let Some(content) = rule.get("ruleContent").and_then(Value::as_str) {
+            let stripped = content.strip_suffix("/**").unwrap_or(content);
+            if !stripped.is_empty() {
+                read_paths.push(stripped.to_string());
+            }
+        }
     }
+
     let mut commands: Vec<&str> = Vec::new();
     for rule in rules
         .iter()
@@ -831,13 +1055,68 @@ fn shell_suggestions_label(tool_name: &str, change_set: &ChangeSet) -> Option<St
             }
         }
     }
-    if commands.is_empty() {
-        return None;
+
+    let mut directories: Vec<String> = Vec::new();
+    for update in change_set
+        .updates
+        .iter()
+        .filter(|u| u.get("type").and_then(Value::as_str) == Some("addDirectories"))
+    {
+        if let Some(dirs) = update.get("directories").and_then(Value::as_array) {
+            for dir in dirs {
+                if let Some(d) = dir.as_str() {
+                    directories.push(d.to_string());
+                }
+            }
+        }
     }
-    Some(format!(
-        "Yes, and don't ask again for {} commands",
-        display_list(&commands)
-    ))
+
+    let has_paths = !read_paths.is_empty() || !directories.is_empty();
+
+    if !read_paths.is_empty() && directories.is_empty() && commands.is_empty() {
+        return Some(format!(
+            "Yes, allow reading from {} from this project",
+            display_paths(&read_paths)
+        ));
+    }
+    if !directories.is_empty() && read_paths.is_empty() && commands.is_empty() {
+        return Some(format!(
+            "Yes, and always allow access to {} from this project",
+            display_paths(&directories)
+        ));
+    }
+    if !commands.is_empty() && !has_paths {
+        return Some(format!(
+            "Yes, and don't ask again for {} commands",
+            display_list(&commands)
+        ));
+    }
+    if has_paths && commands.is_empty() {
+        let mut all_paths = directories;
+        all_paths.extend(read_paths);
+        return Some(format!(
+            "Yes, and always allow access to {} from this project",
+            display_paths(&all_paths)
+        ));
+    }
+    if has_paths && !commands.is_empty() {
+        let mut all_paths = directories;
+        all_paths.extend(read_paths);
+        return Some(if all_paths.len() == 1 && commands.len() == 1 {
+            format!(
+                "Yes, and allow access to {} and {} commands",
+                display_paths(&all_paths),
+                display_list(&commands)
+            )
+        } else {
+            format!(
+                "Yes, and allow {} access and {} commands",
+                display_paths(&all_paths),
+                display_list(&commands)
+            )
+        });
+    }
+    None
 }
 
 // --- selection effects (`dist/permissions/effects.js`) ---
@@ -1196,11 +1475,202 @@ mod tests {
             );
             let options = build_options(&g);
             assert_eq!(options[1]["name"], "Yes, during this session");
+
+            // P-23: When input.path is missing, default to cwd so session rule covers it.
+            let g_missing_path = with_changeset(
+                ctx(tool, json!({})),
+                vec![json!({
+                    "type":"addRules",
+                    "rules":[{"toolName":"Read","ruleContent":"/repo/**"}],
+                    "behavior":"allow",
+                    "destination":"session"
+                })],
+            );
+            let options_missing = build_options(&g_missing_path);
+            assert_eq!(
+                options_missing[1]["name"], "Yes, during this session",
+                "missing path in {tool} defaults to cwd"
+            );
         }
+
+        // P-24: Trailing /** or \** is stripped, but not from the middle.
+        assert_eq!(
+            permission_path(Some(&json!("/repo/**"))).as_deref(),
+            Some("/repo")
+        );
+        assert_eq!(
+            permission_path(Some(&json!("C:\\repo\\**"))).as_deref(),
+            Some("C:\\repo")
+        );
+        assert_eq!(
+            permission_path(Some(&json!("/repo/**/sub/**"))).as_deref(),
+            Some("/repo/**/sub")
+        );
 
         // Without a session change set, Read offers Yes/No only.
         let plain = build_options(&ctx("Read", json!({ "file_path": "a.rs" })));
         assert_eq!(ids(&plain), vec!["allow-once", "reject"]);
+    }
+
+    /// P-20 — Bash and PowerShell durable labels for path, directory, command, and mixed forms.
+    #[test]
+    fn p20_shell_suggestions_durable_labels() {
+        // 1. Single command
+        let bash_cmd = with_changeset(
+            ctx("Bash", json!({ "command": "npm test" })),
+            vec![json!({
+                "type": "addRules",
+                "rules": [{ "toolName": "Bash", "ruleContent": "npm test:*" }],
+                "behavior": "allow",
+                "destination": "session",
+            })],
+        );
+        assert_eq!(
+            build_options(&bash_cmd)[1]["name"],
+            "Yes, and don't ask again for npm test commands"
+        );
+
+        // PowerShell single command
+        let ps_cmd = with_changeset(
+            ctx("PowerShell", json!({ "command": "Get-Process" })),
+            vec![json!({
+                "type": "addRules",
+                "rules": [{ "toolName": "PowerShell", "ruleContent": "Get-Process:*" }],
+                "behavior": "allow",
+                "destination": "session",
+            })],
+        );
+        assert_eq!(
+            build_options(&ps_cmd)[1]["name"],
+            "Yes, and don't ask again for Get-Process commands"
+        );
+
+        // 2. Read path only
+        let bash_read = with_changeset(
+            ctx("Bash", json!({ "command": "cat /outside/a" })),
+            vec![json!({
+                "type": "addRules",
+                "rules": [{ "toolName": "Read", "ruleContent": "/outside/**" }],
+                "behavior": "allow",
+                "destination": "session",
+            })],
+        );
+        assert_eq!(
+            build_options(&bash_read)[1]["name"],
+            "Yes, allow reading from outside/ from this project"
+        );
+
+        // 3. Directory only
+        let bash_dir = with_changeset(
+            ctx("Bash", json!({ "command": "ls /outside" })),
+            vec![json!({
+                "type": "addDirectories",
+                "directories": ["/outside"],
+                "destination": "session",
+            })],
+        );
+        assert_eq!(
+            build_options(&bash_dir)[1]["name"],
+            "Yes, and always allow access to outside/ from this project"
+        );
+
+        // 4. Single directory + single command
+        let bash_dir_cmd = with_changeset(
+            ctx("Bash", json!({ "command": "npm test" })),
+            vec![
+                json!({
+                    "type": "addDirectories",
+                    "directories": ["/work"],
+                    "destination": "session",
+                }),
+                json!({
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "npm test:*" }],
+                    "behavior": "allow",
+                    "destination": "session",
+                }),
+            ],
+        );
+        assert_eq!(
+            build_options(&bash_dir_cmd)[1]["name"],
+            "Yes, and allow access to work/ and npm test commands"
+        );
+
+        // 5. Mixed: directory + read path + command
+        let bash_mixed = with_changeset(
+            ctx("Bash", json!({ "command": "npm test" })),
+            vec![
+                json!({
+                    "type": "addDirectories",
+                    "directories": ["/work"],
+                    "destination": "session",
+                }),
+                json!({
+                    "type": "addRules",
+                    "rules": [
+                        { "toolName": "Read", "ruleContent": "/outside/**" },
+                        { "toolName": "Bash", "ruleContent": "npm test:*" },
+                    ],
+                    "behavior": "allow",
+                    "destination": "session",
+                }),
+            ],
+        );
+        assert_eq!(
+            build_options(&bash_mixed)[1]["name"],
+            "Yes, and allow work/ and outside/ access and npm test commands"
+        );
+
+        // 6. Shortest distinguishing parent
+        let bash_dist = with_changeset(
+            ctx("Bash", json!({ "command": "ls -R" })),
+            vec![json!({
+                "type": "addRules",
+                "rules": [
+                    { "toolName": "Read", "ruleContent": "/repos/codex-acp/src/**" },
+                    { "toolName": "Read", "ruleContent": "/repos/claude-agent-acp/src/**" },
+                    { "toolName": "Bash", "ruleContent": "ls -R:*" },
+                ],
+                "behavior": "allow",
+                "destination": "session",
+            })],
+        );
+        assert_eq!(
+            build_options(&bash_dist)[1]["name"],
+            "Yes, and allow codex-acp/src/ and claude-agent-acp/src/ access and ls -R commands"
+        );
+
+        // 7. Similar truncation for long commands
+        let bash_long = with_changeset(
+            ctx("Bash", json!({ "command": "a" })),
+            vec![json!({
+                "type": "addRules",
+                "rules": [
+                    { "toolName": "Bash", "ruleContent": "a-very-long-command-name-one:*" },
+                    { "toolName": "Bash", "ruleContent": "a-very-long-command-name-two:*" },
+                ],
+                "behavior": "allow",
+                "destination": "session",
+            })],
+        );
+        assert_eq!(
+            build_options(&bash_long)[1]["name"],
+            "Yes, and don't ask again for similar commands"
+        );
+
+        // 8. Multiple directories (> 2 paths)
+        let bash_3dirs = with_changeset(
+            ctx("Bash", json!({ "command": "ls" })),
+            vec![json!({
+                "type": "addDirectories",
+                "directories": ["/p1", "/p2", "/p3"],
+                "destination": "session",
+            })],
+        );
+        assert_eq!(
+            build_options(&bash_3dirs)[1]["name"],
+            "Yes, and always allow access to p1/, p2/ and 1 more from this project"
+        );
     }
 
     /// P7 — WebFetch offers a generated domain rule, Skill offers exact/prefix
@@ -1664,5 +2134,65 @@ mod tests {
             url_hostname("http://user:pass@example.com:80/x").as_deref(),
             Some("example.com")
         );
+    }
+
+    /// String-level only: the host is macOS, where std does not parse `C:` as a
+    /// prefix, so `resolve_lexical` itself cannot be run on a Windows base.
+    /// Node's win32 `path.resolve("C:\\repo", ...)` gave `C:\repo\foo` for
+    /// `C:foo`, `C:\repo` for `C:`, `C:\x` for `C:..\x`, `C:\foo` for `C:\foo`,
+    /// `C:/foo` and `\foo`, and `\\srv\sh\f` for the UNC form.
+    #[test]
+    fn drive_relative_candidates_are_anchored_like_win32_resolve() {
+        use DriveRelative::{OtherDrive, SameDrive};
+        assert_eq!(anchor_drive_relative('C', "C:foo"), Some(SameDrive("foo")));
+        assert_eq!(
+            anchor_drive_relative('C', "c:foo\\bar"),
+            Some(SameDrive("foo\\bar"))
+        );
+        assert_eq!(anchor_drive_relative('C', "C:"), Some(SameDrive("")));
+        assert_eq!(
+            anchor_drive_relative('C', "C:..\\x"),
+            Some(SameDrive("..\\x"))
+        );
+        assert_eq!(anchor_drive_relative('c', "C:foo"), Some(SameDrive("foo")));
+        assert_eq!(
+            anchor_drive_relative('C', "D:foo"),
+            Some(OtherDrive("D:\\foo".to_string()))
+        );
+        assert_eq!(
+            anchor_drive_relative('C', "D:"),
+            Some(OtherDrive("D:\\".to_string()))
+        );
+        // Fully absolute, rooted, UNC and plain relative forms are left alone.
+        for untouched in [
+            "C:\\foo",
+            "C:/foo",
+            "\\foo",
+            "/foo",
+            "\\\\srv\\sh\\f",
+            "foo",
+            "",
+            "1:foo",
+            "C",
+        ] {
+            assert_eq!(anchor_drive_relative('C', untouched), None, "{untouched}");
+        }
+        // The rest, resolved against the base, is what Node prints.
+        assert_eq!(
+            resolve_lexical(Path::new("/repo"), "foo"),
+            PathBuf::from("/repo/foo")
+        );
+        // On this host a POSIX base never takes the drive branch: `C:foo` is a name.
+        assert_eq!(
+            resolve_lexical(Path::new("/repo"), "C:foo"),
+            PathBuf::from("/repo/C:foo")
+        );
+    }
+
+    /// Only a trailing `/` is the marker: a trailing `\` stays part of the name.
+    #[test]
+    fn trailing_backslash_is_not_a_trailing_slash() {
+        assert_eq!(normalize_path_for_display("a\\b\\"), "a\\b\\");
+        assert_eq!(normalize_path_for_display("a\\b\\/"), "a\\b\\/");
     }
 }

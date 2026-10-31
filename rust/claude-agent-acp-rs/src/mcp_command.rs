@@ -905,6 +905,10 @@ pub struct McpTurn {
     pub prepared: Option<McpPrepared>,
     /// Whether the replacement (or the kept CLI text) has been published.
     pub delivered: bool,
+    /// The spawned control run started: the turn's result must wait for its
+    /// [`McpPrepared`] (`await pending` in `takeLocalCommandMarkdown`) instead of
+    /// publishing the CLI text.
+    pub run_started: bool,
 }
 
 impl McpTurns {
@@ -917,6 +921,7 @@ impl McpTurns {
                 message_id: None,
                 prepared: None,
                 delivered: false,
+                run_started: false,
             },
         );
     }

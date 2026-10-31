@@ -67,6 +67,8 @@ pub struct SessionExt {
     pub goal: crate::goal::GoalState,
     /// Session title state machine (Decision 13 / D6).
     pub titles: crate::session_titles::SessionTitles,
+    /// Failure context recorded from assistant frames for the active turn (G9).
+    pub failure_ctx: crate::session_failure::AssistantFailureCtx,
 }
 
 impl SessionExt {
@@ -95,6 +97,7 @@ impl SessionExt {
             mcp: crate::mcp_command::McpTurns::default(),
             goal: crate::goal::GoalState::default(),
             titles: crate::session_titles::SessionTitles::new(),
+            failure_ctx: crate::session_failure::AssistantFailureCtx::default(),
         }
     }
 

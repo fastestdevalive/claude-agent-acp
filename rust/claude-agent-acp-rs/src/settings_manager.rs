@@ -236,13 +236,13 @@ async fn run_watcher(mut cfg: WatcherConfig) {
                         if new_cwd != cfg.current_cwd {
                             cfg.current_cwd = new_cwd;
                             let new_settings = reload(&cfg.current_cwd);
+                            // Upstream `setCwd` (`settings.ts:215-223`) disposes,
+                            // swaps the cwd and re-initializes: it reloads the
+                            // settings but never fires `onChange`.
                             let _ = cfg.state_tx.send(State {
                                 cwd: cfg.current_cwd.clone(),
                                 settings: new_settings,
                             });
-                            if let Some(cb) = &cfg.on_change {
-                                cb();
-                            }
                             watched_paths = watched_paths_for(
                                 &cfg.current_cwd,
                                 &cfg.env,

@@ -1,0 +1,56 @@
+{
+  "permission": "allow",
+  "steps": [
+    {
+      "call": "initialize"
+    },
+    {
+      "call": "session/new"
+    },
+    {
+      "call": "session/prompt",
+      "text": "dying turn"
+    },
+    {
+      "call": "sleep",
+      "ms": 300
+    },
+    {
+      "call": "request",
+      "method": "session/set_mode",
+      "params": {
+        "sessionId": "$SESSION",
+        "modeId": "plan"
+      },
+      "expect_error": true
+    },
+    {
+      "call": "request",
+      "method": "session/set_config_option",
+      "params": {
+        "sessionId": "$SESSION",
+        "configId": "mode",
+        "value": "plan"
+      },
+      "expect_error": true
+    },
+    {
+      "call": "request",
+      "method": "_session/steering",
+      "params": {
+        "sessionId": "$SESSION",
+        "prompt": [
+          {
+            "type": "text",
+            "text": "hi"
+          }
+        ]
+      },
+      "expect_error": true
+    },
+    {
+      "call": "session/prompt",
+      "text": "after eof"
+    }
+  ]
+}

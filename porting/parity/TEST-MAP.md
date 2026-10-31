@@ -6,40 +6,40 @@
 # Wildcard rows (`*`, `<prefix> > *`) may only be missing:<id>.
 
 file | case title | status | note
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > uses permissions.defaultMode for new sessions | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > initial effort reflects SDK state: %j | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > keeps a settings-requested ultracode on when applying effort | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > seeds effort from higher-priority programmatic model settings | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > supports acceptEdits mode defaults | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > drops escalating defaultMode when it comes from project-tier settings | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > honors the host opt-out from bypassPermissions | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > honors permissions.disableBypassPermissionsMode from %s settings | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > defaults to 'default' when no permissions.defaultMode is set | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > continues in the last permission mode of the transcript | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > uses permissions.defaultMode when the transcript has no mode | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > uses permissions.defaultMode when bypass is not available now | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > continues in the last permission mode on session/load | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > keeps the live mode when it recreates the session | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > keeps the live mode when a sign-out respawn starts a fresh conversation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > falls back to 'default' when permissions.defaultMode is invalid | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > ignores model from settings when it is not a string | ported:src/session_model.rs::f5b_settings_model_non_string_logged_and_ignored | upstream message text asserted | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > advertises `auto` when the resolved model lacks supportsAutoMode | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > includes `auto` when the resolved model has supportsAutoMode: true | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > falls back permissions.defaultMode='auto' to Accept edits on an unsupported model | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > does not clamp permissions.defaultMode='auto' on a model that supports auto | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > restricts configOptions to the user's allowlist using their exact IDs | covered:config-model-allowlist | Node-captured picker | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > unions availableModels across user and project settings | ported:src/settings.rs::f5b_available_models_union_across_tiers | source-order union+dedupe | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > returns only the default entry when availableModels is an empty array | ported:src/session_model.rs::f5b_allowlist_overrides_custom_option | `[]` -> Default only | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not filter when availableModels is absent from settings | ported:src/session_model.rs::f5b_model_priority_and_empty_env | absent allowlist passes the SDK list | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > passes the user's exact ID to setModel when it matches an SDK alias | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not inherit display info across mismatched model versions | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not inherit display info across mismatched model families | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > preserves ANTHROPIC_CUSTOM_MODEL_OPTION even when absent from the allowlist | ported:src/session_model.rs::f5b_allowlist_overrides_custom_option | appended last, exempt | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not duplicate the custom model option when also in the allowlist | ported:src/session_model.rs::f5b_allowlist_overrides_custom_option | dedupe by seen set | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > maps allowlist aliases through modelOverrides to provider IDs | covered:config-model-overrides | surfaced value and setModel target | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > resolves model aliases like opus[1m] to the correct model | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > skips the initial setModel when the resolved value matches the SDK's model list verbatim | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > still calls setModel when the allowlist synthesizes a value the SDK has not surfaced | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > uses permissions.defaultMode for new sessions | covered:spawn-settings-mode | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > initial effort reflects SDK state: %j | missing:F11 | O-56: creation-time effort seeding, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > keeps a settings-requested ultracode on when applying effort | ported:tests/t1b_config.rs::effort_flag_settings_carries_ultracode_only_when_requested | pure effortFlagSettings; session.rs:1972 passes ext.config.ultracode
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > seeds effort from higher-priority programmatic model settings | missing:F11 | O-50/O-56: session.rs must call merge_effort_settings (ported) for the seed, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > supports acceptEdits mode defaults | covered:spawn-settings-mode | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > drops escalating defaultMode when it comes from project-tier settings | ported:src/settings.rs::inv_57_settings_merge_and_escalation_filter | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > honors the host opt-out from bypassPermissions | covered:spawn-bypass-opt-out | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > honors permissions.disableBypassPermissionsMode from %s settings | covered:spawn-bypass-disabled | each: the user-tier settings seed; the other tiers are covered by settings.rs tests
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > defaults to 'default' when no permissions.defaultMode is set | covered:config-session-new | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > continues in the last permission mode of the transcript | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | resolution; the resumed-tail read is exercised by session-resume
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > uses permissions.defaultMode when the transcript has no mode | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > uses permissions.defaultMode when bypass is not available now | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > continues in the last permission mode on session/load | missing:F11 | session/load mode seeding wiring (session.rs), Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > keeps the live mode when it recreates the session | missing:F34 | session recreation is the --hide-claude-auth respawn (F34)
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > on resume > keeps the live mode when a sign-out respawn starts a fresh conversation | missing:F34 | sign-out respawn is F34
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > falls back to 'default' when permissions.defaultMode is invalid | ported:src/permission_mode.rs::inv_57_invalid_permission_mode_is_logged | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > ignores model from settings when it is not a string | ported:src/session_model.rs::f5b_settings_model_non_string_logged_and_ignored | upstream message text asserted
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > advertises `auto` when the resolved model lacks supportsAutoMode | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > includes `auto` when the resolved model has supportsAutoMode: true | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > falls back permissions.defaultMode='auto' to Accept edits on an unsupported model | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > auto mode availability per model > does not clamp permissions.defaultMode='auto' on a model that supports auto | missing:F11 | P-06/R-01: per-model Auto availability at creation, Turn 5
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > restricts configOptions to the user's allowlist using their exact IDs | covered:config-model-allowlist | Node-captured picker
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > unions availableModels across user and project settings | ported:src/settings.rs::f5b_available_models_union_across_tiers | source-order union+dedupe
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > returns only the default entry when availableModels is an empty array | ported:src/session_model.rs::f5b_allowlist_overrides_custom_option | `[]` -> Default only
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not filter when availableModels is absent from settings | ported:src/session_model.rs::f5b_model_priority_and_empty_env | absent allowlist passes the SDK list
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > passes the user's exact ID to setModel when it matches an SDK alias | covered:config-model-allowlist | + src/session_model.rs::f5b_allowlist_overrides_custom_option
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not inherit display info across mismatched model versions | ported:src/session_model.rs::f5b_family_version_guard | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not inherit display info across mismatched model families | ported:src/session_model.rs::f5b_family_version_guard | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > preserves ANTHROPIC_CUSTOM_MODEL_OPTION even when absent from the allowlist | ported:src/session_model.rs::f5b_allowlist_overrides_custom_option | appended last, exempt
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > does not duplicate the custom model option when also in the allowlist | ported:src/session_model.rs::f5b_allowlist_overrides_custom_option | dedupe by seen set
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > availableModels allowlist from settings > maps allowlist aliases through modelOverrides to provider IDs | covered:config-model-overrides | surfaced value and setModel target
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > resolves model aliases like opus[1m] to the correct model | ported:tests/t1b_model.rs::settings_alias_with_context_hint_resolves_to_the_long_context_row | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > skips the initial setModel when the resolved value matches the SDK's model list verbatim | ported:tests/t1b_model.rs::verbatim_env_model_skips_the_initial_set_model | 
+src/tests/acp-agent-settings.test.ts | ClaudeAcpAgent settings > still calls setModel when the allowlist synthesizes a value the SDK has not surfaced | ported:tests/t1b_model.rs::allowlist_synthesized_value_still_calls_set_model | 
 src/tests/acp-agent.test.ts | task plan lifecycle > republishes the session task snapshot when a follow-up prompt starts | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task plan lifecycle > does not republish a completed plan on an unrelated follow-up | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | task plan lifecycle > clears the task plan on a conversation reset | missing:T-UNCLASSIFIED | 
@@ -68,7 +68,7 @@ src/tests/acp-agent.test.ts | tool conversions > should handle Read tool calls#2
 src/tests/acp-agent.test.ts | tool conversions > should handle Read with limit | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool conversions > should handle Read with offset and limit | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool conversions > should handle Read with only offset | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | tool conversions > should use relative path in title when cwd is provided | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | tool conversions > should use relative path in title when cwd is provided | ported:src/tools.rs::tests::inv_74_display_path_inside | relative path display
 src/tests/acp-agent.test.ts | tool conversions > should handle plan entries | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool conversions > should return empty update for successful edit result | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool conversions > should return content update for edit failure | missing:T-UNCLASSIFIED | 
@@ -87,8 +87,8 @@ src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > should build diff
 src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > should build multiple diff content blocks for replaceAll with multiple hunks | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > should handle deletion (newText becomes empty string) | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > should return empty for empty structuredPatch array | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > emits a whole-file diff for a Write update whose structuredPatch is empty | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > emits a truthful note for a Write update whose previous content was too large to diff | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > emits a whole-file diff for a Write update whose structuredPatch is empty | ported:tests/t1fc_diff_engine.rs::final_change_falls_back_when_no_exact_patch_exists | whole-file diff for both client kinds
+src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > emits a truthful note for a Write update whose previous content was too large to diff | ported:tests/t1fc_diff_engine.rs::final_change_falls_back_when_no_exact_patch_exists | "previous content too large to diff" note
 src/tests/acp-agent.test.ts | toolUpdateFromDiffToolResponse > keeps the empty return for a Write create and for Edit-shaped responses | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stripLocalCommandMetadata > returns null for strings that are pure marker metadata | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | stripLocalCommandMetadata > reconstructs marker-only model-bound slash skill prompts | missing:T-UNCLASSIFIED | 
@@ -163,26 +163,26 @@ src/tests/acp-agent.test.ts | SDK behavior > custom session id | missing:T-UNCLA
 src/tests/acp-agent.test.ts | SDK behavior > uses the API message id as a stable anchor across streaming and replay | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | SDK behavior > keeps the streaming query open across turns and stays done after input ends | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | permission requests > should include title field in tool permission request structure | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > forwards the tool-call signal so a pending permission request is cancelled on abort | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > does not wait for a permission client that ignores cancellation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > does not wait for $name when its client ignores cancellation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > observes a client rejection when the signal aborts during request creation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > does not wait for an eager tool-call update that ignores cancellation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > clears pending ExitPlanMode state even after the query has closed | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > does not emit or request permission for a pre-aborted tool call | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > allows a streamed tool call to retry after eager emission fails | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > treats a cancelled permission outcome as an aborted tool use | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > omits the durable action when Claude supplies no permission update | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > maps explicit reject to deny while retaining Claude classification | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > publishes the effective mode after %s approval | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > keeps the plan approval when publishing the new mode fails | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > interrupts the turn after an ExitPlanMode keep-planning rejection | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > offers ExitPlanMode clear-context with measured usage and records the handoff | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > maps Claude presentation fields without reconstructing provider text or changing input | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > keeps concurrent permission requests independent even for the same tool call | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > applies the exact representable provider updates described by the selected option | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > keeps provider permission effects inside the adapter | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | permission request cancellation > does not expose an update bundle that Claude's Bash dialog cannot label | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | permission request cancellation > forwards the tool-call signal so a pending permission request is cancelled on abort | ported:tests/cancel_request_t1a.rs::u107_cancel_sends_cancel_request_for_the_open_permission | 
+src/tests/acp-agent.test.ts | permission request cancellation > does not wait for a permission client that ignores cancellation | ported:src/session.rs::inv_27_no_inline_await | 
+src/tests/acp-agent.test.ts | permission request cancellation > does not wait for $name when its client ignores cancellation | ported:src/session.rs::inv_27_no_inline_await | 
+src/tests/acp-agent.test.ts | permission request cancellation > observes a client rejection when the signal aborts during request creation | different:the permission request is enqueued synchronously on the outbound channel; there is no creation phase an abort can race | 
+src/tests/acp-agent.test.ts | permission request cancellation > does not wait for an eager tool-call update that ignores cancellation | different:the eager tool_call update is a channel send that never awaits the client | 
+src/tests/acp-agent.test.ts | permission request cancellation > clears pending ExitPlanMode state even after the query has closed | missing:F22 | ExitPlanMode pending state (B-75)
+src/tests/acp-agent.test.ts | permission request cancellation > does not emit or request permission for a pre-aborted tool call | missing:T-PORT | pre-aborted can_use_tool request; behaviour for a withdrawn request is the control.rs inflight abort
+src/tests/acp-agent.test.ts | permission request cancellation > allows a streamed tool call to retry after eager emission fails | missing:T-PORT | eager emission retry
+src/tests/acp-agent.test.ts | permission request cancellation > treats a cancelled permission outcome as an aborted tool use | ported:src/permission.rs::inv_21_deny_payload_and_continue | 
+src/tests/acp-agent.test.ts | permission request cancellation > omits the durable action when Claude supplies no permission update | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
+src/tests/acp-agent.test.ts | permission request cancellation > maps explicit reject to deny while retaining Claude classification | ported:src/permission.rs::inv_21_deny_payload_and_continue | 
+src/tests/acp-agent.test.ts | permission request cancellation > publishes the effective mode after %s approval | missing:F21 | ExitPlanMode mode publish / keep-planning interrupt
+src/tests/acp-agent.test.ts | permission request cancellation > keeps the plan approval when publishing the new mode fails | missing:F21 | ExitPlanMode mode publish / keep-planning interrupt
+src/tests/acp-agent.test.ts | permission request cancellation > interrupts the turn after an ExitPlanMode keep-planning rejection | missing:F21 | ExitPlanMode mode publish / keep-planning interrupt
+src/tests/acp-agent.test.ts | permission request cancellation > offers ExitPlanMode clear-context with measured usage and records the handoff | missing:F22 | ExitPlanMode clear-context
+src/tests/acp-agent.test.ts | permission request cancellation > maps Claude presentation fields without reconstructing provider text or changing input | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
+src/tests/acp-agent.test.ts | permission request cancellation > keeps concurrent permission requests independent even for the same tool call | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
+src/tests/acp-agent.test.ts | permission request cancellation > applies the exact representable provider updates described by the selected option | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
+src/tests/acp-agent.test.ts | permission request cancellation > keeps provider permission effects inside the adapter | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
+src/tests/acp-agent.test.ts | permission request cancellation > does not expose an update bundle that Claude's Bash dialog cannot label | missing:T-PORT | permission option presentation/effects: lane C (permission_options.rs)
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > emits the tool_call (then asks permission) when the stream hasn't yet | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > carries the PowerShell description in claudeCode meta like Bash | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | tool_call emitted before permission request > does not re-emit the tool_call when the stream already surfaced it | missing:T-UNCLASSIFIED | 
@@ -267,53 +267,53 @@ src/tests/acp-agent.test.ts | native subagent eager tool ownership > keeps permi
 src/tests/acp-agent.test.ts | native subagent eager tool ownership > pins a raced child tool lifecycle to the root where permission created it | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | runPromptWithCancellation > cancels the in-flight prompt when the request signal aborts ($/cancel_request) | ported:tests/wire_transport.rs::wire_cancel_request_cancels_the_prompt | prompt settles `cancelled` via the session cancel path |
 src/tests/acp-agent.test.ts | runPromptWithCancellation > does not cancel after the prompt settles normally | ported:tests/wire_transport.rs::wire_late_cancel_request_is_ignored | the cancellation watch is dropped with the reply | 
-src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when success result has stop_reason max_tokens | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when success result has stop_reason max_tokens and is_error true | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when error_during_execution has stop_reason max_tokens | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > should return end_turn for success with null stop_reason | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > should consume background task results and return the prompt's own result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > only reconciles Fast mode from user-driven results, not task-notification followups | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > does not fold a task-notification result's tokens into an already-active turn's usage | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > ignores command_lifecycle frames without logging an unexpected-case error | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > treats the command_lifecycle 'refused' state (2.1.238+) as terminal, not unknown | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when success result has stop_reason max_tokens | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
+src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when success result has stop_reason max_tokens and is_error true | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
+src/tests/acp-agent.test.ts | stop reason propagation > should return max_tokens when error_during_execution has stop_reason max_tokens | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
+src/tests/acp-agent.test.ts | stop reason propagation > should return end_turn for success with null stop_reason | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
+src/tests/acp-agent.test.ts | stop reason propagation > should consume background task results and return the prompt's own result | ported:src/turn/turn_tests.rs::autonomous_result_does_not_touch_live_turn | 
+src/tests/acp-agent.test.ts | stop reason propagation > only reconciles Fast mode from user-driven results, not task-notification followups | missing:T-PORT | Fast mode reconcile on user results only (lane B fast-mode config)
+src/tests/acp-agent.test.ts | stop reason propagation > does not fold a task-notification result's tokens into an already-active turn's usage | ported:src/turn/turn_tests.rs::inv_48_machine_autonomous_advances_reading_not_tally | 
+src/tests/acp-agent.test.ts | stop reason propagation > ignores command_lifecycle frames without logging an unexpected-case error | ported:src/turn/turn_tests_t1a.rs::f13_lifecycle_diagnostics | 
+src/tests/acp-agent.test.ts | stop reason propagation > treats the command_lifecycle 'refused' state (2.1.238+) as terminal, not unknown | ported:src/turn/turn_tests_t1a.rs::f13_lifecycle_diagnostics | 
 src/tests/acp-agent.test.ts | stop reason propagation > publishes active_goal as provider-neutral session state without changing turn settlement | covered:goal-set-clear | runtime snapshot then `goal:null` after the result; unit inv_53_to_goal_snapshot 
 src/tests/acp-agent.test.ts | stop reason propagation > publishes a submitted goal before a long-running command returns without active_goal | covered:goal-set-clear | optimistic update before the result; unit inv_53_optimistic_publish_and_pending 
 src/tests/acp-agent.test.ts | stop reason propagation > rolls back an optimistic goal update when the goal command fails | ported:src/goal.rs::inv_53_rollback_on_failed_result | started + failed result publishes `previous`; actor result hook session.rs:2940 
 src/tests/acp-agent.test.ts | stop reason propagation > derives only state-changing goal slash commands | ported:src/goal.rs::inv_53_goal_update_from_prompt | exact upstream table (clear/bare/mention/leading space) 
 src/tests/acp-agent.test.ts | stop reason propagation > maps the SDK goal shape without exposing provider fields | ported:src/goal.rs::inv_53_to_goal_snapshot | provider fields dropped; `lastReason:null`, `createdAt` 
-src/tests/acp-agent.test.ts | stop reason propagation > settles a no-echo command result (e.g. /compact) by promoting the head turn | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > resolves at the terminal result without waiting for a lagging idle (issue #773) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > forwards background output that arrives after the turn resolves (issue #679) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > should throw internal error for success with is_error true and no max_tokens | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > publishes the Claude failure title for compatible AIR version %i | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > updates an api retry warning into the terminal failure | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > says how long a no-response retry waited and will wait | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > clears a connection retry warning internally after the turn succeeds | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > does not publish typed failures for %s | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > maps SDK error %s to broad category %s | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > classifies a live synthetic spend limit as exhausted quota | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > keeps the prior turn's context usage when a fresh turn is refused for quota | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > preserves live usage-limit prose for clients without typed failures | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > maps terminal subtype %s to %s | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > rejects authentication_failed through ACP without an access update | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > recovers auth_required internally after a successful auth_status | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > keeps auth_required active when auth_status reports an error | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > does not republish auth_required when the result repeats the login text | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > does not treat a successful answer mentioning /login as auth_required | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > rejects a later sign-out after a real model answer | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > publishes no retry warning for an authentication_failed api_retry | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > keeps the historical failure record unchanged after recovery | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > does not publish a clear record when the next turn is refused | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > does not publish clear records on repeated successful turns | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > logs loudly when a failure has no active turn to reject | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > retains a replayed worker shutdown through later buffered activity | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > returns an active-turn worker shutdown on PromptResponse only at live tail | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > publishes an idle worker shutdown as a session update only | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > ignores a late worker shutdown from a replaced query consumer | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > uses a fresh session-scoped failure identity for each query-stream consumer | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > publishes and returns a sanitized transport failure when the query iterator throws | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > forwards SDKAssistantMessage.error as structured data on internal errors | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | stop reason propagation > omits errorKind data when no SDKAssistantMessage.error was observed | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | stop reason propagation > settles a no-echo command result (e.g. /compact) by promoting the head turn | ported:src/turn/turn_tests.rs::echo_less_result_promotes_head | 
+src/tests/acp-agent.test.ts | stop reason propagation > resolves at the terminal result without waiting for a lagging idle (issue #773) | covered:lagging-idle | 
+src/tests/acp-agent.test.ts | stop reason propagation > forwards background output that arrives after the turn resolves (issue #679) | missing:F14 | post-settle background output with real task frames
+src/tests/acp-agent.test.ts | stop reason propagation > should throw internal error for success with is_error true and no max_tokens | ported:src/turn/turn_tests.rs::result_subtype_grid | 
+src/tests/acp-agent.test.ts | stop reason propagation > publishes the Claude failure title for compatible AIR version %i | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > updates an api retry warning into the terminal failure | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > says how long a no-response retry waited and will wait | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > clears a connection retry warning internally after the turn succeeds | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > does not publish typed failures for %s | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > maps SDK error %s to broad category %s | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > classifies a live synthetic spend limit as exhausted quota | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > keeps the prior turn's context usage when a fresh turn is refused for quota | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > preserves live usage-limit prose for clients without typed failures | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > maps terminal subtype %s to %s | ported:src/turn/turn_tests.rs::result_subtype_grid | table-driven (.each/loop): every row of the table is asserted by the cited test
+src/tests/acp-agent.test.ts | stop reason propagation > rejects authentication_failed through ACP without an access update | covered:auth-required | 
+src/tests/acp-agent.test.ts | stop reason propagation > recovers auth_required internally after a successful auth_status | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > keeps auth_required active when auth_status reports an error | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > does not republish auth_required when the result repeats the login text | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > does not treat a successful answer mentioning /login as auth_required | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > rejects a later sign-out after a real model answer | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > publishes no retry warning for an authentication_failed api_retry | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > keeps the historical failure record unchanged after recovery | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > does not publish a clear record when the next turn is refused | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > does not publish clear records on repeated successful turns | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > logs loudly when a failure has no active turn to reject | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > retains a replayed worker shutdown through later buffered activity | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > returns an active-turn worker shutdown on PromptResponse only at live tail | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > publishes an idle worker shutdown as a session update only | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > ignores a late worker shutdown from a replaced query consumer | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > uses a fresh session-scoped failure identity for each query-stream consumer | missing:F25 | session failure completion / auth recovery / worker shutdown
+src/tests/acp-agent.test.ts | stop reason propagation > publishes and returns a sanitized transport failure when the query iterator throws | ported:src/session/tests_t1ga.rs::t1ga_air_child_death_ends_the_active_turn_with_transport_lost | AIR active turn ends end_turn with transport_lost meta; also t1ga_air_child_death_without_an_active_turn_publishes_the_failure_on_the_session and the Node-captured process-death-active-air / process-death-reload-air
+src/tests/acp-agent.test.ts | stop reason propagation > forwards SDKAssistantMessage.error as structured data on internal errors | covered:session-failure-provider-error | 
+src/tests/acp-agent.test.ts | stop reason propagation > omits errorKind data when no SDKAssistantMessage.error was observed | covered:error-result | 
 src/tests/acp-agent.test.ts | model refusal fallback handling > notifies the user and reconciles model state on model_refusal_fallback | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | model refusal fallback handling > includes the refusal explanation in the fallback notice when present | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | model refusal fallback handling > publishes the model fallback as a warning advisory for AIR clients | missing:T-UNCLASSIFIED | 
@@ -356,17 +356,17 @@ src/tests/acp-agent.test.ts | session/delete > succeeds for a session that does 
 src/tests/acp-agent.test.ts | session/delete > succeeds for an id that is not a session id, without asking the SDK | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/delete > propagates other errors from the SDK delete call | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | session/delete > does not affect other sessions when deleting one | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > returns cached session when params are unchanged | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down existing session when cwd changes | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > starts a fresh query under the same id for a live session that was never prompted | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > still fails a resume of an unknown session that has no stored conversation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > does not start a fresh query when the resume of a live session fails otherwise | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down existing session when mcpServers change | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > treats mcpServers in different order as unchanged | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > treats reordered and duplicate skills as unchanged | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down the existing session when any other Claude option changes | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down the existing session when additionalDirectories change | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | getOrCreateSession param change detection > ignores option key order, per-call resume controls and creation-only options | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > returns cached session when params are unchanged | covered:resume-live-fingerprint-same | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down existing session when cwd changes | ported:src/agent.rs::b117_session_fingerprint_matches_upstream_param_change_detection | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > starts a fresh query under the same id for a live session that was never prompted | ported:src/agent.rs::b117_recreate_falls_back_to_a_fresh_query_only_for_a_live_unpersisted_session | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > still fails a resume of an unknown session that has no stored conversation | ported:src/agent.rs::b117_recreate_falls_back_to_a_fresh_query_only_for_a_live_unpersisted_session | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > does not start a fresh query when the resume of a live session fails otherwise | ported:src/agent.rs::b117_recreate_falls_back_to_a_fresh_query_only_for_a_live_unpersisted_session | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down existing session when mcpServers change | ported:src/agent.rs::b117_session_fingerprint_matches_upstream_param_change_detection | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > treats mcpServers in different order as unchanged | ported:src/agent.rs::b117_session_fingerprint_matches_upstream_param_change_detection | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > treats reordered and duplicate skills as unchanged | ported:src/agent.rs::b117_session_fingerprint_matches_upstream_param_change_detection | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down the existing session when any other Claude option changes | ported:src/agent.rs::b117_session_fingerprint_matches_upstream_param_change_detection | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > tears down the existing session when additionalDirectories change | covered:resume-live-fingerprint-changed | 
+src/tests/acp-agent.test.ts | getOrCreateSession param change detection > ignores option key order, per-call resume controls and creation-only options | ported:src/agent.rs::b117_session_fingerprint_matches_upstream_param_change_detection | 
 src/tests/acp-agent.test.ts | usage_update computation > used sums all token types as post-turn context occupancy proxy | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | usage_update computation > coerces null input/output tokens so wire `used` is never null | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | usage_update computation > stream_event message_start emits usage_update before result | missing:T-UNCLASSIFIED | 
@@ -452,61 +452,61 @@ src/tests/acp-agent.test.ts | emitRawSDKMessages > filter without subtype matche
 src/tests/acp-agent.test.ts | emitRawSDKMessages > supports multiple filters | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
 src/tests/acp-agent.test.ts | emitRawSDKMessages > filter by origin kind only emits matching results | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
 src/tests/acp-agent.test.ts | emitRawSDKMessages > filter without origin matches results regardless of origin | ported:src/sdk_options.rs::inv_57_raw_sdk_message_filter | |
-src/tests/acp-agent.test.ts | result origin handling > forwards origin in usage_update _meta | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | result origin handling > carries only the model in _meta when origin is absent | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | result origin handling > task-notification result with max_tokens does not override the user-turn stopReason | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | result origin handling > user-prompted result with max_tokens still sets stopReason | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | result origin handling > forwards origin in usage_update _meta | covered:cancel-held-live-followup | 
+src/tests/acp-agent.test.ts | result origin handling > carries only the model in _meta when origin is absent | covered:cancel-stream-drop | 
+src/tests/acp-agent.test.ts | result origin handling > task-notification result with max_tokens does not override the user-turn stopReason | ported:src/turn/turn_tests.rs::autonomous_result_does_not_touch_live_turn | 
+src/tests/acp-agent.test.ts | result origin handling > user-prompted result with max_tokens still sets stopReason | ported:src/turn/turn_tests.rs::inv_stop_reason_table | 
 src/tests/acp-agent.test.ts | memory_recall handling > emits a synthetic tool_call for select mode with one location per memory | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | memory_recall handling > uses singular 'memory' in title when exactly one entry | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | memory_recall handling > emits synthesis content and no locations for synthesize mode | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > drains a failed turn's trailing idle so the next prompt is not short-circuited | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > rejects only the failed turn; a queued prompt still runs | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > hands off to a queued prompt when the next turn starts without a trailing idle | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > does not let a settled turn's lagging idle resolve the next turn early (issue #773 race) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > rejects later prompts after the query stream errors instead of hanging on a dead consumer | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > settles a cancelled turn as 'cancelled' even when the next prompt's echo arrives first | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > exposes the accumulated usage on a cancelled turn's PromptResponse (issue #844) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > ignores cancel() after the query stream has closed (no interrupt on a dead query) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > still interrupts and cleans up when native subagent cancellation publication fails | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > settles a turn that ends via the stream-done path even if releasing resources throws | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > rejects (not 'cancelled') a prompt enqueued after a cancel when the stream then ends | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > settles a no-echo command (/compact) submitted right after a cancel | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > skips the orphan result of a cancelled queued turn instead of misattributing it | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > drains the orphan count, then promotes a no-echo /compact while still cancelled | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > uncounts an orphan the interrupt receipt reports dropped, so a no-echo result isn't swallowed | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > keeps counting an orphan the interrupt receipt reports still queued | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > drains BOTH coalesced orphans on their one shared result (one result for two commands) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > forgets an orphan whose `cancelled` frame precedes any `started` (dropped, no result coming) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > skips a zombie orphan's late result exactly once (`cancelled` after `started`) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > forgets a pending orphan the interrupt receipt reports dropped (lifecycle lane) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > uses a result's user_message_uuid to consume exactly the orphan it names | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > deletes (not zombifies) an orphan whose `cancelled` frame arrives AFTER its error result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > drains ALL coalesced orphans of an aborted turn on its single error result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > does not seed an orphan for a queued command whose terminal frame already passed | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > stops blocking on a started orphan whose terminal frame never arrives | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > consumes an orphan's result that arrives while the turn queue is empty | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > does not zombify a command folded into the active turn whose shared result was the active turn's | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > does not seed a zombie for a fold-aborted command whose shared result passed BEFORE the cancel | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | post-error recovery > does not seed an orphan on force-cancel when the wedged turn's result and terminal frame already passed | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > answers a cancelled prompt at its interrupted result and delivers the follow-up that Claude Code runs next | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > delivers a follow-up that Claude Code runs after a cancel while nothing ran | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a prompt that Claude Code had taken off its queue before the cancel | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > shows nothing of a tool that a prompt the cancel abandoned asks to run, and denies it, when Claude Code asks %s (#1061) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > stops waiting for a tool use that the stream does not show, when Claude Code withdraws the request or the wait runs out | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > asks for the next prompt's tool once the consumer reaches it, when Claude Code asks while the window still looks open | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > does not let the next prompt take the result of a prompt the cancel abandoned | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > drops an abandoned prompt that Claude Code folds into its own follow-up | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a prompt sent while the cancel was still in progress | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a prompt sent during the cancel whose request comes before the cancel abandons it | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > keeps the prompts an earlier cancel stopped when the user cancels again | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a steer that Claude Code had taken before the cancel | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > does not fail the next prompt on the idle that trails a cancelled steered turn's result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > keeps the window open across the cancelled turn's next model request | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > does not fail the next prompt on the idle that trails the cancelled turn's result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > keeps dropping output after a cancel until the next prompt when requests do not list their prompts | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > delivers the next prompt's answer once when its echo arrives in the middle of its stream | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > delivers a follow-up that Claude Code runs before a prompt sent after the cancel | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | output after a cancel > delivers what streams of a subagent's text once the window closes, for a client that gets it only streamed | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | post-error recovery > drains a failed turn's trailing idle so the next prompt is not short-circuited | ported:src/turn/turn_tests.rs::lagging_idle_after_next_echo_absorbed | 
+src/tests/acp-agent.test.ts | post-error recovery > rejects only the failed turn; a queued prompt still runs | ported:src/turn/turn_tests.rs::result_for_active_turn_while_queued_settles_active | 
+src/tests/acp-agent.test.ts | post-error recovery > hands off to a queued prompt when the next turn starts without a trailing idle | ported:src/turn/turn_tests.rs::result_for_active_turn_while_queued_settles_active | 
+src/tests/acp-agent.test.ts | post-error recovery > does not let a settled turn's lagging idle resolve the next turn early (issue #773 race) | covered:lagging-idle | 
+src/tests/acp-agent.test.ts | post-error recovery > rejects later prompts after the query stream errors instead of hanging on a dead consumer | covered:eof-mid-turn | 
+src/tests/acp-agent.test.ts | post-error recovery > settles a cancelled turn as 'cancelled' even when the next prompt's echo arrives first | ported:src/turn/turn_tests.rs::echo_handoff_cancelled_first_and_owes_idle | 
+src/tests/acp-agent.test.ts | post-error recovery > exposes the accumulated usage on a cancelled turn's PromptResponse (issue #844) | ported:src/turn/turn_tests_t1a.rs::f12_cancelled_held_idle_absorbs_debt_and_keeps_usage | 
+src/tests/acp-agent.test.ts | post-error recovery > ignores cancel() after the query stream has closed (no interrupt on a dead query) | different:cancel on an ended actor is a dropped command-channel send, ignored by the notification handler | 
+src/tests/acp-agent.test.ts | post-error recovery > still interrupts and cleans up when native subagent cancellation publication fails | missing:F14 | native subagent cancellation publication
+src/tests/acp-agent.test.ts | post-error recovery > settles a turn that ends via the stream-done path even if releasing resources throws | different:there is no throwing resource-release step; the drop cascade ends the child | 
+src/tests/acp-agent.test.ts | post-error recovery > rejects (not 'cancelled') a prompt enqueued after a cancel when the stream then ends | ported:src/turn/turn_tests.rs::stream_end_settles_active_rejects_queued | 
+src/tests/acp-agent.test.ts | post-error recovery > settles a no-echo command (/compact) submitted right after a cancel | covered:cancel-queued-echo-less | 
+src/tests/acp-agent.test.ts | post-error recovery > skips the orphan result of a cancelled queued turn instead of misattributing it | ported:src/turn/turn_tests.rs::inv_30_orphan_result_not_reused | 
+src/tests/acp-agent.test.ts | post-error recovery > drains the orphan count, then promotes a no-echo /compact while still cancelled | ported:src/turn/turn_tests.rs::orphan_late_result_never_activates_echo_less | 
+src/tests/acp-agent.test.ts | post-error recovery > uncounts an orphan the interrupt receipt reports dropped, so a no-echo result isn't swallowed | ported:src/turn/turn_tests.rs::inv_23_receipt_field_guard | 
+src/tests/acp-agent.test.ts | post-error recovery > keeps counting an orphan the interrupt receipt reports still queued | ported:src/turn/turn_tests.rs::inv_23_receipt_field_guard | 
+src/tests/acp-agent.test.ts | post-error recovery > drains BOTH coalesced orphans on their one shared result (one result for two commands) | ported:src/turn/turn_tests_t1a.rs::f13_coalesced_orphans_drain_on_one_shared_result | also corpus lifecycle-coalesced
+src/tests/acp-agent.test.ts | post-error recovery > forgets an orphan whose `cancelled` frame precedes any `started` (dropped, no result coming) | ported:src/turn/turn_tests_t1a.rs::f13_cancelled_before_started_forgets_the_orphan | 
+src/tests/acp-agent.test.ts | post-error recovery > skips a zombie orphan's late result exactly once (`cancelled` after `started`) | ported:src/turn/turn_tests_t1a.rs::f13_zombie_orphan_result_skipped_exactly_once | 
+src/tests/acp-agent.test.ts | post-error recovery > forgets a pending orphan the interrupt receipt reports dropped (lifecycle lane) | ported:src/turn/turn_tests_t1a.rs::f13_receipt_forgets_dropped_pending_orphan_on_lifecycle_lane | 
+src/tests/acp-agent.test.ts | post-error recovery > uses a result's user_message_uuid to consume exactly the orphan it names | ported:src/turn/turn_tests_t1a.rs::f13_stamped_result_consumes_exactly_the_named_orphan | 
+src/tests/acp-agent.test.ts | post-error recovery > deletes (not zombifies) an orphan whose `cancelled` frame arrives AFTER its error result | ported:src/turn/turn_tests_t1a.rs::f13_cancelled_frame_after_error_result_does_not_zombify | 
+src/tests/acp-agent.test.ts | post-error recovery > drains ALL coalesced orphans of an aborted turn on its single error result | ported:src/turn/turn_tests_t1a.rs::f13_aborted_coalesced_orphans_drain_on_single_error_result | 
+src/tests/acp-agent.test.ts | post-error recovery > does not seed an orphan for a queued command whose terminal frame already passed | ported:src/turn/turn_tests_t1a.rs::f13_no_orphan_for_command_whose_terminal_frame_passed | 
+src/tests/acp-agent.test.ts | post-error recovery > stops blocking on a started orphan whose terminal frame never arrives | ported:src/turn/turn_tests_t1a.rs::f13_started_orphan_drained_by_its_result_without_terminal_frame | 
+src/tests/acp-agent.test.ts | post-error recovery > consumes an orphan's result that arrives while the turn queue is empty | ported:src/turn/turn_tests_t1a.rs::f13_orphan_result_with_empty_queue_is_consumed | 
+src/tests/acp-agent.test.ts | post-error recovery > does not zombify a command folded into the active turn whose shared result was the active turn's | ported:src/turn/turn_tests_t1a.rs::f13_active_turns_result_covers_started_entries | 
+src/tests/acp-agent.test.ts | post-error recovery > does not seed a zombie for a fold-aborted command whose shared result passed BEFORE the cancel | ported:src/turn/turn_tests_t1a.rs::f13_no_zombie_when_shared_result_passed_before_cancel | 
+src/tests/acp-agent.test.ts | post-error recovery > does not seed an orphan on force-cancel when the wedged turn's result and terminal frame already passed | ported:src/turn/turn_tests_t1a.rs::f13_force_cancel_seeds_by_fate | 
+src/tests/acp-agent.test.ts | output after a cancel > answers a cancelled prompt at its interrupted result and delivers the follow-up that Claude Code runs next | ported:src/turn/turn_tests_t1a.rs::f16a_cancelled_turn_settles_at_its_interrupted_result | also corpus cancel-held-live-followup
+src/tests/acp-agent.test.ts | output after a cancel > delivers a follow-up that Claude Code runs after a cancel while nothing ran | ported:src/turn/turn_tests_t1a.rs::f16a_status_requesting_reopens_cancelled_window | 
+src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a prompt that Claude Code had taken off its queue before the cancel | ported:src/turn/turn_tests_t1a.rs::f16b_stream_events_drop_only_after_work_end_is_reported | also corpus cancel-stream-drop
+src/tests/acp-agent.test.ts | output after a cancel > shows nothing of a tool that a prompt the cancel abandoned asks to run, and denies it, when Claude Code asks %s (#1061) | ported:src/session.rs::f16b_permission_for_dropped_tool_use_is_denied | table-driven (.each/loop): every row of the table is asserted by the cited test
+src/tests/acp-agent.test.ts | output after a cancel > stops waiting for a tool use that the stream does not show, when Claude Code withdraws the request or the wait runs out | ported:src/session.rs::f16b_permission_wait_is_bounded | 
+src/tests/acp-agent.test.ts | output after a cancel > asks for the next prompt's tool once the consumer reaches it, when Claude Code asks while the window still looks open | ported:src/session.rs::f16b_permission_waits_for_the_stream_to_reach_the_tool_use | 
+src/tests/acp-agent.test.ts | output after a cancel > does not let the next prompt take the result of a prompt the cancel abandoned | ported:src/turn/turn_tests_t1a.rs::f13_result_naming_cancelled_prompt_does_not_settle_next_prompt | 
+src/tests/acp-agent.test.ts | output after a cancel > drops an abandoned prompt that Claude Code folds into its own follow-up | ported:src/turn/turn_tests_t1a.rs::f16a_status_requesting_reopens_cancelled_window | 
+src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a prompt sent while the cancel was still in progress | ported:src/turn/turn_tests_t1a.rs::f16b_cancelled_prompts_recorded_and_cleared_at_activation | 
+src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a prompt sent during the cancel whose request comes before the cancel abandons it | ported:src/turn/turn_tests_t1a.rs::f16b_cancelled_prompts_recorded_and_cleared_at_activation | 
+src/tests/acp-agent.test.ts | output after a cancel > keeps the prompts an earlier cancel stopped when the user cancels again | ported:src/turn/turn_tests_t1a.rs::f16b_cancelled_prompts_recorded_and_cleared_at_activation | 
+src/tests/acp-agent.test.ts | output after a cancel > drops the answer to a steer that Claude Code had taken before the cancel | ported:src/turn/turn_tests_t1a.rs::f16b_cancelled_prompts_recorded_and_cleared_at_activation | 
+src/tests/acp-agent.test.ts | output after a cancel > does not fail the next prompt on the idle that trails a cancelled steered turn's result | ported:src/turn/turn_tests.rs::steer_cancel_seeds_orphans_and_owes_trailer | 
+src/tests/acp-agent.test.ts | output after a cancel > keeps the window open across the cancelled turn's next model request | ported:src/turn/turn_tests_t1a.rs::f16a_status_requesting_reopens_cancelled_window | 
+src/tests/acp-agent.test.ts | output after a cancel > does not fail the next prompt on the idle that trails the cancelled turn's result | ported:src/turn/turn_tests_t1a.rs::f16a_cancelled_turn_settles_at_its_interrupted_result | 
+src/tests/acp-agent.test.ts | output after a cancel > keeps dropping output after a cancel until the next prompt when requests do not list their prompts | ported:src/turn/turn_tests_t1a.rs::f16a_status_requesting_reopens_cancelled_window | without request_marker_lists_v1 the window never reopens on a request
+src/tests/acp-agent.test.ts | output after a cancel > delivers the next prompt's answer once when its echo arrives in the middle of its stream | ported:src/turn/turn_tests_t1a.rs::f16b_dropped_stream_latches_until_message_start | 
+src/tests/acp-agent.test.ts | output after a cancel > delivers a follow-up that Claude Code runs before a prompt sent after the cancel | covered:cancel-held-live-followup | 
+src/tests/acp-agent.test.ts | output after a cancel > delivers what streams of a subagent's text once the window closes, for a client that gets it only streamed | ported:src/turn/turn_tests_t1a.rs::f16b_subagent_streams_and_background_exception | 
 src/tests/acp-agent.test.ts | terminal of a command in the background > ends the terminal when the command's task ends | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | terminal of a command in the background > ends an AIR client's terminal at the Bash result, as before | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > holds the prompt open while a subagent is live and resolves at the followup's result | missing:T-UNCLASSIFIED | 
@@ -553,73 +553,73 @@ src/tests/acp-agent.test.ts | deferred settlement for live background subagents 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a prompt folded into an autonomous cycle > hands off a held turn and settles the prompt folded into its followup | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a prompt folded into an autonomous cycle > keeps a task-notification result naming no pending prompt off the user turn | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | deferred settlement for live background subagents (issues #864/#866) > a prompt folded into an autonomous cycle > keeps a held turn open when a followup result names its own prompt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects when the session is unknown | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects when the query stream has already closed | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > preserves the existing steering capability declaration | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > submits set and clear through the session prompt queue when the session is idle | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects when the session is unknown | missing:T-PORT | unknown-session error of _session/steering
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects when the query stream has already closed | covered:husk-after-eof | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > preserves the existing steering capability declaration | covered:initialize-capabilities-plain | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > submits set and clear through the session prompt queue when the session is idle | covered:goal-set-clear | 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > injects clear into a running goal at priority 'now' and publishes removal | ported:src/goal.rs::inv_53_clear_pending_only_matches_clear | actor Steer publish (session.rs:1542); cancel path never clears (structural) 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > replaces a running goal through the goal extension and publishes it immediately | ported:src/goal.rs::inv_53_optimistic_publish_and_pending | actor Steer publish (session.rs:1542) 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not let a stale runtime update overwrite an optimistic goal replacement | ported:src/goal.rs::inv_53_runtime_goal_suppresses_stale_update | pending expectation suppresses the old goal's late frame 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > cancels the running turn without clearing the persistent goal | different:cancel-path-does-not-touch-goal-state | no goal write on cancel; parity is structural (upstream asserts the absence) 
 src/tests/acp-agent.test.ts | turn steering (_session/steering) > validates goal control requests | ported:src/goal.rs::inv_53_parse_goal_request | trim, action table, the four -32602 texts; wire inv_53_goal_params_wire 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > preserves startedNewTurn by default when no turn is in flight | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > returns promptRequired without consuming an opted-in prompt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > lets the host retry promptRequired content through session/prompt exactly once | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > injects (outcome 'injected') a priority:'now' message into the running turn without spawning a new turn | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > uses priority:'later' while $name is pending | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > uses priority:'now' again once $name is withdrawn, though its client never settles it | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > publishes an optimistic goal update for a steered goal replacement | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not attribute a cancelled pending steer result to the next prompt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > keeps the turn open across the interrupt its own steer caused | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not fail the turn on the SDK diagnostic result emitted before a steered echo | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > maps the correlated ExitPlanMode interrupt diagnostic to cancellation | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > continues an accepted plan in a fresh private query without exposing the internal reject | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects the pending turn if a fresh clear-context query cannot be created | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not resurrect a clear-context session closed while its replacement is created | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not hide a diagnostic before the rejected ExitPlanMode tool result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not fail a replacement prompt on the cancelled prompt's late SDK diagnostic | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > swallows a stamped interruption diagnostic that names the cancelled command | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not let a stale hand-off token swallow a live turn's stamped interruption diagnostic | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not hide an empty user-interruption diagnostic without a cancelled predecessor | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not settle a steered turn at an idle that precedes the steered echo | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > hands a steered turn off to the next prompt with its recorded outcome | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > cancels a steered turn without false-failing the next prompt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steered turn at a result that names the steer, even with its echo missing | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steer that joined the running cycle $name | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a ready steered turn at an idle that owed-idle debt would absorb | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not settle a steered turn on a lagged owed idle before the steered result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn steering (_session/steering) > always injects at 'now' priority, ignoring any client-supplied priority | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > resolves the pending prompt with cancelled when the SDK never yields after interrupt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > returns cancelled through the normal idle path without waiting the grace period when interrupt works | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > does not arm the backstop when no prompt is running | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > does not reset the force-cancel floor on repeated cancels | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > resolves an in-flight wedged prompt immediately when the session is closed | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > preserves startedNewTurn by default when no turn is in flight | ported:src/agent.rs::inv_steering_in_flight_and_idle_default | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > returns promptRequired without consuming an opted-in prompt | ported:src/agent.rs::inv_steering_idle_prompt_required_and_invalid_behavior | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > lets the host retry promptRequired content through session/prompt exactly once | missing:T-PORT | promptRequired retry through session/prompt
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > injects (outcome 'injected') a priority:'now' message into the running turn without spawning a new turn | ported:tests/agent.rs::inv_steering_end_to_end | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > uses priority:'later' while $name is pending | ported:src/session.rs::inv_43_steer_later_while_permission_open | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > uses priority:'now' again once $name is withdrawn, though its client never settles it | missing:T-PORT | priority now again once the request is withdrawn
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > publishes an optimistic goal update for a steered goal replacement | covered:goal-set-clear | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not attribute a cancelled pending steer result to the next prompt | ported:src/turn/turn_tests.rs::steer_cancel_seeds_orphans_and_owes_trailer | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > keeps the turn open across the interrupt its own steer caused | covered:steer-error-result | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not fail the turn on the SDK diagnostic result emitted before a steered echo | ported:src/turn/turn_tests.rs::steer_error_result_with_pending_echo_stays_on_lane | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > maps the correlated ExitPlanMode interrupt diagnostic to cancellation | missing:F21 | ExitPlanMode interrupt diagnostic
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > continues an accepted plan in a fresh private query without exposing the internal reject | missing:F22 | clear-context fresh query
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > rejects the pending turn if a fresh clear-context query cannot be created | missing:F22 | clear-context restart failure
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not resurrect a clear-context session closed while its replacement is created | missing:F22 | clear-context closed session
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not hide a diagnostic before the rejected ExitPlanMode tool result | missing:F21 | rejected ExitPlanMode tool result diagnostic
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not fail a replacement prompt on the cancelled prompt's late SDK diagnostic | ported:src/turn/turn_tests_t1a.rs::f13_empty_interruption_diagnostic_is_swallowed | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > swallows a stamped interruption diagnostic that names the cancelled command | ported:src/turn/turn_tests_t1a.rs::f13_empty_interruption_diagnostic_is_swallowed | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not let a stale hand-off token swallow a live turn's stamped interruption diagnostic | ported:src/turn/turn_tests_t1a.rs::f13_empty_interruption_diagnostic_is_swallowed | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not hide an empty user-interruption diagnostic without a cancelled predecessor | ported:src/turn/turn_tests_t1a.rs::f13_empty_interruption_diagnostic_is_swallowed | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not settle a steered turn at an idle that precedes the steered echo | ported:src/turn/turn_tests.rs::steer_idle_before_echo_is_swallowed | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > hands a steered turn off to the next prompt with its recorded outcome | ported:src/turn/turn_tests.rs::steer_echo_handoff_uses_steered_settle | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > cancels a steered turn without false-failing the next prompt | ported:src/turn/turn_tests.rs::steer_cancel_seeds_orphans_and_owes_trailer | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steered turn at a result that names the steer, even with its echo missing | missing:F12 | result naming a steer retires its echo (R811-6) is not in this lane rows
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a steer that joined the running cycle $name | missing:F12 | result naming a steer retires its echo (R811-6) is not in this lane rows
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > settles a ready steered turn at an idle that owed-idle debt would absorb | ported:src/turn/turn_tests_t1a.rs::f12_steered_ready_settles_ahead_of_owed_debt | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > does not settle a steered turn on a lagged owed idle before the steered result | ported:src/turn/turn_tests.rs::steer_owed_idle_absorbed_before_lane | 
+src/tests/acp-agent.test.ts | turn steering (_session/steering) > always injects at 'now' priority, ignoring any client-supplied priority | covered:steer-mid-turn | 
+src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > resolves the pending prompt with cancelled when the SDK never yields after interrupt | ported:src/session.rs::inv_17_force_cancel_floor | 
+src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > returns cancelled through the normal idle path without waiting the grace period when interrupt works | covered:cancel-mid-turn | 
+src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > does not arm the backstop when no prompt is running | ported:src/session.rs::inv_22_cancel_idempotent | 
+src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > does not reset the force-cancel floor on repeated cancels | ported:src/session.rs::inv_22_cancel_idempotent | 
+src/tests/acp-agent.test.ts | session/cancel wedge recovery (issue #680) > resolves an in-flight wedged prompt immediately when the session is closed | ported:src/session.rs::inv_52_close_with_turn_in_flight | 
 src/tests/acp-agent.test.ts | prompt response quota metadata (_meta.quota) > breaks a turn's spend down per model | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | prompt response quota metadata (_meta.quota) > reports each turn's own share of the running per-model total | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | prompt response quota metadata (_meta.quota) > keeps an autonomous cycle's spend out of the next turn | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | prompt response quota metadata (_meta.quota) > treats a rewound running total as the turn's own spend | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | prompt response quota metadata (_meta.quota) > seeds the per-model baseline from a resumed session's first result | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | prompt response quota metadata (_meta.quota) > lists no per-model rows for a resumed first result with no top-level model | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > fails the in-flight prompt when the SDK goes idle without emitting a result | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > absorbs a cancelled turn's lagged trailing idle without failing the next turn | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > counts an orphaned queued turn's trailer so it cannot false-fail a later prompt | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > skips a force-cancelled turn's late result and absorbs its trailer after recovery | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > does not leak the owed idle when a cancel lands between a result and its trailer | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > fails the in-flight prompt when the SDK goes idle without emitting a result | ported:src/turn/turn_tests.rs::inv_31_idle_without_result_fails | also corpus idle-without-result
+src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > absorbs a cancelled turn's lagged trailing idle without failing the next turn | ported:src/turn/turn_tests.rs::echo_handoff_cancelled_first_and_owes_idle | 
+src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > counts an orphaned queued turn's trailer so it cannot false-fail a later prompt | ported:src/turn/turn_tests.rs::inv_30_orphan_result_not_reused | 
+src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > skips a force-cancelled turn's late result and absorbs its trailer after recovery | ported:src/turn/turn_tests_t1a.rs::f13_force_cancel_seeds_by_fate | 
+src/tests/acp-agent.test.ts | turn abandoned by the SDK (issue #825) > does not leak the owed idle when a cancel lands between a result and its trailer | ported:src/turn/turn_tests_t1a.rs::f16a_cancelled_turn_settles_at_its_interrupted_result | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > refines a tool call as soon as a streamed input field is complete | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > scans a large streamed tool input in linear time | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > refines a pending Write title when its file path arrives | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > refines a pending Write from the consolidated block after complete streamed input | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > refines $case before the full JSON object completes | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > waits for the consolidated message when $case is the only field | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps streamed TodoWrite input out of the tool feed | ported:src/map.rs::f6b_streamed_todo_and_task_input_never_refine | shouldEmitToolCall gate; G10a F6b | 
-src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps deliberately suppressed $name calls out of the tool feed | ported:src/map.rs::f6b_streamed_todo_and_task_input_never_refine | Task* variants; G10a F6b | 
+src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps streamed TodoWrite input out of the tool feed | ported:src/map.rs::f6b_streamed_todo_and_task_input_never_refine | shouldEmitToolCall gate; G10a F6b
+src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > keeps deliberately suppressed $name calls out of the tool feed | ported:src/map.rs::f6b_streamed_todo_and_task_input_never_refine | Task* variants; G10a F6b
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > does not publish an unfinished string | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > does not publish an ambiguous number until its delimiter arrives | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > recovers a completed $label value at a field boundary | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > survives a ping keep-alive arriving mid-stream | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > drops the buffered input at content_block_stop and message boundaries | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | streamEventToAcpNotifications > partial tool input coverage > drops the buffered input at content_block_stop and message boundaries | ported:src/map.rs::tests::content_block_stop_drops_only_its_block | buffer dropped at stop boundary
 src/tests/acp-agent.test.ts | streamEventToAcpNotifications > treats `ping` keep-alive events as no-ops without logging to stderr | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | streamEventToAcpNotifications > attaches the supplied messageId to streamed text chunks | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | streamEventToAcpNotifications > attaches the supplied messageId to streamed text chunks | ported:src/map.rs::tests::m51_user_chunk_message_id_grouping | messageId grouping on chunks
 src/tests/acp-agent.test.ts | toAcpNotifications messageId > sets messageId on agent message chunks from string content | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | toAcpNotifications messageId > sets messageId on user message chunks and thought chunks | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | toAcpNotifications messageId > omits messageId when none is supplied | missing:T-UNCLASSIFIED | 
@@ -633,14 +633,14 @@ src/tests/acp-agent.test.ts | messageIdForGrouping > uses the Anthropic API mess
 src/tests/acp-agent.test.ts | messageIdForGrouping > falls back to the uuid for assistant messages without an API id | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | messageIdForGrouping > uses the uuid for user messages (they carry no API id and aren't streamed) | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | messageIdForGrouping > returns undefined when there is no usable id | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > discoverCustomAgents > filters out Claude Code's built-in subagents | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > discoverCustomAgents > excludes a custom agent named 'default' (reserved sentinel) | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > discoverCustomAgents > returns an empty list when discovery throws | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions agent option > omits the agent option when no custom agents are configured | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions agent option > adds an agent option with a synthetic Default entry when custom agents exist | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions model option resolved description > sets description to the named model's displayName when resolvedModel matches | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions model option resolved description > falls back to resolvedModel itself when no named model shares it | missing:T-UNCLASSIFIED | 
-src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions model option resolved description > leaves description undefined when default model has no resolvedModel | missing:T-UNCLASSIFIED | 
+src/tests/acp-agent.test.ts | agent selection config option > discoverCustomAgents > filters out Claude Code's built-in subagents | ported:tests/t1b_config.rs::discover_filters_out_builtin_subagents | A-04
+src/tests/acp-agent.test.ts | agent selection config option > discoverCustomAgents > excludes a custom agent named 'default' (reserved sentinel) | ported:tests/t1b_config.rs::discover_excludes_the_reserved_default_name | A-04
+src/tests/acp-agent.test.ts | agent selection config option > discoverCustomAgents > returns an empty list when discovery throws | ported:tests/t1b_config.rs::discover_returns_an_empty_list_for_a_missing_or_malformed_roster | the control request failure maps to a missing roster
+src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions agent option > omits the agent option when no custom agents are configured | ported:tests/t1b_config.rs::agent_option_is_omitted_without_custom_agents | O-32
+src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions agent option > adds an agent option with a synthetic Default entry when custom agents exist | ported:tests/t1b_config.rs::agent_option_adds_a_synthetic_default_entry | O-32
+src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions model option resolved description > sets description to the named model's displayName when resolvedModel matches | ported:src/session_config.rs::inv_62_model_option_shape | default-row description from the resolved model is existing behaviour of build_model_config_option; recommended-value variant: tests/t1b_config.rs
+src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions model option resolved description > falls back to resolvedModel itself when no named model shares it | ported:src/session_config.rs::inv_62_model_option_shape | default-row description from the resolved model is existing behaviour of build_model_config_option; recommended-value variant: tests/t1b_config.rs
+src/tests/acp-agent.test.ts | agent selection config option > buildConfigOptions model option resolved description > leaves description undefined when default model has no resolvedModel | ported:src/session_config.rs::inv_62_model_option_shape | default-row description from the resolved model is existing behaviour of build_model_config_option; recommended-value variant: tests/t1b_config.rs
 src/tests/acp-agent.test.ts | agent selection config option > switching the agent > applies the agent flag live without restarting the subprocess | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | agent selection config option > switching the agent > clears the flag (agent: null) when switching back to default | missing:T-UNCLASSIFIED | 
 src/tests/acp-agent.test.ts | agent selection config option > switching the agent > leaves tracked state untouched when the live switch is rejected | missing:T-UNCLASSIFIED | 
@@ -839,12 +839,12 @@ src/tests/acp-v2.test.ts | ACP v2 session translation > fails on a message chunk
 src/tests/acp-v2.test.ts | ACP v2 providers > lists, sets, and disables the provider | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 auth > pushes the auth status of the connection after initialize | missing:T-UNCLASSIFIED | 
 src/tests/acp-v2.test.ts | ACP v2 auth > logs in to a gateway with auth/login and out with auth/logout | missing:T-UNCLASSIFIED | 
-src/tests/additional-roots.test.ts | additionalRoots > passes through relative roots as provided | missing:T-UNCLASSIFIED | 
-src/tests/additional-roots.test.ts | additionalRoots > merges additionalRoots with user additionalDirectories without normalization | missing:T-UNCLASSIFIED | 
-src/tests/additional-roots.test.ts | additionalRoots > prefers the official ACP additionalDirectories field over _meta.additionalRoots | missing:T-UNCLASSIFIED | 
-src/tests/additional-roots.test.ts | additionalRoots > merges official ACP additionalDirectories with claudeCode SDK additionalDirectories | missing:T-UNCLASSIFIED | 
-src/tests/additional-roots.test.ts | additionalRoots > falls back to _meta.additionalRoots when the official field is omitted | missing:T-UNCLASSIFIED | 
-src/tests/agent-discovery.test.ts | agent discovery (SDK) > BUILTIN_AGENT_NAMES exactly covers the SDK's default agent roster | missing:T-UNCLASSIFIED | 
+src/tests/additional-roots.test.ts | additionalRoots > passes through relative roots as provided | ported:tests/t1b_roots.rs::passes_through_relative_roots_as_provided | argv effect: corpus spawn-additional-directories
+src/tests/additional-roots.test.ts | additionalRoots > merges additionalRoots with user additionalDirectories without normalization | ported:tests/t1b_roots.rs::merges_additional_roots_with_user_directories_without_normalization | 
+src/tests/additional-roots.test.ts | additionalRoots > prefers the official ACP additionalDirectories field over _meta.additionalRoots | ported:tests/t1b_roots.rs::prefers_the_official_field_over_meta_additional_roots | 
+src/tests/additional-roots.test.ts | additionalRoots > merges official ACP additionalDirectories with claudeCode SDK additionalDirectories | ported:tests/t1b_roots.rs::merges_official_directories_with_the_sdk_option | 
+src/tests/additional-roots.test.ts | additionalRoots > falls back to _meta.additionalRoots when the official field is omitted | ported:tests/t1b_roots.rs::falls_back_to_meta_additional_roots_when_the_official_field_is_omitted | 
+src/tests/agent-discovery.test.ts | agent discovery (SDK) > BUILTIN_AGENT_NAMES exactly covers the SDK's default agent roster | ported:tests/t1b_config.rs::builtin_agent_names_match_the_upstream_roster | the live-SDK roster comparison (RUN_INTEGRATION_TESTS) is not run offline; the constant is asserted
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > recovers a background Bash task from its structured tool result | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends every update of a task to the session that owned its tool call at the spawn | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > publishes a stopped terminal after a task-specific stop | missing:T-UNCLASSIFIED | 
@@ -880,7 +880,7 @@ src/tests/async-tasks.test.ts | AsyncTaskRuntime > heals a lone lost terminal ed
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > recovers a live task whose task_started edge was lost | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps level-only recovery panel-only when task_started arrives late | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends the changed fields again when a retry follows a failed send | missing:T-UNCLASSIFIED | 
-src/tests/async-tasks.test.ts | AsyncTaskRuntime > finishes remaining tasks and can retry a task whose terminal publication failed | missing:T-UNCLASSIFIED | 
+src/tests/async-tasks.test.ts | AsyncTaskRuntime > finishes remaining tasks and can retry a task whose terminal publication failed | ported:src/async_tasks.rs::v18_finish_all_continues_and_retries_a_failed_terminal_publication | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > keeps the updates of a held task behind its spawn | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > sends the spawn without a tool id when a held task ends first | missing:T-UNCLASSIFIED | 
 src/tests/async-tasks.test.ts | AsyncTaskRuntime > takes the tool id of the terminal notification of a held task | missing:T-UNCLASSIFIED | 
@@ -937,9 +937,9 @@ src/tests/authorization.test.ts | authorization > gateway auth not offered witho
 src/tests/authorization.test.ts | authorization > gateway auth offered when client advertises auth._meta.gateway capability | ported:src/agent.rs::gateway_methods_are_gated_on_auth_meta_gateway | gateway + gateway-bedrock order |
 src/tests/authorization.test.ts | authorization > uses gateway env after anthropic gateway auth | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > uses gateway env after gateway auth | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > hide claude authentication without terminal-auth | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > hide claude auth but still show console login when terminal-auth is set | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > hide claude auth but still show console login with terminal capability | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > hide claude authentication without terminal-auth | missing:F34 | same: flag wiring is F34
+src/tests/authorization.test.ts | authorization > hide claude auth but still show console login when terminal-auth is set | missing:F34 | same: flag wiring is F34
+src/tests/authorization.test.ts | authorization > hide claude auth but still show console login with terminal capability | missing:F34 | same: flag wiring is F34
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > classifies apiKeySource %s | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > classifies apiProvider %s | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > billsClaudeSubscription > bills the subscription when apiProvider and apiKeySource are absent | missing:T-UNCLASSIFIED | 
@@ -994,10 +994,10 @@ src/tests/authorization.test.ts | authorization > --hide-claude-auth subscriptio
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > auth refusal and existing failure state > does not add a subscription row before a later sign-out | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on steer > rejects a steer that would start a new turn | missing:T-UNCLASSIFIED | 
 src/tests/authorization.test.ts | authorization > --hide-claude-auth subscription guard > on providers/disable > keeps going when a session cannot be recreated | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > SSH session falls back to single legacy login method | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > CLAUDE_CODE_REMOTE falls back to single legacy login method | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > remote environment respects hide-claude-auth | missing:T-UNCLASSIFIED | 
-src/tests/authorization.test.ts | authorization > show claude authentication | missing:T-UNCLASSIFIED | 
+src/tests/authorization.test.ts | authorization > SSH session falls back to single legacy login method | ported:tests/t1b_caps.rs::remote_environment_offers_the_tui_login_instead | WB-04
+src/tests/authorization.test.ts | authorization > CLAUDE_CODE_REMOTE falls back to single legacy login method | ported:tests/t1b_caps.rs::remote_environment_offers_the_tui_login_instead | WB-04
+src/tests/authorization.test.ts | authorization > remote environment respects hide-claude-auth | missing:F34 | builder takes hide_claude_auth (tests/t1b_caps.rs::hide_claude_auth_drops_the_claude_ai_login_only); the flag/guard is F34
+src/tests/authorization.test.ts | authorization > show claude authentication | ported:tests/t1b_caps.rs::terminal_capable_client_gets_both_logins_without_terminal_auth_meta | WB-04
 src/tests/authorization.test.ts | session failure reason field > carries reason only when the publisher passes one | missing:T-UNCLASSIFIED | 
 src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > moves the pending ACP turn and its session preferences to a fresh query | missing:T-UNCLASSIFIED | 
 src/tests/clear-context-coordinator.test.ts | continuePlanInFreshContext > does not turn an automatic displayed effort into a pin during restart | missing:T-UNCLASSIFIED | 
@@ -1144,53 +1144,53 @@ src/tests/create-session-options.test.ts | createSession options merging > loadS
 src/tests/create-session-options.test.ts | createSession options merging > loadSession history replay > load replay end > sends no end event when the CLI start fails part way through the replay | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > loadSession history replay > load replay end > sends no end event when the replay fails | missing:T-UNCLASSIFIED | 
 src/tests/create-session-options.test.ts | createSession options merging > loadSession history replay > load replay end > sends no end event to a client without the capability | missing:T-UNCLASSIFIED | 
-src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > diffs an Edit once and gives the hook the same patch | missing:T-UNCLASSIFIED | 
-src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > diffs again when the written file differs from the preview | missing:T-UNCLASSIFIED | 
-src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > diffs again after a diff that ran out of its budget | missing:T-UNCLASSIFIED | 
-src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > keeps only a few recent diffs, each until it is read again | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > builds a compact approval patch from a 12000-line file | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > builds an approval patch for every replace_all occurrence | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > builds update and creation approval patches for Write | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > reads the Write alias keys that the CLI accepts | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > returns no preview when the patch would not be exact | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > returns no preview for a FIFO without waiting for a writer | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > returns no preview when a replace_all result can exceed the size limit | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > builds a creation patch for an Edit with an empty old_string | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > keeps the missing final newline marker | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > marks the final newline of a Write that changes only that newline | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > uses the tool input as it is | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > builds the patch of a Write that changes hundreds of lines of a large file | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > falls back to the standard Write diff when the patch budget expires | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > builds patches that turn the old text into the new text | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > removes the line break of a line that an empty new_string deletes | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | approval patch previews > sends no content when there is no preview | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | git patch headers > strips the leading slash and converts Windows separators | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | git patch headers > quotes names like git and marks names with a space | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | git patch headers > writes a created file header | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | git patch headers > uses one header form for previews and hook patches | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | tool-call diff content > sends the standard diff for an Edit snippet in both modes | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | tool-call diff content > sends a Write diff at tool use only to a client without diffPatch | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > names the absolute path in a git patch, without the a/ and b/ prefixes | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > shows no diff at tool use, where the input holds a snippet or no old text | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > builds the exact patch of a finished change from the written file | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > falls back to the display hunks when the written file cannot give the patch | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > shows a created file whose patch cannot be exact with its whole text | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > sends the change alone for an update without hunks | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > previews a change in v2 form | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | ACP v2 diffs > sends no diff where the operation is unknown or nothing changed | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | Write tool calls for an existing file > does not read the file at tool use | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows the standard diff in the approval of a Write whose diff exceeds the budget | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | Write tool calls for an existing file > sends no hook patch when the previous text is larger than the limit | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows a created file that cannot have a patch in the hook result | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows in the approval that the Write overwrites a file whose text is unknown | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows the standard diff in the approval of a Write whose text cannot have a patch | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | PostToolUse hook patches > builds the patch from the written file, not from display hunks | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | PostToolUse hook patches > builds a creation patch for a Write that created the file | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | PostToolUse hook patches > keeps the standard diff for an Edit that fills an empty file | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | PostToolUse hook patches > builds no patch for a Write that changed nothing | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | PostToolUse hook patches > declines a patch that it cannot build exactly | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | PostToolUse hook patches > maps structured hunks to the standard diff | missing:T-UNCLASSIFIED | 
-src/tests/diff-patch.test.ts | PostToolUse hook patches > leaves a created file to the tool-call content in the standard mapping | missing:T-UNCLASSIFIED | 
+src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > diffs an Edit once and gives the hook the same patch | ported:tests/t1c_diff_tests.rs::test_diff_memo_reuse_edit_approval_and_hook | exact diff-call count 1 across approval and hook (also tests/t1fc_diff_memo.rs, process-wide memo); fails with the memo disabled
+src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > diffs again when the written file differs from the preview | ported:tests/t1c_diff_tests.rs::test_diff_memo_rediff_on_change | exact count 2; fails with a memo keyed on the old text only
+src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > diffs again after a diff that ran out of its budget | ported:tests/t1c_diff_tests.rs::test_diff_memo_rediff_after_budget | exact count 2 after a zero-budget diff, standard-diff fallback then exact patch; fails when an out-of-budget diff is remembered
+src/tests/diff-memo.test.ts | line diff reuse between the approval and the PostToolUse hook > keeps only a few recent diffs, each until it is read again | ported:tests/t1c_diff_tests.rs::test_diff_memo_cache_eviction | exact counts 6, 6, 7, 8; fails with the memo disabled
+src/tests/diff-patch.test.ts | approval patch previews > builds a compact approval patch from a 12000-line file | ported:tests/t1c_diff_tests.rs::test_compact_patch_12000_lines | compact patch Myers diff
+src/tests/diff-patch.test.ts | approval patch previews > builds an approval patch for every replace_all occurrence | ported:tests/t1c_diff_tests.rs::test_patch_replace_all | replace_all multi-occurrence diff
+src/tests/diff-patch.test.ts | approval patch previews > builds update and creation approval patches for Write | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | approval patch previews > reads the Write alias keys that the CLI accepts | ported:tests/t1c_diff_tests.rs::test_write_alias_keys | Write alias keys normalization
+src/tests/diff-patch.test.ts | approval patch previews > returns no preview when the patch would not be exact | ported:tests/t1c_diff_tests.rs::test_no_preview_when_not_exact | inexact patch returns None fallback
+src/tests/diff-patch.test.ts | approval patch previews > returns no preview for a FIFO without waiting for a writer | ported:tests/t1fc_diff_engine.rs::a_named_pipe_gives_no_preview_and_does_not_block | mkfifo, bounded by a 30 s timeout; blocks without the is_file check
+src/tests/diff-patch.test.ts | approval patch previews > returns no preview when a replace_all result can exceed the size limit | ported:tests/t1c_diff_tests.rs::test_patch_replace_all | replace_all multi-occurrence diff
+src/tests/diff-patch.test.ts | approval patch previews > builds a creation patch for an Edit with an empty old_string | ported:tests/t1c_diff_tests.rs::test_creation_patch_for_edit_empty_old_string | empty old_string creates file patch
+src/tests/diff-patch.test.ts | approval patch previews > keeps the missing final newline marker | ported:tests/t1c_diff_tests.rs::test_missing_final_newline_marker | No newline at end of file marker
+src/tests/diff-patch.test.ts | approval patch previews > marks the final newline of a Write that changes only that newline | ported:tests/t1c_diff_tests.rs::test_missing_final_newline_marker | No newline at end of file marker
+src/tests/diff-patch.test.ts | approval patch previews > uses the tool input as it is | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | approval patch previews > builds the patch of a Write that changes hundreds of lines of a large file | ported:tests/t1c_diff_tests.rs::test_compact_patch_12000_lines | compact patch Myers diff
+src/tests/diff-patch.test.ts | approval patch previews > falls back to the standard Write diff when the patch budget expires | ported:tests/t1fc_diff_engine.rs::full_rewrite_of_a_large_file_is_bounded_and_falls_back_like_a_timeout | real 840 KB rewrite: standard diff for Write, no preview for Edit, search state under 32 MiB
+src/tests/diff-patch.test.ts | approval patch previews > builds patches that turn the old text into the new text | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | approval patch previews > removes the line break of a line that an empty new_string deletes | ported:tests/t1c_diff_tests.rs::test_empty_new_string_deletes_line_break | line break deletion on empty new_string
+src/tests/diff-patch.test.ts | approval patch previews > sends no content when there is no preview | ported:tests/t1c_diff_tests.rs::test_no_preview_when_not_exact | inexact patch returns None fallback
+src/tests/diff-patch.test.ts | git patch headers > strips the leading slash and converts Windows separators | ported:tests/t1c_diff_tests.rs::test_git_patch_headers | git patch headers escaping and prefixes
+src/tests/diff-patch.test.ts | git patch headers > quotes names like git and marks names with a space | ported:tests/t1c_diff_tests.rs::test_git_patch_headers | git patch headers escaping and prefixes
+src/tests/diff-patch.test.ts | git patch headers > writes a created file header | ported:tests/t1c_diff_tests.rs::test_git_patch_headers | git patch headers escaping and prefixes
+src/tests/diff-patch.test.ts | git patch headers > uses one header form for previews and hook patches | ported:tests/t1c_diff_tests.rs::test_git_patch_headers | git patch headers escaping and prefixes
+src/tests/diff-patch.test.ts | tool-call diff content > sends the standard diff for an Edit snippet in both modes | ported:tests/t1c_diff_tests.rs::test_t40_write_input_diff_gating | diffPatch gating on tool use Write diff
+src/tests/diff-patch.test.ts | tool-call diff content > sends a Write diff at tool use only to a client without diffPatch | ported:tests/t1c_diff_tests.rs::test_t40_write_input_diff_gating | diffPatch gating on tool use Write diff
+src/tests/diff-patch.test.ts | ACP v2 diffs > names the absolute path in a git patch, without the a/ and b/ prefixes | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | ACP v2 diffs > shows no diff at tool use, where the input holds a snippet or no old text | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | ACP v2 diffs > builds the exact patch of a finished change from the written file | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | ACP v2 diffs > falls back to the display hunks when the written file cannot give the patch | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | ACP v2 diffs > shows a created file whose patch cannot be exact with its whole text | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | ACP v2 diffs > sends the change alone for an update without hunks | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | ACP v2 diffs > previews a change in v2 form | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | ACP v2 diffs > sends no diff where the operation is unknown or nothing changed | ported:tests/t1c_diff_tests.rs::test_v2_diff_content_and_updates | ACP v2 diff formats and updates
+src/tests/diff-patch.test.ts | Write tool calls for an existing file > does not read the file at tool use | ported:tests/t1c_diff_tests.rs::test_t40_write_input_diff_gating | diffPatch gating on tool use Write diff
+src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows the standard diff in the approval of a Write whose diff exceeds the budget | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | Write tool calls for an existing file > sends no hook patch when the previous text is larger than the limit | ported:tests/t1c_diff_tests.rs::test_no_preview_when_not_exact | inexact patch returns None fallback
+src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows a created file that cannot have a patch in the hook result | ported:tests/t1fc_diff_engine.rs::final_change_falls_back_when_no_exact_patch_exists | createdFileDiff for a diffPatch client; also covered on the wire by write-create-patch-client
+src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows in the approval that the Write overwrites a file whose text is unknown | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | Write tool calls for an existing file > shows the standard diff in the approval of a Write whose text cannot have a patch | ported:tests/t1c_diff_tests.rs::test_no_preview_when_not_exact | inexact patch returns None fallback
+src/tests/diff-patch.test.ts | PostToolUse hook patches > builds the patch from the written file, not from display hunks | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | PostToolUse hook patches > builds a creation patch for a Write that created the file | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | PostToolUse hook patches > keeps the standard diff for an Edit that fills an empty file | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | PostToolUse hook patches > builds no patch for a Write that changed nothing | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | PostToolUse hook patches > declines a patch that it cannot build exactly | ported:tests/t1c_diff_tests.rs::test_no_preview_when_not_exact | inexact patch returns None fallback
+src/tests/diff-patch.test.ts | PostToolUse hook patches > maps structured hunks to the standard diff | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
+src/tests/diff-patch.test.ts | PostToolUse hook patches > leaves a created file to the tool-call content in the standard mapping | ported:tests/t1c_diff_tests.rs::test_write_update_and_creation_patches | Write and Edit preview and hook patches
 src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > maps a form-mode request, defaulting the schema type to object | missing:T-UNCLASSIFIED | 
 src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > maps a url-mode request and preserves the elicitation id | missing:T-UNCLASSIFIED | 
 src/tests/elicitation.test.ts | mcpElicitationToCreateRequest > generates an elicitation id when a url request omits one | missing:T-UNCLASSIFIED | 
@@ -1237,35 +1237,35 @@ src/tests/event-loop-yield.test.ts | consumer teardown under a buffered backlog 
 src/tests/event-loop-yield.test.ts | nodeToWebWritable > writes the bytes of each chunk, including a view into a larger buffer | missing:T-UNCLASSIFIED | 
 src/tests/event-loop-yield.test.ts | nodeToWebWritable > gives an object-mode stream a Buffer copy | missing:T-UNCLASSIFIED | 
 src/tests/event-loop-yield.test.ts | nodeToWebWritable > rejects the write that fails | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | createFastModeConfigOption > produces a native boolean toggle when the client opted in | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | createFastModeConfigOption > explains a blocking disabled reason while the toggle reads off | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | createFastModeConfigOption > ignores routine and on-state reasons | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | createFastModeConfigOption > falls back to an on/off select when the client did not opt in | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | clientSupportsBooleanConfigOptions > is true only when session.configOptions.boolean is present | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | clientSupportsBooleanConfigOptions > is false when the capability is omitted or null at any level | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | resolveFastModeEnabled > accepts native boolean values | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | resolveFastModeEnabled > accepts the on/off select fallback | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | resolveFastModeEnabled > rejects any other value | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | fastModeStateEnabled > treats cooldown as on (the user's intent persists through rate-limit cooldown) | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | normalizeFastModeDisabledReason > retains only reasons we have an explanation for | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | normalizeFastModeDisabledReason > drops routine states and unknown values | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > omits the Fast mode option when the model does not support it | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > omits the Fast mode option when no fast mode state is provided | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > surfaces a boolean toggle when supported and the client opted in | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > surfaces a select fallback when supported but the client did not opt in | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode on/off through a boolean value | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode through the on/off select fallback | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > does not change session state when the SDK rejects the flag | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > emits a config_option_update when the SDK reports a new state | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > leaves the toggle on and quiet during a rate-limit cooldown | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > never lets a stray cooldown spuriously enable a toggle the user has off | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > clears the toggle when the SDK reports off | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > is a no-op when the reported state is undefined or unchanged | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains a blocking reason once when the SDK refuses a toggle the user turned on | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains the flip as a live notice to a client on the notice contract | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > updates the description when only the reason changes | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > drops a retained reason once fast mode comes back on | missing:T-UNCLASSIFIED | 
-src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > preserves the retained setting (no clobber) when the model has no Fast mode option | missing:T-UNCLASSIFIED | 
+src/tests/fast-mode-config.test.ts | createFastModeConfigOption > produces a native boolean toggle when the client opted in | ported:tests/t1b_config.rs::fast_option_is_a_native_boolean_toggle_when_the_client_opted_in | exact wire shape
+src/tests/fast-mode-config.test.ts | createFastModeConfigOption > explains a blocking disabled reason while the toggle reads off | ported:tests/t1b_config.rs::fast_option_explains_a_blocking_reason_while_the_toggle_reads_off | 
+src/tests/fast-mode-config.test.ts | createFastModeConfigOption > ignores routine and on-state reasons | ported:tests/t1b_config.rs::fast_option_ignores_routine_and_on_state_reasons | 
+src/tests/fast-mode-config.test.ts | createFastModeConfigOption > falls back to an on/off select when the client did not opt in | ported:tests/t1b_config.rs::fast_option_falls_back_to_an_on_off_select_without_boolean_support | 
+src/tests/fast-mode-config.test.ts | clientSupportsBooleanConfigOptions > is true only when session.configOptions.boolean is present | ported:tests/t1b_config.rs::client_boolean_config_capability_is_true_only_when_present | 
+src/tests/fast-mode-config.test.ts | clientSupportsBooleanConfigOptions > is false when the capability is omitted or null at any level | ported:tests/t1b_config.rs::client_boolean_config_capability_is_true_only_when_present | 
+src/tests/fast-mode-config.test.ts | resolveFastModeEnabled > accepts native boolean values | ported:tests/t1b_config.rs::resolve_fast_mode_accepts_booleans_and_the_select_fallback | 
+src/tests/fast-mode-config.test.ts | resolveFastModeEnabled > accepts the on/off select fallback | ported:tests/t1b_config.rs::resolve_fast_mode_accepts_booleans_and_the_select_fallback | 
+src/tests/fast-mode-config.test.ts | resolveFastModeEnabled > rejects any other value | ported:tests/t1b_config.rs::resolve_fast_mode_rejects_any_other_value | 
+src/tests/fast-mode-config.test.ts | fastModeStateEnabled > treats cooldown as on (the user's intent persists through rate-limit cooldown) | ported:tests/t1b_config.rs::fast_mode_state_treats_cooldown_as_on | 
+src/tests/fast-mode-config.test.ts | normalizeFastModeDisabledReason > retains only reasons we have an explanation for | ported:tests/t1b_config.rs::normalize_fast_mode_reason_retains_only_explainable_reasons | 
+src/tests/fast-mode-config.test.ts | normalizeFastModeDisabledReason > drops routine states and unknown values | ported:tests/t1b_config.rs::normalize_fast_mode_reason_drops_routine_states_and_unknown_values | 
+src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > omits the Fast mode option when the model does not support it | ported:tests/t1b_config.rs::build_options_omit_fast_mode_when_unsupported_or_without_state | 
+src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > omits the Fast mode option when no fast mode state is provided | ported:tests/t1b_config.rs::build_options_omit_fast_mode_when_unsupported_or_without_state | 
+src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > surfaces a boolean toggle when supported and the client opted in | ported:tests/t1b_config.rs::build_options_surface_fast_mode_as_boolean_or_select | 
+src/tests/fast-mode-config.test.ts | buildConfigOptions Fast mode > surfaces a select fallback when supported but the client did not opt in | ported:tests/t1b_config.rs::build_options_surface_fast_mode_as_boolean_or_select | 
+src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode on/off through a boolean value | missing:F11 | M-37/A-02: set_config_option fast branch + applyFlagSettings({fastMode}) is session.rs (Turn 5); resolve_fast_mode_enabled is ported
+src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > toggles Fast mode through the on/off select fallback | missing:F11 | M-37/A-02: set_config_option fast branch + applyFlagSettings({fastMode}) is session.rs (Turn 5); resolve_fast_mode_enabled is ported
+src/tests/fast-mode-config.test.ts | setSessionConfigOption Fast mode toggle > does not change session state when the SDK rejects the flag | missing:F11 | M-37/A-02: set_config_option fast branch + applyFlagSettings({fastMode}) is session.rs (Turn 5); resolve_fast_mode_enabled is ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > emits a config_option_update when the SDK reports a new state | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > leaves the toggle on and quiet during a rate-limit cooldown | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > never lets a stray cooldown spuriously enable a toggle the user has off | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > clears the toggle when the SDK reports off | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > is a no-op when the reported state is undefined or unchanged | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains a blocking reason once when the SDK refuses a toggle the user turned on | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > explains the flip as a live notice to a client on the notice contract | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > updates the description when only the reason changes | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > drops a retained reason once fast mode comes back on | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
+src/tests/fast-mode-config.test.ts | syncFastModeState (SDK-driven state changes) > preserves the retained setting (no clobber) when the model has no Fast mode option | missing:F11 | N-03/N-31/N-45: SDK fast_mode_state reconciliation is session.rs (Turn 5); the option builders it uses are ported
 src/tests/field-tracker.test.ts | ToolCallFieldTracker > removes unchanged fields and drops an update with nothing new | missing:T-UNCLASSIFIED | 
 src/tests/field-tracker.test.ts | ToolCallFieldTracker > keeps an update whose _meta carries more than claudeCode | missing:T-UNCLASSIFIED | 
 src/tests/field-tracker.test.ts | ToolCallFieldTracker > merges _meta.jetbrains.air keys like claudeCode keys | missing:T-UNCLASSIFIED | 
@@ -1442,11 +1442,11 @@ src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAut
 src/tests/mcp-command.test.ts | /mcp and MCP OAuth > does not start the MCP OAuth flow when the result fell back to the CLI text | different:MCP OAuth follow-up needs F23 URL elicitation (A-01/A-25) | 
 src/tests/mcp-command.test.ts | /mcp in available_commands_update > advertises one mcp entry when Claude Code also has one | covered:commands-proactive | the adapter's entry replaces a CLI `mcp` entry (map.rs)
 src/tests/mcp-command.test.ts | /mcp replay > hides a persisted /mcp invocation | ported:src/transcript.rs::inv_67_local_command_metadata_stripped | REPLAY_HIDDEN_COMMANDS includes /mcp; marker-only stripping covers both upstream cases
-src/tests/model-presentation.test.ts | versioned model display names > adds standard-family versions and preserves model identity and recommendation | missing:T-UNCLASSIFIED | 
-src/tests/model-presentation.test.ts | versioned model display names > adds major and minor versions without changing custom or already-versioned names | missing:T-UNCLASSIFIED | 
-src/tests/model-presentation.test.ts | versioned model display names > only moves the context hint out of the name when the description retains it | missing:T-UNCLASSIFIED | 
-src/tests/model-presentation.test.ts | versioned model display names > keeps the suffix if another selectable model is already named Opus | missing:T-UNCLASSIFIED | 
-src/tests/model-presentation.test.ts | the real SDK exposes one plain Opus row | missing:T-UNCLASSIFIED | 
+src/tests/model-presentation.test.ts | versioned model display names > adds standard-family versions and preserves model identity and recommendation | ported:tests/t1b_model.rs::versioned_names_and_recommendation_through_the_model_option | + src/session_model.rs::model_presentation_goldens
+src/tests/model-presentation.test.ts | versioned model display names > adds major and minor versions without changing custom or already-versioned names | ported:src/session_model.rs::model_presentation_goldens | case 2
+src/tests/model-presentation.test.ts | versioned model display names > only moves the context hint out of the name when the description retains it | ported:src/session_model.rs::model_presentation_goldens | case 3
+src/tests/model-presentation.test.ts | versioned model display names > keeps the suffix if another selectable model is already named Opus | ported:src/session_model.rs::model_presentation_goldens | case 4 (collision fallback)
+src/tests/model-presentation.test.ts | the real SDK exposes one plain Opus row | different:integration test, skipped upstream unless RUN_INTEGRATION_TESTS and needs a live authenticated SDK; the Rust adapter cannot assert the SDK's own model roster offline | 
 src/tests/model-resolution.test.ts | resolveModelPreference - resolvedModel matching > matches a preference that equals an alias's resolvedModel exactly | missing:T-UNCLASSIFIED | 
 src/tests/model-resolution.test.ts | resolveModelPreference - resolvedModel matching > is case-insensitive | missing:T-UNCLASSIFIED | 
 src/tests/model-resolution.test.ts | resolveModelPreference - resolvedModel matching > still resolves plain aliases via the direct-match tier | missing:T-UNCLASSIFIED | 
@@ -1474,12 +1474,12 @@ src/tests/model-resolution.test.ts | isDeniedModel > blocks only that version wh
 src/tests/model-resolution.test.ts | isDeniedModel > blocks a whole family for a family alias and ignores settings-dependent aliases | missing:T-UNCLASSIFIED | 
 src/tests/model-resolution.test.ts | model resolution (real SDK) > every model's resolvedModel (when present) resolves back to that same row | missing:T-UNCLASSIFIED | 
 src/tests/model-resolution.test.ts | model resolution (real SDK) > resolves the well-known 'sonnet' and 'opus' aliases to a model bearing their family name | missing:T-UNCLASSIFIED | 
-src/tests/model-resolution.test.ts | settingsEffortForModel > prefers the per-model entry keyed by the resolved model id | missing:T-UNCLASSIFIED | 
-src/tests/model-resolution.test.ts | settingsEffortForModel > falls back to the picker row value, then the raw model id | missing:T-UNCLASSIFIED | 
-src/tests/model-resolution.test.ts | settingsEffortForModel > matches equivalent -1m and [1m] modelSettings keys | missing:T-UNCLASSIFIED | 
-src/tests/model-resolution.test.ts | settingsEffortForModel > falls back to the top-level effortLevel when no per-model entry matches | missing:T-UNCLASSIFIED | 
-src/tests/model-resolution.test.ts | settingsEffortForModel > returns undefined when neither layer sets an effort | missing:T-UNCLASSIFIED | 
-src/tests/model-resolution.test.ts | effortFlagSettings > carries ultracode only when settings request it | missing:T-UNCLASSIFIED | 
+src/tests/model-resolution.test.ts | settingsEffortForModel > prefers the per-model entry keyed by the resolved model id | ported:tests/t1b_config.rs::settings_effort_prefers_the_per_model_entry_keyed_by_the_resolved_model | 
+src/tests/model-resolution.test.ts | settingsEffortForModel > falls back to the picker row value, then the raw model id | ported:tests/t1b_config.rs::settings_effort_falls_back_to_the_row_value_then_the_raw_id | 
+src/tests/model-resolution.test.ts | settingsEffortForModel > matches equivalent -1m and [1m] modelSettings keys | ported:tests/t1b_config.rs::settings_effort_matches_equivalent_1m_spellings | 
+src/tests/model-resolution.test.ts | settingsEffortForModel > falls back to the top-level effortLevel when no per-model entry matches | ported:tests/t1b_config.rs::settings_effort_falls_back_to_the_top_level_effort | 
+src/tests/model-resolution.test.ts | settingsEffortForModel > returns undefined when neither layer sets an effort | ported:tests/t1b_config.rs::settings_effort_falls_back_to_the_top_level_effort | 
+src/tests/model-resolution.test.ts | effortFlagSettings > carries ultracode only when settings request it | ported:tests/t1b_config.rs::effort_flag_settings_carries_ultracode_only_when_requested | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > publishes a raced spawn exactly once | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > publishes a raced terminal exactly once after the spawn | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime lifecycle > falls back to one ordinary failed tool call when no child ever starts | missing:T-UNCLASSIFIED | 
@@ -1551,27 +1551,27 @@ src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > restores the agent from a task_started under a SendMessage id | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > does not read the history for a task_started without a subagent type | missing:T-UNCLASSIFIED | 
 src/tests/native-subagents.test.ts | NativeSubagentRuntime in the AIR form, for an agent from before a load or resume > opens a new Agent whose task_started comes before its frame as the bare id, unannounced | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > applies the native Skill effect for %s | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > applies a generated WebFetch effect and an exact MCP provider effect | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > applies the exact provider filesystem effect for %s | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > suppresses generated durable effects when an ask rule forced the prompt | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > allows EnterPlanMode temporarily without changing mode before the tool runs | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > applies the selected ExitPlanMode mode and maps rejection | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > interrupts the old query when ExitPlanMode clears context | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > returns clear-context semantics with the decoded permission decision | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > maps one-time allow without remembered updates | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > maps durable allow to the snapshotted provider effect | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > distinguishes explicit reject from cancellation | missing:T-UNCLASSIFIED | 
-src/tests/permission-effects.test.ts | Claude permission response effects > fails closed for an unavailable or unknown selection | missing:T-UNCLASSIFIED | 
-src/tests/permission-normalization.test.ts | durable permission normalization safety > fails closed when validation reads a throwing update accessor | missing:T-UNCLASSIFIED | 
-src/tests/permission-normalization.test.ts | durable permission normalization safety > fails closed when validation reads a throwing suggestions proxy | missing:T-UNCLASSIFIED | 
-src/tests/permission-normalization.test.ts | durable permission normalization safety > rejects strings whose untrimmed value exceeds the wire limit | missing:T-UNCLASSIFIED | 
+src/tests/permission-effects.test.ts | Claude permission response effects > applies the native Skill effect for %s | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > applies a generated WebFetch effect and an exact MCP provider effect | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > applies the exact provider filesystem effect for %s | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > suppresses generated durable effects when an ask rule forced the prompt | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > allows EnterPlanMode temporarily without changing mode before the tool runs | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > applies the selected ExitPlanMode mode and maps rejection | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > interrupts the old query when ExitPlanMode clears context | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > returns clear-context semantics with the decoded permission decision | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > maps one-time allow without remembered updates | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > maps durable allow to the snapshotted provider effect | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > distinguishes explicit reject from cancellation | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-effects.test.ts | Claude permission response effects > fails closed for an unavailable or unknown selection | missing:F10 | permission response effects owned by Turn 6
+src/tests/permission-normalization.test.ts | durable permission normalization safety > fails closed when validation reads a throwing update accessor | missing:F10 | permission normalization safety owned by Turn 6
+src/tests/permission-normalization.test.ts | durable permission normalization safety > fails closed when validation reads a throwing suggestions proxy | missing:F10 | permission normalization safety owned by Turn 6
+src/tests/permission-normalization.test.ts | durable permission normalization safety > rejects strings whose untrimmed value exceeds the wire limit | missing:F10 | permission normalization safety owned by Turn 6
 src/tests/permission-options.test.ts | Claude permission options and response mapping > leads with the reject options when the CLI defaults the ask to no | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > builds the native Bash static-suggestions option from the exact update bundle | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > ports the native static shell label for %s | missing:T-UNCLASSIFIED | 
+src/tests/permission-options.test.ts | Claude permission options and response mapping > builds the native Bash static-suggestions option from the exact update bundle | ported:src/permission_options.rs::tests::p20_shell_suggestions_durable_labels | Bash shell durable labels and path normalization
+src/tests/permission-options.test.ts | Claude permission options and response mapping > ports the native static shell label for %s | ported:src/permission_options.rs::tests::p20_shell_suggestions_durable_labels | Bash shell durable labels and path normalization
 src/tests/permission-options.test.ts | Claude permission options and response mapping > uses Claude Code's `similar` truncation for long command lists | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > uses the shortest distinguishing parent for paths with the same basename | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > does not repeat an identical path in the durable option | missing:T-UNCLASSIFIED | 
+src/tests/permission-options.test.ts | Claude permission options and response mapping > uses the shortest distinguishing parent for paths with the same basename | ported:src/permission_options.rs::tests::p20_shell_suggestions_durable_labels | Bash shell durable labels and path normalization
+src/tests/permission-options.test.ts | Claude permission options and response mapping > does not repeat an identical path in the durable option | ported:src/permission_options.rs::tests::p20_shell_suggestions_durable_labels | Bash shell durable labels and path normalization
 src/tests/permission-options.test.ts | Claude permission options and response mapping > offers only one-time allow and reject for %s without a representable update | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > uses generated native effects instead of applying an unrelated provider suggestion | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > preserves an MCP tool's exact provider suggestion | missing:T-UNCLASSIFIED | 
@@ -1580,11 +1580,11 @@ src/tests/permission-options.test.ts | Claude permission options and response ma
 src/tests/permission-options.test.ts | Claude permission options and response mapping > builds the native session label for %s | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > does not call a persistent filesystem update a session grant | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > does not offer a path-specific filesystem effect for a different in-project path | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > resolves relative permission paths from the session cwd | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > recognizes a backslash glob suffix in a provider path rule | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > treats acceptEdits as broad only for ordinary write paths | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > builds WebFetch and sandbox-host labels from provider data | missing:T-UNCLASSIFIED | 
-src/tests/permission-options.test.ts | Claude permission options and response mapping > uses Claude Code's special session label for its own settings | missing:T-UNCLASSIFIED | 
+src/tests/permission-options.test.ts | Claude permission options and response mapping > resolves relative permission paths from the session cwd | ported:tests/t1fd_permission_options.rs::inv_p22_relative_paths_from_session_cwd | 
+src/tests/permission-options.test.ts | Claude permission options and response mapping > recognizes a backslash glob suffix in a provider path rule | ported:tests/t1fd_permission_options.rs::inv_p22_backslash_glob_suffix | 
+src/tests/permission-options.test.ts | Claude permission options and response mapping > treats acceptEdits as broad only for ordinary write paths | ported:tests/t1fd_permission_options.rs::inv_p22_accept_edits_broad_only_for_ordinary_write_paths | 
+src/tests/permission-options.test.ts | Claude permission options and response mapping > builds WebFetch and sandbox-host labels from provider data | ported:tests/t1fd_permission_options.rs::inv_p25_webfetch_and_sandbox_host_labels | 
+src/tests/permission-options.test.ts | Claude permission options and response mapping > uses Claude Code's special session label for its own settings | ported:tests/t1fd_permission_options.rs::inv_p22_claude_settings_special_session_label | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > builds Claude Code's exact and prefix Skill options from tool input | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > suppresses generated Skill rules when a configured ask rule forced the prompt | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > keeps EnterPlanMode at its two reachable one-time choices | missing:T-UNCLASSIFIED | 
@@ -1598,33 +1598,33 @@ src/tests/permission-options.test.ts | Claude permission options and response ma
 src/tests/permission-options.test.ts | Claude permission options and response mapping > reuses the Computer Use MCP tool-call title | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > uses the provider display name for a matching generic-tool rule | missing:T-UNCLASSIFIED | 
 src/tests/permission-options.test.ts | Claude permission options and response mapping > refuses to route AskUserQuestion through permission options | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > omits a durable choice for %j | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > supports and snapshots %s | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > keeps the approved effect stable if the provider mutates its suggestions later | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > supports setMode %s | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > supports %s | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > fails closed for an unknown or invalid change set | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > fails closed when an otherwise valid provider update is not cloneable | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > suppresses every durable option for a forced ask | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses the provider-built patch for an edit confirmation | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses Approve Plan as the tool title and keeps the question in permission metadata | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > forwards the CLI's defaultToNo hint in the permission record | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps command descriptions and decision reasons in their presentation fields | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses the Terminal fallback for %s when no command is available yet | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > shows the exact %s command instead of its model-authored description | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > %s command fidelity > preserves $label in the approval title | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps the WebFetch URL in structured tool input | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps the WebSearch query out of the permission description | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses the %s tool-call title | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses tool-call titles and temporarily exposes decisionReason | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > does not use the %s operation subtitle as a permission explanation | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > adds a non-duplicated blocked path to standard locations | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses the standard title for an unknown tool | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > repeats the whole tool call and sends no AIR key | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > keeps the Write file text in rawInput and adds a blocked path | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > shows the input of a network request that has no content | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > gives the prompt a title and description of its own, apart from the tool call | missing:T-UNCLASSIFIED | 
-src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > shows the exact preview patch, which the tool call does not show | missing:T-UNCLASSIFIED | 
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > omits a durable choice for %j | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > supports and snapshots %s | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > keeps the approved effect stable if the provider mutates its suggestions later | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > supports setMode %s | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > supports %s | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > fails closed for an unknown or invalid change set | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > fails closed when an otherwise valid provider update is not cloneable | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission suggestion normalization > suppresses every durable option for a forced ask | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses the provider-built patch for an edit confirmation | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses Approve Plan as the tool title and keeps the question in permission metadata | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > forwards the CLI's defaultToNo hint in the permission record | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps command descriptions and decision reasons in their presentation fields | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > uses the Terminal fallback for %s when no command is available yet | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > shows the exact %s command instead of its model-authored description | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > %s command fidelity > preserves $label in the approval title | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps the WebFetch URL in structured tool input | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > keeps the WebSearch query out of the permission description | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses the %s tool-call title | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses tool-call titles and temporarily exposes decisionReason | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > does not use the %s operation subtitle as a permission explanation | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > adds a non-duplicated blocked path to standard locations | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission ACP v1 presentation > reuses the standard title for an unknown tool | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > repeats the whole tool call and sends no AIR key | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > keeps the Write file text in rawInput and adds a blocked path | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission presentation for a client that is not AIR > shows the input of a network request that has no content | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > gives the prompt a title and description of its own, apart from the tool call | missing:F10 | permission presentation owned by Turn 6
+src/tests/permission-presentation.test.ts | Claude permission presentation for a v2 client > shows the exact preview patch, which the tool call does not show | missing:F10 | permission presentation owned by Turn 6
 src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > drops a prediction that says nothing | missing:T-UNCLASSIFIED | 
 src/tests/prompt-suggestions.test.ts | the follow-up prompt on the wire > names no vendor and clears with an empty list | missing:T-UNCLASSIFIED | 
 src/tests/prompt-suggestions.test.ts | the follow-up prompt at turn-end > publishes the predicted prompt after the turn's result | missing:T-UNCLASSIFIED | 
@@ -1666,15 +1666,15 @@ src/tests/providers.test.ts | providers > gateway model discovery > sets a gatew
 src/tests/providers.test.ts | providers > gateway model discovery > applies providers/set and providers/disable in the order they arrive while a listing runs | missing:T-UNCLASSIFIED | 
 src/tests/providers.test.ts | providers > gateway model discovery > keeps the later providers/set when an earlier one lists slower | missing:T-UNCLASSIFIED | 
 src/tests/providers.test.ts | providers > gateway model discovery > drops the listing on providers/disable and reuses it when the same gateway is set again | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | recommended config value capability > is enabled through the common AIR capability list | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | recommended config value capability > keeps legacy behavior for omitted and malformed AIR metadata | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > retains default model and effort entries without the capability | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > omits default entries and advertises concrete recommendations | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > preserves explicit selections while keeping independent recommendations | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > keeps the legacy model sentinel when the SDK recommendation is not selectable | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > does not substitute a similar model for the unavailable default %s | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > matches equivalent SDK context suffix spellings exactly | missing:T-UNCLASSIFIED | 
-src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > uses an available effort when medium is not supported | missing:T-UNCLASSIFIED | 
+src/tests/recommended-config-values.test.ts | recommended config value capability > is enabled through the common AIR capability list | ported:tests/t1b_config.rs::recommended_capability_is_enabled_through_the_common_air_capability_list | 
+src/tests/recommended-config-values.test.ts | recommended config value capability > keeps legacy behavior for omitted and malformed AIR metadata | ported:tests/t1b_config.rs::recommended_capability_keeps_legacy_behavior_for_omitted_and_malformed_air | 
+src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > retains default model and effort entries without the capability | ported:tests/t1b_config.rs::recommended_retains_default_entries_without_the_capability | 
+src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > omits default entries and advertises concrete recommendations | ported:tests/t1b_config.rs::recommended_omits_default_entries_and_advertises_concrete_recommendations | also corpus config-recommended-air
+src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > preserves explicit selections while keeping independent recommendations | ported:tests/t1b_config.rs::recommended_preserves_explicit_selections_with_independent_recommendations | 
+src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > keeps the legacy model sentinel when the SDK recommendation is not selectable | ported:tests/t1b_config.rs::recommended_keeps_the_legacy_sentinel_when_the_recommendation_is_not_selectable | 
+src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > does not substitute a similar model for the unavailable default %s | ported:tests/t1b_config.rs::recommended_does_not_substitute_a_similar_model_for_the_unavailable_default | each: both resolvedModel spellings are looped in the one Rust test
+src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > matches equivalent SDK context suffix spellings exactly | ported:tests/t1b_config.rs::recommended_matches_equivalent_context_suffix_spellings_exactly | 
+src/tests/recommended-config-values.test.ts | buildConfigOptions recommended values presentation > uses an available effort when medium is not supported | ported:tests/t1b_config.rs::recommended_uses_an_available_effort_when_medium_is_not_supported | 
 src/tests/remote-control.test.ts | /remote-control > starts Remote Control and reports the URL | missing:T-UNCLASSIFIED | 
 src/tests/remote-control.test.ts | /remote-control > passes the argument as the session name | missing:T-UNCLASSIFIED | 
 src/tests/remote-control.test.ts | /remote-control > reconnects and renames on every run instead of toggling | missing:T-UNCLASSIFIED | 
@@ -1713,65 +1713,65 @@ src/tests/resumed-session.test.ts | readResumedTail > gives no plan mode when a 
 src/tests/resumed-session.test.ts | readResumedTail > stops the mode search at the last human prompt without a mode | missing:T-UNCLASSIFIED | 
 src/tests/resumed-session.test.ts | readResumedTail > reads the mode of the prompt before a compaction | missing:T-UNCLASSIFIED | 
 src/tests/resumed-session.test.ts | readResumedTail > returns no permission mode when the transcript records none | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > newSession returns configOptions > includes configOptions in the response | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > newSession returns configOptions > includes mode and model config options | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > loadSession returns configOptions > includes configOptions from createSession | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when session not found | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when config option not found | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when value is not valid for the option | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > rejects mode and config changes once the query stream has closed (husk session) | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > changes mode, sends current_mode_update but not config_option_update | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > changes model and does not send a config_option_update notification | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > resolves model alias 'opus' to full model ID | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > resolves model alias 'sonnet' to full model ID | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > resolves display name to model ID | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > still works with exact model ID | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws for completely invalid model value | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > returns full configOptions in the response | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > other options are unchanged when one is updated | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > returns configOptions with the new model when changed | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > updates stored configOptions currentValue when model changes | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > drops effort from returned configOptions when model drops effort support | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > clamps effort in returned configOptions when new model has different supported levels | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > preserves effort in returned configOptions when new model supports same level | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > no config_option_update notification when using setSessionConfigOption > sends no config_option_update when setting mode via config option | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > no config_option_update notification when using setSessionConfigOption > sends no config_option_update when setting model via config option | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > calls applyFlagSettings with effortLevel | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > calls applyFlagSettings with null effortLevel for 'default' | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > updates effort currentValue in returned configOptions | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > keeps effort state unchanged when the SDK rejects a direct selection | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > throws for invalid effort value | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > does not send config_option_update notification | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > other options are unchanged when effort is updated | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > applies concrete defaults and re-seeds automatic effort from each model's settings | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > re-seeds switches from retained programmatic settings before file settings | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears an unsupported user pin before choosing the new model's concrete effort | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a legacy pin without promoting persisted effort to a flag override | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > retains the original pin value when a legacy clamp fails | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > restores the last applied effort when recommended-value synchronization fails | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > returns the new model state when effort synchronization fails | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > publishes the new model state when external-switch effort synchronization fails | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > drops effort option when switching to a model without effort support | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a pinned effort via applyFlagSettings when switching to a model without effort | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > adds effort option when switching to a model that supports effort | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clamps effort to valid value when new model has different supported levels | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > preserves effort value when new model supports the same level | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > seeds effort from the new model's persisted modelSettings entry on an unpinned switch | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > falls back to the top-level settings effort when the new model has no per-model entry | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionConfigOption for mode also calls underlying setPermissionMode | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionConfigOption for model also calls underlying setModel | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > bidirectional consistency > resolves a full model id onto its hinted row via session.modelInfos | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > bidirectional consistency > accepts the reported currentValue even when it has no options entry | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionMode also syncs configOptions | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionConfigOption(model) also syncs configOptions | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > context window on model change > seeds the window from text inference on model switch | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > context window on model change > falls back to the default window when inference misses, then refines it in the background | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > context window on model change > drops a background answer that arrives after another switch | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > context window on model change > keeps the learned window when re-asserting the current model | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the stable mode catalog when switching to Haiku | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the same mode catalog when switching from Haiku back to Opus | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > preserves the current mode when it remains valid after a model switch | missing:T-UNCLASSIFIED | 
-src/tests/session-config-options.test.ts | session config options > auto mode availability per model > falls back to Accept edits and emits current_mode_update on a Haiku switch | missing:T-UNCLASSIFIED | 
+src/tests/session-config-options.test.ts | session config options > newSession returns configOptions > includes configOptions in the response | covered:config-session-new | 
+src/tests/session-config-options.test.ts | session config options > newSession returns configOptions > includes mode and model config options | covered:config-session-new | 
+src/tests/session-config-options.test.ts | session config options > loadSession returns configOptions > includes configOptions from createSession | covered:resume-load | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when session not found | missing:F11 | behaviour exists (agent.rs 'Session not found') but has no Rust test; add with the M-43 husk tests, Turn 5
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when config option not found | covered:config-invalid | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws when value is not valid for the option | covered:config-invalid | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > rejects mode and config changes once the query stream has closed (husk session) | missing:F11 | M-43: husk session, Turn 5
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > changes mode, sends current_mode_update but not config_option_update | covered:config-set-mode | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > changes model and does not send a config_option_update notification | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > resolves model alias 'opus' to full model ID | ported:tests/t1b_model.rs::set_config_model_value_resolves_aliases_display_names_and_exact_ids | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > resolves model alias 'sonnet' to full model ID | ported:tests/t1b_model.rs::set_config_model_value_resolves_aliases_display_names_and_exact_ids | + corpus config-set-model
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > resolves display name to model ID | ported:tests/t1b_model.rs::set_config_model_value_resolves_aliases_display_names_and_exact_ids | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > still works with exact model ID | ported:tests/t1b_model.rs::set_config_model_value_resolves_aliases_display_names_and_exact_ids | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > throws for completely invalid model value | ported:tests/t1b_model.rs::set_config_model_value_that_matches_nothing_does_not_resolve | the 'Invalid value for config option model' text is covered by config-invalid
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > returns full configOptions in the response | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption > other options are unchanged when one is updated | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > returns configOptions with the new model when changed | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > updates stored configOptions currentValue when model changes | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > drops effort from returned configOptions when model drops effort support | ported:tests/t1b_config.rs::effort_option_is_dropped_for_a_model_without_effort_support | pure rebuild
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > clamps effort in returned configOptions when new model has different supported levels | ported:tests/t1b_config.rs::effort_value_is_clamped_to_the_new_models_levels | pure rebuild
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption(model) returns updated configOptions > preserves effort in returned configOptions when new model supports same level | ported:tests/t1b_config.rs::effort_value_is_preserved_when_the_new_model_supports_it | pure rebuild
+src/tests/session-config-options.test.ts | session config options > no config_option_update notification when using setSessionConfigOption > sends no config_option_update when setting mode via config option | covered:config-set-mode | 
+src/tests/session-config-options.test.ts | session config options > no config_option_update notification when using setSessionConfigOption > sends no config_option_update when setting model via config option | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > calls applyFlagSettings with effortLevel | covered:config-set-effort | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > calls applyFlagSettings with null effortLevel for 'default' | ported:tests/t1b_config.rs::effort_flag_settings_carries_ultracode_only_when_requested | toSdkEffortLevel -> null
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > updates effort currentValue in returned configOptions | covered:config-set-effort | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > keeps effort state unchanged when the SDK rejects a direct selection | missing:F11 | A-09: reject path of the effort apply, Turn 5
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > throws for invalid effort value | missing:F11 | validation exists in session.rs but has no Rust test, Turn 5
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > does not send config_option_update notification | covered:config-set-effort | 
+src/tests/session-config-options.test.ts | session config options > setSessionConfigOption for effort > other options are unchanged when effort is updated | covered:config-set-effort | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > applies concrete defaults and re-seeds automatic effort from each model's settings | missing:F11 | A-08/O-55: effort sync after model switch, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > re-seeds switches from retained programmatic settings before file settings | missing:F11 | O-50: session-side effortSettingsOverride, Turn 5 (merge_effort_settings ported)
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears an unsupported user pin before choosing the new model's concrete effort | missing:F11 | A-08, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a legacy pin without promoting persisted effort to a flag override | missing:F11 | A-08, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > retains the original pin value when a legacy clamp fails | missing:F11 | A-09, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > restores the last applied effort when recommended-value synchronization fails | missing:F11 | A-09/O-55, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > returns the new model state when effort synchronization fails | missing:F11 | A-09, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > publishes the new model state when external-switch effort synchronization fails | missing:F11 | R-01/A-09, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > drops effort option when switching to a model without effort support | ported:tests/t1b_config.rs::effort_option_is_dropped_for_a_model_without_effort_support | pure rebuild
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clears a pinned effort via applyFlagSettings when switching to a model without effort | missing:F11 | A-08, Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > adds effort option when switching to a model that supports effort | ported:tests/t1b_config.rs::effort_option_appears_for_a_model_that_supports_effort | pure rebuild
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > clamps effort to valid value when new model has different supported levels | ported:tests/t1b_config.rs::effort_value_is_clamped_to_the_new_models_levels | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > preserves effort value when new model supports the same level | ported:tests/t1b_config.rs::effort_value_is_preserved_when_the_new_model_supports_it | 
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > seeds effort from the new model's persisted modelSettings entry on an unpinned switch | missing:F11 | A-08: session seed (settings_effort_for_model ported in tests/t1b_config.rs), Turn 5
+src/tests/session-config-options.test.ts | session config options > effort level and model switch interactions > falls back to the top-level settings effort when the new model has no per-model entry | missing:F11 | A-08: session seed, Turn 5
+src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionConfigOption for mode also calls underlying setPermissionMode | covered:config-set-mode | 
+src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionConfigOption for model also calls underlying setModel | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > bidirectional consistency > resolves a full model id onto its hinted row via session.modelInfos | missing:F11 | session.modelInfos hinted-row resolution, Turn 5
+src/tests/session-config-options.test.ts | session config options > bidirectional consistency > accepts the reported currentValue even when it has no options entry | missing:F11 | Turn 5
+src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionMode also syncs configOptions | covered:config-set-mode | 
+src/tests/session-config-options.test.ts | session config options > bidirectional consistency > setSessionConfigOption(model) also syncs configOptions | covered:config-set-model | 
+src/tests/session-config-options.test.ts | session config options > context window on model change > seeds the window from text inference on model switch | missing:F11 | R-01 context-window reconcile, Turn 5
+src/tests/session-config-options.test.ts | session config options > context window on model change > falls back to the default window when inference misses, then refines it in the background | missing:F11 | R-01, Turn 5
+src/tests/session-config-options.test.ts | session config options > context window on model change > drops a background answer that arrives after another switch | ported:src/session_model.rs::f5b_context_window_answer_still_current | 
+src/tests/session-config-options.test.ts | session config options > context window on model change > keeps the learned window when re-asserting the current model | ported:src/session.rs::inv_63_model_reselection_keeps_learned_window | 
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the stable mode catalog when switching to Haiku | missing:F11 | P-06/R-01, Turn 5
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > keeps the same mode catalog when switching from Haiku back to Opus | missing:F11 | P-06/R-01, Turn 5
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > preserves the current mode when it remains valid after a model switch | missing:F11 | P-06/R-01, Turn 5
+src/tests/session-config-options.test.ts | session config options > auto mode availability per model > falls back to Accept edits and emits current_mode_update on a Haiku switch | missing:F11 | P-06/R-01, Turn 5
 src/tests/session-hooks.test.ts | session hooks with the Claude Code binary > [dynamic-describe#1] > runs the user, project and IDE hooks of one event, only in their session | missing:T-UNCLASSIFIED | 
 src/tests/session-hooks.test.ts | session hooks with the Claude Code binary > [dynamic-describe#1] > replaces and removes IDE hooks on session/load | missing:T-UNCLASSIFIED | 
 src/tests/session-index-units.test.ts | project directory encoding > matches the SDK encoding and never decodes | missing:T-UNCLASSIFIED | 
@@ -2001,23 +2001,23 @@ src/tests/session-load.test.ts | session load/resume lifecycle > ACP: newSession
 src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession does not replay local-command metadata user messages | missing:T-UNCLASSIFIED | 
 src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession strips marker tags from a concatenated single-string prompt | missing:T-UNCLASSIFIED | 
 src/tests/session-load.test.ts | session load/resume lifecycle > ACP: loadSession reports the model the resumed session is actually running | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > applies a valid mode to the SDK query | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > rejects invalid and unavailable modes before touching the query | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > detects model-specific Auto availability | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > falls Auto back to Accept edits and warns only once per session | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > warns about the Auto fallback as a live notice when the client can present one | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > handles setSessionMode and publishes the updated config option | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > rejects missing and closed sessions | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > omits bypassPermissions from the catalog when bypass capability is disabled | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > initializes the stable mode catalog and falls unsupported Auto back | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > keeps mode state and its config option synchronized | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > remembers the mode the session left when it entered plan mode | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | session mode > reconciles Auto after a model switch | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | resolveInitialPermissionMode > uses defaultMode when nothing else is given | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | resolveInitialPermissionMode > continues in the mode of the resumed transcript instead of defaultMode | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | resolveInitialPermissionMode > lets an explicit mode win over the resumed transcript | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | resolveInitialPermissionMode > falls back to defaultMode when bypass is not available now | missing:T-UNCLASSIFIED | 
-src/tests/session-mode.test.ts | resolveInitialPermissionMode > falls back to defaultMode for an unknown resumed mode | missing:T-UNCLASSIFIED | 
+src/tests/session-mode.test.ts | session mode > applies a valid mode to the SDK query | covered:config-set-mode | set_permission_mode control request
+src/tests/session-mode.test.ts | session mode > rejects invalid and unavailable modes before touching the query | covered:config-invalid | unknown mode / bypass-unavailable error
+src/tests/session-mode.test.ts | session mode > detects model-specific Auto availability | missing:F11 | R-01/P-06: session.rs model_lacks_auto has no direct test of the upstream cases (Turn 5)
+src/tests/session-mode.test.ts | session mode > falls Auto back to Accept edits and warns only once per session | ported:src/session.rs::fallback_warning_is_published_once_per_session | P-06 (deferred first-prompt warning) is Turn 5
+src/tests/session-mode.test.ts | session mode > warns about the Auto fallback as a live notice when the client can present one | missing:F11 | P-06: notice-capable warning path, Turn 5
+src/tests/session-mode.test.ts | session mode > handles setSessionMode and publishes the updated config option | covered:config-set-mode | current_mode_update + config_option_update
+src/tests/session-mode.test.ts | session mode > rejects missing and closed sessions | missing:F11 | M-43: husk session / SESSION_ENDED_MESSAGE, Turn 5
+src/tests/session-mode.test.ts | session mode > omits bypassPermissions from the catalog when bypass capability is disabled | ported:src/session_config.rs::inv_62_mode_catalog | 
+src/tests/session-mode.test.ts | session mode > initializes the stable mode catalog and falls unsupported Auto back | missing:F11 | P-06: creation-time auto clamp, Turn 5
+src/tests/session-mode.test.ts | session mode > keeps mode state and its config option synchronized | covered:config-set-mode | 
+src/tests/session-mode.test.ts | session mode > remembers the mode the session left when it entered plan mode | missing:F11 | pre_plan_mode (session.rs) has no direct Rust test, Turn 5
+src/tests/session-mode.test.ts | session mode > reconciles Auto after a model switch | missing:F11 | R-01: PostModelSwitch mode reconcile, Turn 5
+src/tests/session-mode.test.ts | resolveInitialPermissionMode > uses defaultMode when nothing else is given | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
+src/tests/session-mode.test.ts | resolveInitialPermissionMode > continues in the mode of the resumed transcript instead of defaultMode | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
+src/tests/session-mode.test.ts | resolveInitialPermissionMode > lets an explicit mode win over the resumed transcript | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | 
+src/tests/session-mode.test.ts | resolveInitialPermissionMode > falls back to defaultMode when bypass is not available now | ported:src/permission_mode.rs::inv_57_resolve_initial_mode_order | log text: inv_57_unresolvable_resumed_mode_is_logged
+src/tests/session-mode.test.ts | resolveInitialPermissionMode > falls back to defaultMode for an unknown resumed mode | ported:src/permission_mode.rs::inv_57_unresolvable_resumed_mode_is_logged | 
 src/tests/session-notices.test.ts | session notices > requires an object under clientCapabilities.session.notices | ported:src/notices.rs::notices_require_an_object_under_session_notices | |
 src/tests/session-notices.test.ts | session notices > renders the bold-label transcript line for clients without the capability | ported:src/notices.rs::renders_the_bold_label_transcript_line_without_the_capability | |
 src/tests/session-notices.test.ts | session notices > sends a notice update when the client can present one | ported:src/notices.rs::sends_a_notice_update_when_the_client_can_present_one | |
@@ -2329,21 +2329,21 @@ src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanM
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows nothing for a subagent's plan | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows nothing for a plan that waits for its team lead | missing:T-UNCLASSIFIED | 
 src/tests/tools.test.ts | toAcpNotifications - the plan of an approved ExitPlanMode > shows nothing for an empty plan | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > reports a turn as inserted under the uuid of its user message, then ended | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > reports a turn inserted when Claude Code starts it, before output that comes before its echo | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > reports a turn inserted only after a held turn before it ended | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > reports waiting on a permission request, then resuming | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > reports waiting on a request that Claude Code opens for a started turn before its echo | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > reports work that starts while a request is open as waiting at once | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > awaits the user while any request in the session is open, also one opened before the turn | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > ends a queued turn that is cancelled before it is inserted, without inserting it | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > drops a queued prompt that a cancel ends from Claude Code's queue, so it does not run | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > ends a cancelled turn when the force-cancel fires while an update is being sent | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > ends a held turn cancelled mid-followup after the output its interrupt flushes | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > does not insert a turn that a cancel ended while the previous turn was handed off | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > ends a closed session's turn before the close returns, also for a slow client | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > fails a queued turn without inserting it when the query ends | missing:T-UNCLASSIFIED | 
-src/tests/turn-events.test.ts | turn events > rejects a prompt that it refuses before starting a turn, and reports nothing | missing:T-UNCLASSIFIED | 
+src/tests/turn-events.test.ts | turn events > reports a turn as inserted under the uuid of its user message, then ended | missing:B-113 | v2 turn events
+src/tests/turn-events.test.ts | turn events > reports a turn inserted when Claude Code starts it, before output that comes before its echo | missing:B-113 | v2 turn events
+src/tests/turn-events.test.ts | turn events > reports a turn inserted only after a held turn before it ended | missing:B-113 | v2 turn events
+src/tests/turn-events.test.ts | turn events > reports waiting on a permission request, then resuming | missing:B-113 | v2 state events
+src/tests/turn-events.test.ts | turn events > reports waiting on a request that Claude Code opens for a started turn before its echo | missing:B-113 | v2 state events
+src/tests/turn-events.test.ts | turn events > reports work that starts while a request is open as waiting at once | missing:B-113 | v2 state events
+src/tests/turn-events.test.ts | turn events > awaits the user while any request in the session is open, also one opened before the turn | missing:B-113 | v2 state events
+src/tests/turn-events.test.ts | turn events > ends a queued turn that is cancelled before it is inserted, without inserting it | ported:src/turn/turn_tests.rs::cancelled_queued_sweep_reports_no_usage | v1 equivalent: a swept queued turn settles cancelled without usage
+src/tests/turn-events.test.ts | turn events > drops a queued prompt that a cancel ends from Claude Code's queue, so it does not run | ported:src/turn/turn_tests.rs::inv_38_cancel_async_message_sequence_precedes_interrupt | 
+src/tests/turn-events.test.ts | turn events > ends a cancelled turn when the force-cancel fires while an update is being sent | ported:src/session.rs::inv_17_force_cancel_floor | 
+src/tests/turn-events.test.ts | turn events > ends a held turn cancelled mid-followup after the output its interrupt flushes | covered:cancel-held-live-followup | 
+src/tests/turn-events.test.ts | turn events > does not insert a turn that a cancel ended while the previous turn was handed off | missing:B-113 | v2 insert events
+src/tests/turn-events.test.ts | turn events > ends a closed session's turn before the close returns, also for a slow client | ported:src/session.rs::v08_close_waits_for_cancelled_turns_then_settles | 
+src/tests/turn-events.test.ts | turn events > fails a queued turn without inserting it when the query ends | ported:src/turn/turn_tests.rs::stream_end_settles_active_rejects_queued | 
+src/tests/turn-events.test.ts | turn events > rejects a prompt that it refuses before starting a turn, and reports nothing | missing:B-113 | v2 refusal reporting
 scripts/next-preview-version.test.mjs | bumpPatch > increments the patch | missing:T-UNCLASSIFIED | 
 scripts/next-preview-version.test.mjs | bumpPatch > increments numerically rather than by concatenation | missing:T-UNCLASSIFIED | 
 scripts/next-preview-version.test.mjs | bumpPatch > trims surrounding whitespace | missing:T-UNCLASSIFIED | 

@@ -31,7 +31,7 @@ pub struct AsyncTaskRuntime {
     tasks: HashMap<String, Task>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Task {
     id: String,
     name: String,
@@ -359,6 +359,47 @@ impl AsyncTaskRuntime {
             out.extend(self.finish(&id, state, None));
         }
         out
+    }
+
+    /// [`Self::finish_all`] with a fallible publisher (Node `finishAll`,
+    /// `async-tasks.ts:380-393`): every live task is finished even when an earlier
+    /// publication failed, the errors are collected (Node aggregates them), and a
+    /// task whose terminal publication failed gets its previous state back — so a
+    /// later call retries it instead of treating it as already finished
+    /// (`finish`'s `catch`, `async-tasks.ts:683-688`). Returns the error messages.
+    pub fn finish_all_with(
+        &mut self,
+        state: &str,
+        publish: &mut dyn FnMut(Value) -> Result<(), String>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        let ids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| (t.announced || t.held) && !t.ignored && !is_terminal(&t.state))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let previous = self.tasks.get(&id).cloned();
+            let updates = self.finish(&id, state, None);
+            let mut failed = None;
+            for update in updates {
+                if let Err(error) = publish(update) {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = failed {
+                if let Some(previous) = previous {
+                    self.tasks.insert(id.clone(), previous);
+                }
+                errors.push(error);
+            }
+        }
+        errors
     }
 
     fn task_mut(&mut self, id: &str) -> &mut Task {
@@ -852,6 +893,45 @@ mod tests {
         assert!(updates[0].get("toolCallId").is_none());
         assert_eq!(updates[1]["sessionUpdate"], "async_task_state_update");
         assert_eq!(updates[1]["state"], "stopped");
+    }
+
+    /// V-18 — upstream "finishes remaining tasks and can retry a task whose
+    /// terminal publication failed" (`async-tasks.test.ts:1039-1081`): a failing
+    /// publish for `first` does not stop `second` from finishing, the failure is
+    /// reported, and a second `finish_all` retries `first`.
+    #[test]
+    fn v18_finish_all_continues_and_retries_a_failed_terminal_publication() {
+        let mut r = rt();
+        for id in ["first", "second"] {
+            let started = json!({"task_id": id, "task_type": "local_bash",
+                "description": id, "is_backgrounded": true});
+            r.task_started(&started);
+        }
+        let mut published: Vec<Value> = Vec::new();
+        let mut fail_first = true;
+        let mut publish = |update: Value| -> Result<(), String> {
+            if fail_first
+                && update["sessionUpdate"] == "async_task_state_update"
+                && update["asyncTaskId"] == "first"
+            {
+                fail_first = false;
+                return Err("client disconnected".to_string());
+            }
+            published.push(update);
+            Ok(())
+        };
+        let errors = r.finish_all_with("failed", &mut publish);
+        assert_eq!(errors, vec!["client disconnected".to_string()]);
+        let errors = r.finish_all_with("failed", &mut publish);
+        assert!(errors.is_empty(), "the retry succeeds: {errors:?}");
+        let terminal_ids: Vec<&str> = published
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "async_task_state_update")
+            .filter_map(|u| u["asyncTaskId"].as_str())
+            .collect();
+        assert_eq!(terminal_ids, vec!["second", "first"]);
+        // Finished tasks are not finished again.
+        assert!(r.finish_all_with("failed", &mut |_| Ok(())).is_empty());
     }
 
     #[test]

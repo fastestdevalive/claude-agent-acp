@@ -1362,3 +1362,11 @@ fn inv_24_permission_two_requests() {
 fn inv_24_session_title() {
     run_and_diff("session-title");
 }
+
+/// Turn 2, Group T2-G1 (AG-2) — sessionFailure extension scenarios and auth required error.
+#[test]
+fn inv_24_session_failure() {
+    run_and_diff("auth-required");
+    run_and_diff("session-failure-unfinished");
+    run_and_diff("session-failure-provider-error");
+}

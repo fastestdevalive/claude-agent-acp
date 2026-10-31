@@ -86,6 +86,10 @@ pub struct MapState {
     /// `rawInput` while the input still streams, the AIR `rawOutput` rule, and
     /// pass through the [`ChangedMetaFilter`]. Off for every other client.
     air: bool,
+    /// The client negotiated AIR `diffPatch` (T-40): a Write's live tool call
+    /// shows no input diff, the approval preview and the PostToolUse hook carry
+    /// the exact patch instead. Never set for a replay or an ACP v2 client.
+    diff_patch: bool,
     /// The session working directory (locates a Skill's `SKILL.md`), AIR only.
     cwd: Option<PathBuf>,
     /// True while a `content_block_start` tool_use block is mapped: its input
@@ -162,6 +166,82 @@ impl MapState {
     pub(crate) fn configure_air(&mut self, cwd: PathBuf) {
         self.air = true;
         self.set_cwd(cwd);
+    }
+
+    /// Record whether the client negotiated `diffPatch` (`capabilities.diffPatch`
+    /// of the tool-call capabilities, read from `ClientCapabilities::diff_patch`).
+    pub(crate) fn set_diff_patch(&mut self, diff_patch: bool) {
+        self.diff_patch = diff_patch;
+    }
+
+    /// Whether the client negotiated `diffPatch`.
+    pub(crate) fn diff_patch(&self) -> bool {
+        self.diff_patch
+    }
+
+    /// The tool shape of a streamed or surfaced tool call for this client
+    /// (`tool_shape_full`: AIR facts, and the `diffPatch` gating of a Write's
+    /// input diff). The session replay path never goes through the live map.
+    pub(crate) fn tool_shape(&self, name: &str, input: &Value) -> tools::ToolShape {
+        tools::tool_shape_full(
+            name,
+            input,
+            self.cwd.as_deref(),
+            self.air,
+            false,
+            self.diff_patch,
+        )
+    }
+
+    /// The `rawInput` of a tool use for this client: an AIR client gets it
+    /// without the file text that the tool call's diff holds.
+    pub(crate) fn raw_input(&self, name: &str, input: &Value) -> Value {
+        if self.air {
+            tools::air_raw_input(name, input)
+        } else {
+            input.clone()
+        }
+    }
+
+    /// The exact patch the approval of an Edit or Write shows (upstream
+    /// `previewPatchContent` in `canUseTool`), for a `diffPatch` client only.
+    /// `None` keeps the standard tool-call content.
+    pub(crate) fn approval_preview(&self, tool_name: &str, input: &Value) -> Option<Vec<Value>> {
+        if !self.diff_patch {
+            return None;
+        }
+        crate::diff::preview_patch_content(
+            tool_name,
+            input,
+            self.cwd.as_deref(),
+            crate::diff::PatchForm::Air,
+        )
+    }
+
+    /// Show `preview` as the content of tool call `id` and pin it
+    /// (`ensureToolCallEmitted` with `previewContent`, upstream
+    /// `pinContent`): a tool call that is surfaced now carries it, and the
+    /// streamed input that follows must not replace it with the standard diff of
+    /// the Edit snippet. Only a final result (`tool_result` or the PostToolUse
+    /// hook) replaces it.
+    pub(crate) fn pin_approval_preview(
+        &mut self,
+        id: &str,
+        surfaced: Option<&mut SessionUpdate>,
+        preview: &[Value],
+    ) {
+        let Ok(content) =
+            serde_json::from_value::<Vec<ToolCallContent>>(Value::Array(preview.to_vec()))
+        else {
+            return;
+        };
+        if let Some(SessionUpdate::ToolCall(call)) = surfaced {
+            call.content = content.clone();
+        }
+        if let Some(entry) = self.tool_tracker.get_mut(id) {
+            entry.content = content;
+            entry.content_pinned = true;
+        }
     }
 
     /// Whether the client gets a subagent's text/thinking
@@ -329,9 +409,28 @@ impl MapState {
         id: &str,
         fields: &ToolCallUpdateFields,
     ) -> Option<ToolCallUpdateFields> {
+        self.track_update(id, fields, false)
+    }
+
+    /// [`MapState::track_tool_call_update`] for a final result (`tool_result`):
+    /// it may replace a pinned approval patch (`replacePinnedContent`).
+    pub(crate) fn track_final_tool_call_update(
+        &mut self,
+        id: &str,
+        fields: &ToolCallUpdateFields,
+    ) -> Option<ToolCallUpdateFields> {
+        self.track_update(id, fields, true)
+    }
+
+    fn track_update(
+        &mut self,
+        id: &str,
+        fields: &ToolCallUpdateFields,
+        replace_pinned: bool,
+    ) -> Option<ToolCallUpdateFields> {
         match self.tool_tracker.get_mut(id) {
             Some(entry) => {
-                let changed = entry.apply(fields);
+                let changed = entry.apply(fields, replace_pinned);
                 if changed.is_empty() {
                     None
                 } else {
@@ -376,6 +475,8 @@ impl MapState {
             if let Ok(new_content) =
                 serde_json::from_value::<Vec<ToolCallContent>>(content_val.clone())
             {
+                // The final change of the tool replaces a pinned approval patch.
+                entry.content_pinned = false;
                 if new_content == entry.content {
                     if let Some(obj) = update.as_object_mut() {
                         obj.remove("content");
@@ -396,6 +497,21 @@ impl MapState {
                 }
             }
         }
+    }
+
+    /// Run a raw PostToolUse update through the AIR changed-`_meta` filter, which
+    /// upstream applies to every final notification: the `toolName` the
+    /// `tool_call` already sent goes, and an update with nothing left is `None`.
+    /// Any other client gets the update as it is.
+    pub(crate) fn filter_hook_meta(&mut self, update: Value) -> Option<Value> {
+        if !self.air {
+            return Some(update);
+        }
+        let Ok(typed) = serde_json::from_value::<SessionUpdate>(update.clone()) else {
+            return Some(update);
+        };
+        let filtered = self.meta_filter.apply(typed)?;
+        Some(serde_json::to_value(filtered).unwrap_or(update))
     }
 
     /// Clear EVERY per-tool-call field-tracker entry (review follow-up
@@ -427,6 +543,8 @@ pub(crate) struct TrackedToolCall {
     locations: Vec<ToolCallLocation>,
     raw_input: Option<Value>,
     raw_output: Option<Value>,
+    /// The content is an exact approval patch (`contentPinned`).
+    content_pinned: bool,
     pub(crate) result_seen: bool,
 }
 
@@ -448,13 +566,14 @@ impl TrackedToolCall {
             locations,
             raw_input,
             raw_output: None,
+            content_pinned: false,
             result_seen: false,
         }
     }
 
     /// Compare `fields` against the held values; record and return the changed
     /// subset (updating the held state).
-    fn apply(&mut self, fields: &ToolCallUpdateFields) -> Changed {
+    fn apply(&mut self, fields: &ToolCallUpdateFields, replace_pinned: bool) -> Changed {
         let mut changed = Changed::default();
         if let Some(v) = &fields.status {
             if v != &self.status {
@@ -475,9 +594,15 @@ impl TrackedToolCall {
             }
         }
         if let Some(v) = &fields.content {
-            if v != &self.content {
-                changed.content = Some(v.clone());
-                self.content = v.clone();
+            // An exact approval patch stays until a final result replaces it.
+            if self.content_pinned && !replace_pinned {
+                // dropped: the client keeps the pinned patch
+            } else {
+                self.content_pinned = false;
+                if v != &self.content {
+                    changed.content = Some(v.clone());
+                    self.content = v.clone();
+                }
             }
         }
         if let Some(v) = &fields.locations {
@@ -1035,13 +1160,13 @@ fn tool_call_from_use(
     }
 
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = tools::tool_shape_with(&name, &input, state.cwd.as_deref(), state.air);
+    let shape = state.tool_shape(&name, &input);
     // AIR gets `rawInput` once it is complete; every other client gets the
     // input as it stands, also the empty input at the stream start.
     let sent_raw_input = if state.air && state.input_incomplete {
         None
     } else {
-        raw_input.clone()
+        raw_input.as_ref().map(|raw| state.raw_input(&name, raw))
     };
     // 2.9 (X-7): seed the field tracker with what the client now holds.
     state.seed_tool_tracker(
@@ -1117,7 +1242,7 @@ fn tool_update_from_result(
         if let Some(raw_output) = result.raw_output {
             fields = fields.raw_output(raw_output);
         }
-        let fields = state.track_tool_call_update(&id, &fields)?;
+        let fields = state.track_final_tool_call_update(&id, &fields)?;
         let hook_pending = state.pending_hooks.contains(&id);
         state.finish_result_tool_tracker(&id, hook_pending);
         return Some(SessionUpdate::ToolCallUpdate(
@@ -1170,7 +1295,7 @@ fn tool_update_from_result(
 
     // 2.9 (X-7): emit only fields the client does not already hold; the
     // status always differs (Pending -> Completed/Failed) so this is `Some`.
-    let fields = state.track_tool_call_update(&id, &fields)?;
+    let fields = state.track_final_tool_call_update(&id, &fields)?;
     // Entry ends after the tool_result (or kept if hook is pending, M3/Decision 12).
     let hook_pending = state.pending_hooks.contains(&id);
     state.finish_result_tool_tracker(&id, hook_pending);
@@ -1196,7 +1321,7 @@ fn tool_call_update_refine(
         state.record_tool_call_parent(&id, parent);
     }
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = tools::tool_shape_with(name, &input, state.cwd.as_deref(), state.air);
+    let shape = state.tool_shape(name, &input);
     let mut fields = ToolCallUpdateFields::new()
         .kind(shape.kind)
         .title(shape.title)
@@ -1205,7 +1330,7 @@ fn tool_call_update_refine(
         fields = fields.locations(shape.locations);
     }
     if let Some(raw_input) = raw_input {
-        fields = fields.raw_input(raw_input);
+        fields = fields.raw_input(state.raw_input(name, &raw_input));
     }
     let fields = state.track_tool_call_update(&id, &fields)?;
     let mut meta = state.use_meta(name, &input);
@@ -1832,7 +1957,7 @@ fn streamed_input_refinement(
     if let Some(parent) = ctx.parent.as_deref() {
         state.record_tool_call_parent(id, parent);
     }
-    let shape = tools::tool_shape_with(name, &input, state.cwd.as_deref(), state.air);
+    let shape = state.tool_shape(name, &input);
     // The `_meta` reads the recovered partial input (`partialRefinement`).
     let mut meta = state.use_meta(name, &input);
     crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
@@ -3688,5 +3813,162 @@ mod tests {
         assert!(plan.get("status").is_none());
         assert!(plan.get("content").is_none());
         assert!(plan.get("kind").is_none());
+    }
+}
+
+/// T-40/T-43/T-106 through the real mapping path: the `diffPatch` capability
+/// gates the Write input diff, the approval preview and the pinned content.
+#[cfg(test)]
+mod diff_patch_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_use_frame(id: &str, name: &str, input: Value) -> Value {
+        json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": name, "input": input}
+            ]}
+        })
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "acp-map-diff-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn first_tool_call_content(updates: &[SessionUpdate]) -> Vec<Value> {
+        let SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("expected a tool_call, got {:?}", updates[0]);
+        };
+        call.content
+            .iter()
+            .map(|block| serde_json::to_value(block).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn write_tool_call_input_diff_follows_the_diff_patch_capability() {
+        let input = json!({"file_path": "/work/a.ts", "content": "a\n"});
+
+        let mut plain = MapState::default();
+        let updates =
+            map_consolidated_assistant(&tool_use_frame("t1", "Write", input.clone()), &mut plain);
+        let content = first_tool_call_content(&updates);
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0]["type"], "diff");
+        assert_eq!(content[0]["newText"], "a\n");
+
+        let mut patch = MapState::default();
+        patch.set_diff_patch(true);
+        let updates = map_consolidated_assistant(&tool_use_frame("t1", "Write", input), &mut patch);
+        assert!(first_tool_call_content(&updates).is_empty());
+    }
+
+    #[test]
+    fn edit_tool_call_keeps_the_snippet_diff_for_a_diff_patch_client() {
+        let mut patch = MapState::default();
+        patch.set_diff_patch(true);
+        let input = json!({"file_path": "/work/a.ts", "old_string": "a", "new_string": "b"});
+        let updates = map_consolidated_assistant(&tool_use_frame("t1", "Edit", input), &mut patch);
+        let content = first_tool_call_content(&updates);
+        assert_eq!(content[0]["oldText"], "a");
+        assert_eq!(content[0]["newText"], "b");
+    }
+
+    #[test]
+    fn approval_preview_needs_the_capability_and_resolves_against_the_cwd() {
+        let dir = temp_dir("preview");
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        let input = json!({"file_path": "sub/../a.txt", "old_string": "two", "new_string": "2"});
+
+        let mut state = MapState::default();
+        state.set_cwd(dir.clone());
+        assert!(state.approval_preview("Edit", &input).is_none());
+
+        state.set_diff_patch(true);
+        let preview = state.approval_preview("Edit", &input).expect("preview");
+        let text = preview[0]["_meta"]["jetbrains"]["air"]["diffPatch"]["text"]
+            .as_str()
+            .unwrap();
+        let name = dir
+            .join("a.txt")
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        // The patch names the resolved file, not the raw `sub/../a.txt`.
+        assert!(
+            text.starts_with(&format!("diff --git a/{name} b/{name}\n")),
+            "{text}"
+        );
+        assert!(text.contains("-two\n+2\n"), "{text}");
+        assert!(state.approval_preview("Read", &input).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pinned_approval_patch_survives_the_streamed_snippet_and_yields_to_the_result() {
+        let dir = temp_dir("pin");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let file_str = file.to_string_lossy().to_string();
+        let input = json!({"file_path": &file_str, "old_string": "two", "new_string": "2"});
+
+        let mut state = MapState::default();
+        state.set_cwd(dir.clone());
+        state.set_diff_patch(true);
+        // The tool call is surfaced by the stream with the snippet diff.
+        let updates =
+            map_consolidated_assistant(&tool_use_frame("t1", "Edit", input.clone()), &mut state);
+        assert_eq!(first_tool_call_content(&updates)[0]["oldText"], "two");
+
+        // The approval pins the exact patch over it.
+        let preview = state.approval_preview("Edit", &input).expect("preview");
+        state.pin_approval_preview("t1", None, &preview);
+
+        // The snippet diff of a streamed refinement is dropped...
+        let snippet: Vec<ToolCallContent> = serde_json::from_value(json!([
+            {"type": "diff", "path": &file_str, "oldText": "two", "newText": "2x"}
+        ]))
+        .unwrap();
+        let refine = ToolCallUpdateFields::new().content(snippet.clone());
+        assert!(state.track_tool_call_update("t1", &refine).is_none());
+
+        // ...and a final result replaces it.
+        let fin = state
+            .track_final_tool_call_update("t1", &refine)
+            .expect("the final result replaces the pinned patch");
+        assert_eq!(fin.content, Some(snippet));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pin_replaces_the_content_of_a_tool_call_surfaced_by_the_approval() {
+        let mut state = MapState::default();
+        let preview = vec![json!({
+            "type": "diff", "path": "/work/a.ts", "oldText": null, "newText": "",
+            "_meta": {"jetbrains": {"air": {"diffPatch": {"version": 1, "format": "git_patch", "text": "p"}}}}
+        })];
+        let mut surfaced = crate::permission::ensure_tool_call_emitted(
+            "Edit",
+            &json!({"file_path": "/work/a.ts", "old_string": "a", "new_string": "b"}),
+            "t1",
+            None,
+            &mut state,
+            None,
+        );
+        state.pin_approval_preview("t1", surfaced.as_mut(), &preview);
+        let content = first_tool_call_content(std::slice::from_ref(surfaced.as_ref().unwrap()));
+        assert_eq!(
+            content[0]["_meta"]["jetbrains"]["air"]["diffPatch"]["text"],
+            "p"
+        );
     }
 }

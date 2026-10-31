@@ -1,0 +1,35 @@
+{
+  "permission": "allow",
+  "steps": [
+    {
+      "call": "initialize"
+    },
+    {
+      "call": "request",
+      "method": "session/new",
+      "capture_session_id": true,
+      "params": {
+        "cwd": "$CWD",
+        "mcpServers": []
+      }
+    },
+    {
+      "call": "request",
+      "method": "session/set_config_option",
+      "params": {
+        "sessionId": "$SESSION",
+        "configId": "effort",
+        "value": "high"
+      }
+    },
+    {
+      "call": "request",
+      "method": "session/set_config_option",
+      "params": {
+        "sessionId": "$SESSION",
+        "configId": "effort",
+        "value": "default"
+      }
+    }
+  ]
+}

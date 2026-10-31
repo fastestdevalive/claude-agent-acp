@@ -185,123 +185,6 @@ fn process_entrypoint() -> (String, Vec<String>) {
     (executable, argv)
 }
 
-/// The terminal auth methods, mirroring `initialize` (`acp-agent.ts:2869-2947`).
-///
-/// The remote branch (`NO_BROWSER`/`SSH_*`/`CLAUDE_CODE_REMOTE`) offers the
-/// TUI login instead of the browser redirect; the non-remote branch offers the
-/// subscription and Console logins. A client that only declared
-/// `_meta["terminal-auth"]` gets the same methods with the launch command.
-fn terminal_auth_methods(
-    caps: &ClientCapabilities,
-    env: &crate::env_snapshot::EnvSnapshot,
-    executable: &str,
-    argv: &[String],
-) -> Vec<Value> {
-    let supports_terminal = caps.auth_terminal;
-    let supports_meta = caps.meta_terminal_auth;
-    if !supports_terminal && !supports_meta {
-        return Vec::new();
-    }
-
-    // `--hide-claude-auth` belongs to F34; until then Claude auth is not
-    // hidden.
-    let hidden = false;
-    let is_remote = env.flag("NO_BROWSER")
-        || env.flag("SSH_CONNECTION")
-        || env.flag("SSH_CLIENT")
-        || env.flag("SSH_TTY")
-        || env.flag("CLAUDE_CODE_REMOTE");
-
-    let terminal_auth = |extra: &[&str], label: &str| -> Value {
-        let args: Vec<String> = argv
-            .iter()
-            .cloned()
-            .chain(extra.iter().map(|arg| (*arg).to_string()))
-            .collect();
-        json!({
-            "command": executable,
-            "args": args,
-            "label": label,
-        })
-    };
-
-    if is_remote {
-        let mut method = json!({
-            "description": "Run `claude /login` in the terminal",
-            "name": "Log in with Claude",
-            "id": "claude-login",
-            "type": "terminal",
-            "args": ["--cli"],
-        });
-        if supports_meta {
-            method["_meta"] = json!({
-                "terminal-auth": terminal_auth(&["--cli"], "Claude Login"),
-            });
-        }
-        if !hidden && (supports_terminal || supports_meta) {
-            return vec![method];
-        }
-        return Vec::new();
-    }
-
-    let mut claude_login = json!({
-        "description": "Use Claude subscription ",
-        "name": "Claude Subscription",
-        "id": "claude-ai-login",
-        "type": "terminal",
-        "args": ["--cli", "auth", "login", "--claudeai"],
-    });
-    let mut console_login = json!({
-        "description": "Use Anthropic Console (API usage billing)",
-        "name": "Anthropic Console",
-        "id": "console-login",
-        "type": "terminal",
-        "args": ["--cli", "auth", "login", "--console"],
-    });
-    if supports_meta {
-        claude_login["_meta"] = json!({
-            "terminal-auth": terminal_auth(
-                &["--cli", "auth", "login", "--claudeai"],
-                "Claude Login",
-            ),
-        });
-        console_login["_meta"] = json!({
-            "terminal-auth": terminal_auth(
-                &["--cli", "auth", "login", "--console"],
-                "Anthropic Console Login",
-            ),
-        });
-    }
-
-    let mut methods = Vec::new();
-    if !hidden && (supports_terminal || supports_meta) {
-        methods.push(claude_login);
-    }
-    if supports_terminal || supports_meta {
-        methods.push(console_login);
-    }
-    methods
-}
-
-/// The custom-gateway auth methods, offered only when the client declared
-/// `auth._meta.gateway === true` (`acp-agent.ts:2844-2867`).
-fn gateway_auth_methods() -> Vec<Value> {
-    vec![
-        json!({
-            "id": "gateway",
-            "name": "Custom model gateway",
-            "description": "Use a custom gateway to authenticate and access models",
-            "_meta": {"gateway": {"protocol": "anthropic"}},
-        }),
-        json!({
-            "id": "gateway-bedrock",
-            "name": "Custom model gateway",
-            "description": "Use a custom gateway to authenticate and access models",
-            "_meta": {"gateway": {"protocol": "bedrock"}},
-        }),
-    ]
-}
-
 /// The `initialize` response, byte-matching the Node adapter at the pinned
 /// upstream version (modulo ignored volatile fields); `agentInfo.version` is
 /// composed from `porting/UPSTREAM_VERSION` (Decision 3).
@@ -336,10 +219,9 @@ fn initialize_response(
         session_caps.insert("subagents".into(), json!({}));
     }
 
-    let mut auth_methods = terminal_auth_methods(caps, env, executable, argv);
-    if caps.auth_gateway {
-        auth_methods.extend(gateway_auth_methods());
-    }
+    // WB-04 / F2a: the pure builder lives in `client_caps`; `--hide-claude-auth`
+    // (F34) will pass `true` here.
+    let auth_methods = crate::client_caps::auth_methods(caps, env, executable, argv, false);
 
     let mut meta = serde_json::Map::new();
     meta.insert("steering".into(), json!({ "supported": true }));
@@ -538,6 +420,158 @@ fn format_uri_as_link(uri: &str) -> String {
     } else {
         uri.to_string()
     }
+}
+
+/// The `_meta.claudeCode.options` keys whose change on `session/load` or
+/// `session/resume` of a live session must rebuild the process
+/// (`OPTION_REBUILDS_SESSION`, `acp-agent.ts:1601-1675`, the `true` entries).
+/// Almost every option is read only when the process starts. The `false` entries
+/// are managed by the adapter, per-call attach controls, live objects that cannot
+/// cross JSON-RPC, or without effect on a created session.
+const OPTION_REBUILDS_SESSION: &[&str] = &[
+    "additionalDirectories",
+    "agentProgressSummaries",
+    "agents",
+    "allowDangerouslySkipPermissions",
+    "allowedTools",
+    "betas",
+    "debug",
+    "debugFile",
+    "disallowedTools",
+    "effort",
+    "enableFileCheckpointing",
+    "env",
+    "executableArgs",
+    "extraArgs",
+    "fallbackModel",
+    "forwardSubagentText",
+    "includeHookEvents",
+    "managedSettings",
+    "maxBudgetUsd",
+    "maxThinkingTokens",
+    "maxTurns",
+    "mcpServers",
+    "model",
+    "outputFormat",
+    "pathToClaudeCodeExecutable",
+    "permissionPrompts",
+    "permissionPromptToolName",
+    "persistSession",
+    "perTaskStopAffordance",
+    "planModeInstructions",
+    "pluginDelivery",
+    "plugins",
+    "projectConfigRoot",
+    "promptSuggestions",
+    "sandbox",
+    "sessionStoreFlush",
+    "settings",
+    "settingSources",
+    "skills",
+    "strictMcpConfig",
+    "supportedDialogKinds",
+    "systemPrompt",
+    "taskBudget",
+    "thinking",
+    "toolAliases",
+    "toolConfig",
+    "tools",
+    "verbatimPrompts",
+];
+
+/// A JSON value with object keys sorted, so key order never changes a
+/// fingerprint (`canonicalJson`, `acp-agent.ts:1678-1692`).
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), canonical_json(&map[key])))
+                    .collect(),
+            )
+        }
+        other => other.clone(),
+    }
+}
+
+/// A stable fingerprint of the session-defining params of `session/new|load|resume`
+/// (`computeSessionFingerprint`, `acp-agent.ts:1694-1722`): a `load`/`resume` of a
+/// live session whose fingerprint changed tears the session down and recreates it
+/// so the process picks up the new values. MCP servers are sorted by name and
+/// skills are a set, so reordering never triggers a rebuild; only the options of
+/// [`OPTION_REBUILDS_SESSION`] count.
+pub fn compute_session_fingerprint(params: &Value) -> String {
+    let meta = params.get("_meta");
+    let claude_code = meta.and_then(|m| m.get("claudeCode"));
+    let mut servers: Vec<Value> = params
+        .get("mcpServers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    servers.sort_by(|a, b| {
+        let name = |v: &Value| {
+            v.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        name(a).cmp(&name(b))
+    });
+    let mut options = serde_json::Map::new();
+    if let Some(given) = claude_code
+        .and_then(|c| c.get("options"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in given {
+            if OPTION_REBUILDS_SESSION.contains(&key.as_str()) {
+                options.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if let Some(Value::Array(skills)) = options.get("skills").cloned() {
+        // `normalizeSkills`: array order and duplicates do not rebuild the Query.
+        let mut set: Vec<String> = skills
+            .iter()
+            .filter_map(|s| s.as_str().map(str::to_string))
+            .collect();
+        set.sort();
+        set.dedup();
+        options.insert(
+            "skills".to_string(),
+            Value::Array(set.into_iter().map(Value::String).collect()),
+        );
+    }
+    // `undefined` fields are omitted by `JSON.stringify`; so are nulls here.
+    let optional = [
+        ("cwd", params.get("cwd")),
+        ("additionalDirectories", params.get("additionalDirectories")),
+        (
+            "additionalRoots",
+            meta.and_then(|m| m.get("additionalRoots")),
+        ),
+        ("systemPrompt", meta.and_then(|m| m.get("systemPrompt"))),
+        ("clientSystemPrompt", params.get("systemPrompt")),
+        (
+            "disableBuiltInTools",
+            meta.and_then(|m| m.get("disableBuiltInTools")),
+        ),
+        (
+            "emitRawSDKMessages",
+            claude_code.and_then(|c| c.get("emitRawSDKMessages")),
+        ),
+    ];
+    let mut fingerprint = serde_json::Map::new();
+    for (key, value) in optional {
+        if let Some(value) = value.filter(|v| !v.is_null()) {
+            fingerprint.insert(key.to_string(), value.clone());
+        }
+    }
+    fingerprint.insert("mcpServers".to_string(), Value::Array(servers));
+    fingerprint.insert("options".to_string(), Value::Object(options));
+    canonical_json(&Value::Object(fingerprint)).to_string()
 }
 
 /// Build the child [`SpawnOptions`] for a session (8.4, rust-parity-fixes 1.3).
@@ -922,6 +956,14 @@ fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
                 Some(json!({"details": message})),
             );
         }
+        // `internalErrorForClient({errorKind:"transport_lost"})` for an AIR client
+        // carries no detail: the message stays bare `Internal error`.
+        SessionError::TransportLost => {
+            return (
+                "Internal error".to_string(),
+                Some(json!({"errorKind": "transport_lost"})),
+            );
+        }
         SessionError::Closed => (crate::turn::SESSION_ENDED_MESSAGE.to_string(), None),
         SessionError::Start(m) => (m.clone(), None),
     };
@@ -940,6 +982,31 @@ fn rpc_error(rpc: (String, Option<Value>)) -> Error {
     err
 }
 
+/// Convert a `SessionError` to the JSON-RPC wire error (`RequestError.authRequired`
+/// code -32000 for `AuthRequired`, else -32603).
+fn session_rpc_error(err: &SessionError) -> Error {
+    if let SessionError::PromptFailed {
+        kind: crate::turn::FailureKind::AuthRequired,
+        ..
+    } = err
+    {
+        return Error::new(-32000, "Authentication required");
+    }
+    rpc_error(session_error_to_rpc(err))
+}
+
+/// The JSON-RPC error for a failed `session/set_mode` / `session/set_config_option`.
+/// A session whose stream already ended is a husk: the request answers the same
+/// "session ended" error a prompt does (`requireOpenSession` /
+/// `setSessionConfigOption`, `session-mode.ts:318-320`, `acp-agent.ts:8951-8953`)
+/// instead of acting on a closed query; any other failure keeps its text.
+fn set_request_error(message: String) -> Error {
+    if message == crate::session::SESSION_GONE {
+        return session_rpc_error(&SessionError::Closed);
+    }
+    Error::internal_error().data(json!({ "details": message }))
+}
+
 /// A resumed session whose CLI cannot find the stored conversation answers
 /// `resourceNotFound` (-32002), not `Internal error` (`acp-agent.ts:8662-8672`:
 /// `RequestError.resourceNotFound(sessionId)`). Node maps the SDK's
@@ -955,25 +1022,49 @@ fn resumed_start_error(err: &SessionError, resumed: bool, session_id: &str) -> E
             }
         }
     }
-    rpc_error(session_error_to_rpc(err))
+    session_rpc_error(err)
 }
 
 /// Serve ACP over `transport` (D9). Runs until the transport closes.
 pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOptions) -> Result<()> {
+    serve_until(transport, opts, None).await
+}
+
+/// [`serve`], ending early when `shutdown` (if any) flips to `true`; either way
+/// every session the connection created is torn down before it returns.
+async fn serve_until(
+    transport: impl ConnectTo<Agent> + 'static,
+    opts: ServeOptions,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<()> {
     // A `session/cancel` notification must reach the owning session actor. The
     // request handler owns the live registry; it publishes each new session's
     // handle (a cheap clone, not session state) over this channel so the
     // notification handler keeps its own copy — lock-free (guard G5).
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<(String, Session)>();
+    // Every session this connection created, so that closing the connection can
+    // tear each one down (`dispose`, `acp-agent.ts:8917-8920`, V-11).
+    let (dispose_tx, mut dispose_rx) = mpsc::unbounded_channel::<Session>();
+    let (deferred_tx, deferred_rx) = mpsc::unbounded_channel::<RegistryMsg>();
+    // The spawned recreate tasks (a changed-params `load`/`resume` of a live
+    // session), so the connection's end can wait for or stop them before it
+    // disposes the sessions.
+    let (recreate_tx, mut recreate_rx) = mpsc::unbounded_channel::<RecreateTask>();
     let mut registry = Registry {
+        recreating: std::collections::HashMap::new(),
+        recreate_tx,
         sessions: std::collections::HashMap::new(),
         session_tx,
+        dispose_tx,
         air: None,
         caps: ClientCapabilities::default(),
         auth: None,
         settings_managers: std::collections::HashMap::new(),
+        fingerprints: std::collections::HashMap::new(),
+        deferred_tx,
+        deferred_rx,
     };
-    Agent
+    let connected = Agent
         .builder()
         .name("claude-agent-acp-rs")
         .on_receive_request(
@@ -997,8 +1088,58 @@ pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOption
             },
             agent_client_protocol::on_receive_notification!(),
         )
-        .connect_to(transport)
+        .connect_to(transport);
+    let result = match shutdown {
+        Some(mut shutdown) => tokio::select! {
+            res = connected => res,
+            _ = shutdown_requested(&mut shutdown) => Ok(()),
+        },
+        None => connected.await,
+    };
+    // The connection closed (or the owner asked to stop): tear down every session (cancel its work, interrupt
+    // and end its actor, which drops the child) instead of relying on the drop
+    // cascade, so each prompt in flight still gets its terminal state and each
+    // child gets the interrupt before it is killed.
+    // A recreate still tearing down or starting its session would register it
+    // after the list below was read: tell each to stop, give it the dispose
+    // bound to hand its new session to the list (or close it), and stop what
+    // stays.
+    let mut recreates = Vec::new();
+    let mut aborters = Vec::new();
+    while let Ok(task) = recreate_rx.try_recv() {
+        task.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        aborters.push(task.handle.abort_handle());
+        recreates.push(task.handle);
+    }
+    if tokio::time::timeout(DISPOSE_TIMEOUT, futures::future::join_all(recreates))
         .await
+        .is_err()
+    {
+        for aborter in aborters {
+            aborter.abort();
+        }
+    }
+    let mut sessions = Vec::new();
+    while let Ok(session) = dispose_rx.try_recv() {
+        sessions.push(session);
+    }
+    dispose_sessions(&sessions).await;
+    result
+}
+
+/// How long [`dispose_sessions`] waits for every session's teardown
+/// (`TEARDOWN_TURN_END_TIMEOUT_MS`-bounded per session in Node; here the session's
+/// own close bound plus slack).
+const DISPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Tear down all the connection's sessions concurrently (`dispose()`): `close` is
+/// idempotent, so a session that already ended or was closed returns at once.
+pub(crate) async fn dispose_sessions(sessions: &[Session]) {
+    let _ = tokio::time::timeout(
+        DISPOSE_TIMEOUT,
+        futures::future::join_all(sessions.iter().map(Session::close)),
+    )
+    .await;
 }
 
 /// A handle to a running [`serve`] loop (`serve.ts:29-34`, V-20).
@@ -1051,12 +1192,9 @@ pub fn serve_handle(transport: impl ConnectTo<Agent> + 'static, opts: ServeOptio
 pub async fn serve_with_shutdown(
     transport: impl ConnectTo<Agent> + 'static,
     opts: ServeOptions,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    tokio::select! {
-        res = serve(transport, opts) => res,
-        _ = shutdown_requested(&mut shutdown) => Ok(()),
-    }
+    serve_until(transport, opts, Some(shutdown)).await
 }
 
 /// Resolve once `shutdown` is (or becomes) `true`.
@@ -1097,6 +1235,8 @@ struct Registry {
     sessions: std::collections::HashMap<String, Session>,
     /// Publishes each new session's handle to the notification handler.
     session_tx: mpsc::UnboundedSender<(String, Session)>,
+    /// Publishes every registered session to the connection's dispose list.
+    dispose_tx: mpsc::UnboundedSender<Session>,
     /// The parsed AIR client declaration from `initialize` (Decision 11),
     /// `Some` only when the client declared `_meta.jetbrains.air`.
     air: Option<AirClient>,
@@ -1108,10 +1248,165 @@ struct Registry {
     /// Settings managers per session (F5a / O-60).
     settings_managers:
         std::collections::HashMap<String, Arc<crate::settings_manager::SettingsManager>>,
+    /// The [`compute_session_fingerprint`] each live session was created with
+    /// (`Session.sessionFingerprint`), compared on `load`/`resume` of a live id.
+    fingerprints: std::collections::HashMap<String, String>,
+    /// Where a `load`/`resume` that finishes off the request handler leaves its
+    /// registry entries; drained at the start of every request.
+    deferred_tx: mpsc::UnboundedSender<RegistryMsg>,
+    deferred_rx: mpsc::UnboundedReceiver<RegistryMsg>,
+    /// The ids of sessions a spawned recreate is tearing down and restarting
+    /// (they are in no other map meanwhile). A `session/close` of such an id
+    /// cancels the recreate; a second `load`/`resume` of it is refused.
+    recreating: std::collections::HashMap<String, Recreating>,
+    /// Hands each spawned recreate to [`serve_until`], which stops them before
+    /// it disposes the connection's sessions.
+    recreate_tx: mpsc::UnboundedSender<RecreateTask>,
+}
+
+/// A recreate in flight: its cancel flag (checked between its steps) and a
+/// signal that flips once the task has ended.
+struct Recreating {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    ended: watch::Receiver<bool>,
+}
+
+/// What a recreate task reports when it ends, however it ends: its id is no
+/// longer being recreated and a waiting `session/close` may answer.
+struct RecreateEnding {
+    deferred_tx: mpsc::UnboundedSender<RegistryMsg>,
+    session_id: String,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    ended_tx: watch::Sender<bool>,
+}
+
+impl Drop for RecreateEnding {
+    fn drop(&mut self) {
+        let _ = self.deferred_tx.send(RegistryMsg::RecreateEnded {
+            session_id: std::mem::take(&mut self.session_id),
+            cancel: self.cancel.clone(),
+        });
+        let _ = self.ended_tx.send(true);
+    }
+}
+
+/// A spawned recreate, as [`serve_until`] tracks it.
+struct RecreateTask {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// A change to the registry that a task running off the request handler leaves
+/// for the handler to apply before it serves the next request.
+enum RegistryMsg {
+    /// A started session's entries.
+    Register(Box<RegistryUpdate>),
+    /// The process behind the session died: forget it (`delete this.sessions`).
+    Evict {
+        session_id: String,
+        /// The dead session's command channel, held weakly.
+        husk: mpsc::WeakUnboundedSender<crate::session::Command>,
+    },
+    /// The recreate of `session_id` that owns `cancel` has ended.
+    RecreateEnded {
+        session_id: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+/// A registry entry a session start leaves for the request handler to apply.
+struct RegistryUpdate {
+    session_id: String,
+    session: Session,
+    settings_manager: Arc<crate::settings_manager::SettingsManager>,
+    fingerprint: String,
+    /// The cancel flag of the recreate this session belongs to. Checked when the
+    /// handler applies the update, not only before it was sent: a `session/close`
+    /// that arrives while the start is still finishing leaves it set, and the
+    /// session is then closed instead of registered under an id the client
+    /// already closed.
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// What a `load`/`resume` start needs of the registry, as cheap clones, so the
+/// start can run off the request handler.
+struct ResumeEnv {
+    air: Option<AirClient>,
+    caps: ClientCapabilities,
+    auth: Option<AuthHandle>,
+    session_tx: mpsc::UnboundedSender<(String, Session)>,
+    dispose_tx: mpsc::UnboundedSender<Session>,
+    deferred_tx: mpsc::UnboundedSender<RegistryMsg>,
+    /// The permission mode of the live session the start recreates, if any.
+    live_mode: Option<String>,
+    /// Set when the recreate this start belongs to is cancelled (a
+    /// `session/close` of the id, or the connection ending).
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[allow(dead_code)]
 impl Registry {
+    /// The clones a `load`/`resume` start needs.
+    fn resume_env(&self, live_mode: Option<String>) -> ResumeEnv {
+        ResumeEnv {
+            air: self.air.clone(),
+            caps: self.caps.clone(),
+            auth: self.auth.clone(),
+            session_tx: self.session_tx.clone(),
+            dispose_tx: self.dispose_tx.clone(),
+            deferred_tx: self.deferred_tx.clone(),
+            live_mode,
+            cancel: None,
+        }
+    }
+
+    /// Apply what tasks running off the request handler left behind.
+    fn apply_deferred(&mut self) {
+        while let Ok(msg) = self.deferred_rx.try_recv() {
+            match msg {
+                RegistryMsg::Register(update) => {
+                    if update
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst))
+                    {
+                        // Cancelled after its last check: nobody can use the id.
+                        let session = update.session;
+                        tokio::spawn(async move { session.close().await });
+                        continue;
+                    }
+                    self.settings_managers
+                        .insert(update.session_id.clone(), update.settings_manager);
+                    self.fingerprints
+                        .insert(update.session_id.clone(), update.fingerprint);
+                    self.sessions.insert(update.session_id, update.session);
+                }
+                RegistryMsg::Evict { session_id, husk } => {
+                    // Only the husk itself: a newer session under the same id
+                    // (a load after the death) stays.
+                    let is_husk = self.sessions.get(&session_id).is_some_and(|live| {
+                        husk.upgrade()
+                            .is_some_and(|tx| tx.same_channel(live.command_sender()))
+                    });
+                    if is_husk {
+                        self.sessions.remove(&session_id);
+                        self.settings_managers.remove(&session_id);
+                        self.fingerprints.remove(&session_id);
+                    }
+                }
+                RegistryMsg::RecreateEnded { session_id, cancel } => {
+                    if self
+                        .recreating
+                        .get(&session_id)
+                        .is_some_and(|r| Arc::ptr_eq(&r.cancel, &cancel))
+                    {
+                        self.recreating.remove(&session_id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Settings manager for a session, if registered.
     pub fn settings_manager(
         &self,
@@ -1184,7 +1479,12 @@ fn spawn_auth(
 /// Hand a created session's account and cwd to the auth actor (publish the
 /// session identity; re-probe when the cwd differs from the last probe's).
 fn publish_session_account(registry: &Registry, cwd: PathBuf, session: &Session) {
-    if let Some(auth) = &registry.auth {
+    publish_account(registry.auth.as_ref(), cwd, session);
+}
+
+/// [`publish_session_account`] given the auth-status actor directly.
+fn publish_account(auth: Option<&AuthHandle>, cwd: PathBuf, session: &Session) {
+    if let Some(auth) = auth {
         auth.send(AuthCmd::SessionCreated {
             cwd,
             account: session.account().cloned(),
@@ -1261,6 +1561,8 @@ fn initialize_options_for(
         system_prompt,
         append_system_prompt,
         hooks: Some(crate::hooks::init_hooks_payload()),
+        // O-144: `_meta.claudeCode.options.agents` goes to `initialize` verbatim.
+        agents: opts.agents,
         prompt_suggestions: Some(prompt_suggestions),
         tool_aliases: opts.tool_aliases,
         tool_config: opts.tool_config,
@@ -1285,9 +1587,37 @@ fn register_session(
     registry
         .sessions
         .insert(session_id.to_string(), session.clone());
-    let _ = registry
-        .session_tx
-        .send((session_id.to_string(), session.clone()));
+    wire_session(
+        &registry.session_tx,
+        &registry.dispose_tx,
+        &registry.deferred_tx,
+        session_id,
+        session,
+        update_rx,
+        connection,
+    );
+}
+
+/// [`register_session`] without the registry entry: publish the session to the
+/// notification handler and the dispose list, and start its update forwarder.
+fn wire_session(
+    session_tx: &mpsc::UnboundedSender<(String, Session)>,
+    dispose_tx: &mpsc::UnboundedSender<Session>,
+    deferred_tx: &mpsc::UnboundedSender<RegistryMsg>,
+    session_id: &str,
+    session: Session,
+    update_rx: mpsc::UnboundedReceiver<SessionOutbound>,
+    connection: &ConnectionTo<agent_client_protocol::Client>,
+) {
+    let _ = session_tx.send((session_id.to_string(), session.clone()));
+    // Weak, so this task (which lives as long as the actor's outbound channel)
+    // does not keep the actor's command channel open.
+    let evict = (
+        deferred_tx.clone(),
+        session_id.to_string(),
+        session.command_sender().downgrade(),
+    );
+    let _ = dispose_tx.send(session.clone());
 
     // Decision 9 / 2.1 + F5b/A-10: background get_context_usage {detail:"summary"}
     // spawned after register. The request is tagged with the model it was issued
@@ -1351,6 +1681,20 @@ fn register_session(
                 SessionOutbound::Flush(done) => {
                     let _ = done.send(());
                 }
+                // The process died: the registry forgets the session before any
+                // reply queued behind this marker reaches the client, so the
+                // client's next `session/load` starts a new child.
+                SessionOutbound::ProcessDied => {
+                    let (deferred_tx, session_id, husk) = evict.clone();
+                    let _ = deferred_tx.send(RegistryMsg::Evict { session_id, husk });
+                }
+                // A prompt response barrier that keeps FIFO response order within a
+                // settle batch: wait (bounded) until the prompt task queued its
+                // response before the next batch member's barrier resolves.
+                SessionOutbound::FlushAcked { done, ack } => {
+                    let _ = done.send(());
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), ack).await;
+                }
                 // Phase 10: a permission request from the session actor. Spawn a
                 // task that sends `session/request_permission` to the client and
                 // resolves the oneshot with the raw `result` (or an error), so the
@@ -1362,11 +1706,21 @@ fn register_session(
                     // non-AIR `locations:[]` to an AIR request.
                     let connection = connection.clone();
                     tokio::spawn(async move {
+                        let mut reply = reply;
                         let result = match UntypedMessage::new("session/request_permission", params)
                         {
                             Ok(msg) => {
                                 let sent = connection.send_request(msg);
-                                sent.block_task().await.map_err(|e| e.to_string())
+                                // `requestPermission(params, signal)`: when the turn
+                                // is cancelled the actor drops its receiver (it
+                                // aborts the round-trip), which aborts the request —
+                                // dropping the pending `SentRequest` sends
+                                // `$/cancel_request` so the client can dismiss its
+                                // prompt (`acp-agent.ts:2374-2390`, U-107).
+                                tokio::select! {
+                                    res = sent.block_task() => res.map_err(|e| e.to_string()),
+                                    () = reply.closed() => Err("Tool use aborted".to_string()),
+                                }
                             }
                             Err(e) => Err(e.to_string()),
                         };
@@ -1405,11 +1759,90 @@ impl ResumedKind {
     }
 }
 
+/// The zod-shaped `data` of the `-32602` the SDK answers for a `set_config_option`
+/// request whose `value` fits neither schema branch: a string `value`, or
+/// `type: "boolean"` with a boolean `value` (`error.format()`: every failing
+/// branch contributes its message, the boolean branch first). `None` when valid.
+fn set_config_option_schema_error(params: &Value) -> Option<Value> {
+    let received = |value: Option<&Value>| match value {
+        None => "undefined",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    };
+    let value = params.get("value");
+    let boolean_branch = params.get("type").and_then(Value::as_str) == Some("boolean");
+    let value_is_bool = value.is_some_and(Value::is_boolean);
+    let value_is_string = value.is_some_and(Value::is_string);
+    if value_is_string || (boolean_branch && value_is_bool) {
+        return None;
+    }
+    let mut value_errors = Vec::new();
+    if !value_is_bool {
+        value_errors.push(format!(
+            "Invalid input: expected boolean, received {}",
+            received(value)
+        ));
+    }
+    value_errors.push(format!(
+        "Invalid input: expected string, received {}",
+        received(value)
+    ));
+    let mut tree = serde_json::Map::new();
+    tree.insert("_errors".to_string(), json!([]));
+    tree.insert("value".to_string(), json!({ "_errors": value_errors }));
+    if !boolean_branch {
+        tree.insert(
+            "type".to_string(),
+            json!({ "_errors": ["Invalid input: expected \"boolean\""] }),
+        );
+    }
+    Some(Value::Object(tree))
+}
+
+/// Whether the resume of a recreated LIVE session failed because Claude Code never
+/// wrote its conversation, so it starts a fresh query under the same id instead
+/// (`recreateLiveSession`, `acp-agent.ts:4123-4143`). A session that is not loaded
+/// here keeps the failure (an unknown session), as does any other error.
+fn recreate_falls_back_to_fresh<T>(
+    was_live: bool,
+    already_fresh: bool,
+    result: &Result<T, SessionError>,
+) -> bool {
+    was_live
+        && !already_fresh
+        && matches!(
+            result,
+            Err(SessionError::Start(message))
+                if message.contains("No conversation found with session ID")
+        )
+}
+
+/// Whether the recreate `env` belongs to was cancelled.
+fn recreate_cancelled(env: &ResumeEnv) -> bool {
+    env.cancel
+        .as_ref()
+        .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 /// Start (or restart) the session `session_id` from its stored transcript
 /// (`--resume`) and answer a `session/load`, `session/resume` or `session/fork`
 /// request; the new session is registered and its proactive command list sent.
+///
+/// [`ResumeEnv::live_mode`] is the permission mode of the live session this start
+/// recreates (changed-params `load`/`resume`): the recreated session keeps its live
+/// mode and falls back to a fresh query under the same id when it was never
+/// prompted (`recreateLiveSession`, `acp-agent.ts:4123-4143`). Passed in, not
+/// parked in the registry, so a rejected request cannot leave it for a later load
+/// to inherit.
+///
+/// The registry entries of the new session go to [`ResumeEnv::deferred_tx`]; the
+/// request handler applies them before it serves the next request.
 async fn start_resumed(
-    registry: &mut Registry,
+    env: &ResumeEnv,
     session_id: String,
     params: &Value,
     opts: &ServeOptions,
@@ -1426,72 +1859,105 @@ async fn start_resumed(
         return responder.respond_with_error(e);
     }
     timing.phase("validate-cwd", "");
-    let initialize = match initialize_options_for(params, &registry.caps, registry.air.as_ref()) {
+    let initialize = match initialize_options_for(params, &env.caps, env.air.as_ref()) {
         Ok(initialize) => initialize,
         Err(e) => return responder.respond_with_error(e),
     };
     let cwd = cwd_str.map(PathBuf::from);
-    let (mut claude, permission_mode, allow_bypass) =
-        match spawn_inputs(params, cwd.as_deref(), opts, Some(&session_id)) {
-            Ok(inputs) => inputs,
-            Err(e) => return responder.respond_with_error(e),
-        };
-    claude.enable_file_checkpointing = Some(initialize.enable_file_checkpointing);
-    timing.phase("resume-transcript", "");
-    timing.phase("settings", "");
-    let raw_sdk_messages = claude.raw_sdk_messages.clone();
-    let mut spawn = session_spawn_options(
-        opts,
-        cwd,
-        session_id.clone(),
-        claude,
-        permission_mode,
-        allow_bypass,
-        true,
-    );
-    spawn.resume = Some(session_id.clone());
-    spawn.session_id = None;
-    let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
-    let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
-        .with_air(registry.air.clone())
-        .with_caps(registry.caps.clone())
-        .with_raw_sdk_messages(raw_sdk_messages)
-        .with_env(opts.env.clone())
-        .with_logger(opts.logger.clone());
-    // PC-2.2 / B-02: the replay runs while the CLI starts (Node
-    // `createSessionWhileReplaying`) and reads the transcript off the async
-    // runtime; the response waits for both, so the replay frames still precede
-    // it.
-    let air = registry.air.is_some();
-    let replay_future = async {
-        let messages = crate::transcript::session_messages_async(&opts.env, &session_id).await;
-        let (notifications, task_state, last_published) =
-            crate::transcript::replay_with_task_state(&messages, &session_id, air);
-        for mut value in notifications {
-            if let Some(update) = value.get_mut("update") {
-                crate::map::materialize_tool_call_defaults(update);
-                crate::map::materialize_diff_old_text(update);
-            }
-            if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                let _ = connection.send_notification(msg);
-            }
+    let mut fresh = false;
+    let (start_result, replayed, auth_cwd) = loop {
+        let (mut claude, permission_mode, allow_bypass) =
+            match spawn_inputs(params, cwd.as_deref(), opts, Some(&session_id)) {
+                Ok(inputs) => inputs,
+                Err(e) => return responder.respond_with_error(e),
+            };
+        let permission_mode = env.live_mode.clone().unwrap_or(permission_mode);
+        claude.enable_file_checkpointing = Some(initialize.enable_file_checkpointing);
+        timing.phase("resume-transcript", "");
+        timing.phase("settings", "");
+        let raw_sdk_messages = claude.raw_sdk_messages.clone();
+        let mut spawn = session_spawn_options(
+            opts,
+            cwd.clone(),
+            session_id.clone(),
+            claude,
+            permission_mode,
+            allow_bypass,
+            true,
+        );
+        if fresh {
+            // A new conversation that keeps the old id: `resume` stays unset, so
+            // the id reaches the SDK as `options.sessionId`.
+            spawn.resume = None;
+            spawn.session_id = Some(session_id.clone());
+        } else {
+            spawn.resume = Some(session_id.clone());
+            spawn.session_id = None;
         }
-        (task_state, last_published)
-    };
-    let no_replay: (Vec<(String, crate::hooks::TaskStateEntry)>, Option<String>) =
-        (Vec::new(), None);
-    let (start_result, replayed) = if replay {
-        tokio::join!(Session::start(sess_opts, session_id.clone()), replay_future)
-    } else {
-        (
-            Session::start(sess_opts, session_id.clone()).await,
-            no_replay,
-        )
+        let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
+        let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize.clone())
+            .with_air(env.air.clone())
+            .with_caps(env.caps.clone())
+            .with_raw_sdk_messages(raw_sdk_messages)
+            .with_env(opts.env.clone())
+            .with_logger(opts.logger.clone());
+        // PC-2.2 / B-02: the replay runs while the CLI starts (Node
+        // `createSessionWhileReplaying`) and reads the transcript off the async
+        // runtime; the response waits for both, so the replay frames still
+        // precede it.
+        let air = env.air.is_some();
+        let replay_future = async {
+            let messages = crate::transcript::session_messages_async(&opts.env, &session_id).await;
+            let (notifications, task_state, last_published) =
+                crate::transcript::replay_with_task_state(&messages, &session_id, air);
+            for mut value in notifications {
+                if let Some(update) = value.get_mut("update") {
+                    crate::map::materialize_tool_call_defaults(update);
+                    crate::map::materialize_diff_old_text(update);
+                }
+                if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                    let _ = connection.send_notification(msg);
+                }
+            }
+            (task_state, last_published)
+        };
+        let no_replay: (Vec<(String, crate::hooks::TaskStateEntry)>, Option<String>) =
+            (Vec::new(), None);
+        let (start_result, replayed) = if replay {
+            tokio::join!(Session::start(sess_opts, session_id.clone()), replay_future)
+        } else {
+            (
+                Session::start(sess_opts, session_id.clone()).await,
+                no_replay,
+            )
+        };
+        if recreate_falls_back_to_fresh(env.live_mode.is_some(), fresh, &start_result) {
+            // A live session may never have been prompted, so it may have no stored
+            // conversation to resume: it has no history to lose, and the client
+            // keeps a session it can use. Any other failure does not start a fresh
+            // query.
+            if let Some(logger) = &opts.logger {
+                logger.log(&format!(
+                    "session {session_id} was never persisted; starting a fresh query under the same id"
+                ));
+            }
+            fresh = true;
+            continue;
+        }
+        break (start_result, replayed, auth_cwd);
     };
     match start_result {
         Ok((session, update_rx)) => {
             timing.phase("session-ready", "");
-            publish_session_account(registry, auth_cwd.clone(), &session);
+            // The recreate was cancelled while the child started (the client
+            // closed the session, or the connection is ending): the new session
+            // is neither registered nor left running.
+            if recreate_cancelled(env) {
+                drop(update_rx);
+                session.close().await;
+                return responder.respond_with_error(session_rpc_error(&SessionError::Closed));
+            }
+            publish_account(env.auth.as_ref(), auth_cwd.clone(), &session);
             // Phase 15 (Item 1): upstream sends a proactive
             // `available_commands_update` with the REAL command list right
             // after session/new / session/load
@@ -1524,8 +1990,27 @@ async fn start_resumed(
                     poll_interval: None,
                 }),
             ));
-            registry.settings_managers.insert(session_id.clone(), mgr);
-            register_session(registry, &session_id, session, update_rx, connection);
+            // The registry entries wait for the request handler; the session's
+            // own wiring (notification handler, dispose list, update forwarder)
+            // does not need the registry.
+            let _ = env
+                .deferred_tx
+                .send(RegistryMsg::Register(Box::new(RegistryUpdate {
+                    session_id: session_id.clone(),
+                    session: session.clone(),
+                    settings_manager: mgr,
+                    fingerprint: compute_session_fingerprint(params),
+                    cancel: env.cancel.clone(),
+                })));
+            wire_session(
+                &env.session_tx,
+                &env.dispose_tx,
+                &env.deferred_tx,
+                &session_id,
+                session,
+                update_rx,
+                connection,
+            );
             timing.phase("register", "");
             responder.respond(session_response(&session_id, &modes, &config_options))?;
             let update = map::map_commands_changed(&json!(commands), &[]);
@@ -1555,6 +2040,8 @@ async fn handle_request(
 ) -> Result<(), Error> {
     let method = req.method().to_string();
     let params = req.params().clone();
+    // Sessions started off this handler (a recreate) have left their entries.
+    registry.apply_deferred();
 
     match method.as_str() {
         "initialize" => {
@@ -1664,6 +2151,9 @@ async fn handle_request(
                         }),
                     ));
                     registry.settings_managers.insert(session_id.clone(), mgr);
+                    registry
+                        .fingerprints
+                        .insert(session_id.clone(), compute_session_fingerprint(&params));
                     register_session(registry, &session_id, session, update_rx, &connection);
                     timing.phase("register", "");
                     responder.respond(session_response(&session_id, &modes, &config_options))?;
@@ -1693,11 +2183,109 @@ async fn handle_request(
                 .unwrap_or("")
                 .to_string();
             let replay = method == "session/load";
+            // The id is mid-recreate (its old session is torn down, the new one
+            // not yet up): a second start would run a second child on the same
+            // transcript. Node serializes these on the awaited teardown; the
+            // recreate runs off this handler, so the second request is refused.
+            if !registry.sessions.contains_key(&session_id)
+                && registry.recreating.contains_key(&session_id)
+            {
+                return responder.respond_with_error(Error::internal_error().data(json!({
+                    "details": format!("Session {session_id} is being recreated")
+                })));
+            }
             // Follow-up (a): if the request targets an already live session,
             // reuse it without leaking or starting a redundant child process. A
             // `session/load` on a live session replays its history (X8,
             // `acp-agent.js:1583-1587`); `session/resume` does not.
-            if let Some(session) = registry.sessions.get(&session_id) {
+            // `getOrCreateSession`: reject a prompt the agent cannot apply before
+            // reusing a live session, then compare the session-defining params
+            // with the live session's fingerprint (`acp-agent.ts:10868-10900`).
+            let live = registry.sessions.get(&session_id).cloned();
+            let mut changed = false;
+            if live.is_some() {
+                if let Err(e) =
+                    initialize_options_for(&params, &registry.caps, registry.air.as_ref())
+                {
+                    return responder.respond_with_error(e);
+                }
+                changed = registry
+                    .fingerprints
+                    .get(&session_id)
+                    .is_some_and(|stored| *stored != compute_session_fingerprint(&params));
+            }
+            if changed {
+                // Session-defining params changed (cwd pointed at a git worktree,
+                // MCP servers reconfigured, the skill set changed, ...): tear the
+                // live session down and recreate it so the process picks up the
+                // new values. A recreated live session keeps its LIVE permission
+                // mode, not the mode of the transcript.
+                registry.sessions.remove(&session_id);
+                registry.settings_managers.remove(&session_id);
+                registry.fingerprints.remove(&session_id);
+                // The teardown can take seconds (the close is bounded, not
+                // instant): it runs off the connection's sequential handler, so
+                // other requests and `session/cancel` are not held up, and the
+                // response is still sent after the old session is gone.
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut env = registry.resume_env(None);
+                env.cancel = Some(cancel.clone());
+                let opts = opts.clone();
+                let connection = connection.clone();
+                let kind = if replay {
+                    ResumedKind::Load
+                } else {
+                    ResumedKind::Resume
+                };
+                // The id stays marked until the task ends: while the session is
+                // in no registry map, a `session/close` cancels the recreate and
+                // a second `load` is refused.
+                let (ended_tx, ended) = watch::channel(false);
+                registry.recreating.insert(
+                    session_id.clone(),
+                    Recreating {
+                        cancel: cancel.clone(),
+                        ended,
+                    },
+                );
+                let ending = RecreateEnding {
+                    deferred_tx: registry.deferred_tx.clone(),
+                    session_id: session_id.clone(),
+                    cancel: cancel.clone(),
+                    ended_tx,
+                };
+                let handle = tokio::spawn(async move {
+                    // Dropped however the task ends (a panic included), so the id
+                    // never stays marked as being recreated.
+                    let _ending = ending;
+                    let mut env = env;
+                    if let Some(session) = live {
+                        let live_mode = match session.live_state().await {
+                            Ok((modes, _)) => modes.current_mode_id,
+                            Err(_) => session.modes().current_mode_id.clone(),
+                        };
+                        session.close().await;
+                        env.live_mode = Some(live_mode);
+                    }
+                    if recreate_cancelled(&env) {
+                        let _ =
+                            responder.respond_with_error(session_rpc_error(&SessionError::Closed));
+                    } else {
+                        let _ = start_resumed(
+                            &env,
+                            session_id,
+                            &params,
+                            &opts,
+                            responder,
+                            &connection,
+                            kind,
+                        )
+                        .await;
+                    }
+                });
+                let _ = registry.recreate_tx.send(RecreateTask { cancel, handle });
+                return Ok(());
+            } else if let Some(session) = live.as_ref() {
                 if replay {
                     let messages =
                         crate::transcript::session_messages_async(&opts.env, &session_id).await;
@@ -1759,7 +2347,7 @@ async fn handle_request(
                 return Ok(());
             }
             start_resumed(
-                registry,
+                &registry.resume_env(None),
                 session_id,
                 &params,
                 opts,
@@ -1805,7 +2393,7 @@ async fn handle_request(
                 Err(e) => return responder.respond_with_error(e),
             };
             start_resumed(
-                registry,
+                &registry.resume_env(None),
                 new_id,
                 &params,
                 opts,
@@ -1824,15 +2412,34 @@ async fn handle_request(
                 .unwrap_or("")
                 .to_string();
             registry.settings_managers.remove(&session_id);
-            match registry.sessions.remove(&session_id) {
-                Some(session) => {
+            registry.fingerprints.remove(&session_id);
+            // A session mid-recreate is in no map: closing it cancels the
+            // recreate, and the close answers once that has ended (its new
+            // child closed, or never started).
+            let recreate_ended = registry.recreating.remove(&session_id).map(|recreating| {
+                recreating
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                recreating.ended
+            });
+            match (registry.sessions.remove(&session_id), recreate_ended) {
+                (None, None) => responder.respond(json!({})),
+                (session, recreate_ended) => {
                     tokio::spawn(async move {
-                        session.close().await;
+                        if let Some(session) = session {
+                            session.close().await;
+                        }
+                        if let Some(mut ended) = recreate_ended {
+                            let _ = tokio::time::timeout(
+                                DISPOSE_TIMEOUT,
+                                ended.wait_for(|ended| *ended),
+                            )
+                            .await;
+                        }
                         let _ = responder.respond(json!({}));
                     });
                     Ok(())
                 }
-                None => responder.respond(json!({})),
             }
         }
         "session/set_mode" => {
@@ -1860,9 +2467,7 @@ async fn handle_request(
                         let _ = responder.respond(json!({}));
                     }
                     Err(e) => {
-                        let _ = responder.respond_with_error(
-                            Error::internal_error().data(json!({ "details": e })),
-                        );
+                        let _ = responder.respond_with_error(set_request_error(e));
                     }
                 }
             });
@@ -1879,14 +2484,14 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let value = match params.get("value") {
-                Some(v) => v.clone(),
-                None => {
-                    return responder.respond_with_error(Error::internal_error().data(json!({
-                        "details": format!("Invalid value for config option {config_id}: undefined")
-                    })));
-                }
-            };
+            // The SDK validates the request against its schema before the handler
+            // runs: a bare string `value`, or `{type: "boolean", value: <bool>}`.
+            if let Some(data) = set_config_option_schema_error(&params) {
+                return responder.respond_with_error(
+                    Error::new(-32602, "Invalid params".to_string()).data(data),
+                );
+            }
+            let value = params.get("value").cloned().unwrap_or(Value::Null);
             let session = match registry.sessions.get(&session_id) {
                 Some(s) => s.clone(),
                 None => {
@@ -1901,9 +2506,7 @@ async fn handle_request(
                         let _ = responder.respond(json!({ "configOptions": config_options }));
                     }
                     Err(e) => {
-                        let _ = responder.respond_with_error(
-                            Error::internal_error().data(json!({ "details": e })),
-                        );
+                        let _ = responder.respond_with_error(set_request_error(e));
                     }
                 }
             });
@@ -2052,7 +2655,7 @@ async fn handle_request(
                         (&mut reply_rx).await
                     }
                 }
-                .unwrap_or_else(|_| Err(SessionError::Closed));
+                .unwrap_or_else(|_| Err(SessionError::Closed.into()));
                 match reply {
                     Ok(reply) => {
                         // Forward this turn's streaming updates (e.g. a
@@ -2098,9 +2701,16 @@ async fn handle_request(
                             let _ = flush_rx.await;
                         }
                         let _ = responder.respond(result);
+                        if let Some(ack) = reply.ack {
+                            let _ = ack.send(());
+                        }
                     }
-                    Err(e) => {
-                        let _ = responder.respond_with_error(rpc_error(session_error_to_rpc(&e)));
+                    Err(failure) => {
+                        let _ = responder.respond_with_error(session_rpc_error(&failure.error));
+                        // Release the forwarder's ordering wait for this response.
+                        if let Some(ack) = failure.ack {
+                            let _ = ack.send(());
+                        }
                     }
                 }
             });
@@ -2137,10 +2747,18 @@ async fn handle_request(
             let frame = prompt_to_claude(&params, &session_id, &uuid);
             let reply_rx = session.steer(uuid, frame, is_local_only, steer.prompt_required);
             tokio::spawn(async move {
-                let outcome = reply_rx
-                    .await
-                    .unwrap_or_else(|_| json!({ "outcome": "error" }));
-                let _ = responder.respond(outcome);
+                // The actor is gone: the stream ended (a husk session), so the
+                // steer answers the same "session ended" error a prompt does
+                // (`acp-agent.ts:4323-4325`).
+                match reply_rx.await {
+                    Ok(outcome) => {
+                        let _ = responder.respond(outcome);
+                    }
+                    Err(_) => {
+                        let _ =
+                            responder.respond_with_error(session_rpc_error(&SessionError::Closed));
+                    }
+                }
             });
             Ok(())
         }
@@ -2160,7 +2778,7 @@ async fn handle_request(
                         let _ = responder.respond(json!({ "stopped": stopped }));
                     }
                     Err(e) => {
-                        let _ = responder.respond_with_error(rpc_error(session_error_to_rpc(&e)));
+                        let _ = responder.respond_with_error(session_rpc_error(&e));
                     }
                 }
             });
@@ -2215,10 +2833,17 @@ async fn handle_request(
                             if let Some(flush_rx) = reply.flush_rx {
                                 let _ = flush_rx.await;
                             }
+                            // This steer response is not a prompt response: release
+                            // the batch barrier now.
+                            if let Some(ack) = reply.ack {
+                                let _ = ack.send(());
+                            }
                         }
-                        Err(e) => {
-                            let _ =
-                                responder.respond_with_error(rpc_error(session_error_to_rpc(&e)));
+                        Err(failure) => {
+                            let _ = responder.respond_with_error(session_rpc_error(&failure.error));
+                            if let Some(ack) = failure.ack {
+                                let _ = ack.send(());
+                            }
                             return;
                         }
                     }
@@ -2249,8 +2874,137 @@ pub fn resume_from_argv(argv: &[String]) -> Option<&str> {
 }
 
 #[cfg(test)]
+mod tests_t1ha;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-117 — upstream "getOrCreateSession param change detection": the params
+    /// that must NOT rebuild a live session (mcpServers order, reordered/duplicate
+    /// skills, option key order, per-call resume controls, creation-only options)
+    /// and those that MUST (cwd, mcpServers, skills, any rebuilding option,
+    /// additionalDirectories).
+    #[test]
+    fn b117_session_fingerprint_matches_upstream_param_change_detection() {
+        let fp = |params: Value| compute_session_fingerprint(&params);
+        let base = json!({"cwd": "/project", "mcpServers": []});
+
+        // "returns cached session when params are unchanged"
+        assert_eq!(fp(base.clone()), fp(base.clone()));
+        // "tears down existing session when cwd changes"
+        assert_ne!(
+            fp(base.clone()),
+            fp(json!({"cwd": "/new", "mcpServers": []}))
+        );
+        // "tears down existing session when mcpServers change"
+        let with_server = json!({"cwd": "/project", "mcpServers": [
+            {"name": "new-server", "command": "node", "args": ["server.js"], "env": []}]});
+        assert_ne!(fp(base.clone()), fp(with_server));
+        // "treats mcpServers in different order as unchanged"
+        let a = json!({"name": "a-server", "command": "node", "args": ["a.js"], "env": []});
+        let b = json!({"name": "b-server", "command": "node", "args": ["b.js"], "env": []});
+        assert_eq!(
+            fp(json!({"cwd": "/project", "mcpServers": [b.clone(), a.clone()]})),
+            fp(json!({"cwd": "/project", "mcpServers": [a, b]})),
+        );
+        // "tears down the existing session when additionalDirectories change"
+        assert_ne!(
+            fp(base.clone()),
+            fp(json!({"cwd": "/project", "mcpServers": [], "additionalDirectories": ["/other"]}))
+        );
+        // "tears down the existing session when skills change from $label"
+        let skills = |value: Option<Value>| {
+            let options = match value {
+                Some(v) => json!({"skills": v}),
+                None => json!({}),
+            };
+            json!({"cwd": "/project", "mcpServers": [],
+                   "_meta": {"claudeCode": {"options": options}}})
+        };
+        for (previous, next) in [
+            (None, Some(json!("all"))),
+            (Some(json!("all")), Some(json!([]))),
+            (Some(json!([])), None),
+            (Some(json!(["pdf"])), Some(json!(["docx"]))),
+        ] {
+            assert_ne!(
+                fp(skills(previous.clone())),
+                fp(skills(next.clone())),
+                "{previous:?} -> {next:?}"
+            );
+        }
+        // "treats reordered and duplicate skills as unchanged"
+        assert_eq!(
+            fp(skills(Some(json!(["pdf", "docx"])))),
+            fp(skills(Some(json!(["pdf", "docx", "pdf"])))),
+        );
+        // "tears down the existing session when any other Claude option changes"
+        let env = |value: &str| {
+            json!({"cwd": "/project", "mcpServers": [],
+                   "_meta": {"claudeCode": {"options": {"env": {"CUSTOM_ENV": value}}}}})
+        };
+        assert_ne!(fp(env("original")), fp(env("changed")));
+        // "ignores option key order, per-call resume controls and creation-only options"
+        let before = json!({"cwd": "/project", "mcpServers": [], "_meta": {"claudeCode": {
+            "options": {"maxTurns": 10, "env": {"A": "1", "B": "2"}}}}});
+        let after = json!({"cwd": "/project", "mcpServers": [], "_meta": {"claudeCode": {
+            "options": {"env": {"B": "2", "A": "1"}, "maxTurns": 10, "resume": "s1",
+                "sessionId": "s1", "forkSession": false, "resumeSessionAt": "msg-1",
+                "resumeDropsTurn": "msg-1", "title": "Renamed"}}}});
+        assert_eq!(fp(before), fp(after));
+        // The session-defining _meta fields count.
+        assert_ne!(
+            fp(base.clone()),
+            fp(json!({"cwd": "/project", "mcpServers": [],
+                      "_meta": {"systemPrompt": "be brief"}}))
+        );
+        assert_ne!(
+            fp(base),
+            fp(json!({"cwd": "/project", "mcpServers": [],
+                      "_meta": {"claudeCode": {"emitRawSDKMessages": true}}}))
+        );
+    }
+
+    /// B-117 — upstream "starts a fresh query under the same id for a live session
+    /// that was never prompted" / "still fails a resume of an unknown session that
+    /// has no stored conversation" / "does not start a fresh query when the resume
+    /// of a live session fails otherwise".
+    #[test]
+    fn b117_recreate_falls_back_to_a_fresh_query_only_for_a_live_unpersisted_session() {
+        let not_found: Result<(), SessionError> = Err(SessionError::Start(
+            "No conversation found with session ID: s1".to_string(),
+        ));
+        assert!(recreate_falls_back_to_fresh(true, false, &not_found));
+        assert!(
+            !recreate_falls_back_to_fresh(false, false, &not_found),
+            "unknown session"
+        );
+        assert!(
+            !recreate_falls_back_to_fresh(true, true, &not_found),
+            "already fresh"
+        );
+        let other: Result<(), SessionError> =
+            Err(SessionError::Start("CLI failed to start".to_string()));
+        assert!(!recreate_falls_back_to_fresh(true, false, &other));
+        let ok: Result<(), SessionError> = Ok(());
+        assert!(!recreate_falls_back_to_fresh(true, false, &ok));
+    }
+
+    /// V-10 — a request to a session whose stream ended (a husk) answers the same
+    /// "session ended" error a prompt does; any other failure keeps its text.
+    #[test]
+    fn v10_set_request_on_an_ended_session_answers_session_ended() {
+        let ended = set_request_error(crate::session::SESSION_GONE.to_string());
+        let prompt_on_ended = session_rpc_error(&SessionError::Closed);
+        assert_eq!(
+            serde_json::to_value(&ended).unwrap(),
+            serde_json::to_value(&prompt_on_ended).unwrap()
+        );
+        assert!(ended.message.contains(crate::turn::SESSION_ENDED_MESSAGE));
+        let other = set_request_error("Invalid Mode".to_string());
+        assert_eq!(other.data, Some(json!({"details": "Invalid Mode"})));
+    }
 
     #[test]
     fn uuid_is_v4_shaped() {
@@ -2529,6 +3283,21 @@ mod tests {
             data,
             Some(json!({"details": "Claude Code returned an error result: model overloaded"}))
         );
+    }
+
+    #[test]
+    fn inv_54_auth_required_code() {
+        use crate::turn::FailureKind;
+        let err = SessionError::PromptFailed {
+            kind: FailureKind::AuthRequired,
+            message: "Authentication required. Please run /login.".to_string(),
+            assistant_had_error: false,
+        };
+        let rpc = session_rpc_error(&err);
+        let val = serde_json::to_value(&rpc).unwrap();
+        assert_eq!(val["code"], -32000);
+        assert_eq!(val["message"], "Authentication required");
+        assert!(val.get("data").is_none());
     }
 
     /// 12.T1 — `_session/steering` outcome decisions (R32 / B1):

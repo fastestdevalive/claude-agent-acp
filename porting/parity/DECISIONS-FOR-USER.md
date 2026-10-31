@@ -95,3 +95,10 @@ nothing here blocks work.
 - **Alternatives:** Add an external safe wrapper crate (e.g. `win32job`) to `Cargo.toml`; or rewrite
   Windows process spawning using raw `CreateProcessW` FFI with `CREATE_SUSPENDED` (closing the
   assignment window); or accept the documented window.
+
+## D9 — The `url` crate is a direct dependency (WebFetch hostname option)
+
+- **What:** `claude-agent-acp-rs` depends on `url = "2"` (WHATWG URL parser; transitively `idna`, `percent-encoding`, the ICU data crates). It is used only to compute the hostname of the WebFetch "don't ask again for <hostname>" permission option, exactly as upstream does with `new URL(..).hostname`.
+- **Why:** a hand-rolled parser mis-reads `https://evil.com\@trusted.com/` (WHATWG treats the backslash as a path separator, so the fetched host is `evil.com`; the earlier Rust code offered and saved `domain:trusted.com`). Opus review of Turn 1 rated this HIGH. Tabs/newlines, invalid ports and IDN (punycode) also need the real algorithm. The crate was already in the local cargo registry cache (resolved with `--offline`).
+- **Alternatives:** keep a hand-written parser that refuses anything unusual (no option offered) — smaller dependency tree, but then IDN and exotic URL forms diverge from upstream permanently. Say so and it is a contained follow-up (`permission_options.rs` only).
+- **Guard G10 is unaffected:** it covers only `agent-client-protocol`, which stays at 2.1.0.

@@ -818,7 +818,11 @@ async fn test_mishandling_probe_target_stopped_at_depth_1() {
     let script_content = format!(
         r#"#!/bin/sh
 COUNT_FILE="{}"
-PREV=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+if [ -f "$COUNT_FILE" ]; then
+    read -r PREV < "$COUNT_FILE"
+else
+    PREV=0
+fi
 NEXT=$((PREV + 1))
 echo "$NEXT" > "$COUNT_FILE"
 
@@ -832,7 +836,13 @@ exec "$0" --reaper --probe
 "#,
         counter_file.display()
     );
-    std::fs::write(&script, script_content).expect("write script");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&script).expect("create script");
+        f.write_all(script_content.as_bytes())
+            .expect("write script");
+        f.sync_all().expect("sync script");
+    }
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
     // Run probe with a 5s kill-switch timeout
@@ -859,6 +869,91 @@ exec "$0" --reaper --probe
         count, 1,
         "mishandling binary must only be executed at depth 1"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Turn 1 Fix Round, Lane D (Item 4):
+/// Probe stdout wait is bounded: if the probed binary exits but leaves a background child
+/// holding its stdout open, probe must not block indefinitely and must complete within its
+/// bounded timeout (~2s).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_probe_stdout_wait_bounded_when_child_leaks_stdout() {
+    use claude_agent_acp_rs::process::is_reaper_binary;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = std::env::temp_dir().join(format!("acp-probe-stdout-bound-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+    let pid_file = tmp.join("bg_child.pid");
+    let script = tmp.join("probe_target_leaking_stdout.sh");
+    let script_content = format!(
+        r#"#!/bin/sh
+PID_FILE="{}"
+# Background a sleep holding stdout open
+sleep 30 >&1 &
+BG_PID=$!
+echo "$BG_PID" > "$PID_FILE"
+exit 0
+"#,
+        pid_file.display()
+    );
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&script).expect("create script");
+        f.write_all(script_content.as_bytes())
+            .expect("write script");
+        f.sync_all().expect("sync script");
+    }
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Run probe with a 5s kill-switch timeout
+    let start = std::time::Instant::now();
+    let passed = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::task::spawn_blocking({
+            let script = script.clone();
+            move || is_reaper_binary(&script)
+        })
+        .await
+        .expect("join")
+    })
+    .await
+    .expect("probe must finish within 5s bounded timeout");
+
+    let elapsed = start.elapsed();
+    assert!(
+        !passed,
+        "leaking probe target must be rejected (Indeterminate)"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "probe wait must be bounded by probe deadline (~2s), took {elapsed:?}"
+    );
+
+    // Read background child PID and clean it up (leave none!)
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+        if let Ok(bg_pid) = pid_str.trim().parse::<i32>() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(bg_pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    // Process hygiene: verify no leaked sleep or probe processes from our temp dir
+    let script_path = script.to_string_lossy();
+    let ps_check = std::process::Command::new("ps")
+        .args(["-Ao", "pid,command"])
+        .output()
+        .expect("ps");
+    let ps_text = String::from_utf8_lossy(&ps_check.stdout);
+    for line in ps_text.lines() {
+        if line.contains(script_path.as_ref()) {
+            panic!("Found leaked process: {line}");
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

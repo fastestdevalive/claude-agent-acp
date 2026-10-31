@@ -1,0 +1,34 @@
+{
+  "permission": "allow",
+  "steps": [
+    {
+      "call": "initialize"
+    },
+    {
+      "call": "session/new"
+    },
+    {
+      "call": "session/prompt",
+      "text": "first"
+    },
+    {
+      "call": "session/prompt",
+      "text": "second",
+      "no_wait": true
+    },
+    {
+      "call": "wait_recv",
+      "contains": "cycle one"
+    },
+    {
+      "call": "session/cancel"
+    },
+    {
+      "call": "session/wait"
+    },
+    {
+      "call": "sleep",
+      "ms": 500
+    }
+  ]
+}

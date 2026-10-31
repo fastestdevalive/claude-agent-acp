@@ -1,0 +1,12 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}},
+    {"call": "session/prompt", "text": "long running", "no_wait": true},
+    {"call": "wait_recv", "contains": "Working"},
+    {"call": "request", "method": "session/close", "params": {"sessionId": "$SESSION"}},
+    {"call": "session/wait"}
+  ]
+}

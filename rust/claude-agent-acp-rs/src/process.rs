@@ -1137,6 +1137,36 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Opens `path` read-only without waiting on a named pipe, and keeps it only
+/// if the opened handle is a regular file (upstream `readPatchSource` opens
+/// with `O_NONBLOCK` and runs `fstat` on the handle). The kind is read from
+/// the handle, so a path swapped to a FIFO between a check and the open cannot
+/// block the caller. A non-regular file is `ErrorKind::InvalidInput`.
+#[cfg(unix)]
+pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)?;
+    ensure_regular_file(file)
+}
+
+/// Elsewhere a plain open does the job: Windows has no named-pipe paths in
+/// the file namespace that block on open.
+#[cfg(not(unix))]
+pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    ensure_regular_file(std::fs::File::open(path)?)
+}
+
+fn ensure_regular_file(file: std::fs::File) -> std::io::Result<std::fs::File> {
+    if file.metadata()?.file_type().is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    }
+}
+
 /// The managed (policy) settings file per OS, mirroring
 /// `getManagedSettingsPath` in `dist/settings.js` (Decision 3).
 #[cfg(target_os = "macos")]
@@ -1837,11 +1867,15 @@ fn probe_reaper_binary(path: &Path) -> ProbeOutcome {
             .stderr(std::process::Stdio::null())
             .process_group(0);
 
+        // Retry ONLY on ETXTBSY ("executable file busy"): a freshly written
+        // candidate can still be open for writing in another thread. Any other
+        // spawn error (missing, not executable, ...) is definitive. Worst case
+        // 50 retries x 20 ms = 1 s of sleeping before giving up.
         let mut attempts = 0;
         let mut child = loop {
             match cmd.spawn() {
                 Ok(c) => break c,
-                Err(_) if attempts < 5 => {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
                     attempts += 1;
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -1858,11 +1892,12 @@ fn probe_reaper_binary(path: &Path) -> ProbeOutcome {
             }
         };
 
-        let reader = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
             let mut take = (&mut stdout).take(1024);
             let _ = take.read_to_end(&mut buf);
-            buf
+            let _ = tx.send(buf);
         });
 
         let timeout = Duration::from_secs(2);
@@ -1891,7 +1926,8 @@ fn probe_reaper_binary(path: &Path) -> ProbeOutcome {
             return ProbeOutcome::Indeterminate;
         }
 
-        let Ok(buf) = reader.join() else {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let Ok(buf) = rx.recv_timeout(remaining) else {
             return ProbeOutcome::Indeterminate;
         };
 

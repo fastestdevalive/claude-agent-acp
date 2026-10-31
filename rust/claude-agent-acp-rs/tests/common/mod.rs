@@ -654,13 +654,14 @@ fn acquire_build_lock() -> BuildLockGuard {
 }
 
 /// Build and return the path to a crate example binary.
+///
+/// Always runs `cargo build` (a no-op when up to date): reusing an existing binary once let a stale
+/// pre-fix `in_process` recurse through `--reaper --probe` into thousands of processes. The target dir is
+/// pinned to `rust/target` so the returned path is the one that was just built.
 pub fn build_example(name: &str) -> PathBuf {
     let root = repo_root();
     let bin = root.join("rust/target/debug/examples").join(name);
     let _guard = acquire_build_lock();
-    if bin.exists() {
-        return bin;
-    }
     let status = std::process::Command::new("cargo")
         .args([
             "build",
@@ -669,6 +670,7 @@ pub fn build_example(name: &str) -> PathBuf {
             "--example",
             name,
         ])
+        .env_remove("CARGO_TARGET_DIR")
         .current_dir(&root)
         .status()
         .expect("spawn cargo build --example");

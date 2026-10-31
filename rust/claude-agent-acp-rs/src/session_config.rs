@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+use crate::air::{with_air_meta, AirClient, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY};
+
 pub use crate::session_model::{
     canonicalize_model_id, context_hint_of, extract_model_family_version, get_available_models,
     match_resumed_model, model_versions_compatible, resolve_model_preference, strip_context_hints,
@@ -14,6 +16,16 @@ pub use crate::session_model::{
 
 pub const MODE_CONFIG_ID: &str = "mode";
 pub const EFFORT_CONFIG_ID: &str = "effort";
+// Shared sentinels and ids (`session-config-ids.ts`, `acp-agent.ts:12358-12366`).
+pub const DEFAULT_MODEL_ID: &str = "default";
+pub const DEFAULT_AGENT_ID: &str = "default";
+pub const AGENT_CONFIG_ID: &str = "agent";
+pub const FAST_MODE_CONFIG_ID: &str = "fast";
+/// Select-fallback values used when the client has not opted into boolean
+/// config options.
+pub const FAST_MODE_ON: &str = "on";
+pub const FAST_MODE_OFF: &str = "off";
+const FAST_MODE_DESCRIPTION: &str = "Faster responses on supported models";
 pub const AUTO_MODE_FALLBACK: &str = "acceptEdits";
 
 /// An available permission mode.
@@ -36,20 +48,83 @@ pub struct ModesState {
 }
 
 /// A config option surfaced to the client.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+///
+/// A `select` option carries a string `currentValue` and `options`. A
+/// `boolean` option (`option_type == "boolean"`, the Fast mode toggle for a
+/// client that opted in) keeps its value as `"true"`/`"false"` here and
+/// serializes it as a JSON boolean without an `options` key. An empty
+/// `category` is omitted from the wire (the Agent option has none).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "ConfigOptionWire", into = "ConfigOptionWire")]
 pub struct ConfigOption {
     pub id: String,
     pub name: String,
     pub description: String,
     pub category: String,
-    #[serde(rename = "type")]
     pub option_type: String,
     pub current_value: String,
     pub options: Vec<ConfigOptionValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Value>,
 }
+
+/// The wire shape of a [`ConfigOption`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigOptionWire {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category: Option<String>,
+    #[serde(rename = "type")]
+    option_type: String,
+    current_value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    options: Option<Vec<ConfigOptionValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    _meta: Option<Value>,
+}
+
+impl From<ConfigOption> for ConfigOptionWire {
+    fn from(option: ConfigOption) -> Self {
+        let boolean = option.option_type == BOOLEAN_OPTION_TYPE;
+        Self {
+            id: option.id,
+            name: option.name,
+            description: option.description,
+            category: (!option.category.is_empty()).then_some(option.category),
+            option_type: option.option_type,
+            current_value: if boolean {
+                Value::Bool(option.current_value == "true")
+            } else {
+                Value::String(option.current_value)
+            },
+            options: (!boolean).then_some(option.options),
+            _meta: option._meta,
+        }
+    }
+}
+
+impl From<ConfigOptionWire> for ConfigOption {
+    fn from(wire: ConfigOptionWire) -> Self {
+        Self {
+            id: wire.id,
+            name: wire.name,
+            description: wire.description,
+            category: wire.category.unwrap_or_default(),
+            option_type: wire.option_type,
+            current_value: match wire.current_value {
+                Value::String(text) => text,
+                other => other.to_string(),
+            },
+            options: wire.options.unwrap_or_default(),
+            _meta: wire._meta,
+        }
+    }
+}
+
+const BOOLEAN_OPTION_TYPE: &str = "boolean";
 
 /// A selectable option value inside a select-type config option.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -257,7 +332,19 @@ pub fn build_model_config_option(
         option_type: "select".into(),
         current_value,
         options,
-        _meta: None,
+        // The concrete recommendation rides `_meta.jetbrains.air.recommendedValue`
+        // (`session-model.ts:225-239`).
+        _meta: if concrete_recommendation {
+            recommended.map(|m| {
+                with_air_meta(
+                    None,
+                    AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+                    json!(m.value),
+                )
+            })
+        } else {
+            None
+        },
     }
 }
 
@@ -396,15 +483,418 @@ pub fn build_effort_config_option(
         option_type: "select".into(),
         current_value,
         options,
+        // `session-effort.ts:117-126`.
+        _meta: use_recommended_value.then(|| {
+            with_air_meta(
+                None,
+                AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+                json!(recommended_effort),
+            )
+        }),
+    })
+}
+
+/// `canonicalizeModelSettingsKey` (`session-effort.ts:29-34`): the same
+/// spelling folding as the picker ids.
+fn canonicalize_model_settings_key(value: &str) -> String {
+    canonicalize_model_id(value)
+}
+
+/// Programmatic query settings have higher priority than file-backed settings
+/// (`mergeEffortSettings`, `session-effort.ts:62-80`). Unrelated per-model
+/// entries of the lower tier survive; entries the override supplies shadow
+/// the lower tier's entries for the same canonical model key.
+pub fn merge_effort_settings(base: &Value, override_settings: Option<&Value>) -> Value {
+    let Some(override_settings) = override_settings else {
+        return base.clone();
+    };
+    let base_models = base.get("modelSettings").and_then(Value::as_object);
+    let override_models = override_settings
+        .get("modelSettings")
+        .and_then(Value::as_object);
+    let mut merged = base.as_object().cloned().unwrap_or_default();
+    if let Some(over) = override_settings.as_object() {
+        for (key, value) in over {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    if base_models.is_none() && override_models.is_none() {
+        merged.remove("modelSettings");
+        return Value::Object(merged);
+    }
+    let overridden: HashSet<String> = override_models
+        .map(|m| {
+            m.keys()
+                .map(|k| canonicalize_model_settings_key(k))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut model_settings = serde_json::Map::new();
+    for (key, entry) in base_models.into_iter().flatten() {
+        if !overridden.contains(&canonicalize_model_settings_key(key)) {
+            model_settings.insert(key.clone(), entry.clone());
+        }
+    }
+    for (key, entry) in override_models.into_iter().flatten() {
+        model_settings.insert(key.clone(), entry.clone());
+    }
+    merged.insert("modelSettings".into(), Value::Object(model_settings));
+    Value::Object(merged)
+}
+
+/// The `appliedEffortLevel` after a direct effort pick
+/// (`acp-agent.ts:10706`): the picked level, or none for `default`.
+pub fn applied_effort_after_pick(value: &str) -> Option<String> {
+    (value != DEFAULT_MODEL_ID).then(|| value.to_string())
+}
+
+/// The `appliedEffortLevel` after a successful effort sync on a model switch
+/// (`acp-agent.ts:10654-10655`): only an opted-in (AIR) client applies the
+/// concrete displayed level.
+pub fn applied_effort_after_sync(
+    use_recommended_value: bool,
+    new_effort: Option<&str>,
+) -> Option<String> {
+    match new_effort {
+        Some(level) if use_recommended_value && level != DEFAULT_MODEL_ID => {
+            Some(level.to_string())
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fast mode option (acp-agent.ts:12358-12470)
+// ---------------------------------------------------------------------------
+
+/// User-facing explanations for the SDK's `fast_mode_disabled_reason` values a
+/// user can act on. Deliberately partial: `sdk_opt_in_required`, `preference`,
+/// `pending`, `unknown` and any future reason are not surfaced.
+fn fast_mode_unavailable_explanation(reason: &str) -> Option<&'static str> {
+    match reason {
+        "free" => Some("not available on the free plan"),
+        "extra_usage_disabled" => Some("requires extra usage to be enabled for this account"),
+        "model_not_allowed" => Some("not available for the selected model"),
+        "not_first_party" => Some("not available on this API provider"),
+        "disabled_by_env" => Some("disabled by environment configuration"),
+        "network_error" => Some("eligibility could not be verified (network error)"),
+        _ => None,
+    }
+}
+
+/// Map the SDK's tri-state `fast_mode_state` onto the boolean toggle.
+/// `cooldown` keeps the toggle on: only an explicit `off` clears it.
+pub fn fast_mode_state_enabled(state: &str) -> bool {
+    state != "off"
+}
+
+/// Normalize an SDK-reported `fast_mode_disabled_reason` to the one retained:
+/// a reason with an explanation, else `None`.
+pub fn normalize_fast_mode_disabled_reason(reason: Option<&str>) -> Option<String> {
+    reason
+        .filter(|r| fast_mode_unavailable_explanation(r).is_some())
+        .map(String::from)
+}
+
+/// Whether the client advertised boolean session config options
+/// (`session.configOptions.boolean` present and not null).
+pub fn client_supports_boolean_config_options(client_capabilities: Option<&Value>) -> bool {
+    client_capabilities
+        .and_then(|c| c.get("session"))
+        .and_then(|s| s.get("configOptions"))
+        .and_then(|o| o.get("boolean"))
+        .is_some_and(|v| !v.is_null())
+}
+
+/// Whether the client advertised the AIR `recommendedValue` capability.
+pub fn client_supports_recommended_config_value(client_capabilities: Option<&Value>) -> bool {
+    client_capabilities
+        .and_then(AirClient::from_client_capabilities)
+        .is_some_and(|air| air.supports(AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY))
+}
+
+/// Build the Fast mode config option: a native boolean toggle for a client that
+/// opted in, an `on`/`off` select otherwise. While the toggle reads off, an
+/// explainable `disabled_reason` is folded into the description.
+pub fn create_fast_mode_config_option(
+    enabled: bool,
+    use_boolean_option: bool,
+    disabled_reason: Option<&str>,
+) -> ConfigOption {
+    let explanation = if enabled {
+        None
+    } else {
+        disabled_reason.and_then(fast_mode_unavailable_explanation)
+    };
+    let description = match explanation {
+        Some(text) => format!("{FAST_MODE_DESCRIPTION} \u{2014} {text}"),
+        None => FAST_MODE_DESCRIPTION.to_string(),
+    };
+    let base =
+        |option_type: &str, current_value: &str, options: Vec<ConfigOptionValue>| ConfigOption {
+            id: FAST_MODE_CONFIG_ID.into(),
+            name: "Fast mode".into(),
+            description: description.clone(),
+            category: "model_config".into(),
+            option_type: option_type.into(),
+            current_value: current_value.into(),
+            options,
+            _meta: None,
+        };
+    if use_boolean_option {
+        return base(
+            BOOLEAN_OPTION_TYPE,
+            if enabled { "true" } else { "false" },
+            Vec::new(),
+        );
+    }
+    let plain = |value: &str, name: &str| ConfigOptionValue {
+        value: value.into(),
+        name: name.into(),
+        description: None,
+        _meta: None,
+    };
+    base(
+        "select",
+        if enabled { FAST_MODE_ON } else { FAST_MODE_OFF },
+        vec![plain(FAST_MODE_ON, "On"), plain(FAST_MODE_OFF, "Off")],
+    )
+}
+
+/// JavaScript's template-literal rendering of a JSON value, for the
+/// `Invalid value for config option` message.
+fn js_display(value: &Value) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|v| {
+                if v.is_null() {
+                    String::new()
+                } else {
+                    js_display(v)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolve the requested Fast mode value from a `session/set_config_option`
+/// value: a native boolean or the `on`/`off` select fallback
+/// (`resolveFastModeEnabled`, `acp-agent.ts:12464-12478`).
+pub fn resolve_fast_mode_enabled(value: Option<&Value>) -> Result<bool, String> {
+    match value {
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(Value::String(text)) if text == FAST_MODE_ON => Ok(true),
+        Some(Value::String(text)) if text == FAST_MODE_OFF => Ok(false),
+        other => Err(format!(
+            "Invalid value for config option {FAST_MODE_CONFIG_ID}: {}",
+            other.map_or_else(|| "undefined".to_string(), js_display)
+        )),
+    }
+}
+
+/// Per-model Fast mode state threaded into [`build_config_options_with`]. The
+/// option is only surfaced when the current model `supported`s fast mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FastModeOptionState {
+    pub supported: bool,
+    pub enabled: bool,
+    /// Whether the client opted into boolean config options.
+    pub use_boolean_option: bool,
+    /// Latest explainable `fast_mode_disabled_reason`.
+    pub disabled_reason: Option<String>,
+}
+
+/// Seed the Fast mode option from the SDK's `initialize` answer
+/// (`acp-agent.ts:11565-11584`): the CLI may start with fast mode on, or force
+/// it off. A reason is retained only while the toggle reads off and only when
+/// it is explainable (a fresh SDK session reports `sdk_opt_in_required`, which
+/// normalizes away). The toggle is surfaced only while the model supports it.
+pub fn fast_mode_option_state_from_initialize(
+    initialize: &Value,
+    model_supports_fast_mode: bool,
+    use_boolean_option: bool,
+) -> FastModeOptionState {
+    let enabled = initialize
+        .get("fast_mode_state")
+        .and_then(Value::as_str)
+        .is_some_and(fast_mode_state_enabled);
+    let disabled_reason = if enabled {
+        None
+    } else {
+        normalize_fast_mode_disabled_reason(
+            initialize
+                .get("fast_mode_disabled_reason")
+                .and_then(Value::as_str),
+        )
+    };
+    FastModeOptionState {
+        supported: model_supports_fast_mode,
+        enabled,
+        use_boolean_option,
+        disabled_reason,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent option (acp-agent.ts:12318-12355, 12520-12560)
+// ---------------------------------------------------------------------------
+
+/// The agent to select at session creation: the requested `agent` option only
+/// when the picker surfaces it, else `default`. A built-in or unknown name would
+/// leave `currentValue` pointing at an entry outside its own `options`
+/// (`acp-agent.ts:11553-11561`).
+pub fn resolve_current_agent(requested: Option<&str>, agents: &[AgentInfo]) -> String {
+    requested
+        .filter(|name| !name.is_empty() && agents.iter().any(|a| a.name == *name))
+        .unwrap_or(DEFAULT_AGENT_ID)
+        .to_string()
+}
+
+/// A main-thread agent the SDK reports (`AgentInfo`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AgentInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Claude Code's built-in subagents, which are not main-thread personas.
+pub const BUILTIN_AGENT_NAMES: [&str; 5] = [
+    "claude",
+    "general-purpose",
+    "Explore",
+    "Plan",
+    "statusline-setup",
+];
+
+/// Discover user/plugin/project-configured main-thread agents from the
+/// `agents` the SDK's initialize response reports (`supportedAgents`),
+/// excluding the built-in subagents and the reserved `default` sentinel. A
+/// missing or malformed list yields none, so discovery never blocks session
+/// creation (`discoverCustomAgents`).
+pub fn discover_custom_agents(supported_agents: Option<&Value>) -> Vec<AgentInfo> {
+    supported_agents
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let name = entry.get("name").and_then(Value::as_str)?;
+                    let description = entry
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    Some(AgentInfo {
+                        name: name.to_string(),
+                        description: description.to_string(),
+                    })
+                })
+                .filter(|agent| {
+                    !BUILTIN_AGENT_NAMES.contains(&agent.name.as_str())
+                        && agent.name != DEFAULT_AGENT_ID
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The Agent picker. Only built when at least one custom agent is configured,
+/// since "Default" would otherwise be the only entry.
+pub fn build_agent_config_option(
+    agents: &[AgentInfo],
+    current_agent: &str,
+) -> Option<ConfigOption> {
+    if agents.is_empty() {
+        return None;
+    }
+    let mut options = vec![ConfigOptionValue {
+        value: DEFAULT_AGENT_ID.into(),
+        name: "Default".into(),
+        description: Some("Standard Claude Code agent".into()),
+        _meta: None,
+    }];
+    options.extend(agents.iter().map(|agent| ConfigOptionValue {
+        value: agent.name.clone(),
+        name: agent.name.clone(),
+        description: (!agent.description.is_empty()).then(|| agent.description.clone()),
+        _meta: None,
+    }));
+    Some(ConfigOption {
+        id: AGENT_CONFIG_ID.into(),
+        name: "Agent".into(),
+        description: "Main-thread agent persona".into(),
+        category: String::new(),
+        option_type: "select".into(),
+        current_value: current_agent.into(),
+        options,
         _meta: None,
     })
+}
+
+/// The `applyFlagSettings` payload of a live agent switch: `null` clears the
+/// flag layer back to the standard Claude Code agent (`acp-agent.ts:10683`).
+pub fn agent_flag_settings(value: &str) -> Value {
+    json!({ "agent": if value == DEFAULT_AGENT_ID { Value::Null } else { json!(value) } })
 }
 
 // ---------------------------------------------------------------------------
 // Config option composition
 // ---------------------------------------------------------------------------
 
-/// Compose all session config options for a session.
+/// Everything `buildConfigOptions` composes the option list from.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigOptionsInput<'a> {
+    pub modes: &'a ModesState,
+    pub available_models: &'a [AvailableModel],
+    pub current_model_id: &'a str,
+    pub model_infos: &'a [ModelInfo],
+    pub current_effort: Option<&'a str>,
+    pub agents: &'a [AgentInfo],
+    pub current_agent: &'a str,
+    pub fast_mode: Option<&'a FastModeOptionState>,
+    pub use_recommended_value: bool,
+}
+
+/// Compose all session config options (`buildConfigOptions`,
+/// `acp-agent.ts:12497-12562`): mode, model, effort, Fast mode (only when the
+/// current model supports it), Agent (only when custom agents exist).
+pub fn build_config_options_with(input: &ConfigOptionsInput<'_>) -> Vec<ConfigOption> {
+    let mut options = vec![build_mode_config_option(input.modes)];
+    // A gateway that lists none of the SDK's models leaves no model option.
+    if !input.available_models.is_empty() {
+        options.push(build_model_config_option(
+            input.available_models,
+            input.current_model_id,
+            input.model_infos,
+            input.use_recommended_value,
+        ));
+    }
+    if let Some(effort_opt) = build_effort_config_option(
+        input.model_infos,
+        input.current_model_id,
+        input.current_effort,
+        input.use_recommended_value,
+    ) {
+        options.push(effort_opt);
+    }
+    if let Some(fast) = input.fast_mode.filter(|f| f.supported) {
+        options.push(create_fast_mode_config_option(
+            fast.enabled,
+            fast.use_boolean_option,
+            fast.disabled_reason.as_deref(),
+        ));
+    }
+    options.extend(build_agent_config_option(input.agents, input.current_agent));
+    options
+}
+
+/// Compose the mode, model and effort options (no Fast mode, no Agent).
 pub fn build_config_options(
     modes: &ModesState,
     available_models: &[AvailableModel],
@@ -413,25 +903,17 @@ pub fn build_config_options(
     current_effort: Option<&str>,
     use_recommended_value: bool,
 ) -> Vec<ConfigOption> {
-    let mut options = Vec::new();
-    options.push(build_mode_config_option(modes));
-    if !available_models.is_empty() {
-        options.push(build_model_config_option(
-            available_models,
-            current_model_id,
-            model_infos,
-            use_recommended_value,
-        ));
-    }
-    if let Some(effort_opt) = build_effort_config_option(
-        model_infos,
+    build_config_options_with(&ConfigOptionsInput {
+        modes,
+        available_models,
         current_model_id,
+        model_infos,
         current_effort,
+        agents: &[],
+        current_agent: DEFAULT_AGENT_ID,
+        fast_mode: None,
         use_recommended_value,
-    ) {
-        options.push(effort_opt);
-    }
-    options
+    })
 }
 
 #[cfg(test)]

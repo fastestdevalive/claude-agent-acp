@@ -631,7 +631,8 @@ pub fn normalize_model_id(value: &str) -> String {
     if let Some(rest) = id.strip_suffix("-fast") {
         id = rest.to_string();
     }
-    if id.len() > 9 {
+    // `/-\d{8}$/`: a bare `-20260101` strips to the empty string.
+    if id.len() >= 9 && id.is_char_boundary(id.len() - 9) {
         let (head, tail) = id.split_at(id.len() - 9);
         if tail.starts_with('-') && tail[1..].chars().all(|c| c.is_ascii_digit()) {
             id = head.to_string();

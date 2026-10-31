@@ -645,7 +645,8 @@ async fn inv_63_set_mode_and_config_option() {
                     let mode_opt = opts.iter().find(|o| o["id"] == "mode").unwrap();
                     assert_eq!(mode_opt["currentValue"], "plan");
 
-                    // session/set_config_option missing value -> invalid value ... undefined
+                    // session/set_config_option missing value -> the SDK's schema
+                    // check: -32602 Invalid params (Node-captured, config-set-option-bad-value)
                     let err = connection
                         .send_request(UntypedMessage::new(
                             "session/set_config_option",
@@ -654,10 +655,10 @@ async fn inv_63_set_mode_and_config_option() {
                         .block_task()
                         .await
                         .expect_err("missing value must fail");
-                    assert_eq!(i32::from(err.code), -32603);
+                    assert_eq!(i32::from(err.code), -32602);
                     assert_eq!(
-                        err.data.as_ref().unwrap()["details"],
-                        "Invalid value for config option mode: undefined"
+                        err.data.as_ref().unwrap()["value"]["_errors"][1],
+                        "Invalid input: expected string, received undefined"
                     );
 
                     // session/set_config_option with unknown config option

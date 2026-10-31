@@ -1,0 +1,17 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "first", "no_wait": true},
+    {"call": "wait_recv", "contains": "ready-one"},
+    {"call": "session/prompt", "text": "second", "no_wait": true},
+    {"call": "wait_recv", "contains": "ready-two"},
+    {"call": "session/prompt", "text": "third", "no_wait": true},
+    {"call": "wait_recv", "contains": "ready-three"},
+    {"call": "session/cancel"},
+    {"call": "session/wait"},
+    {"call": "wait_recv", "contains": "usage_update"},
+    {"call": "session/prompt", "text": "/context"}
+  ]
+}

@@ -305,7 +305,7 @@ pub fn build_tool_call(
         tc.insert("title".into(), Value::String(shape.title.clone()));
         tc.insert(
             "rawInput".into(),
-            air_permission_raw_input(tool_name, tool_input),
+            tools::air_raw_input(tool_name, tool_input),
         );
         return Value::Object(tc);
     }
@@ -352,47 +352,6 @@ pub fn build_tool_call(
     val
 }
 
-/// Node's `rawInput(facts, input)` for AIR (`renderer.ts:729-744`): the file
-/// text a diff already holds is removed from the input (`Write`'s content key,
-/// `Edit`'s `old_string`/`new_string`). Every other tool sends its input as is.
-fn air_permission_raw_input(tool_name: &str, tool_input: &Value) -> Value {
-    let Some(obj) = tool_input.as_object() else {
-        return tool_input.clone();
-    };
-    let mut input = obj.clone();
-    match tool_name {
-        "Write" => {
-            // `fileTextKeys = [write.contentKey]`: the first present non-null
-            // alias (`reporters/file-edit.ts:55,79`).
-            if let Some(key) = ["content", "file_text", "file_content"]
-                .into_iter()
-                .find(|key| obj.get(*key).is_some_and(|value| !value.is_null()))
-            {
-                input.remove(key);
-            }
-        }
-        "Edit" => {
-            // `fileTextKeys = ["old_string", "new_string"]` when the diff is
-            // built: a file path and a non-empty old or new string.
-            let has_file = obj
-                .get("file_path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| !path.is_empty());
-            let has_text = ["old_string", "new_string"].into_iter().any(|key| {
-                obj.get(key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-            });
-            if has_file && has_text {
-                input.remove("old_string");
-                input.remove("new_string");
-            }
-        }
-        _ => {}
-    }
-    Value::Object(input)
-}
-
 /// Emit the `tool_call` a permission request references if the client has not
 /// seen it yet (INV-20 / #851), port of `ensureToolCallEmitted`
 /// (`acp-agent.js:4047-4071`).
@@ -416,7 +375,20 @@ pub fn ensure_tool_call_emitted(
         json!({"type": "tool_use", "id": tool_use_id, "name": tool_name, "input": tool_input}),
     );
 
-    let shape = tools::tool_shape(tool_name, tool_input, cwd);
+    // The same shape and `rawInput` the streamed path gives this client
+    // (`AcpToolCallRenderer.toolCall`): AIR facts, a `diffPatch` client's Write
+    // without its input diff, and for AIR the input without the file text that
+    // the diff holds. The streamed refinement then carries the same `rawInput`,
+    // so no extra update follows.
+    let shape = tools::tool_shape_full(
+        tool_name,
+        tool_input,
+        cwd,
+        state.is_air(),
+        false,
+        state.diff_patch(),
+    );
+    let raw_input = state.raw_input(tool_name, tool_input);
     // 2.9 (X-7): a surfaced `tool_call` seeds the field tracker.
     state.seed_tool_tracker(
         tool_use_id.to_string(),
@@ -425,7 +397,7 @@ pub fn ensure_tool_call_emitted(
             shape.title.clone(),
             shape.content.clone(),
             shape.locations.clone(),
-            Some(tool_input.clone()),
+            Some(raw_input.clone()),
         ),
     );
     let mut meta = state.use_meta(tool_name, tool_input);
@@ -445,7 +417,7 @@ pub fn ensure_tool_call_emitted(
             .status(ToolCallStatus::Pending)
             .content(shape.content)
             .locations(shape.locations)
-            .raw_input(tool_input.clone())
+            .raw_input(raw_input)
             .meta(meta),
     ))
 }
@@ -803,6 +775,45 @@ mod tests {
             meta_of(mcp),
             json!({"claudeCode": {"toolName": "mcp__s__t"}})
         );
+    }
+
+    /// T1GA finding 5 — an AIR client's permission-surfaced `tool_call` and the
+    /// request's own `toolCall` carry the `rawInput` the streamed path would send
+    /// (a Write without its file text), and the tracker is seeded with it, so the
+    /// streamed refinement that follows adds no `rawInput` update. A Write without
+    /// a file path keeps its text (`fileTextKeys` is set only with a path).
+    #[test]
+    fn t1ga_early_permission_tool_call_is_air_shaped() {
+        let input = json!({"file_path": "/work/a.txt", "content": "secret text\n"});
+        let mut air = MapState::default();
+        air.configure_air(std::env::temp_dir());
+        let surfaced = ensure_tool_call_emitted("Write", &input, "t1", None, &mut air, None);
+        let Some(SessionUpdate::ToolCall(tc)) = surfaced else {
+            panic!("expected a ToolCall");
+        };
+        assert_eq!(tc.raw_input, Some(json!({"file_path": "/work/a.txt"})));
+        // The streamed tool use of the same call: the same shape and `rawInput`,
+        // so nothing differs from what the client holds.
+        let streamed = air.tool_shape("Write", &input);
+        assert_eq!(streamed.title, tc.title);
+        assert_eq!(
+            air.raw_input("Write", &input),
+            json!({"file_path": "/work/a.txt"})
+        );
+
+        let request = build_tool_call("Write", &input, "t1", None, None, true);
+        assert_eq!(request["rawInput"], json!({"file_path": "/work/a.txt"}));
+        let pathless = json!({"content": "kept"});
+        let request = build_tool_call("Write", &pathless, "t2", None, None, true);
+        assert_eq!(request["rawInput"], pathless);
+
+        // A plain client still gets the whole input.
+        let mut plain = MapState::default();
+        let surfaced = ensure_tool_call_emitted("Write", &input, "t3", None, &mut plain, None);
+        let Some(SessionUpdate::ToolCall(tc)) = surfaced else {
+            panic!("expected a ToolCall");
+        };
+        assert_eq!(tc.raw_input, Some(input));
     }
 
     /// 10.T1 (INV-20) — a request for an unseen tool id first emits the

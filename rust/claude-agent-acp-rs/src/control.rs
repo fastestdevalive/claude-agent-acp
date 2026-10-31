@@ -104,6 +104,9 @@ enum Outbound {
     /// Replay a `pending_permission_requests` entry through the inbound handler
     /// (4.5).
     Replay(Value),
+    /// Resolve the sender once every frame enqueued before this marker was written
+    /// to the child's stdin ([`Control::flushed`]).
+    Barrier(oneshot::Sender<()>),
     /// Mark an inbound handler finished so its `request_id` is no longer
     /// in-flight. Sent after the handler wrote a response **or** chose to stay
     /// silent (`sdk.mjs` `handleControlRequest`'s `finally` deletes the
@@ -134,6 +137,13 @@ pub struct InitializeInfo {
     pub account: Option<Value>,
     /// `pending_permission_requests` from the initialize response (4.5).
     pub pending_permission_requests: Vec<Value>,
+    /// `agents` from the initialize response (`supportedAgents()`; feeds
+    /// `session_config::discover_custom_agents`, A-04).
+    pub agents: Option<Value>,
+    /// `fast_mode_state` (`on`/`off`/`cooldown`), seeds the Fast mode option.
+    pub fast_mode_state: Option<String>,
+    /// `fast_mode_disabled_reason`, normalized by the Fast mode option.
+    pub fast_mode_disabled_reason: Option<String>,
 }
 
 /// Options used to build the `initialize` control_request payload (4.4).
@@ -269,6 +279,25 @@ impl Control {
         reply_rx.await.map_err(|_| ControlError::Closed)?
     }
 
+    /// Enqueue a `control_request` on the single unbounded writer NOW and hand back
+    /// the receiver of its correlated `control_response`, so a caller can write
+    /// further requests in call order before awaiting the reply (Node's
+    /// `query.interrupt()` writes synchronously and is awaited after
+    /// `stopBackgroundWorkflows`).
+    pub fn enqueue_request(
+        &self,
+        payload: Value,
+    ) -> Result<oneshot::Receiver<Result<Value, ControlError>>, ControlError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Outbound::Request {
+                payload,
+                reply: reply_tx,
+            })
+            .map_err(|_| ControlError::Closed)?;
+        Ok(reply_rx)
+    }
+
     /// Enqueue a `control_request` on the single unbounded writer WITHOUT
     /// awaiting its response (2.13 / E-8). The request is given a fresh
     /// `request_id`, and like every `Outbound::Request` the writer DOES register
@@ -308,6 +337,17 @@ impl Control {
         self.tx
             .send(Outbound::Cancel(frame))
             .map_err(|_| ControlError::Closed)
+    }
+
+    /// Wait until every frame enqueued so far has been written to the child's
+    /// stdin. Teardown uses it to be sure the `interrupt` is on the wire before the
+    /// child is killed, without waiting for the CLI's reply (Node's
+    /// `awaitInterrupt: false`).
+    pub async fn flushed(&self) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self.tx.send(Outbound::Barrier(ack_tx)).is_ok() {
+            let _ = ack_rx.await;
+        }
     }
 
     /// Stop answering inbound `control_request`s (`sdk.mjs`
@@ -416,6 +456,15 @@ pub fn parse_initialize_response(frame: &Value) -> InitializeInfo {
         models: arr("models"),
         account: response.and_then(|r| r.get("account")).cloned(),
         pending_permission_requests: arr("pending_permission_requests"),
+        agents: response.and_then(|r| r.get("agents")).cloned(),
+        fast_mode_state: response
+            .and_then(|r| r.get("fast_mode_state"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        fast_mode_disabled_reason: response
+            .and_then(|r| r.get("fast_mode_disabled_reason"))
+            .and_then(Value::as_str)
+            .map(String::from),
     }
 }
 
@@ -563,6 +612,10 @@ async fn control_task(
                     }
                     Outbound::Replay(frame) => {
                         spawn_inbound_handler(frame, &mut inflight, &outbound_tx, &opts);
+                    }
+                    Outbound::Barrier(ack) => {
+                        // Every earlier frame was written (`write_frame` awaited).
+                        let _ = ack.send(());
                     }
                     Outbound::Finished(id) => {
                         inflight.remove(&id);

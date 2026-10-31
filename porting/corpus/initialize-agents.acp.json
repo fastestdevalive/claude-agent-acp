@@ -1,0 +1,19 @@
+{
+  "permission": "allow",
+  "capture_init": true,
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": [],
+                "_meta": {"claudeCode": {"options": {
+                  "agents": {
+                    "reviewer": {
+                      "description": "Reviews code for bugs",
+                      "prompt": "You are a careful code reviewer.",
+                      "tools": ["Read", "Grep"]
+                    }
+                  }
+                }}}}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}

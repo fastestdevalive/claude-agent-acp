@@ -1,0 +1,39 @@
+{
+  "permission": "allow",
+  "steps": [
+    {
+      "call": "initialize",
+      "client_capabilities_meta": {
+        "jetbrains": {
+          "air": {
+            "version": 1,
+            "capabilities": [
+              "sessionFailure"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "call": "session/new"
+    },
+    {
+      "call": "session/prompt",
+      "text": "dying turn",
+      "no_wait": true
+    },
+    {
+      "call": "session/prompt",
+      "text": "queued turn",
+      "no_wait": true
+    },
+    {
+      "call": "wait_recv",
+      "contains": "exited unexpectedly"
+    },
+    {
+      "call": "sleep",
+      "ms": 300
+    }
+  ]
+}

@@ -99,10 +99,66 @@ impl AirClient {
     }
 }
 
+/// The AIR capability that advertises a recommended select value
+/// (`AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY`, `air-extension.ts:4`).
+pub const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY: &str = "recommendedValue";
+
+/// The extension version stamped into every AIR `_meta` (`AIR_EXTENSION_VERSION`).
+const AIR_EXTENSION_VERSION: u64 = 1;
+
+/// Merge one AIR extension payload into a `_meta` (`withAirMeta`,
+/// `air-extension.ts:91-109`). Every other namespace and every other key of the
+/// `jetbrains.air` object is preserved; `version` is always stamped. Pass `None`
+/// to build a fresh `_meta`.
+pub fn with_air_meta(meta: Option<&Value>, capability: &str, payload: Value) -> Value {
+    let mut root = meta.and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut jetbrains = root
+        .get("jetbrains")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut air = jetbrains
+        .get("air")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    air.insert("version".into(), Value::from(AIR_EXTENSION_VERSION));
+    air.insert(capability.into(), payload);
+    jetbrains.insert("air".into(), Value::Object(air));
+    root.insert("jetbrains".into(), Value::Object(jetbrains));
+    Value::Object(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn with_air_meta_builds_fresh_and_preserves_siblings() {
+        let fresh = with_air_meta(
+            None,
+            AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+            json!("medium"),
+        );
+        assert_eq!(
+            fresh,
+            json!({"jetbrains": {"air": {"version": 1, "recommendedValue": "medium"}}})
+        );
+        let existing = json!({
+            "claudeCode": {"toolName": "Bash"},
+            "jetbrains": {"other": 1, "air": {"kind": "x", "version": 9}}
+        });
+        let merged = with_air_meta(Some(&existing), "recommendedValue", json!("a"));
+        assert_eq!(merged["claudeCode"]["toolName"], "Bash");
+        assert_eq!(merged["jetbrains"]["other"], 1);
+        assert_eq!(merged["jetbrains"]["air"]["kind"], "x");
+        assert_eq!(merged["jetbrains"]["air"]["version"], 1);
+        assert_eq!(merged["jetbrains"]["air"]["recommendedValue"], "a");
+        // A non-object _meta is replaced, like `asRecord`.
+        let from_junk = with_air_meta(Some(&json!("junk")), "recommendedValue", json!("b"));
+        assert_eq!(from_junk["jetbrains"]["air"]["recommendedValue"], "b");
+    }
 
     #[test]
     fn parses_air_client_capabilities() {

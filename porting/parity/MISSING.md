@@ -40,3 +40,9 @@ removed when the gate flips to `--forbid-unclassified` in Phase 3.
 | AG-2 | session-failure extension | AG-2 |
 | AG-3 | file-change audit report | AG-3 |
 | AG-4 | `/mcp` prompt command | AG-4 |
+| B-113 | v2 cancel and withdrawal rules (acp-v2 cancel tests; row B-113) | F39 (Turn 6, lane A) |
+| F11 | config-option session side: fast mode, agent switch, effort sync, husk rejection, PostModelSwitch reconcile | F11 (Turn 5, lane A) |
+| F12 | steering R811-6 swallow cases (test-map rows 162-163) not yet ported | F12 (carried to Turn 2, lane A) |
+| F14 | background-task changedFields dedupe / live task tests | F14 (Turn 2, lane A) |
+| F25 | session failure controller, session_info_update carrier, usage-limit replay tests | F25 (Turn 3, lane A) |
+| T-PORT | upstream test whose behaviour exists in Rust but is not yet ported as a Rust test | TEST-MAP classification (Turns 8-9) |

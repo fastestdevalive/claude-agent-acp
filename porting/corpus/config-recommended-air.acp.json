@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "request", "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["recommendedValue"]}}}}}},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}}
+  ]
+}
