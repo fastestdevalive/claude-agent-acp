@@ -1730,7 +1730,9 @@ fn g4_f11_default_window_is_refined_in_the_background() {
         &mut usage,
         "claude-sonnet-4-6",
         967_000,
-        "claude-sonnet-4-6"
+        "claude-sonnet-4-6",
+        0,
+        0
     ));
     assert_eq!(usage.context_window, 967_000);
     assert!(usage.authoritative);

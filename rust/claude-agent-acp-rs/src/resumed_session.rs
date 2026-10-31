@@ -27,7 +27,9 @@ pub fn concrete_model(model: Option<&str>) -> Option<String> {
     if m.is_empty() {
         return None;
     }
-    if m.starts_with('<') && m.ends_with('>') {
+    // FA3-15: Node's synthetic test is `/^<[^>]+>$/` — the interior must be
+    // non-empty and contain no `>`, so `<a>b>` and `<>` are real names.
+    if m.starts_with('<') && m.ends_with('>') && m.len() > 2 && !m[1..m.len() - 1].contains('>') {
         return None;
     }
     Some(m.to_string())
@@ -300,6 +302,9 @@ mod tests {
         );
         assert_eq!(concrete_model(Some("<synthetic>")), None);
         assert_eq!(concrete_model(Some("<custom-placeholder>")), None);
+        // FA3-15: Node's `/^<[^>]+>$/` only rejects a simple synthetic name.
+        assert_eq!(concrete_model(Some("<a>b>")), Some("<a>b>".to_string()));
+        assert_eq!(concrete_model(Some("<>")), Some("<>".to_string()));
         assert_eq!(concrete_model(Some("")), None);
         assert_eq!(concrete_model(Some("   ")), None);
         assert_eq!(concrete_model(None), None);

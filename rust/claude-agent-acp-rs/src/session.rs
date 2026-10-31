@@ -39,8 +39,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -205,6 +205,127 @@ fn record_air_session_failure(
     meta
 }
 
+/// The client's answer channel of one `CreateElicitation` outbound, carrying
+/// whether the client has answered and the answer itself.
+///
+/// The flag and the answer are set by whoever resolves the round trip (the
+/// agent's forwarding task in production, the test client in tests), before the
+/// spawned elicitation task queues its `ElicitationControlAnswered`. The steer
+/// priority reads the flag so an answered round trip no longer counts as open
+/// (RR1a-01) while its entry — and the CLI's `reply` sender inside it — stays in
+/// the map until `ElicitationControlAnswered` removes it (RR2-01). The cancel
+/// and close paths read the answer so an answer the client already gave still
+/// reaches the CLI instead of the cancel outcome (RR3-01).
+pub struct ElicitationReply {
+    answered: Arc<AtomicBool>,
+    answer: Arc<OnceLock<Result<Value, String>>>,
+    sender: oneshot::Sender<Result<Value, String>>,
+}
+
+impl ElicitationReply {
+    /// A reply with its own answer flag, for a round trip the session does not
+    /// track in `pending_elicitations` (the OAuth and question flows).
+    fn channel() -> (Self, oneshot::Receiver<Result<Value, String>>) {
+        Self::with_flag(Arc::new(AtomicBool::new(false)), Arc::new(OnceLock::new()))
+    }
+
+    /// A reply sharing `answered` and `answer` with the session's pending entry.
+    fn with_flag(
+        answered: Arc<AtomicBool>,
+        answer: Arc<OnceLock<Result<Value, String>>>,
+    ) -> (Self, oneshot::Receiver<Result<Value, String>>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                answered,
+                answer,
+                sender,
+            },
+            receiver,
+        )
+    }
+
+    /// Resolve the round trip, capturing the answer and marking the client as
+    /// answered first. The answer is stored before the flag so a reader that
+    /// sees `answered` always sees it.
+    pub fn send(self, value: Result<Value, String>) -> Result<(), Result<Value, String>> {
+        let _ = self.answer.set(value.clone());
+        self.answered.store(true, Ordering::SeqCst);
+        self.sender.send(value)
+    }
+
+    /// Resolves when the receiver is dropped: the request was withdrawn.
+    pub async fn closed(&mut self) {
+        self.sender.closed().await;
+    }
+}
+
+/// One open MCP elicitation / user-dialog round trip.
+///
+/// `reply` answers the CLI's `control_request`. It must survive a steer: the
+/// steer path only reads [`Self::awaiting_client`] and never removes the entry,
+/// so the queued `ElicitationControlAnswered` can still send the client's answer
+/// instead of the control handler's `decline` (RR2-01). `answered` is shared
+/// with the outbound [`ElicitationReply`].
+struct PendingElicitation {
+    reply: oneshot::Sender<Value>,
+    cancel_response: Value,
+    handle: tokio::task::JoinHandle<()>,
+    answered: Arc<AtomicBool>,
+    answer: Arc<OnceLock<Result<Value, String>>>,
+    kind: PendingElicitationKind,
+}
+
+impl PendingElicitation {
+    /// Whether the round trip still waits on the CLIENT: the client has not
+    /// answered and the spawned task has not finished. Read-only, so a steer
+    /// can use it without dropping `reply`.
+    fn awaiting_client(&self) -> bool {
+        !self.answered.load(Ordering::SeqCst) && !self.handle.is_finished()
+    }
+}
+
+/// Which client round trip an entry answers, so the abort paths can turn a
+/// client answer the abort raced into the CLI's own response shape.
+#[derive(Clone, Copy)]
+enum PendingElicitationKind {
+    /// An MCP elicitation (`{"action": …}`).
+    Mcp,
+    /// The refusal-fallback consent dialog (`{"behavior": …}`).
+    Dialog,
+}
+
+impl PendingElicitationKind {
+    /// The CLI `control_response` for a client answer that resolved the round
+    /// trip before the abort: Node's continuation returns the accepted or
+    /// declined content and only then checks `signal.aborted`
+    /// (`acp-agent.ts:10283-10288`), so the cancel must not replace it (RR3-01).
+    fn answered_response(self, request_id: &str, answer: &Result<Value, String>) -> Value {
+        let result = match (self, answer) {
+            (Self::Mcp, Ok(response)) => {
+                crate::elicitation::create_elicitation_response_to_elicit_result(response)
+            }
+            // The client's round trip failed: Node's catch declines when its
+            // signal is not aborted (`acp-agent.ts:10289-10296`).
+            (Self::Mcp, Err(_)) => json!({ "action": "decline" }),
+            (Self::Dialog, Ok(response)) => json!({
+                "behavior": "completed",
+                "result": crate::elicitation::refusal_fallback_result_from_response(response),
+            }),
+            // An aborted dialog answers its default (`acp-agent.ts:10392-10394`).
+            (Self::Dialog, Err(_)) => json!({ "behavior": "cancelled" }),
+        };
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": result,
+            },
+        })
+    }
+}
+
 /// One item on the session → agent outbound channel (phase 9 flush barrier).
 ///
 /// The agent forwards `Update`s to the client as notifications and uses a
@@ -258,7 +379,7 @@ pub enum SessionOutbound {
     /// waits on it; dropping `reply` cancels the request (`$/cancel_request`).
     CreateElicitation {
         params: Value,
-        reply: oneshot::Sender<Result<Value, String>>,
+        reply: ElicitationReply,
     },
     /// `elicitation/complete` (F23b/N-37): a notification, no answer expected.
     CompleteElicitation { params: Value },
@@ -600,9 +721,15 @@ pub(crate) enum Command {
         reply: oneshot::Sender<Result<bool, String>>,
     },
     /// Update context window size from background get_context_usage. `model_id`
-    /// is the model the request was issued for: the answer is dropped if the
-    /// session switched models meanwhile (F5b/A-10 `stillCurrent`).
-    UpdateContextWindow { size: u64, model_id: String },
+    /// is the model the request was issued for and `generation` the child query
+    /// it was issued against: the answer is dropped if the session switched
+    /// models or the query was replaced meanwhile (F5b/A-10, FA4-06
+    /// `stillCurrent`).
+    UpdateContextWindow {
+        size: u64,
+        model_id: String,
+        generation: u64,
+    },
     /// The forwarder could not write a raw (AIR) `session/update` to the client:
     /// the async-task fields recorded as published are rolled back so a retry
     /// carries them again (`recordPublished` only after a resolved send, U-75).
@@ -1025,6 +1152,9 @@ impl Session {
                 on_request: Some(build_permission_request_handler(tx.clone(), support)),
             },
         );
+        // FA3-03: `verbatimPrompts` is an SDK option, not an initialize field.
+        // It makes every user frame carry `client_composed: true`.
+        control.set_client_composed(opts.initialize.verbatim_prompts.unwrap_or(false));
 
         let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
         let high_water = Arc::new(AtomicUsize::new(0));
@@ -1073,7 +1203,8 @@ impl Session {
         // `stopsWorkflowsOnCancel` (`acp-agent.ts:11687`): a client with the
         // per-task stop affordance and no async tasks of its own gets the
         // background workflows stopped after a cancel's interrupt.
-        let stops_workflows = opts.initialize.per_task_stop_affordance == Some(true)
+        let stops_workflows = opts.initialize.per_task_stop_affordance
+            == Some(serde_json::Value::Bool(true))
             && !opts
                 .air
                 .as_ref()
@@ -3111,7 +3242,7 @@ async fn authenticate_mcp_server(
         move |params| {
             let tx = elicit_tx.clone();
             async move {
-                let (ptx, prx) = oneshot::channel();
+                let (ptx, prx) = ElicitationReply::channel();
                 let _ = tx.send(SessionOutbound::CreateElicitation { params, reply: ptx });
                 prx.await
                     .unwrap_or_else(|_| Err("Tool use aborted".to_string()))
@@ -3262,10 +3393,7 @@ async fn run_loop(
     // cancel or the session close withdraws the request, the task waiting on the
     // client)`. Aborting the task drops the client request's reply, which sends
     // `$/cancel_request` (as for permissions).
-    let mut pending_elicitations: HashMap<
-        String,
-        (oneshot::Sender<Value>, Value, tokio::task::JoinHandle<()>),
-    > = HashMap::new();
+    let mut pending_elicitations: HashMap<String, PendingElicitation> = HashMap::new();
     // F23a: AskUserQuestion round trips (`request_id -> (reply, aborted answer)`).
     let mut pending_ask: HashMap<String, (oneshot::Sender<Value>, Value)> = HashMap::new();
     // The session's abort signal, handed to the elicitation helpers so a spawned
@@ -3413,6 +3541,18 @@ async fn run_loop(
                             // The interrupt didn't make the SDK yield within the grace:
                             // force the active turn to settle `cancelled` (INV-17, #680).
                             force_cancel_deadline = None;
+                            // FA4-07: the abort path closes an in-progress compaction
+                            // before settling (`await compaction.interrupt()`,
+                            // `acp-agent.ts:5726`): a follow-up cycle of the held turn
+                            // may have started one after the cancel's own interrupt.
+                            let updates = ext.t2a.compaction.interrupt();
+                            publish_compaction_updates(
+                                &mut ext,
+                                &mut map_state,
+                                updates,
+                                &update_tx,
+                                &session_id,
+                            );
                             let events = machine.force_cancel();
                             settle_events(
                                 events,
@@ -4298,6 +4438,16 @@ async fn run_loop(
                                 let session_id = session_id.clone();
                                 let cancel = elicit_cancel_rx.clone();
                                 let request_id_for_task = request_id.clone();
+                                // RR2-01: the client's answer flag is shared with
+                                // the pending entry, so a steer reads it without
+                                // removing the entry (and its CLI reply sender).
+                                // RR3-01: the answer itself is shared too, so a
+                                // cancel/close that races the answer still sends
+                                // the client's content to the CLI.
+                                let answered = Arc::new(AtomicBool::new(false));
+                                let answered_for_task = answered.clone();
+                                let answer = Arc::new(OnceLock::new());
+                                let answer_for_task = answer.clone();
                                 let handle = tokio::spawn(async move {
                                     let send_tx = update_tx.clone();
                                     let response =
@@ -4306,7 +4456,10 @@ async fn run_loop(
                                             &session_id,
                                             support,
                                             move |params| {
-                                                let (ptx, prx) = oneshot::channel();
+                                                let (ptx, prx) = ElicitationReply::with_flag(
+                                                    answered_for_task,
+                                                    answer_for_task,
+                                                );
                                                 let _ = send_tx.send(
                                                     SessionOutbound::CreateElicitation {
                                                         params,
@@ -4329,17 +4482,24 @@ async fn run_loop(
                                         },
                                     );
                                 });
-                                pending_elicitations
-                                    .insert(request_id, (reply, cancel_response, handle));
+                                pending_elicitations.insert(
+                                    request_id,
+                                    PendingElicitation {
+                                        reply,
+                                        cancel_response,
+                                        handle,
+                                        answered,
+                                        answer,
+                                        kind: PendingElicitationKind::Mcp,
+                                    },
+                                );
                             }
                             Command::ElicitationControlAnswered {
                                 request_id,
                                 response,
                             } => {
-                                if let Some((reply, _, _)) =
-                                    pending_elicitations.remove(&request_id)
-                                {
-                                    let _ = reply.send(response);
+                                if let Some(pending) = pending_elicitations.remove(&request_id) {
+                                    let _ = pending.reply.send(response);
                                 }
                                 map_state.v2.close_input(&request_id, false);
                                 drain_v2(&mut map_state, &update_tx, &session_id);
@@ -4373,6 +4533,13 @@ async fn run_loop(
                                 let session_id = session_id.clone();
                                 let cancel = elicit_cancel_rx.clone();
                                 let request_id_for_task = request_id.clone();
+                                // RR2-01: same answered-by-client flag as the
+                                // elicitation round trip; RR3-01: and the answer
+                                // itself, so a racing cancel/close keeps it.
+                                let answered = Arc::new(AtomicBool::new(false));
+                                let answered_for_task = answered.clone();
+                                let answer = Arc::new(OnceLock::new());
+                                let answer_for_task = answer.clone();
                                 let handle = tokio::spawn(async move {
                                     let send_tx = update_tx.clone();
                                     let response =
@@ -4381,7 +4548,10 @@ async fn run_loop(
                                             &session_id,
                                             support,
                                             move |params| {
-                                                let (ptx, prx) = oneshot::channel();
+                                                let (ptx, prx) = ElicitationReply::with_flag(
+                                                    answered_for_task,
+                                                    answer_for_task,
+                                                );
                                                 let _ = send_tx.send(
                                                     SessionOutbound::CreateElicitation {
                                                         params,
@@ -4402,17 +4572,24 @@ async fn run_loop(
                                         response,
                                     });
                                 });
-                                pending_elicitations
-                                    .insert(request_id, (reply, cancel_response, handle));
+                                pending_elicitations.insert(
+                                    request_id,
+                                    PendingElicitation {
+                                        reply,
+                                        cancel_response,
+                                        handle,
+                                        answered,
+                                        answer,
+                                        kind: PendingElicitationKind::Dialog,
+                                    },
+                                );
                             }
                             Command::UserDialogAnswered {
                                 request_id,
                                 response,
                             } => {
-                                if let Some((reply, _, _)) =
-                                    pending_elicitations.remove(&request_id)
-                                {
-                                    let _ = reply.send(response);
+                                if let Some(pending) = pending_elicitations.remove(&request_id) {
+                                    let _ = pending.reply.send(response);
                                 }
                                 map_state.v2.close_input(&request_id, false);
                                 drain_v2(&mut map_state, &update_tx, &session_id);
@@ -4719,12 +4896,35 @@ async fn run_loop(
                                         // awaiting the user, `later` — interrupting that
                                         // callback would cancel the ACP request
                                         // (`openUserInputs`, `dist/acp-agent.js:2646`).
+                                        // Node's `openUserInputs` counts EVERY client
+                                        // request: a permission, an AskUserQuestion round
+                                        // trip, an MCP elicitation and the refusal
+                                        // fallback dialog (`withPendingUserInput`,
+                                        // `acp-agent.ts:9588-9604`).
+                                        // RR1a-01: `withPendingUserInput` deletes its
+                                        // entry in the promise's `finally` as soon as
+                                        // the answer resolves, before the next stdin
+                                        // message (`acp-agent.ts:9597-9603`): an answer
+                                        // given just before the steer must not keep it
+                                        // at `later`.
+                                        // RR2-01: the elicitation entry's first field is
+                                        // the reply that answers the CLI's control
+                                        // request, so the steer path must NEVER remove
+                                        // it: the queued `ElicitationControlAnswered`
+                                        // still has to send the client's answer (a
+                                        // dropped sender answers `decline`). Read the
+                                        // answered-by-client flag instead and leave the
+                                        // entry for that command to remove.
                                         pending_permissions.retain(|_, h| !h.is_finished());
-                                        injected["priority"] = if pending_permissions.is_empty() {
-                                            json!("now")
-                                        } else {
-                                            json!("later")
-                                        };
+                                        let awaiting_client = pending_elicitations
+                                            .values()
+                                            .any(PendingElicitation::awaiting_client);
+                                        injected["priority"] =
+                                            if pending_permissions.is_empty() && !awaiting_client {
+                                                json!("now")
+                                            } else {
+                                                json!("later")
+                                            };
                                         // R2: mark the running turn steered so the
                                         // injected echo feeds `machine.on_echo`'s steer
                                         // lane instead of settling the turn outright.
@@ -4889,19 +5089,27 @@ async fn run_loop(
                             Command::CommandsSnapshot { reply } => {
                                 let _ = reply.send(ext.commands.clone());
                             }
-                            Command::UpdateContextWindow { size, model_id } => {
+                            Command::UpdateContextWindow {
+                                size,
+                                model_id,
+                                generation,
+                            } => {
                                 // MAJOR 1 / P4 (acp-agent.js:7884-7891): the background
                                 // get_context_usage answer only refines a NON-authoritative
                                 // window. Once the window is authoritative (seeded from the
                                 // model row, learned from `result.modelUsage`/cache), the
                                 // background result is dropped. F5b/A-10: it is also
                                 // dropped when the session switched models while the
-                                // request was in flight (`stillCurrent`).
+                                // request was in flight (`stillCurrent`). FA4-06: and when
+                                // a clear-context restart replaced the child query
+                                // (`session.query === query`).
                                 apply_context_window_answer(
                                     &mut ext.usage,
                                     &ext.config.current_model_id,
                                     size,
                                     &model_id,
+                                    generation,
+                                    control.query_generation(),
                                 );
                             }
                             Command::UpdateSendFailed => {
@@ -5698,13 +5906,20 @@ async fn run_loop(
                                     let control = control.clone();
                                     let tx = command_tx.clone();
                                     let model_id = model_val.clone();
+                                    // FA4-06: tie the answer to the child query that
+                                    // issued it (`stillCurrent`).
+                                    let generation = control.query_generation();
                                     tokio::spawn(async move {
                                         if let Ok(res) = control
                                             .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
                                             .await
                                         {
                                             if let Some(raw) = crate::usage::raw_max_tokens(&res) {
-                                                let _ = tx.send(Command::UpdateContextWindow { size: raw, model_id });
+                                                let _ = tx.send(Command::UpdateContextWindow {
+                                                    size: raw,
+                                                    model_id,
+                                                    generation,
+                                                });
                                             }
                                         }
                                     });
@@ -6337,22 +6552,32 @@ fn abort_pending_permissions(
 /// withdraw helpers take one handle instead of four.
 struct PendingClientRequests<'a> {
     permissions: &'a mut HashMap<String, tokio::task::JoinHandle<()>>,
-    elicitations:
-        &'a mut HashMap<String, (oneshot::Sender<Value>, Value, tokio::task::JoinHandle<()>)>,
+    elicitations: &'a mut HashMap<String, PendingElicitation>,
     ask: &'a mut HashMap<String, (oneshot::Sender<Value>, Value)>,
     await_tokens: &'a mut HashMap<String, crate::native_subagents::AwaitToken>,
 }
 
 /// Withdraw every pending client elicitation/dialog: abort the task waiting on
 /// the client (which sends `$/cancel_request`) and answer the CLI with the
-/// request's CANCEL outcome.
-fn abort_pending_elicitations(
-    pending: &mut HashMap<String, (oneshot::Sender<Value>, Value, tokio::task::JoinHandle<()>)>,
-) -> Vec<String> {
+/// request's CANCEL outcome — unless the client already answered, in which case
+/// its accepted or declined content is answered instead (RR3-01). Node's
+/// continuation returns that content and only then checks `signal.aborted`
+/// (`acp-agent.ts:10283-10288`), so an abort that arrives after the answer does
+/// not replace it. The answer is captured synchronously by
+/// [`ElicitationReply::send`], so the drain can answer without waiting for the
+/// spawned task's `ElicitationControlAnswered`; the entry is removed here and
+/// that command then finds nothing to answer.
+fn abort_pending_elicitations(pending: &mut HashMap<String, PendingElicitation>) -> Vec<String> {
     let mut ids = Vec::new();
-    for (id, (reply, response, handle)) in pending.drain() {
-        handle.abort();
-        let _ = reply.send(response);
+    for (id, pending_entry) in pending.drain() {
+        pending_entry.handle.abort();
+        let response = match pending_entry.answer.get() {
+            Some(answer) if pending_entry.answered.load(Ordering::SeqCst) => {
+                pending_entry.kind.answered_response(&id, answer)
+            }
+            _ => pending_entry.cancel_response,
+        };
+        let _ = pending_entry.reply.send(response);
         ids.push(id);
     }
     ids
@@ -6459,8 +6684,8 @@ fn withdraw_request(
     session_id: &str,
     request_id: &str,
 ) {
-    if let Some((_, _, handle)) = pending.elicitations.remove(request_id) {
-        handle.abort();
+    if let Some(pending_entry) = pending.elicitations.remove(request_id) {
+        pending_entry.handle.abort();
     }
     pending.ask.remove(request_id);
     if let Some(handle) = pending.permissions.remove(request_id) {
@@ -9917,6 +10142,16 @@ fn handle_permission(
     if let Some(preview) = &preview {
         map_state.pin_approval_preview(&can.tool_use_id, surfaced.as_mut(), preview);
     }
+    // RR1b-01: a v2 approval preview is a v2 diff (`changes`/`patch`), not a
+    // v1 content block, so the typed `ToolCall` cannot hold it. Node's surfaced
+    // call carries it as `previewContent` (`ensureToolCallEmitted`,
+    // `acp-agent.ts:9907-9919`; `renderer.ts:261`), so send the call raw with
+    // the preview as its content, as the hook path does.
+    let v2_preview = if map_state.caps_v2() {
+        preview.as_deref()
+    } else {
+        None
+    };
     // `toolUseOwner` (`acp-agent.ts:9943-9956`): the session of an eagerly
     // emitted tool call and of its requests is the subagent's announced child
     // session, else the root. The RFD form only announces a child it can place.
@@ -9940,6 +10175,23 @@ fn handle_permission(
         // client now holds, so the later streamed refinement and the result do
         // not repeat it.
         for update in map_state.filter_updates(vec![update]) {
+            if let Some(preview) = v2_preview {
+                // The v2 patch goes out verbatim (`v2_tool_call_patch` passes a
+                // v2 diff through); the typed channel would drop it as a
+                // non-v1 block. The typed path's defaults (`status`, `content`)
+                // are normally materialised on the typed channel, so add them
+                // here.
+                let mut value = serde_json::to_value(&update).unwrap_or(Value::Null);
+                crate::map::materialize_tool_call_defaults(&mut value);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("content".to_string(), Value::Array(preview.to_vec()));
+                }
+                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                    "sessionId": permission_session_id,
+                    "update": value,
+                })));
+                continue;
+            }
             let notif = SessionNotification::new(permission_session_id.clone(), update);
             let value = serde_json::to_value(&notif).unwrap_or(Value::Null);
             let _ = send_notification(value, update_tx);
@@ -10001,7 +10253,7 @@ fn handle_permission(
         let tool_use_id = can.tool_use_id.clone();
         let tool_input = can.tool_input.clone();
         let handle = tokio::spawn(async move {
-            let (ptx, prx) = oneshot::channel();
+            let (ptx, prx) = ElicitationReply::channel();
             let _ = update_tx.send(SessionOutbound::CreateElicitation {
                 params: create_request,
                 reply: ptx,
@@ -10097,6 +10349,7 @@ fn handle_permission(
         terminal_output: map_state.has_terminal(&can.tool_name),
         title: subject,
         preview_content: preview.map(Value::Array),
+        v2: map_state.caps_v2(),
         blocked_path: can.blocked_path.clone(),
         fallback_content,
         mcp_server: can.mcp_server.clone(),
@@ -11512,11 +11765,15 @@ fn apply_context_window_answer(
     current_model_id: &str,
     size: u64,
     answer_model_id: &str,
+    answer_generation: u64,
+    current_generation: u64,
 ) -> bool {
     if crate::session_model::context_window_answer_is_current(
         usage.authoritative,
         current_model_id,
         answer_model_id,
+        answer_generation,
+        current_generation,
     ) {
         usage.update_window_if_positive(Some(size))
     } else {
@@ -14400,6 +14657,701 @@ mod tests {
         assert_eq!(reply.stop_reason, "end_turn");
     }
 
+    /// FA3b-01 — Node's `openUserInputs` counts every client request, including
+    /// an MCP elicitation (`withPendingUserInput`, `acp-agent.ts:9588-9604`): a
+    /// steer sent while the elicitation card is open goes out at
+    /// `priority:"later"`, like one while a permission is open, so the SDK
+    /// callback the card belongs to is not interrupted (IJAI-1191).
+    #[tokio::test]
+    async fn inv_43b_steer_later_while_elicitation_open() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::timeout;
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(
+            a,
+            control_in_rx,
+            ControlOptions {
+                on_request: Some(build_permission_request_handler(
+                    tx.clone(),
+                    crate::elicitation::ElicitationSupport {
+                        form: true,
+                        url: false,
+                    },
+                )),
+            },
+        );
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx.clone(),
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            crate::client_caps::ClientCapabilities {
+                elicitation_form: true,
+                ..crate::client_caps::ClientCapabilities::default()
+            },
+            std::env::temp_dir(),
+            false,
+            false,
+            crate::sdk_options::RawSdkMessages::Off,
+            crate::env_snapshot::EnvSnapshot::empty(),
+            None,
+            Vec::new(),
+        ));
+        let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = ltx.send(line.trim().to_string());
+                    }
+                }
+            }
+        });
+        let (preply_tx, _preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type":"user","uuid":"p1","message":{}}),
+            is_local_only: false,
+            prompt_text: String::new(),
+            reply: preply_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type":"user","uuid":"p1","isReplay":true,
+                "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+            .unwrap();
+        // Steer #1 with no client request open -> "now".
+        let steer = |uuid: &str| {
+            let (sreply_tx, sreply_rx) = oneshot::channel();
+            tx.send(Command::Steer {
+                uuid: uuid.into(),
+                frame: json!({"type":"user","uuid":uuid,"message":{}}),
+                is_local_only: false,
+                is_prompt_required: false,
+                reply: sreply_tx,
+            })
+            .unwrap();
+            sreply_rx
+        };
+        assert_eq!(steer("s1").await.unwrap()["outcome"], "injected");
+        // An MCP elicitation now waits on the client. Its request is registered
+        // before the spawned round trip sends the form, so the form's arrival is
+        // a real barrier that `pending_elicitations` is non-empty.
+        control_in_tx
+            .send(
+                json!({"type":"control_request","request_id":"elicit-1","request":{
+                "subtype":"elicitation","serverName":"srv","message":"Enter a value",
+                "mode":"form","requestedSchema":{"type":"object","properties":{}}}}),
+            )
+            .unwrap();
+        let mut form = None;
+        let mut answer = None;
+        while form.is_none() {
+            match timeout(Duration::from_secs(2), update_rx.recv())
+                .await
+                .expect("the elicitation is forwarded")
+            {
+                Some(SessionOutbound::CreateElicitation { params, reply }) => {
+                    form = Some(params);
+                    // RR1a-01: keep the card genuinely open (the reply is held,
+                    // not answered), so the steer waits as Node's
+                    // `openUserInputs` does.
+                    answer = Some(reply);
+                }
+                Some(_) => {}
+                None => panic!("the actor's outbound channel closed"),
+            }
+        }
+        assert_eq!(
+            form.expect("a form")["sessionId"],
+            json!("s1"),
+            "the elicitation is on the session"
+        );
+        assert_eq!(steer("s2").await.unwrap()["outcome"], "injected");
+
+        let mut priorities = Vec::new();
+        while priorities.len() < 2 {
+            let line = timeout(Duration::from_secs(5), lrx.recv())
+                .await
+                .expect("a user frame is written")
+                .expect("stdin open");
+            let v: Value = serde_json::from_str(&line).expect("JSON");
+            if matches!(v["uuid"].as_str(), Some("s1" | "s2")) {
+                priorities.push((
+                    v["uuid"].as_str().unwrap().to_string(),
+                    v["priority"].clone(),
+                ));
+            }
+        }
+        assert_eq!(
+            priorities,
+            vec![
+                ("s1".to_string(), json!("now")),
+                ("s2".to_string(), json!("later"))
+            ],
+            "an open elicitation makes a steer wait, like an open permission"
+        );
+        drop(answer);
+    }
+
+    /// RR1a-01 — Node's `withPendingUserInput` deletes its `openUserInputs`
+    /// entry in the promise's `finally` as soon as the client's answer resolves,
+    /// before the next stdin message is handled (`acp-agent.ts:9597-9603`). A
+    /// steer sent right after an elicitation answer therefore goes out at
+    /// `priority:"now"`, not `"later"`: the finished round trip is pruned like a
+    /// finished permission.
+    #[tokio::test]
+    async fn inv_43c_steer_now_after_elicitation_answer() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::timeout;
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(
+            a,
+            control_in_rx,
+            ControlOptions {
+                on_request: Some(build_permission_request_handler(
+                    tx.clone(),
+                    crate::elicitation::ElicitationSupport {
+                        form: true,
+                        url: false,
+                    },
+                )),
+            },
+        );
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx.clone(),
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            crate::client_caps::ClientCapabilities {
+                elicitation_form: true,
+                ..crate::client_caps::ClientCapabilities::default()
+            },
+            std::env::temp_dir(),
+            false,
+            false,
+            crate::sdk_options::RawSdkMessages::Off,
+            crate::env_snapshot::EnvSnapshot::empty(),
+            None,
+            Vec::new(),
+        ));
+        let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = ltx.send(line.trim().to_string());
+                    }
+                }
+            }
+        });
+        let (preply_tx, _preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type":"user","uuid":"p1","message":{}}),
+            is_local_only: false,
+            prompt_text: String::new(),
+            reply: preply_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type":"user","uuid":"p1","isReplay":true,
+                "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+            .unwrap();
+        let steer = |uuid: &str| {
+            let (sreply_tx, sreply_rx) = oneshot::channel();
+            tx.send(Command::Steer {
+                uuid: uuid.into(),
+                frame: json!({"type":"user","uuid":uuid,"message":{}}),
+                is_local_only: false,
+                is_prompt_required: false,
+                reply: sreply_tx,
+            })
+            .unwrap();
+            sreply_rx
+        };
+        assert_eq!(steer("s1").await.unwrap()["outcome"], "injected");
+        // An MCP elicitation waits on the client, then the client answers it.
+        control_in_tx
+            .send(
+                json!({"type":"control_request","request_id":"elicit-1","request":{
+                "subtype":"elicitation","serverName":"srv","message":"Enter a value",
+                "mode":"form","requestedSchema":{"type":"object","properties":{}}}}),
+            )
+            .unwrap();
+        let mut form = None;
+        while form.is_none() {
+            match timeout(Duration::from_secs(2), update_rx.recv())
+                .await
+                .expect("the elicitation is forwarded")
+            {
+                Some(SessionOutbound::CreateElicitation { params, reply }) => {
+                    form = Some(params);
+                    reply
+                        .send(Ok(json!({"action":"decline"})))
+                        .expect("the client answers");
+                }
+                Some(_) => {}
+                None => panic!("the actor's outbound channel closed"),
+            }
+        }
+        assert_eq!(
+            form.expect("a form")["sessionId"],
+            json!("s1"),
+            "the elicitation is on the session"
+        );
+        // The answer resolved the round trip; the steer that follows it in the
+        // same tick must not wait for the actor to process the Answered command.
+        assert_eq!(steer("s2").await.unwrap()["outcome"], "injected");
+
+        let mut priorities = Vec::new();
+        while priorities.len() < 2 {
+            let line = timeout(Duration::from_secs(5), lrx.recv())
+                .await
+                .expect("a user frame is written")
+                .expect("stdin open");
+            let v: Value = serde_json::from_str(&line).expect("JSON");
+            if matches!(v["uuid"].as_str(), Some("s1" | "s2")) {
+                priorities.push((
+                    v["uuid"].as_str().unwrap().to_string(),
+                    v["priority"].clone(),
+                ));
+            }
+        }
+        assert_eq!(
+            priorities,
+            vec![
+                ("s1".to_string(), json!("now")),
+                ("s2".to_string(), json!("now"))
+            ],
+            "an answered elicitation no longer makes a steer wait"
+        );
+    }
+
+    /// RR2-01 — a steer that runs BEFORE the queued
+    /// `ElicitationControlAnswered` must not drop the client's answer.
+    ///
+    /// The answer is sent (setting the answered-by-client flag) and the steer is
+    /// queued in the same tick, with no await between, so the actor reads
+    /// `Command::Steer` before the spawned task's Answered command. The steer
+    /// path leaves the entry in `pending_elicitations` (its first field is the
+    /// sender that answers the CLI's `control_request`); the Answered command
+    /// then writes the client's accept content back instead of the control
+    /// handler's `decline` fallback.
+    #[tokio::test]
+    async fn rr2_01_steer_before_the_answered_command_keeps_the_cli_answer() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::timeout;
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(
+            a,
+            control_in_rx,
+            ControlOptions {
+                on_request: Some(build_permission_request_handler(
+                    tx.clone(),
+                    crate::elicitation::ElicitationSupport {
+                        form: true,
+                        url: false,
+                    },
+                )),
+            },
+        );
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx.clone(),
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            crate::client_caps::ClientCapabilities {
+                elicitation_form: true,
+                ..crate::client_caps::ClientCapabilities::default()
+            },
+            std::env::temp_dir(),
+            false,
+            false,
+            crate::sdk_options::RawSdkMessages::Off,
+            crate::env_snapshot::EnvSnapshot::empty(),
+            None,
+            Vec::new(),
+        ));
+        let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = ltx.send(line.trim().to_string());
+                    }
+                }
+            }
+        });
+        let (preply_tx, _preply_rx) = oneshot::channel();
+        tx.send(Command::Prompt {
+            uuid: "p1".into(),
+            frame: json!({"type":"user","uuid":"p1","message":{}}),
+            is_local_only: false,
+            prompt_text: String::new(),
+            reply: preply_tx,
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({"type":"user","uuid":"p1","isReplay":true,
+                "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+            .unwrap();
+        let steer = |uuid: &str| {
+            let (sreply_tx, sreply_rx) = oneshot::channel();
+            tx.send(Command::Steer {
+                uuid: uuid.into(),
+                frame: json!({"type":"user","uuid":uuid,"message":{}}),
+                is_local_only: false,
+                is_prompt_required: false,
+                reply: sreply_tx,
+            })
+            .unwrap();
+            sreply_rx
+        };
+        assert_eq!(steer("s1").await.unwrap()["outcome"], "injected");
+        // An MCP elicitation waits on the client.
+        control_in_tx
+            .send(
+                json!({"type":"control_request","request_id":"elicit-1","request":{
+                "subtype":"elicitation","serverName":"srv","message":"Enter a value",
+                "mode":"form","requestedSchema":{"type":"object","properties":{}}}}),
+            )
+            .unwrap();
+        let mut form = None;
+        while form.is_none() {
+            match timeout(Duration::from_secs(2), update_rx.recv())
+                .await
+                .expect("the elicitation is forwarded")
+            {
+                Some(SessionOutbound::CreateElicitation { params, reply }) => {
+                    form = Some(params);
+                    // The client answers `accept`. This marks the round trip
+                    // answered synchronously; the spawned task has not queued
+                    // its Answered command yet.
+                    reply
+                        .send(Ok(json!({
+                            "action":"accept",
+                            "content":{"value":"yes"}
+                        })))
+                        .expect("the client answers");
+                }
+                Some(_) => {}
+                None => panic!("the actor's outbound channel closed"),
+            }
+        }
+        assert_eq!(
+            form.expect("a form")["sessionId"],
+            json!("s1"),
+            "the elicitation is on the session"
+        );
+        // Queue the steer in the same tick, before the task's Answered command:
+        // no await between the answer and the steer's `send`.
+        assert_eq!(steer("s2").await.unwrap()["outcome"], "injected");
+
+        let mut priorities = Vec::new();
+        let mut control_response = None;
+        while priorities.len() < 2 || control_response.is_none() {
+            let line = timeout(Duration::from_secs(5), lrx.recv())
+                .await
+                .expect("the actor writes the answer")
+                .expect("stdin open");
+            let v: Value = serde_json::from_str(&line).expect("JSON");
+            if matches!(v["uuid"].as_str(), Some("s1" | "s2")) {
+                priorities.push((
+                    v["uuid"].as_str().unwrap().to_string(),
+                    v["priority"].clone(),
+                ));
+            }
+            if v["type"] == "control_response" && v["response"]["request_id"] == "elicit-1" {
+                control_response = Some(v);
+            }
+        }
+        assert_eq!(
+            priorities,
+            vec![
+                ("s1".to_string(), json!("now")),
+                ("s2".to_string(), json!("now"))
+            ],
+            "an answered elicitation no longer makes a steer wait"
+        );
+        let response = control_response.expect("the control response is written");
+        assert_eq!(
+            response["response"]["response"],
+            json!({"action":"accept","content":{"value":"yes"}}),
+            "the CLI receives the client's accept content, not a decline"
+        );
+    }
+
+    /// The real actor over a duplex stdin with an elicitation-capable control
+    /// handler, plus the reader that serializes every line written to the CLI.
+    struct ElicitationActor {
+        /// The actor's command sender.
+        tx: mpsc::UnboundedSender<Command>,
+        /// The actor's outbound items (the client forms among them).
+        update_rx: mpsc::UnboundedReceiver<SessionOutbound>,
+        /// The CLI side of the control channel.
+        control_in_tx: mpsc::UnboundedSender<Value>,
+        /// Keeps the CLI's stream open for the lifetime of the test.
+        _stream_tx: mpsc::UnboundedSender<Value>,
+        /// Every line the actor wrote to the CLI.
+        lrx: mpsc::UnboundedReceiver<String>,
+    }
+
+    fn spawn_elicitation_actor() -> ElicitationActor {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(
+            a,
+            control_in_rx,
+            ControlOptions {
+                on_request: Some(build_permission_request_handler(
+                    tx.clone(),
+                    crate::elicitation::ElicitationSupport {
+                        form: true,
+                        url: false,
+                    },
+                )),
+            },
+        );
+        let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx.clone(),
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            crate::client_caps::ClientCapabilities {
+                elicitation_form: true,
+                ..crate::client_caps::ClientCapabilities::default()
+            },
+            std::env::temp_dir(),
+            false,
+            false,
+            crate::sdk_options::RawSdkMessages::Off,
+            crate::env_snapshot::EnvSnapshot::empty(),
+            None,
+            Vec::new(),
+        ));
+        let (ltx, lrx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = ltx.send(line.trim().to_string());
+                    }
+                }
+            }
+        });
+        ElicitationActor {
+            tx,
+            update_rx,
+            control_in_tx,
+            _stream_tx: stream_tx,
+            lrx,
+        }
+    }
+
+    /// The MCP elicitation control request the CLI sends.
+    fn mcp_elicitation_control_request(request_id: &str) -> Value {
+        json!({"type":"control_request","request_id":request_id,"request":{
+            "subtype":"elicitation","serverName":"srv","message":"Enter a value",
+            "mode":"form","requestedSchema":{"type":"object","properties":{}}}})
+    }
+
+    /// The next `CreateElicitation` outbound, with its reply sender.
+    async fn next_elicitation_form(
+        update_rx: &mut mpsc::UnboundedReceiver<SessionOutbound>,
+    ) -> ElicitationReply {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), update_rx.recv())
+                .await
+                .expect("the elicitation is forwarded")
+            {
+                Some(SessionOutbound::CreateElicitation { reply, .. }) => return reply,
+                Some(_) => {}
+                None => panic!("the actor's outbound channel closed"),
+            }
+        }
+    }
+
+    /// The serialized `control_response` for `request_id` written to the CLI.
+    async fn next_control_response(
+        lrx: &mut mpsc::UnboundedReceiver<String>,
+        request_id: &str,
+    ) -> Value {
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(5), lrx.recv())
+                .await
+                .expect("the actor writes the control response")
+                .expect("stdin open");
+            let value: Value = serde_json::from_str(&line).expect("JSON");
+            if value["type"] == "control_response" && value["response"]["request_id"] == request_id
+            {
+                return value;
+            }
+        }
+    }
+
+    /// RR3-01 — a `session/cancel` that arrives after the client answered must
+    /// not replace that answer: Node's continuation returns the accepted
+    /// content and only then checks `signal.aborted`
+    /// (`acp-agent.ts:10283-10288`), so the CLI receives `accept`, not
+    /// `cancel`.
+    #[tokio::test]
+    async fn rr3_01_cancel_after_the_client_answer_keeps_the_cli_answer() {
+        let mut actor = spawn_elicitation_actor();
+        actor
+            .control_in_tx
+            .send(mcp_elicitation_control_request("elicit-1"))
+            .unwrap();
+        let reply = next_elicitation_form(&mut actor.update_rx).await;
+        // The client answers `accept`: the round trip is resolved and the
+        // answered flag set synchronously, before the spawned task queues its
+        // Answered command.
+        reply
+            .send(Ok(json!({"action":"accept","content":{"value":"yes"}})))
+            .expect("the client answers");
+        // Same tick, no await between: the actor reads the Cancel before the
+        // spawned task's Answered command and drains the answered entry.
+        actor.tx.send(Command::Cancel).unwrap();
+        let response = next_control_response(&mut actor.lrx, "elicit-1").await;
+        assert_eq!(
+            response["response"]["response"],
+            json!({"action":"accept","content":{"value":"yes"}}),
+            "a cancel after the answer keeps the client's accepted content"
+        );
+        // The entry was removed: the queued Answered must not answer twice.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(line) = actor.lrx.try_recv() {
+            let value: Value = serde_json::from_str(&line).expect("JSON");
+            assert!(
+                !(value["type"] == "control_response"
+                    && value["response"]["request_id"] == "elicit-1"),
+                "the answered elicitation answers the CLI exactly once"
+            );
+        }
+    }
+
+    /// RR3-01 — the close path (`session/close`, the session's abort) must keep
+    /// an answer the client already gave, exactly like the cancel path.
+    #[tokio::test]
+    async fn rr3_01_close_after_the_client_answer_keeps_the_cli_answer() {
+        let mut actor = spawn_elicitation_actor();
+        actor
+            .control_in_tx
+            .send(mcp_elicitation_control_request("elicit-1"))
+            .unwrap();
+        let reply = next_elicitation_form(&mut actor.update_rx).await;
+        reply
+            .send(Ok(json!({"action":"accept","content":{"value":"yes"}})))
+            .expect("the client answers");
+        // Same tick: the close is queued before the spawned task's Answered
+        // command, so the actor drains the answered entry on the close path.
+        let (close_tx, close_rx) = oneshot::channel();
+        actor.tx.send(Command::Close { reply: close_tx }).unwrap();
+        let response = next_control_response(&mut actor.lrx, "elicit-1").await;
+        assert_eq!(
+            response["response"]["response"],
+            json!({"action":"accept","content":{"value":"yes"}}),
+            "a close after the answer keeps the client's accepted content"
+        );
+        // The close answers behind its outbound flush barrier; no forwarding
+        // task consumes the outbound channel here, so resolve it.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), actor.update_rx.recv()).await {
+                Ok(Some(SessionOutbound::Flush(done))) => {
+                    let _ = done.send(());
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the actor's outbound channel closed before its flush"),
+                Err(_) => panic!("the close flush barrier is published"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), close_rx)
+            .await
+            .expect("close answers")
+            .expect("close reply sent");
+    }
+
+    /// RR3-01 — an elicitation the client never answered keeps the current
+    /// cancel outcome on `session/cancel`.
+    #[tokio::test]
+    async fn rr3_01_unanswered_elicitation_still_cancels_on_cancel() {
+        let mut actor = spawn_elicitation_actor();
+        actor
+            .control_in_tx
+            .send(mcp_elicitation_control_request("elicit-1"))
+            .unwrap();
+        // Held open: the client never answers.
+        let _reply = next_elicitation_form(&mut actor.update_rx).await;
+        actor.tx.send(Command::Cancel).unwrap();
+        let response = next_control_response(&mut actor.lrx, "elicit-1").await;
+        assert_eq!(
+            response["response"]["response"],
+            json!({"action":"cancel"}),
+            "an unanswered elicitation is still cancelled"
+        );
+    }
+
     /// 10.T3 (INV-27, Unit — `session`): a permission round-trip is spawned, not
     /// awaited inline. Drives the REAL actor path (`run_loop` + a real
     /// `Control` over a duplex stdin): start a `can_use_tool` permission the
@@ -16952,14 +17904,14 @@ mod tests {
         assert_eq!(usage.context_window, crate::usage::DEFAULT_CONTEXT_WINDOW);
 
         assert!(apply_context_window_answer(
-            &mut usage, "m1", 1_000_000, "m1"
+            &mut usage, "m1", 1_000_000, "m1", 0, 0
         ));
         assert_eq!(usage.context_window, 1_000_000);
         assert!(usage.authoritative);
 
         // A second refresh after the window became authoritative is dropped.
         assert!(!apply_context_window_answer(
-            &mut usage, "m1", 200_000, "m1"
+            &mut usage, "m1", 200_000, "m1", 0, 0
         ));
         assert_eq!(usage.context_window, 1_000_000);
 
@@ -16970,7 +17922,7 @@ mod tests {
 
         // And a refresh answering for a model the session left is dropped.
         assert!(!apply_context_window_answer(
-            &mut usage, "m2", 900_000, "m1"
+            &mut usage, "m2", 900_000, "m1", 0, 0
         ));
         assert_eq!(usage.context_window, 500_000);
     }

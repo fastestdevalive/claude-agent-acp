@@ -41,15 +41,32 @@ pub enum PluginDelivery {
     Initialize,
 }
 
+/// One optional filter field, mirroring JavaScript's `===` comparison.
+///
+/// `undefined` (an absent key) is a wildcard; any other value must equal the
+/// message field, so a present non-string value matches nothing
+/// (`acp-agent.ts:11841-11853`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterField {
+    /// The key is absent (`undefined`): match any message value.
+    Any,
+    /// The key holds a string: match exactly.
+    Exact(String),
+    /// The key is present but not a string (`null`, number, object): never
+    /// equals the string message field.
+    Never,
+}
+
 /// One entry of the `emitRawSDKMessages` filter list (`SDKMessageFilter`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawSdkMessageFilter {
     /// `type` — matched exactly against the SDK message's `type`.
     pub type_: String,
-    /// `subtype` — when present, must equal the message's `subtype`.
-    pub subtype: Option<String>,
-    /// `origin` — when present, must equal the message's `origin.kind`.
-    pub origin: Option<String>,
+    /// `subtype` — absent is a wildcard, a string must match, anything else
+    /// matches nothing.
+    pub subtype: FilterField,
+    /// `origin` — same semantics against the message's `origin.kind`.
+    pub origin: FilterField,
 }
 
 /// `_meta.claudeCode.emitRawSDKMessages` (`acp-agent.ts:1731-1773`): whether
@@ -77,16 +94,26 @@ pub fn should_emit_raw_message(config: &RawSdkMessages, message: &Value) -> bool
             let origin = message.pointer("/origin/kind").and_then(Value::as_str);
             filters.iter().any(|filter| {
                 filter.type_ == type_
-                    && filter
-                        .subtype
-                        .as_deref()
-                        .is_none_or(|wanted| Some(wanted) == subtype)
-                    && filter
-                        .origin
-                        .as_deref()
-                        .is_none_or(|wanted| Some(wanted) == origin)
+                    && filter_field_matches(&filter.subtype, subtype)
+                    && filter_field_matches(&filter.origin, origin)
             })
         }
+    }
+}
+
+fn filter_field_matches(field: &FilterField, message: Option<&str>) -> bool {
+    match field {
+        FilterField::Any => true,
+        FilterField::Exact(wanted) => message == Some(wanted.as_str()),
+        FilterField::Never => false,
+    }
+}
+
+fn parse_filter_field(value: Option<&Value>) -> FilterField {
+    match value {
+        None => FilterField::Any,
+        Some(Value::String(text)) => FilterField::Exact(text.clone()),
+        Some(_) => FilterField::Never,
     }
 }
 
@@ -103,14 +130,8 @@ fn parse_raw_sdk_messages(value: Option<&Value>) -> RawSdkMessages {
                     let object = filter.as_object()?;
                     Some(RawSdkMessageFilter {
                         type_: object.get("type").and_then(Value::as_str)?.to_string(),
-                        subtype: object
-                            .get("subtype")
-                            .and_then(Value::as_str)
-                            .map(String::from),
-                        origin: object
-                            .get("origin")
-                            .and_then(Value::as_str)
-                            .map(String::from),
+                        subtype: parse_filter_field(object.get("subtype")),
+                        origin: parse_filter_field(object.get("origin")),
                     })
                 })
                 .collect(),
@@ -140,14 +161,15 @@ pub enum McpServer {
         args: Option<Vec<String>>,
         env: Option<Vec<(String, String)>>,
     },
-    /// `{type:"http", url, headers?}`.
+    /// `{type:"http", url?, headers?}`. A missing `url` is kept as absent, as
+    /// Node forwards `url: undefined` (dropped by `JSON.stringify`).
     Http {
-        url: String,
+        url: Option<String>,
         headers: Option<Vec<(String, String)>>,
     },
-    /// `{type:"sse", url, headers?}`.
+    /// `{type:"sse", url?, headers?}`.
     Sse {
-        url: String,
+        url: Option<String>,
         headers: Option<Vec<(String, String)>>,
     },
 }
@@ -155,6 +177,8 @@ pub enum McpServer {
 /// Parsed `_meta.claudeCode.options`.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeOptions {
+    /// `model` as `if (model) String(model)` (FA1-17): `""`/`0`/`false`/`null`
+    /// are falsy and emit no flag.
     pub model: Option<String>,
     pub betas: Vec<String>,
     /// `extraArgs` in insertion order; `None` value = a bare `--key`.
@@ -166,12 +190,20 @@ pub struct ClaudeOptions {
     pub tools: Option<Vec<String>>,
     /// `toolAliases` (O-155).
     pub tool_aliases: Option<Value>,
-    /// `toolConfig` (O-161).
+    /// `toolConfig` (O-161): Node's SDK only uses it to derive env vars; it is
+    /// never forwarded in the initialize request (FA1-15).
     pub tool_config: Option<Value>,
+    /// `effort` as `if (effort) String(effort)` (FA1-17).
     pub effort: Option<String>,
-    pub max_turns: Option<u32>,
-    pub max_budget_usd: Option<f64>,
+    /// `maxTurns` as the SDK's `String(value)` (FA1-08); `None` for a falsy
+    /// value (`0`, `false`, `""`, `null`, `NaN`), which emits no flag.
+    pub max_turns: Option<String>,
+    /// `maxBudgetUsd` as JS `String()`; `null` is present and becomes `null`
+    /// (FA3-06: Node guards with `!== void 0`, not truthiness).
+    pub max_budget_usd: Option<String>,
+    /// `fallbackModel` as `if (fallbackModel) String(fallbackModel)` (FA1-17).
     pub fallback_model: Option<String>,
+    /// `agent` as `if (agent) String(agent)` (FA1-17).
     pub agent: Option<String>,
     /// `agents` (O-144): custom subagent definitions, passed to the SDK's
     /// `initialize` request verbatim. Only a truthy value is sent.
@@ -186,7 +218,10 @@ pub struct ClaudeOptions {
     /// `persistSession`; only an explicit `false` emits `--no-session-persistence`.
     pub persist_session: Option<bool>,
     pub strict_mcp_config: bool,
-    pub prompt_suggestions: Option<bool>,
+    /// `promptSuggestions` verbatim (FA3b-05): Node spreads the raw client
+    /// value over its `true` default, so `null`/`0`/a string reach the CLI
+    /// (`acp-agent.ts:11103,11233-11236`).
+    pub prompt_suggestions: Option<Value>,
     pub allow_dangerously_skip_permissions: Option<bool>,
     pub setting_sources: Option<Vec<String>>,
     pub resume: Option<String>,
@@ -207,7 +242,13 @@ pub struct ClaudeOptions {
     /// Set when `pluginDelivery` is neither `argv` nor `initialize` (the SDK
     /// throws before spawning).
     pub invalid_plugin_delivery: bool,
-    /// `projectConfigRoot` -> `--project-config-root=<r>`.
+    /// Set when the official ACP `additionalDirectories` (or the legacy
+    /// `_meta.additionalRoots` fallback) is present but not iterable: Node's
+    /// `[...value]` throws, so session creation fails instead of falling back.
+    pub invalid_additional_directories: bool,
+    /// `projectConfigRoot` -> `--project-config-root=<r>`. The SDK guards with
+    /// `!== undefined`, so a present `null` becomes `--project-config-root=null`
+    /// (FA1-17).
     pub project_config_root: Option<String>,
     /// `_meta.disableBuiltInTools === true` -> `tools: []` unless
     /// `options.tools` is present (legacy shorthand).
@@ -244,7 +285,9 @@ pub struct ClaudeOptions {
     /// `permissionPrompts` -> `--permission-prompts=<v>` (O-132).
     pub permission_prompts: Option<String>,
     /// `perTaskStopAffordance` (O-84); `None` lets the RFD default apply.
-    pub per_task_stop_affordance: Option<bool>,
+    /// `perTaskStopAffordance` verbatim (FA3-09): any defined value, including
+    /// `null`/`false`, reaches the initialize payload.
+    pub per_task_stop_affordance: Option<Value>,
     /// `agentProgressSummaries` (O-153): the SDK sends it in `initialize` so the
     /// CLI summarises a subagent's progress; undefined (`None`) is omitted.
     pub agent_progress_summaries: Option<bool>,
@@ -280,14 +323,70 @@ fn js_string(value: &Value) -> String {
     }
 }
 
-/// JavaScript truthiness for the option values Node tests with `if (value)`.
-fn js_truthy(value: Option<&Value>) -> bool {
+/// JavaScript `String(value)` for values the SDK interpolates into argv
+/// (`Be("--max-turns", p)`); numbers use JS's shortest round-trip form.
+pub(crate) fn js_argv_text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                integer.to_string()
+            } else if let Some(integer) = number.as_u64() {
+                integer.to_string()
+            } else {
+                number
+                    .as_f64()
+                    .filter(|float| float.is_finite())
+                    .map_or_else(|| number.to_string(), |float| format!("{float}"))
+            }
+        }
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_argv_text(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+/// JavaScript truthiness (`if (value)`), shared with `agent.rs`'s FA1-07/FA1-17
+/// fallback-model guard.
+pub fn js_truthy(value: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
         Some(Value::Bool(boolean)) => *boolean,
         Some(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0 && !n.is_nan()),
         Some(Value::String(text)) => !text.is_empty(),
         Some(Value::Array(_)) | Some(Value::Object(_)) => true,
+    }
+}
+
+/// `if (value) String(value)` for the option flags the SDK guards with JS
+/// truthiness and interpolates with `String()` (`sdk.mjs`
+/// `ProcessTransport.initialize`): `""`, `0`, `false`, `null` and a missing key
+/// emit no flag (FA1-17), while any other value is stringified like JS.
+fn opt_js_string(opts: &Value, key: &str) -> Option<String> {
+    let value = opts.get(key)?;
+    js_truthy(Some(value)).then(|| js_argv_text(value))
+}
+
+/// JavaScript strict equality (`===`) over parsed JSON primitives, used by the
+/// SDK's `fallbackModel === model` guard (FA1-07): numbers compare by value
+/// (`5 === 5.0`), strings/bools by value, and a mixed-type pair (e.g. `5` vs
+/// `"5"`) is never equal. Objects and arrays are distinct references, so two
+/// different JSON values are never `===`.
+pub fn js_strict_eq(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (Value::Null, Value::Null) => true,
+        _ => false,
     }
 }
 
@@ -345,20 +444,13 @@ fn parse_mcp_servers(value: Option<&Value>) -> Vec<(String, McpServer)> {
         };
         match object.get("type").and_then(Value::as_str) {
             Some(kind @ ("http" | "sse")) => {
-                let Some(url) = object.get("url").and_then(Value::as_str) else {
-                    continue;
-                };
+                // Node keeps the server even without a `url` (`acp-agent.ts:11033-11040`).
+                let url = object.get("url").and_then(Value::as_str).map(String::from);
                 let headers = object.get("headers").map(name_value_pairs);
                 let config = if kind == "http" {
-                    McpServer::Http {
-                        url: url.to_string(),
-                        headers,
-                    }
+                    McpServer::Http { url, headers }
                 } else {
-                    McpServer::Sse {
-                        url: url.to_string(),
-                        headers,
-                    }
+                    McpServer::Sse { url, headers }
                 };
                 out.push((name.to_string(), config));
             }
@@ -415,7 +507,11 @@ fn pairs_json(pairs: &[(String, String)]) -> String {
 fn server_json(server: &McpServer) -> String {
     match server {
         McpServer::Http { url, headers } => {
-            let mut out = format!("{{\"type\":\"http\",\"url\":{}", json_string(url));
+            let mut out = String::from("{\"type\":\"http\"");
+            if let Some(url) = url {
+                out.push_str(",\"url\":");
+                out.push_str(&json_string(url));
+            }
             if let Some(headers) = headers {
                 out.push_str(",\"headers\":");
                 out.push_str(&pairs_json(headers));
@@ -424,7 +520,11 @@ fn server_json(server: &McpServer) -> String {
             out
         }
         McpServer::Sse { url, headers } => {
-            let mut out = format!("{{\"type\":\"sse\",\"url\":{}", json_string(url));
+            let mut out = String::from("{\"type\":\"sse\"");
+            if let Some(url) = url {
+                out.push_str(",\"url\":");
+                out.push_str(&json_string(url));
+            }
             if let Some(headers) = headers {
                 out.push_str(",\"headers\":");
                 out.push_str(&pairs_json(headers));
@@ -550,8 +650,11 @@ fn parse_model_config(raw: Option<&str>) -> Result<Option<Value>, String> {
     let Some(raw) = raw.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
-    let parsed: Value =
-        serde_json::from_str(raw).map_err(|error| format!("CLAUDE_MODEL_CONFIG: {error}"))?;
+    // FA3-13: Node lets `JSON.parse` throw, so the ACP `data.details` is the
+    // engine text — never a `CLAUDE_MODEL_CONFIG: ` prefix. (The exact parser
+    // wording is engine-version-specific; only the non-object message is the
+    // adapter's own.)
+    let parsed: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
     if !parsed.is_object() {
         return Err(String::from("CLAUDE_MODEL_CONFIG must be a JSON object"));
     }
@@ -579,6 +682,28 @@ const SANDBOX_ARRAY_MERGE: [&str; 5] = [
 /// Path keys that must be replaced, never deep-merged (`U4`).
 const SANDBOX_NO_MERGE: [&str; 2] = ["ripgrep", "network.tlsTerminate"];
 
+/// The SDK's array union (FA3-11): `[...new Set([...existing, ...overlay])]`.
+///
+/// JS `Set` dedupes primitives by value and objects/arrays by reference. JSON
+/// tiers are parsed into fresh objects, so an object/array is never the same
+/// reference as one from another tier (or another literal in the same array):
+/// every occurrence survives, while primitive duplicates — including ones
+/// already present in the lower tier — collapse to the first occurrence.
+pub(crate) fn js_array_union(existing: &[Value], overlay: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(existing.len() + overlay.len());
+    for item in existing.iter().chain(overlay.iter()) {
+        match item {
+            Value::Array(_) | Value::Object(_) => out.push(item.clone()),
+            _ => {
+                if !out.iter().any(|seen| seen == item) {
+                    out.push(item.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Deep merge of a settings-file `sandbox` object with the `sandbox` option
 /// (`U4`): objects merge recursively, the listed array keys concatenate with
 /// duplicates removed, the `no-merge` keys and everything else replace.
@@ -602,13 +727,7 @@ fn merge_sandbox(base: &Value, overlay: &Value, path: &str) -> Value {
         let existing = merged.get(key).cloned();
         if SANDBOX_ARRAY_MERGE.contains(&full.as_str()) {
             if let (Some(Value::Array(existing)), Value::Array(overlay)) = (&existing, value) {
-                let mut array = existing.clone();
-                for item in overlay {
-                    if !array.contains(item) {
-                        array.push(item.clone());
-                    }
-                }
-                merged.insert(key.clone(), Value::Array(array));
+                merged.insert(key.clone(), Value::Array(js_array_union(existing, overlay)));
                 continue;
             }
         }
@@ -791,13 +910,10 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         .map(|map| {
             map.iter()
                 .map(|(k, v)| {
-                    let value = match v {
-                        Value::Null => None,
-                        Value::String(s) => Some(s.clone()),
-                        Value::Bool(b) => Some(b.to_string()),
-                        Value::Number(n) => Some(n.to_string()),
-                        other => Some(other.to_string()),
-                    };
+                    // FA3-05: a `null` value is a bare flag; everything else is
+                    // JS `String(v)` (`sdk.mjs` `oy`), so objects are
+                    // `[object Object]` and arrays are comma-joined.
+                    let value = (!v.is_null()).then(|| js_argv_text(v));
                     (k.clone(), value)
                 })
                 .collect::<Vec<_>>()
@@ -814,28 +930,38 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         })
         .unwrap_or_default();
 
-    let additional_directories = {
-        let mut dirs = opt_str_ary(&opts, "additionalDirectories")
-            .into_iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        // Prefer official ACP params.additionalDirectories, falling back to legacy _meta.additionalRoots.
-        let acp_dirs = params
-            .get("additionalDirectories")
-            .and_then(Value::as_array)
-            .or_else(|| {
-                params
-                    .get("_meta")
-                    .and_then(|m| m.get("additionalRoots"))
-                    .and_then(Value::as_array)
-            });
-        if let Some(roots) = acp_dirs {
-            for r in roots.iter().filter_map(Value::as_str) {
-                dirs.push(PathBuf::from(r));
-            }
-        }
-        dirs
+    let mut additional_directories = opt_str_ary(&opts, "additionalDirectories")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    // `params.additionalDirectories ?? sessionMeta?.additionalRoots ?? []`,
+    // then `[...value]` (`acp-agent.ts:11142-11143`): a present official field
+    // wins even when malformed, a string spreads into its characters, and a
+    // non-iterable value fails session creation instead of falling back.
+    let official = params
+        .get("additionalDirectories")
+        .filter(|value| !value.is_null());
+    let legacy = params
+        .get("_meta")
+        .and_then(|meta| meta.get("additionalRoots"))
+        .filter(|value| !value.is_null());
+    let (spread, invalid_additional_directories) = match official.or(legacy) {
+        None => (Vec::new(), false),
+        Some(Value::Array(items)) => (
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect(),
+            false,
+        ),
+        Some(Value::String(text)) => (
+            text.chars().map(|c| PathBuf::from(c.to_string())).collect(),
+            false,
+        ),
+        Some(_) => (Vec::new(), true),
     };
+    additional_directories.extend(spread);
 
     let disable_built_in_tools = params
         .get("_meta")
@@ -880,15 +1006,17 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         Some(_) => (PluginDelivery::Argv, true),
     };
 
-    // `--task-budget`: `String(taskBudget.total)` (`sdk.mjs` ProcessTransport).
+    // `--task-budget`: `Be("--task-budget", taskBudget.total)` (`sdk.mjs`
+    // ProcessTransport), i.e. JS `String()` of whatever `total` is. FA3-04: a
+    // missing total is `undefined`, `null` is `null`, and a float uses JS's
+    // shortest form (`50000.0` -> `50000`).
     let task_budget = opts
         .get("taskBudget")
         .filter(|value| js_truthy(Some(value)))
-        .and_then(|value| value.get("total"))
-        .and_then(|total| match total {
-            Value::Number(number) => Some(number.to_string()),
-            Value::String(text) => Some(text.clone()),
-            _ => None,
+        .map(|value| {
+            value
+                .get("total")
+                .map_or_else(|| "undefined".to_string(), js_argv_text)
         });
 
     // `--json-schema`: the SDK derives it from `outputFormat` only
@@ -906,55 +1034,77 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
     let continue_conversation = js_truthy(opts.get("continue"));
     let permission_prompts = opt_str(&opts, "permissionPrompts").filter(|value| !value.is_empty());
 
+    // `ProcessTransport.initialize` (`sdk.mjs`): `skills === "all" ? ["Skill"] :
+    // skills.map(s => \`Skill(${s})\`)`, appended to the user's `allowedTools`
+    // with a set-dedupe against the original list (FA1-06).
+    let allowed_tools = {
+        let mut tools = opt_str_ary(&opts, "allowedTools");
+        let additions: Vec<String> = match opts.get("skills") {
+            Some(Value::String(skill)) if skill == "all" => vec!["Skill".to_string()],
+            Some(Value::Array(skills)) => skills
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|skill| format!("Skill({skill})"))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let original: std::collections::HashSet<String> = tools.iter().cloned().collect();
+        for addition in additions {
+            if !original.contains(&addition) {
+                tools.push(addition);
+            }
+        }
+        tools
+    };
+
     ClaudeOptions {
-        model: opt_str(&opts, "model"),
+        model: opt_js_string(&opts, "model"),
         betas: opt_str_ary(&opts, "betas"),
         extra_args,
         env,
-        allowed_tools: opt_str_ary(&opts, "allowedTools"),
+        allowed_tools,
         disallowed_tools: opt_str_ary(&opts, "disallowedTools"),
         tools,
-        tool_aliases: opts.get("toolAliases").filter(|v| !v.is_null()).cloned(),
+        // FA3-09: the SDK sends `toolAliases` whenever the key is defined, so a
+        // `null` value stays on the wire.
+        tool_aliases: opts.get("toolAliases").cloned(),
         tool_config: opts.get("toolConfig").filter(|v| !v.is_null()).cloned(),
-        effort: opt_str(&opts, "effort"),
+        effort: opt_js_string(&opts, "effort"),
         max_turns: opts
             .get("maxTurns")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-        max_budget_usd: opts.get("maxBudgetUsd").and_then(Value::as_f64),
-        fallback_model: opt_str(&opts, "fallbackModel"),
-        agent: opt_str(&opts, "agent"),
-        // The SDK sends `...A.agents && {agents: A.agents}`.
-        agents: opts
-            .get("agents")
             .filter(|value| js_truthy(Some(value)))
-            .cloned(),
+            .map(js_argv_text),
+        // FA3-06: `if(f!==void 0) W.push(Be("--max-budget-usd", f))` — a
+        // present `null`/string/number is stringified by JS `String()`.
+        max_budget_usd: opts.get("maxBudgetUsd").map(js_argv_text),
+        fallback_model: opt_js_string(&opts, "fallbackModel"),
+        agent: opt_js_string(&opts, "agent"),
+        // FA3-09: `buildInitializeRequest` sends `agents: initConfig.agents`
+        // whenever the key is defined (`null`/`false` included).
+        agents: opts.get("agents").cloned(),
         // O-169: Node spreads `userProvidedOptions?.hooks`; an absent or
         // non-object value contributes nothing.
         hooks: opts.get("hooks").filter(|value| value.is_object()).cloned(),
-        include_hook_events: opts
-            .get("includeHookEvents")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        // FA3-07: the SDK guards these with JS truthiness
+        // (`if(this.options.includeHookEvents)` / `if(O)`), not `=== true`.
+        include_hook_events: js_truthy(opts.get("includeHookEvents")),
         additional_directories,
         persist_session: opts.get("persistSession").and_then(Value::as_bool),
-        strict_mcp_config: opts
-            .get("strictMcpConfig")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        prompt_suggestions: opts.get("promptSuggestions").and_then(Value::as_bool),
+        strict_mcp_config: js_truthy(opts.get("strictMcpConfig")),
+        prompt_suggestions: opts.get("promptSuggestions").cloned(),
         allow_dangerously_skip_permissions: opts
             .get("allowDangerouslySkipPermissions")
             .and_then(Value::as_bool),
-        setting_sources: {
-            let s = opt_str_ary(&opts, "settingSources");
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        },
-        resume: opt_str(&opts, "resume"),
+        // FA3-02: an explicitly empty array is NOT the same as an absent key.
+        // Node pushes `--setting-sources=` for `settingSources: []`
+        // (`if(L!==void 0) ... L.join(",")`); the adapter's
+        // `["user","project","local"]` default only applies when the client did
+        // not provide the option at all.
+        setting_sources: opts
+            .get("settingSources")
+            .map(|_| opt_str_ary(&opts, "settingSources")),
+        // FA3-06: `if(w)` skips an empty-string resume (no `--resume=`).
+        resume: opt_str(&opts, "resume").filter(|value| !value.is_empty()),
         thinking,
         has_thinking: thinking_present,
         max_thinking_tokens: opts.get("maxThinkingTokens").and_then(Value::as_u64),
@@ -962,7 +1112,8 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         plugins: parse_plugins(&opts),
         plugin_delivery,
         invalid_plugin_delivery,
-        project_config_root: opt_str(&opts, "projectConfigRoot"),
+        invalid_additional_directories,
+        project_config_root: opts.get("projectConfigRoot").map(js_argv_text),
         disable_built_in_tools,
         settings: opts.get("settings").cloned(),
         sandbox: opts.get("sandbox").cloned(),
@@ -980,7 +1131,7 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         session_mirror,
         channels: opt_str_ary(&opts, "channels"),
         permission_prompts,
-        per_task_stop_affordance: opts.get("perTaskStopAffordance").and_then(Value::as_bool),
+        per_task_stop_affordance: opts.get("perTaskStopAffordance").cloned(),
         agent_progress_summaries: opts.get("agentProgressSummaries").and_then(Value::as_bool),
         plan_mode_instructions: opt_str(&opts, "planModeInstructions"),
         enable_file_checkpointing: opts.get("enableFileCheckpointing").and_then(Value::as_bool),
@@ -1013,6 +1164,177 @@ mod tests {
         }
     }
 
+    /// FA3-07 — `includeHookEvents`/`strictMcpConfig` are JS-truthy, so a
+    /// number/string enables the flag like Node (`persistSession` stays strict
+    /// `=== false`, and `allowDangerouslySkipPermissions` is already folded to
+    /// a boolean by the adapter).
+    #[test]
+    fn fa3_07_boolean_options_use_js_truthiness() {
+        let o = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "includeHookEvents": 1,
+                "strictMcpConfig": "yes",
+                "persistSession": 1,
+            }}}
+        }));
+        assert!(o.include_hook_events);
+        assert!(o.strict_mcp_config);
+        assert_eq!(o.persist_session, None);
+        let mut spawn = base_spawn();
+        spawn.include_hook_events = o.include_hook_events;
+        spawn.strict_mcp_config = o.strict_mcp_config;
+        spawn.persist_session = o.persist_session;
+        let argv = build_argv(&spawn);
+        assert!(
+            argv.iter().any(|a| a == "--include-hook-events"),
+            "{argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--no-session-persistence"),
+            "only literal false persists off: {argv:?}"
+        );
+    }
+
+    /// FA3-06 — an empty-string `resume` emits no flag; `maxBudgetUsd` is
+    /// guarded by `!== void 0`, so `null` and strings reach argv.
+    #[test]
+    fn fa3_06_empty_resume_and_present_max_budget() {
+        let o = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "resume": "",
+                "maxBudgetUsd": null,
+            }}}
+        }));
+        assert_eq!(o.resume, None);
+        assert_eq!(o.max_budget_usd.as_deref(), Some("null"));
+
+        let mut spawn = base_spawn();
+        spawn.resume = o.resume;
+        spawn.max_budget_usd = o.max_budget_usd;
+        let argv = build_argv(&spawn);
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--resume=")),
+            "empty resume is skipped: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--max-budget-usd=null"),
+            "null is present: {argv:?}"
+        );
+
+        let numeric = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"maxBudgetUsd": "10"}}}
+        }));
+        assert_eq!(numeric.max_budget_usd.as_deref(), Some("10"));
+    }
+
+    /// FA3-05 — `extraArgs` values use JS `String()`: objects are
+    /// `[object Object]`, arrays are comma-joined, `null` is a bare flag.
+    #[test]
+    fn fa3_05_extra_args_js_string() {
+        let o = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"extraArgs": {
+                "obj": {"a": 1},
+                "arr": [1, 2],
+                "flag": null,
+            }}}}
+        }));
+        assert_eq!(
+            o.extra_args,
+            vec![
+                ("obj".to_string(), Some("[object Object]".to_string())),
+                ("arr".to_string(), Some("1,2".to_string())),
+                ("flag".to_string(), None),
+            ]
+        );
+        let mut spawn = base_spawn();
+        spawn.extra_args = o.extra_args;
+        let argv = build_argv(&spawn);
+        let obj = argv.iter().position(|a| a == "--obj").expect("--obj");
+        assert_eq!(argv[obj + 1], "[object Object]", "{argv:?}");
+        let arr = argv.iter().position(|a| a == "--arr").expect("--arr");
+        assert_eq!(argv[arr + 1], "1,2", "{argv:?}");
+        assert!(argv.iter().any(|a| a == "--flag"), "{argv:?}");
+    }
+
+    /// FA3-04 — `taskBudget.total` is stringified like JS `String()`: missing
+    /// is `undefined`, `null`/booleans are their literal text, floats lose the
+    /// `.0`.
+    #[test]
+    fn fa3_04_task_budget_js_string() {
+        let cases = [
+            (json!({}), Some("undefined")),
+            (json!({"total": null}), Some("null")),
+            (json!({"total": true}), Some("true")),
+            (json!({"total": 50000.0}), Some("50000")),
+            (json!({"total": "12"}), Some("12")),
+        ];
+        for (task_budget, expected) in cases {
+            let o = claude_options(&json!({
+                "_meta": {"claudeCode": {"options": {"taskBudget": task_budget}}}
+            }));
+            assert_eq!(o.task_budget.as_deref(), expected);
+            let mut spawn = base_spawn();
+            spawn.task_budget = o.task_budget;
+            if let Some(value) = expected {
+                let argv = build_argv(&spawn);
+                assert!(
+                    argv.iter().any(|a| a == &format!("--task-budget={value}")),
+                    "argv: {argv:?}"
+                );
+            }
+        }
+    }
+
+    /// FA3-11 — sandbox array keys use the same JS `Set` union: duplicate
+    /// primitives collapse, object entries are distinct references.
+    #[test]
+    fn fa3_11_sandbox_array_union_matches_js_set() {
+        let base = json!({
+            "sandbox": {"filesystem": {"denyRead": ["/a", "/a"]},
+                        "credentials": {"files": [{"path": "/k"}]}}
+        });
+        let overlay = json!({
+            "filesystem": {"denyRead": ["/a", "/b"]},
+            "credentials": {"files": [{"path": "/k"}]}
+        });
+        let merged = merge_sandbox(&base["sandbox"], &overlay, "");
+        assert_eq!(
+            merged["filesystem"]["denyRead"],
+            json!(["/a", "/b"]),
+            "duplicate primitives collapse across the concatenation"
+        );
+        assert_eq!(
+            merged["credentials"]["files"]
+                .as_array()
+                .expect("array")
+                .len(),
+            2,
+            "the same object in two sources is a distinct reference"
+        );
+    }
+
+    /// FA3-02 — an explicit `settingSources: []` yields `--setting-sources=`,
+    /// while an absent key stays absent (the adapter default is applied later,
+    /// in `agent.rs`).
+    #[test]
+    fn fa3_02_empty_setting_sources_is_kept() {
+        let empty = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"settingSources": []}}}
+        }));
+        assert_eq!(empty.setting_sources, Some(Vec::new()));
+        let mut spawn = base_spawn();
+        spawn.setting_sources = empty.setting_sources.unwrap();
+        let argv = build_argv(&spawn);
+        assert!(
+            argv.iter().any(|a| a == "--setting-sources="),
+            "empty list is explicit: {argv:?}"
+        );
+
+        let absent = claude_options(&json!({}));
+        assert_eq!(absent.setting_sources, None);
+    }
+
     #[test]
     fn inv_57_options_to_argv_order() {
         let mut opts = base_spawn();
@@ -1022,8 +1344,8 @@ mod tests {
         opts.disallowed_tools = vec!["Write".into()];
         opts.tools = Some(vec!["Glob".into()]);
         opts.effort = Some("medium".into());
-        opts.max_turns = Some(5);
-        opts.max_budget_usd = Some(1.5);
+        opts.max_turns = Some("5".into());
+        opts.max_budget_usd = Some("1.5".to_string());
         opts.fallback_model = Some("so".into());
         opts.agent = Some("ag".into());
         opts.include_hook_events = true;
@@ -1179,15 +1501,15 @@ mod tests {
         assert_eq!(o.disallowed_tools, vec!["Bash"]);
         assert_eq!(o.tools, Some(vec!["Glob".to_string(), "Grep".to_string()]));
         assert_eq!(o.effort.as_deref(), Some("high"));
-        assert_eq!(o.max_turns, Some(9));
-        assert_eq!(o.max_budget_usd, Some(2.0));
+        assert_eq!(o.max_turns, Some("9".to_string()));
+        assert_eq!(o.max_budget_usd.as_deref(), Some("2"));
         assert_eq!(o.fallback_model.as_deref(), Some("sonnet"));
         assert_eq!(o.agent.as_deref(), Some("builder"));
         assert!(o.include_hook_events);
         assert_eq!(o.additional_directories, vec![PathBuf::from("/x")]);
         assert_eq!(o.persist_session, Some(true));
         assert!(o.strict_mcp_config);
-        assert_eq!(o.prompt_suggestions, Some(false));
+        assert_eq!(o.prompt_suggestions, Some(serde_json::json!(false)));
         assert_eq!(o.allow_dangerously_skip_permissions, Some(false));
         assert_eq!(
             o.setting_sources,
@@ -1196,8 +1518,8 @@ mod tests {
         assert_eq!(o.resume.as_deref(), Some("abc"));
     }
 
-    /// O-144 — `_meta.claudeCode.options.agents` rides to `initialize` verbatim,
-    /// and only when truthy (the SDK's `...A.agents && {agents}`).
+    /// O-144 / FA3-09 — `_meta.claudeCode.options.agents` rides to `initialize`
+    /// verbatim whenever the key is defined (Node drops only `undefined`).
     #[test]
     fn o144_agents_option_passthrough() {
         let defs = serde_json::json!({
@@ -1207,19 +1529,21 @@ mod tests {
             "_meta": {"claudeCode": {"options": {"agents": defs.clone()}}}
         }));
         assert_eq!(with.agents, Some(defs));
-        for absent in [
+        // FA3-09: `buildInitializeRequest` sends `agents: initConfig.agents`
+        // whenever the key is defined (`null`/`false`/`0` included); only an
+        // absent key is `None`.
+        assert_eq!(claude_options(&serde_json::json!({})).agents, None);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(0),
             serde_json::json!({}),
-            serde_json::json!({"_meta": {"claudeCode": {"options": {"agents": null}}}}),
-            serde_json::json!({"_meta": {"claudeCode": {"options": {"agents": false}}}}),
-            serde_json::json!({"_meta": {"claudeCode": {"options": {"agents": 0}}}}),
         ] {
-            assert_eq!(claude_options(&absent).agents, None, "{absent}");
+            let present = claude_options(&serde_json::json!({
+                "_meta": {"claudeCode": {"options": {"agents": value}}}
+            }));
+            assert_eq!(present.agents, Some(value.clone()), "{value}");
         }
-        // An empty object is truthy in JavaScript and is sent as `{}`.
-        let empty = claude_options(&serde_json::json!({
-            "_meta": {"claudeCode": {"options": {"agents": {}}}}
-        }));
-        assert_eq!(empty.agents, Some(serde_json::json!({})));
     }
 
     #[test]
@@ -1317,6 +1641,26 @@ mod tests {
             Some(
                 r#"{"mcpServers":{"remote":{"type":"http","url":"https://x.test/mcp","headers":{"Authorization":"Bearer t"}},"events":{"type":"sse","url":"https://y.test/sse"}}}"#
             )
+        );
+    }
+
+    /// FA1-12 (`acp-agent.ts:11029-11040`): an `http`/`sse` entry without a
+    /// `url` is still forwarded (Node keeps the server with `url: undefined`,
+    /// which `JSON.stringify` drops) instead of being silently omitted from
+    /// `--mcp-config`.
+    #[test]
+    fn fa1_12_http_server_without_url_is_forwarded() {
+        let params = json!({
+            "mcpServers": [
+                {"type": "http", "name": "h"},
+                {"type": "sse", "name": "s",
+                 "headers": [{"name": "A", "value": "b"}]}
+            ]
+        });
+        let o = claude_options(&params);
+        assert_eq!(
+            o.mcp_config.as_deref(),
+            Some(r#"{"mcpServers":{"h":{"type":"http"},"s":{"type":"sse","headers":{"A":"b"}}}}"#)
         );
     }
 
@@ -1512,7 +1856,13 @@ mod tests {
     fn inv_57_model_config_errors() {
         let cwd = std::env::temp_dir();
         let env = crate::env_snapshot::EnvSnapshot::from_pairs([("CLAUDE_MODEL_CONFIG", "{oops")]);
-        assert!(resolve_settings_arg(&cwd, &env, None, None).is_err());
+        let details = resolve_settings_arg(&cwd, &env, None, None).unwrap_err();
+        // FA3-13: the engine's own parse message, with no port prefix.
+        assert!(
+            !details.starts_with("CLAUDE_MODEL_CONFIG"),
+            "no prefix: {details}"
+        );
+        assert!(!details.is_empty(), "a parse error is reported");
 
         let env = crate::env_snapshot::EnvSnapshot::from_pairs([("CLAUDE_MODEL_CONFIG", "[1]")]);
         assert_eq!(
@@ -1698,7 +2048,7 @@ mod tests {
     #[test]
     fn inv_57_argv_fx1_order() {
         let mut opts = base_spawn();
-        opts.max_budget_usd = Some(1.5);
+        opts.max_budget_usd = Some("1.5".to_string());
         opts.task_budget = Some("50000".into());
         opts.model = Some("haiku".into());
         opts.json_schema = Some(r#"{"type":"object"}"#.into());
@@ -1821,7 +2171,7 @@ mod tests {
         assert!(o.session_mirror);
         assert_eq!(o.channels, vec!["alpha".to_string()]);
         assert_eq!(o.permission_prompts.as_deref(), Some("none"));
-        assert_eq!(o.per_task_stop_affordance, Some(false));
+        assert_eq!(o.per_task_stop_affordance, Some(json!(false)));
         assert_eq!(o.agent_progress_summaries, Some(true));
         assert_eq!(o.plan_mode_instructions.as_deref(), Some("Plan with care."));
         assert_eq!(o.enable_file_checkpointing, Some(true));
@@ -1831,18 +2181,18 @@ mod tests {
             RawSdkMessages::Filters(vec![
                 RawSdkMessageFilter {
                     type_: "assistant".into(),
-                    subtype: None,
-                    origin: None
+                    subtype: FilterField::Any,
+                    origin: FilterField::Any
                 },
                 RawSdkMessageFilter {
                     type_: "system".into(),
-                    subtype: Some("init".into()),
-                    origin: None
+                    subtype: FilterField::Exact("init".into()),
+                    origin: FilterField::Any
                 },
                 RawSdkMessageFilter {
                     type_: "result".into(),
-                    subtype: None,
-                    origin: Some("human".into())
+                    subtype: FilterField::Any,
+                    origin: FilterField::Exact("human".into())
                 }
             ])
         );
@@ -1855,7 +2205,7 @@ mod tests {
         }));
         assert_eq!(plain.json_schema, None);
 
-        // A missing `total`/non-boolean debug is not a flag.
+        // FA3-04: a missing `total` is JS `undefined` on the wire.
         let absent = claude_options(&json!({
             "_meta": {"claudeCode": {"options": {
                 "taskBudget": {},
@@ -1864,7 +2214,9 @@ mod tests {
                 "debugFile": ""
             }}}
         }));
-        assert_eq!(absent.task_budget, None);
+        // FA3-04: `String(taskBudget.total)` is `String(undefined)` when the
+        // object carries no `total`.
+        assert_eq!(absent.task_budget.as_deref(), Some("undefined"));
         assert!(!absent.continue_conversation);
         assert!(!absent.session_mirror);
         assert_eq!(absent.debug_file, None);
@@ -1901,13 +2253,13 @@ mod tests {
         let filters = RawSdkMessages::Filters(vec![
             RawSdkMessageFilter {
                 type_: "system".into(),
-                subtype: Some("init".into()),
-                origin: None,
+                subtype: FilterField::Exact("init".into()),
+                origin: FilterField::Any,
             },
             RawSdkMessageFilter {
                 type_: "result".into(),
-                subtype: None,
-                origin: Some("human".into()),
+                subtype: FilterField::Any,
+                origin: FilterField::Exact("human".into()),
             },
         ]);
         assert!(!should_emit_raw_message(&filters, &assistant));
@@ -1950,5 +2302,240 @@ mod tests {
         let empty = claude_options(&json!({}));
         assert_eq!(empty.tool_aliases, None);
         assert_eq!(empty.tool_config, None);
+    }
+
+    /// FA1-05 — `shouldEmitRawMessage` compares with `===`
+    /// (`acp-agent.ts:11841-11853`): only an absent (`undefined`) filter field
+    /// is a wildcard. A present non-string `subtype`/`origin` (JSON `null`,
+    /// number, object) equals no message field, so the filter matches nothing.
+    #[test]
+    fn fa1_05_raw_sdk_filter_non_string_fields_match_nothing() {
+        let config = parse_raw_sdk_messages(Some(&json!([
+            {"type": "system", "subtype": 5}
+        ])));
+        assert!(!should_emit_raw_message(
+            &config,
+            &json!({"type": "system", "subtype": "init"})
+        ));
+        assert!(!should_emit_raw_message(
+            &config,
+            &json!({"type": "system"})
+        ));
+
+        let config = parse_raw_sdk_messages(Some(&json!([
+            {"type": "result", "origin": null}
+        ])));
+        assert!(!should_emit_raw_message(
+            &config,
+            &json!({"type": "result", "origin": {"kind": "model"}})
+        ));
+        assert!(!should_emit_raw_message(
+            &config,
+            &json!({"type": "result"})
+        ));
+
+        // An absent field is still the wildcard the SDK compares to undefined.
+        let config = parse_raw_sdk_messages(Some(&json!([{"type": "system"}])));
+        assert!(should_emit_raw_message(
+            &config,
+            &json!({"type": "system", "subtype": "init"})
+        ));
+        assert!(should_emit_raw_message(&config, &json!({"type": "system"})));
+    }
+
+    /// FA1-06 — the SDK expands `skills` into the spawn `--allowedTools` list
+    /// (`sdk.mjs` `ProcessTransport.initialize`):
+    /// `skills === "all" ? ["Skill"] : skills.map(s => \`Skill(${s})\`)`,
+    /// appended to the user's tools with a set-dedupe against the originals.
+    #[test]
+    fn fa1_06_skills_are_appended_to_allowed_tools() {
+        let opts = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "allowedTools": ["Read", "Skill(pdf)"],
+                "skills": ["pdf", "docx"]
+            }}}
+        }));
+        assert_eq!(
+            opts.allowed_tools,
+            vec!["Read", "Skill(pdf)", "Skill(docx)"],
+            "Skill(pdf) is already present and is not duplicated"
+        );
+
+        let opts = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"skills": "all"}}}
+        }));
+        assert_eq!(opts.allowed_tools, vec!["Skill"]);
+
+        // The expanded list reaches the exact argv token.
+        let mut spawn = base_spawn();
+        spawn.allowed_tools = opts.allowed_tools;
+        let argv = build_argv(&spawn);
+        assert!(argv.iter().any(|a| a == "--allowedTools=Skill"), "{argv:?}");
+    }
+
+    /// FA1-07 — `fallbackModel === model` throws inside
+    /// `ProcessTransport.initialize` (`sdk.mjs`), before any spawn.
+    #[test]
+    fn fa1_07_equal_fallback_model_is_rejected() {
+        // Exercised at the `spawn_inputs` seam in `agent.rs` (the options are
+        // parsed here); this keeps the parse-side contract explicit.
+        let opts = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "model": "same-model",
+                "fallbackModel": "same-model"
+            }}}
+        }));
+        assert_eq!(opts.model.as_deref(), Some("same-model"));
+        assert_eq!(opts.fallback_model.as_deref(), Some("same-model"));
+    }
+
+    /// FA1-08 — `if (maxTurns)` (`sdk.mjs`): `0` is falsy and emits no flag;
+    /// non-integers are truthy and are stringified into `--max-turns=<value>`.
+    #[test]
+    fn fa1_08_max_turns_follows_js_truthiness() {
+        let zero = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"maxTurns": 0}}}
+        }));
+        assert_eq!(zero.max_turns, None, "0 is falsy, no turn limit");
+        let mut spawn = base_spawn();
+        spawn.max_turns = zero.max_turns;
+        let argv = build_argv(&spawn);
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--max-turns")),
+            "{argv:?}"
+        );
+
+        // Fractional and string values are truthy and reach the flag.
+        for (raw, expected) in [
+            (json!(5.5), "--max-turns=5.5"),
+            (json!("5"), "--max-turns=5"),
+        ] {
+            let opts = claude_options(&json!({
+                "_meta": {"claudeCode": {"options": {"maxTurns": raw}}}
+            }));
+            let mut spawn = base_spawn();
+            spawn.max_turns = opts.max_turns;
+            let argv = build_argv(&spawn);
+            assert!(
+                argv.iter().any(|a| a == expected),
+                "{raw} -> {expected}: {argv:?}"
+            );
+        }
+    }
+
+    /// FA1-17 — `model`/`effort`/`agent`/`fallbackModel` follow the SDK's
+    /// `if (value)` truthiness, so `""` emits no flag (Node never spawns with an
+    /// empty `--model=`), while `projectConfigRoot:null` is emitted because that
+    /// flag is guarded with `!== undefined`. Truthy non-strings use
+    /// `String(value)` exactly like the SDK's template interpolation.
+    #[test]
+    fn fa1_17_empty_option_strings_and_null_project_root_match_the_sdk() {
+        let empty = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "model": "",
+                "effort": "",
+                "agent": "",
+                "fallbackModel": "",
+                "projectConfigRoot": null
+            }}}
+        }));
+        assert_eq!(empty.model, None, "empty model emits no --model=");
+        assert_eq!(empty.effort, None);
+        assert_eq!(empty.agent, None);
+        assert_eq!(empty.fallback_model, None);
+        assert_eq!(
+            empty.project_config_root.as_deref(),
+            Some("null"),
+            "a present null projectConfigRoot is `!== undefined`, so it emits =null"
+        );
+
+        // Node's argv for the same options: no empty flags, one =null flag.
+        let spawn = SpawnOptions {
+            project_config_root: empty.project_config_root,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_argv(&spawn),
+            vec![
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--input-format",
+                "stream-json",
+                "--tools=default",
+                "--setting-sources=user,project,local",
+                "--project-config-root=null",
+            ]
+        );
+
+        // Truthy non-strings are stringified like JS `String(value)`.
+        let values = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "model": 5,
+                "effort": true,
+                "agent": ["a", "b"],
+                "fallbackModel": 2.5,
+                "projectConfigRoot": false
+            }}}
+        }));
+        assert_eq!(values.model.as_deref(), Some("5"));
+        assert_eq!(values.effort.as_deref(), Some("true"));
+        assert_eq!(values.agent.as_deref(), Some("a,b"));
+        assert_eq!(values.fallback_model.as_deref(), Some("2.5"));
+        assert_eq!(values.project_config_root.as_deref(), Some("false"));
+
+        let spawn = SpawnOptions {
+            model: values.model,
+            effort: values.effort,
+            agent: values.agent,
+            fallback_model: values.fallback_model,
+            project_config_root: values.project_config_root,
+            ..Default::default()
+        };
+        let argv = build_argv(&spawn);
+        for flag in [
+            "--model=5",
+            "--effort=true",
+            "--agent=a,b",
+            "--fallback-model=2.5",
+            "--project-config-root=false",
+        ] {
+            assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
+        }
+        assert!(
+            !argv.iter().any(|a| a == "--model="),
+            "no empty --model= token: {argv:?}"
+        );
+    }
+
+    /// FA1-09 — the adapter merges `{...extraArgs, "replay-user-messages": ""}`
+    /// (`acp-agent.ts:11274-11277`): a user-supplied key is overwritten in
+    /// place, at its original position, not appended a second time.
+    #[test]
+    fn fa1_09_user_replay_user_messages_is_overwritten_in_place() {
+        let mut opts = base_spawn();
+        opts.replay_user_messages = true;
+        opts.extra_args = vec![
+            ("replay-user-messages".to_string(), Some("true".to_string())),
+            ("chrome".to_string(), None),
+        ];
+        let argv = build_argv(&opts);
+        assert_eq!(
+            argv.iter()
+                .filter(|a| a.as_str() == "--replay-user-messages")
+                .count(),
+            1,
+            "one pair only: {argv:?}"
+        );
+        let idx = argv
+            .iter()
+            .position(|a| a == "--replay-user-messages")
+            .unwrap();
+        assert_eq!(argv[idx + 1], "", "the merged value is the empty string");
+        assert_eq!(argv[idx + 2], "--chrome", "position is preserved");
+        assert!(
+            !argv.iter().any(|a| a == "true"),
+            "the user value is overwritten: {argv:?}"
+        );
     }
 }

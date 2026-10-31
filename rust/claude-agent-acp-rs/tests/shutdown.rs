@@ -374,6 +374,41 @@ async fn inv_sigint_mid_turn_no_orphan() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// FA1-13 (`index.ts:28-35`): when the wrapped CLI dies by a signal, the
+/// adapter re-raises that signal after removing its listener (Node
+/// `process.kill(process.pid, signal)`), so the supervisor observes a signal
+/// death (`WIFSIGNALED`) instead of a normal exit with `128+N`.
+#[tokio::test]
+async fn fa1_13_cli_passthrough_dies_by_the_childs_signal() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tmp = tmp_dir("cli-signal");
+    let fake = write_fake_cli(&tmp, "fake-claude-cli", "#!/bin/sh\nkill -TERM $$\n");
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-agent-acp-rs"))
+            .args(["--cli"])
+            .env("CLAUDE_CODE_EXECUTABLE", &fake)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status(),
+    )
+    .await
+    .expect("the adapter exits within the deadline")
+    .expect("run --cli passthrough");
+
+    assert_eq!(
+        status.signal(),
+        Some(nix::sys::signal::Signal::SIGTERM as i32),
+        "the adapter must die by the child's signal, not exit 128+N: {status:?}"
+    );
+    assert_eq!(status.code(), None, "a signal death has no exit code");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Write an executable fake CLI script into `dir` (hermetic, `#[cfg(unix)]`).
 #[cfg(unix)]
 fn write_fake_cli(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {

@@ -146,6 +146,16 @@ enum Outbound {
 #[derive(Clone)]
 pub struct Control {
     tx: mpsc::UnboundedSender<Outbound>,
+    /// `verbatimPrompts` (FA3-03): the SDK's `Query` stamps
+    /// `client_composed: true` on every user message it writes when the option
+    /// is truthy (`sdk.mjs` `vv`/`streamInput`). The flag lives on the handle so
+    /// every clone (the actor and its spawned tasks) writes the same shape.
+    client_composed: Arc<std::sync::atomic::AtomicBool>,
+    /// The child query this handle writes to (FA4-06). A clear-context restart
+    /// rebinds the handle to a fresh child, so a background `get_context_usage`
+    /// answer issued against the old query can be dropped like Node's
+    /// `session.query === query` (`acp-agent.ts:10483-10491`).
+    query_generation: Arc<AtomicU64>,
 }
 
 /// The parsed `initialize` control_response (4.4).
@@ -188,24 +198,30 @@ pub struct InitializeOptions {
     pub agents: Option<Value>,
     /// `hooks` (the `initHooksPayload`).
     pub hooks: Option<Value>,
-    /// `promptSuggestions` (2.7 / E-14): emitted only when `Some`; the live
-    /// agent leaves it `None`.
-    pub prompt_suggestions: Option<bool>,
+    /// `promptSuggestions` (2.7 / E-14): emitted only when `Some`, verbatim
+    /// (FA3b-05: Node spreads the client's raw value over its `true` default).
+    pub prompt_suggestions: Option<Value>,
     /// `skills`.
     pub skills: Option<Value>,
     /// `toolAliases`.
     pub tool_aliases: Option<Value>,
-    /// `toolConfig`.
+    /// `toolConfig` (O-161): parsed so the port can derive the SDK's
+    /// AskUserQuestion env vars, but **never** sent in the initialize request —
+    /// Node's SDK only destructures it to set env vars (FA1-15).
     pub tool_config: Option<Value>,
     /// `forwardSubagentText`.
     pub forward_subagent_text: bool,
-    /// `perTaskStopAffordance` (O-84): emitted only when `Some`.
-    pub per_task_stop_affordance: Option<bool>,
+    /// `perTaskStopAffordance` (O-84, FA3-09): emitted verbatim when the key is
+    /// defined (`null`/`false` included).
+    pub per_task_stop_affordance: Option<Value>,
     /// `agentProgressSummaries` (O-153): emitted only when `Some`.
     pub agent_progress_summaries: Option<bool>,
     /// `planModeInstructions` (O-154): emitted only when `Some`.
     pub plan_mode_instructions: Option<String>,
-    /// `verbatimPrompts` (O-162): emitted only when `Some`.
+    /// `verbatimPrompts` (O-162, FA3-03): NOT an initialize field. The SDK
+    /// reads it only to mark every user message `client_composed: true`
+    /// (`sdk.mjs` `Query.streamInput`/`vv`), so it rides here only to reach
+    /// the control handle's wire shape.
     pub verbatim_prompts: Option<bool>,
     /// `supportedDialogKinds` (R-08): the blocking dialogs the adapter renders.
     /// Emitted only for a form-capable client (`acp-agent.ts:11259-11269`).
@@ -220,6 +236,18 @@ pub struct InitializeOptions {
 impl InitializeOptions {
     /// Build the `request` object (the `{subtype, ...}` payload) of the
     /// `initialize` control_request.
+    ///
+    /// The key set and insertion order follow the SDK's
+    /// `buildInitializeRequest` (`sdk.mjs`), which is exactly what Node puts on
+    /// the wire: `subtype`, `hooks`, `systemPrompt`, `appendSystemPrompt`,
+    /// `planModeInstructions`, `toolAliases`, `excludeDynamicSections`,
+    /// `agents`, `skills`, `promptSuggestions`, `agentProgressSummaries`,
+    /// `forwardSubagentText`, `supportedDialogKinds`, `perTaskStopAffordance`.
+    /// `toolConfig` is NOT part of the request (FA1-15) and
+    /// `captureSdkMcpManifests` is an internal init-config flag, never a wire
+    /// field (FA1-16; the captured `initialize.json` fixtures show both).
+    /// `verbatimPrompts` is likewise not a wire field (FA3-03): it only marks
+    /// user messages `client_composed`.
     pub fn build_request(&self) -> Value {
         let mut request = serde_json::Map::new();
         request.insert(
@@ -228,12 +256,6 @@ impl InitializeOptions {
         );
         if let Some(hooks) = &self.hooks {
             request.insert("hooks".to_string(), hooks.clone());
-        }
-        if let Some(prompt_suggestions) = &self.prompt_suggestions {
-            request.insert(
-                "promptSuggestions".to_string(),
-                Value::Bool(*prompt_suggestions),
-            );
         }
         if let Some(system_prompt) = &self.system_prompt {
             request.insert("systemPrompt".to_string(), system_prompt.clone());
@@ -250,12 +272,6 @@ impl InitializeOptions {
                 Value::String(instructions.clone()),
             );
         }
-        if let Some(agents) = &self.agents {
-            request.insert("agents".to_string(), agents.clone());
-        }
-        if let Some(skills) = &self.skills {
-            request.insert("skills".to_string(), skills.clone());
-        }
         if let Some(tool_aliases) = &self.tool_aliases {
             request.insert("toolAliases".to_string(), tool_aliases.clone());
         }
@@ -264,8 +280,20 @@ impl InitializeOptions {
         if let Some(exclude) = &self.exclude_dynamic_sections {
             request.insert("excludeDynamicSections".to_string(), exclude.clone());
         }
-        if let Some(tool_config) = &self.tool_config {
-            request.insert("toolConfig".to_string(), tool_config.clone());
+        if let Some(agents) = &self.agents {
+            request.insert("agents".to_string(), agents.clone());
+        }
+        if let Some(skills) = &self.skills {
+            request.insert("skills".to_string(), skills.clone());
+        }
+        if let Some(prompt_suggestions) = &self.prompt_suggestions {
+            request.insert("promptSuggestions".to_string(), prompt_suggestions.clone());
+        }
+        if let Some(summaries) = &self.agent_progress_summaries {
+            request.insert(
+                "agentProgressSummaries".to_string(),
+                Value::Bool(*summaries),
+            );
         }
         // `forwardSubagentText` is always sent (even when false), matching the
         // captured fixture.
@@ -273,24 +301,6 @@ impl InitializeOptions {
             "forwardSubagentText".to_string(),
             Value::Bool(self.forward_subagent_text),
         );
-        if let Some(summaries) = &self.agent_progress_summaries {
-            request.insert(
-                "agentProgressSummaries".to_string(),
-                Value::Bool(*summaries),
-            );
-        }
-        if let Some(per_task_stop) = &self.per_task_stop_affordance {
-            request.insert(
-                "perTaskStopAffordance".to_string(),
-                Value::Bool(*per_task_stop),
-            );
-        }
-        if let Some(verbatim_prompts) = &self.verbatim_prompts {
-            request.insert(
-                "verbatimPrompts".to_string(),
-                Value::Bool(*verbatim_prompts),
-            );
-        }
         if let Some(dialog_kinds) = &self.supported_dialog_kinds {
             request.insert(
                 "supportedDialogKinds".to_string(),
@@ -301,6 +311,9 @@ impl InitializeOptions {
                         .collect(),
                 ),
             );
+        }
+        if let Some(per_task_stop) = &self.per_task_stop_affordance {
+            request.insert("perTaskStopAffordance".to_string(), per_task_stop.clone());
         }
         Value::Object(request)
     }
@@ -328,11 +341,37 @@ impl Control {
             tx_for_tasks,
             opts,
         ));
-        Control { tx }
+        Control {
+            tx,
+            client_composed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            query_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The generation of the child query this handle writes to (FA4-06): a
+    /// background `get_context_usage` answer is only applied while the
+    /// generation it was issued for is still current.
+    pub fn query_generation(&self) -> u64 {
+        self.query_generation.load(Ordering::Relaxed)
+    }
+
+    /// Turn on the SDK's `verbatimPrompts` wire shape (FA3-03): every user
+    /// frame written from now on carries `client_composed: true`.
+    pub fn set_client_composed(&self, enabled: bool) {
+        self.client_composed
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Write a `user` message frame to the child's stdin.
-    pub async fn send_user(&self, frame: Value) -> Result<(), ControlError> {
+    pub async fn send_user(&self, mut frame: Value) -> Result<(), ControlError> {
+        if self
+            .client_composed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Value::Object(map) = &mut frame {
+                map.insert("client_composed".to_string(), Value::Bool(true));
+            }
+        }
         self.tx
             .send(Outbound::User(frame))
             .map_err(|_| ControlError::Closed)
@@ -459,7 +498,10 @@ impl Control {
     ) -> Result<(), ControlError> {
         self.tx
             .send(Outbound::Rebind(Box::new(stdin)))
-            .map_err(|_| ControlError::Closed)
+            .map_err(|_| ControlError::Closed)?;
+        // The handle now writes to a fresh child query (FA4-06).
+        self.query_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Perform the `initialize` handshake (4.4): send the `initialize`
@@ -1254,7 +1296,7 @@ mod tests {
                 "TaskCreated": [{"hookCallbackIds": ["hook_3"]}],
                 "TaskCompleted": [{"hookCallbackIds": ["hook_4"]}],
             })),
-            prompt_suggestions: Some(true),
+            prompt_suggestions: Some(json!(true)),
             forward_subagent_text: false,
             ..Default::default()
         };
@@ -1719,7 +1761,7 @@ mod tests {
     #[test]
     fn initialize_request_carries_per_task_stop_affordance() {
         let opts = InitializeOptions {
-            per_task_stop_affordance: Some(false),
+            per_task_stop_affordance: Some(json!(false)),
             ..Default::default()
         };
         let request = opts.build_request();
@@ -1761,9 +1803,11 @@ mod tests {
             .is_none());
     }
 
-    /// O-155, O-161 — `toolAliases` and `toolConfig` are serialized into initialize payload when provided.
+    /// O-155/O-161 — `toolAliases` is serialized into the initialize payload;
+    /// `toolConfig` is not, because Node's SDK only reads it to derive env vars
+    /// and never puts it in the initialize request (FA1-15).
     #[test]
-    fn initialize_request_carries_tool_aliases_and_tool_config() {
+    fn initialize_request_carries_tool_aliases_and_omits_tool_config() {
         let opts = InitializeOptions {
             tool_aliases: Some(json!({"Read": "CustomRead"})),
             tool_config: Some(json!({"Bash": {"timeout": 60}})),
@@ -1771,11 +1815,72 @@ mod tests {
         };
         let request = opts.build_request();
         assert_eq!(request["toolAliases"], json!({"Read": "CustomRead"}));
-        assert_eq!(request["toolConfig"], json!({"Bash": {"timeout": 60}}));
+        assert!(
+            request.get("toolConfig").is_none(),
+            "toolConfig is never forwarded by Node's SDK: {request}"
+        );
 
         let absent = InitializeOptions::default().build_request();
         assert!(absent.get("toolAliases").is_none());
         assert!(absent.get("toolConfig").is_none());
+    }
+
+    /// FA1-15/FA1-16 — the serialized initialize request carries exactly the
+    /// keys Node's SDK puts on the wire, in its insertion order
+    /// (`sdk.mjs` `buildInitializeRequest`). `toolConfig` is absent (FA1-15) and
+    /// so is `captureSdkMcpManifests`: that boolean is an internal init-config
+    /// flag that only gates the SDK's own manifest capture, and the captured
+    /// Node fixtures (`porting/fixtures/initialize.json`, `*.init.json`) carry
+    /// neither key (FA1-16, a false positive as reported).
+    #[test]
+    fn fa1_15_fa1_16_initialize_request_matches_the_node_wire_payload() {
+        let opts = InitializeOptions {
+            hooks: Some(json!({"PostToolUse": [{"hookCallbackIds": ["hook_0"]}]})),
+            system_prompt: Some(json!(["You are a terse pirate."])),
+            append_system_prompt: Some("Always answer in French.".to_string()),
+            plan_mode_instructions: Some("Plan first.".to_string()),
+            tool_aliases: Some(json!({"Read": "CustomRead"})),
+            exclude_dynamic_sections: Some(json!(true)),
+            agents: Some(json!({"reviewer": {"description": "Reviews"}})),
+            skills: Some(json!(["pdf"])),
+            prompt_suggestions: Some(json!(true)),
+            agent_progress_summaries: Some(true),
+            forward_subagent_text: true,
+            supported_dialog_kinds: Some(vec!["refusal_fallback".to_string()]),
+            per_task_stop_affordance: Some(json!(false)),
+            // Parsed by the port (env-var derivation) but never forwarded.
+            tool_config: Some(json!({"Bash": {"timeout": 60}})),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&opts.build_request()).expect("serialize");
+        assert_eq!(
+            serialized,
+            concat!(
+                r#"{"subtype":"initialize","#,
+                r#""hooks":{"PostToolUse":[{"hookCallbackIds":["hook_0"]}]},"#,
+                r#""systemPrompt":["You are a terse pirate."],"#,
+                r#""appendSystemPrompt":"Always answer in French.","#,
+                r#""planModeInstructions":"Plan first.","#,
+                r#""toolAliases":{"Read":"CustomRead"},"#,
+                r#""excludeDynamicSections":true,"#,
+                r#""agents":{"reviewer":{"description":"Reviews"}},"#,
+                r#""skills":["pdf"],"#,
+                r#""promptSuggestions":true,"#,
+                r#""agentProgressSummaries":true,"#,
+                r#""forwardSubagentText":true,"#,
+                r#""supportedDialogKinds":["refusal_fallback"],"#,
+                r#""perTaskStopAffordance":false}"#
+            ),
+            "the initialize payload must match Node's buildInitializeRequest key set and order"
+        );
+        assert!(
+            !serialized.contains("toolConfig"),
+            "Node never forwards toolConfig in initialize: {serialized}"
+        );
+        assert!(
+            !serialized.contains("captureSdkMcpManifests"),
+            "captureSdkMcpManifests is an SDK init-config flag, not a wire field: {serialized}"
+        );
     }
 
     /// B-74 — `rebind` moves every clone to another child's stdin: frames follow
@@ -1922,9 +2027,11 @@ mod tests {
         );
     }
 
-    /// O-143, O-162 — `skills` and `verbatimPrompts` are serialized into initialize payload when provided.
+    /// O-143, O-162, FA3-03 — `skills` is serialized into initialize when
+    /// provided; `verbatimPrompts` never is (Node's `buildInitializeRequest`
+    /// has no such field). It only changes the user frames' wire shape.
     #[test]
-    fn initialize_request_carries_skills_and_verbatim_prompts() {
+    fn fa3_03_initialize_omits_verbatim_prompts() {
         let opts = InitializeOptions {
             skills: Some(json!(["custom-skill"])),
             verbatim_prompts: Some(true),
@@ -1932,11 +2039,43 @@ mod tests {
         };
         let request = opts.build_request();
         assert_eq!(request["skills"], json!(["custom-skill"]));
-        assert_eq!(request["verbatimPrompts"], json!(true));
+        assert!(request.get("verbatimPrompts").is_none());
 
         let absent = InitializeOptions::default().build_request();
         assert!(absent.get("skills").is_none());
         assert!(absent.get("verbatimPrompts").is_none());
+    }
+
+    /// FA3-03 — with `verbatimPrompts` truthy the SDK writes every user message
+    /// as `{...message, client_composed: true}` (key appended last).
+    #[tokio::test]
+    async fn fa3_03_verbatim_prompts_marks_user_frames_client_composed() {
+        let (control, mut lines, _inbound) = harness(ControlOptions::default());
+        control.set_client_composed(true);
+        control
+            .send_user(json!({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                "parent_tool_use_id": null,
+            }))
+            .await
+            .expect("send");
+        let frame = next_line(&mut lines).await;
+        assert_eq!(
+            serde_json::to_string(&frame).expect("serialize"),
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]},"#,
+                r#""parent_tool_use_id":null,"client_composed":true}"#
+            )
+        );
+
+        control.set_client_composed(false);
+        control
+            .send_user(json!({"type": "user", "message": {}, "parent_tool_use_id": null}))
+            .await
+            .expect("send");
+        let plain = next_line(&mut lines).await;
+        assert!(plain.get("client_composed").is_none());
     }
 
     /// A-27 — enable_remote_control sends `remote_control` control request.

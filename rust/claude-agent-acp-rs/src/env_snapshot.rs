@@ -100,6 +100,29 @@ impl EnvSnapshot {
             managed_docs: self.managed_docs.clone(),
         }
     }
+
+    /// Merge entries over the snapshot, later entries winning (FA3-10).
+    ///
+    /// The managed-policy tier mutates `process.env` before any SDK call in
+    /// Node (`index.ts:51`); the port folds the same entries into the one
+    /// snapshot every adapter reader uses, so provider defaults,
+    /// `ANTHROPIC_MODEL`, `CLAUDE_CONFIG_DIR` and the v2 opt-in all see them.
+    #[must_use]
+    pub fn with_vars<I, K, V>(&self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut map = (*self.vars).clone();
+        for (key, value) in entries {
+            map.insert(key.into(), value.into());
+        }
+        Self {
+            vars: Arc::new(map),
+            managed_docs: self.managed_docs.clone(),
+        }
+    }
 }
 
 impl Default for EnvSnapshot {
@@ -111,5 +134,50 @@ impl Default for EnvSnapshot {
 impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for EnvSnapshot {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         Self::from_pairs(iter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EnvSnapshot;
+
+    /// FA3-10 — managed-policy env is folded into the adapter's snapshot, so
+    /// every reader (spawn resolution, providers, the v2 opt-in) sees it and
+    /// it overrides the host value, like Node's `process.env` mutation.
+    #[test]
+    fn fa3_10_policy_env_reaches_adapter_readers() {
+        let host = EnvSnapshot::from_pairs([
+            ("ANTHROPIC_BASE_URL", "https://host.example"),
+            ("CLAUDE_AGENT_ACP_EXPERIMENTAL_V2", "0"),
+        ])
+        .with_managed_docs(Vec::new());
+        let merged = host.with_vars([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://gateway.example".to_string(),
+            ),
+            ("ANTHROPIC_MODEL".to_string(), "claude-sonnet".to_string()),
+            (
+                "CLAUDE_CODE_EXECUTABLE".to_string(),
+                "/opt/policy/claude".to_string(),
+            ),
+            (
+                "CLAUDE_AGENT_ACP_EXPERIMENTAL_V2".to_string(),
+                "1".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            merged.get("ANTHROPIC_BASE_URL"),
+            Some("https://gateway.example")
+        );
+        assert_eq!(merged.get("ANTHROPIC_MODEL"), Some("claude-sonnet"));
+        assert_eq!(
+            crate::agent::ServeOptions::from_snapshot(merged.clone())
+                .claude_path
+                .as_deref(),
+            Some(std::path::Path::new("/opt/policy/claude"))
+        );
+        assert!(crate::v2::serve::is_experimental_v2_enabled(&merged));
     }
 }

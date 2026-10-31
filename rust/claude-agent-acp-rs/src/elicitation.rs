@@ -894,12 +894,28 @@ pub fn mcp_elicitation_to_create_request(
     }
 }
 
+/// One value of the accept action's `content` record: `string | number |
+/// boolean | string[]` (`zElicitationContentValue`, `zod.gen.js:2201-2207`).
+fn is_elicitation_content_value(value: &Value) -> bool {
+    match value {
+        Value::String(_) | Value::Number(_) | Value::Bool(_) => true,
+        Value::Array(items) => items.iter().all(Value::is_string),
+        Value::Null | Value::Object(_) => false,
+    }
+}
+
 /// Content of an accepted elicitation response.
+///
+/// Uses the SDK guard's classification (`CreateElicitationResponse.isAccept`,
+/// `guards.gen.js:117`): a malformed accept (right tag, ill-typed content)
+/// yields `{}`, like `acceptedElicitationContent` (`elicitation.ts:85-95`).
 #[must_use]
 pub fn accepted_elicitation_content(response: &Value) -> Value {
     if response.get("action").and_then(Value::as_str) == Some("accept") {
         match response.get("content") {
-            Some(Value::Object(map)) => Value::Object(map.clone()),
+            Some(Value::Object(map)) if map.values().all(is_elicitation_content_value) => {
+                Value::Object(map.clone())
+            }
             _ => Value::Object(Map::new()),
         }
     } else {
@@ -2070,6 +2086,61 @@ mod tests {
             "m1 declined this request. Retry with m2?"
         );
         assert!(!request["message"].as_str().unwrap().contains("()"));
+    }
+
+    /// FA1-04 — `acceptedElicitationContent` uses `isAccept`
+    /// (`elicitation.ts:85-95`), whose guard validates `content` as a record of
+    /// `string | number | boolean | string[]` (`guards.gen.js:117`,
+    /// `zElicitationAcceptAction`). An ill-typed accept yields `{}`.
+    #[test]
+    fn fa1_04_accept_content_is_validated_like_the_sdk_guard() {
+        let valid = json!({
+            "action": "accept",
+            "content": {"name": "x", "count": 2, "ok": true, "tags": ["a", "b"]}
+        });
+        assert_eq!(
+            create_elicitation_response_to_elicit_result(&valid),
+            json!({"action": "accept", "content": {
+                "name": "x", "count": 2, "ok": true, "tags": ["a", "b"]
+            }})
+        );
+
+        // An empty string array is still a valid `string[]`.
+        let empty_array = json!({"action": "accept", "content": {"x": []}});
+        assert_eq!(
+            create_elicitation_response_to_elicit_result(&empty_array),
+            json!({"action": "accept", "content": {"x": []}})
+        );
+
+        for content in [
+            json!({"x": {"nested": 1}}),
+            json!({"x": [1, 2]}),
+            json!({"x": null}),
+        ] {
+            let response = json!({"action": "accept", "content": content});
+            assert_eq!(
+                create_elicitation_response_to_elicit_result(&response),
+                json!({"action": "accept", "content": {}}),
+                "{content}"
+            );
+        }
+
+        // A non-object content is not a record at all.
+        for content in [json!("text"), json!(3), json!([1])] {
+            let response = json!({"action": "accept", "content": content});
+            assert_eq!(
+                create_elicitation_response_to_elicit_result(&response),
+                json!({"action": "accept", "content": {}}),
+                "{content}"
+            );
+        }
+
+        // Nullish content is the SDK's `content ?? {}`.
+        let response = json!({"action": "accept", "content": null});
+        assert_eq!(
+            create_elicitation_response_to_elicit_result(&response),
+            json!({"action": "accept", "content": {}})
+        );
     }
 
     #[test]

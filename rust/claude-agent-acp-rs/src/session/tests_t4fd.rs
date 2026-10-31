@@ -40,7 +40,7 @@ impl FdRig {
     }
 
     /// The `CreateElicitation` outbound, with its reply sender.
-    async fn create_elicitation(&mut self) -> oneshot::Sender<Result<Value, String>> {
+    async fn create_elicitation(&mut self) -> ElicitationReply {
         loop {
             let item = tokio::time::timeout(Duration::from_secs(2), self.rig.rx.recv())
                 .await
@@ -543,13 +543,16 @@ async fn t4fd_parent_cancel_keeps_a_rfd_childs_open_request() {
     let mut elicitations = HashMap::new();
     elicitations.insert(
         "elicit-1".to_string(),
-        (
-            elicitation_reply,
-            json!({"type":"control_response","response":{
+        PendingElicitation {
+            reply: elicitation_reply,
+            cancel_response: json!({"type":"control_response","response":{
                 "subtype":"success","request_id":"elicit-1",
                 "response":{"action":"cancel"}}}),
-            elicitation_handle,
-        ),
+            handle: elicitation_handle,
+            answered: Arc::new(AtomicBool::new(false)),
+            answer: Arc::new(OnceLock::new()),
+            kind: PendingElicitationKind::Mcp,
+        },
     );
 
     cancel_parent_round_trips(

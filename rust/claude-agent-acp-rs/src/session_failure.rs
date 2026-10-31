@@ -291,8 +291,13 @@ where
             }
             continue;
         }
-        let model = inner_msg.get("model").and_then(Value::as_str);
-        if model.is_some_and(|m| m != "<synthetic>") {
+        // A present `model` key clears the limit unless it is the synthetic
+        // marker, including `null` and non-string values (`"model" in
+        // message.message` in Node).
+        if inner_msg
+            .get("model")
+            .is_some_and(|model| model.as_str() != Some("<synthetic>"))
+        {
             active = None;
         }
     }
@@ -581,6 +586,43 @@ mod tests {
         let active = active_usage_limit_message(entries);
         assert!(active.is_some());
         assert_eq!(active.unwrap().0, "entry-uuid-limit");
+    }
+
+    /// N-53 (`session-failure-extension.ts:227-233`): a later assistant record
+    /// whose `model` key is present clears the active limit even when the value
+    /// is `null` (Node: `"model" in message.message`, then
+    /// `model !== undefined && model !== "<synthetic>"`); only a record without
+    /// the key leaves it armed.
+    #[test]
+    fn fa2_n53_a_present_null_model_clears_the_active_usage_limit() {
+        let limit = json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "uuid": "limit-uuid",
+            "message": {"model": "<synthetic>", "content": "You've hit your usage limit"}
+        });
+        let null_model = json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "uuid": "null-uuid",
+            "message": {"model": null, "content": "Hello!"}
+        });
+        let missing_model = json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "uuid": "missing-uuid",
+            "message": {"content": "Hello!"}
+        });
+        let numeric_model = json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "uuid": "numeric-uuid",
+            "message": {"model": 5, "content": "Hello!"}
+        });
+
+        assert!(active_usage_limit_message(vec![&limit, &null_model]).is_none());
+        assert!(active_usage_limit_message(vec![&limit, &numeric_model]).is_none());
+        assert!(active_usage_limit_message(vec![&limit, &missing_model]).is_some());
     }
 
     #[test]

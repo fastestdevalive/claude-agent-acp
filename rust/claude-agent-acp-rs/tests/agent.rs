@@ -837,7 +837,18 @@ async fn g4_tport_steering_rejects_an_unknown_session() {
                     Some(-32603),
                     "{value}"
                 );
-                assert!(value.to_string().contains("Session not found"), "{value}");
+                // FA1-01: Node throws a plain `Error("Session not found")`, so
+                // `errorToResult` answers `data:{details:...}` — the same shape
+                // every other "Session not found" reply uses, not a bare string.
+                assert_eq!(
+                    value.pointer("/data/details"),
+                    Some(&json!("Session not found")),
+                    "{value}"
+                );
+                assert!(
+                    value.get("data").is_some_and(serde_json::Value::is_object),
+                    "the error data is an object: {value}"
+                );
                 Ok::<(), agent_client_protocol::Error>(())
             },
         )

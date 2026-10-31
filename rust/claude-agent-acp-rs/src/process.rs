@@ -272,9 +272,11 @@ pub struct SpawnOptions {
     /// `--effort <e>` (rust-parity-fixes Decision 2).
     pub effort: Option<String>,
     /// `--max-turns <n>`.
-    pub max_turns: Option<u32>,
+    /// `--max-turns=<String(maxTurns)>`; absent for a falsy value (FA1-08).
+    pub max_turns: Option<String>,
     /// `--max-budget-usd <n>`.
-    pub max_budget_usd: Option<f64>,
+    /// `--max-budget-usd=<value>` already stringified like JS `String()`.
+    pub max_budget_usd: Option<String>,
     /// `--agent <a>`.
     pub agent: Option<String>,
     /// `--betas=a,b`.
@@ -345,6 +347,10 @@ pub struct SpawnOptions {
     pub debug: bool,
     /// `--debug-file=<path>` (O-121).
     pub debug_file: Option<String>,
+    /// The SDK's env-derived `--debug-file` (FA3-08): set when
+    /// `DEBUG_CLAUDE_AGENT_SDK` is truthy and the client did not pass
+    /// `debugFile` (`sdk.mjs` `lG()`). Emitted after `--debug`, if any.
+    pub debug_file_from_env: Option<String>,
     /// `--session-mirror` (O-126).
     pub session_mirror: bool,
     /// One `--channels=<c>` per entry (O-127).
@@ -401,6 +407,7 @@ impl Default for SpawnOptions {
             json_schema: None,
             debug: false,
             debug_file: None,
+            debug_file_from_env: None,
             session_mirror: false,
             channels: Vec::new(),
             permission_prompts: None,
@@ -496,6 +503,13 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         argv.push(format!("--debug-file={debug_file}"));
     } else if opts.debug {
         argv.push("--debug".into());
+    }
+    // FA3-08: the SDK appends its env-derived debug file after `--debug`
+    // (`if(!debugFile && !spawnClaudeCodeProcess) W.push(Be("--debug-file", lG()))`).
+    if opts.debug_file.is_none() {
+        if let Some(debug_file) = &opts.debug_file_from_env {
+            argv.push(format!("--debug-file={debug_file}"));
+        }
     }
 
     if opts.permission_prompt_tool {
@@ -640,19 +654,29 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         push_extra_arg(&mut argv, "managed-settings", Some(managed_settings));
     }
 
+    // The adapter merges `{...userProvidedOptions.extraArgs,
+    // "replay-user-messages": ""}` (`acp-agent.ts:11274-11277`): a
+    // user-supplied key is overwritten in place, at its original position,
+    // not appended a second time (FA1-09).
+    let replay_in_extra_args = opts
+        .extra_args
+        .iter()
+        .any(|(key, _)| key == "replay-user-messages");
     for (key, value) in &opts.extra_args {
         let overridden = if key == "settings" {
             opts.settings_arg.as_deref()
+        } else if key == "replay-user-messages" && opts.replay_user_messages {
+            Some("")
         } else {
             None
         };
         push_extra_arg(&mut argv, key, overridden.or(value.as_deref()));
     }
 
-    // The SDK's `extraArgs` always ends with `replay-user-messages`, and the
-    // programmatic `settings` tier is appended after it (or overrides an
-    // existing user `settings` key in place).
-    if opts.replay_user_messages {
+    // Otherwise the SDK's `extraArgs` always ends with `replay-user-messages`,
+    // and the programmatic `settings` tier is appended after it (or overrides
+    // an existing user `settings` key in place).
+    if opts.replay_user_messages && !replay_in_extra_args {
         push_extra_arg(&mut argv, "replay-user-messages", Some(""));
     }
     if let Some(settings) = &opts.settings_arg {
@@ -1008,6 +1032,22 @@ pub fn compute_debug_override(
     env_truthy(value).then_some("1")
 }
 
+/// The SDK's env-derived debug file (FA3-08). When the adapter's own
+/// `DEBUG_CLAUDE_AGENT_SDK` is truthy, `lG()` creates `<tmpdir>/debug` and
+/// returns `<tmpdir>/debug/sdk-<uuid>.txt`; the SDK appends
+/// `--debug-file=<path>` unless the client passed `debugFile` or supplied its
+/// own spawn function (the adapter never does).
+pub fn debug_file_from_env() -> Option<String> {
+    let flag = std::env::var("DEBUG_CLAUDE_AGENT_SDK").ok();
+    if !env_truthy(flag.as_deref()) {
+        return None;
+    }
+    let dir = std::env::temp_dir().join("debug");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("sdk-{}.txt", crate::agent::uuid_v4()));
+    Some(path.to_string_lossy().into_owned())
+}
+
 /// Apply the fixed `claude` environment (B2): merge `extra_env`, set
 /// `CLAUDE_CODE_ENTRYPOINT`, set `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`,
 /// remove `NODE_OPTIONS`, and normalise `DEBUG` (O-167): the SDK deletes
@@ -1034,6 +1074,10 @@ fn apply_claude_env(cmd: &mut Command, extra_env: &[(String, String)]) {
         }
     }
     cmd.env_remove("NODE_OPTIONS");
+    // FA3-01: `CLAUDE_AGENT_SDK_VERSION` is only a default. The SDK sets it
+    // `if(!Ct.CLAUDE_AGENT_SDK_VERSION)` (`sdk.mjs`), so a value from the host
+    // or `options.env` is preserved — `compute_claude_env_defaults` above
+    // already enforces that, and the unconditional override is gone.
 }
 
 // =========================================================================
@@ -2432,13 +2476,62 @@ pub async fn wait_for_shutdown_signal() {
     std::future::pending::<()>().await
 }
 
+/// The internal environment variable that asks the binary to die by a signal
+/// before it installs any handler (`die_by_signal`).
+#[cfg(unix)]
+pub const DIE_BY_SIGNAL_ENV: &str = "CLAUDE_ACP_DIE_BY_SIGNAL";
+
+/// Die by `signal`, mirroring Node's `process.removeAllListeners(signal)` +
+/// `process.kill(process.pid, signal)` (`index.ts:28-35`).
+///
+/// A caught signal cannot be re-raised after its disposition is reset without
+/// an FFI call, so the adapter re-executes itself with [`DIE_BY_SIGNAL_ENV`]:
+/// the fresh process raises the signal before any handler is installed, so the
+/// default action terminates it (`WIFSIGNALED`, not a normal `128+N` exit).
+///
+/// Returns `128 + signal` only when the re-exec fails.
+#[cfg(unix)]
+pub fn die_by_signal(signal: i32) -> i32 {
+    use std::os::unix::process::CommandExt;
+
+    let Ok(executable) = std::env::current_exe() else {
+        return 128 + signal;
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let error = std::process::Command::new(executable)
+        .args(args)
+        .env(DIE_BY_SIGNAL_ENV, signal.to_string())
+        .exec();
+    eprintln!("{error}");
+    128 + signal
+}
+
+/// The binary's first step: when [`DIE_BY_SIGNAL_ENV`] is set, raise that
+/// signal now, before any signal handler exists.
+#[cfg(unix)]
+pub fn die_by_signal_if_requested() {
+    let Some(value) = std::env::var_os(DIE_BY_SIGNAL_ENV) else {
+        return;
+    };
+    let Ok(raw) = value.to_string_lossy().parse::<i32>() else {
+        return;
+    };
+    let signal =
+        nix::sys::signal::Signal::try_from(raw).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+    let _ = nix::sys::signal::raise(signal);
+    std::process::exit(128 + (signal as i32));
+}
+
+/// Non-unix: no signals to re-raise (`index.ts` only re-raises on non-win32).
+#[cfg(not(unix))]
+pub fn die_by_signal_if_requested() {}
+
 /// Run the wrapped native `claude` CLI (`--cli`, `index.ts:13-42`).
 ///
 /// The child inherits this process's stdin/stdout/stderr. SIGINT/SIGTERM
 /// (plus SIGHUP on unix) are forwarded to it, and its exit code is mirrored.
-/// A child killed by a signal exits with the conventional `128+N` (the value
-/// the upstream's re-raise produces), since resetting the signal disposition
-/// safely without unsafe C signal handlers is not available.
+/// A child killed by a signal makes the adapter die by that same signal
+/// (`die_by_signal`), as Node's re-raise does.
 #[cfg(unix)]
 pub async fn run_cli_passthrough(binary: &Path, args: &[String]) -> i32 {
     use std::os::unix::process::ExitStatusExt;
@@ -2472,7 +2565,7 @@ pub async fn run_cli_passthrough(binary: &Path, args: &[String]) -> i32 {
                 match status {
                     Ok(status) => {
                         if let Some(signal) = status.signal() {
-                            return 128 + signal;
+                            return die_by_signal(signal);
                         }
                         return status.code().unwrap_or(1);
                     }
@@ -2633,6 +2726,70 @@ mod tests {
         let extra_empty_version = vec![("CLAUDE_AGENT_SDK_VERSION".into(), String::new())];
         let defs = compute_claude_env_defaults(Vec::new(), &extra_empty_version);
         assert!(defs.iter().any(|(k, _)| *k == "CLAUDE_AGENT_SDK_VERSION"));
+    }
+
+    fn command_env(cmd: &Command, key: &str) -> Option<std::ffi::OsString> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_string_lossy() == key)
+            .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    }
+
+    /// FA3-01 — a client/host `CLAUDE_AGENT_SDK_VERSION` is preserved instead
+    /// of being forced to the pinned `0.3.303` (`sdk.mjs` sets it only
+    /// `if(!Ct.CLAUDE_AGENT_SDK_VERSION)`).
+    #[test]
+    fn fa3_01_apply_claude_env_preserves_user_sdk_version() {
+        let mut cmd = Command::new("claude");
+        apply_claude_env(
+            &mut cmd,
+            &[("CLAUDE_AGENT_SDK_VERSION".into(), "9.9.9".into())],
+        );
+        assert_eq!(
+            command_env(&cmd, "CLAUDE_AGENT_SDK_VERSION").as_deref(),
+            Some(std::ffi::OsStr::new("9.9.9"))
+        );
+    }
+
+    /// FA3-08 — `DEBUG_CLAUDE_AGENT_SDK` makes the SDK spawn the CLI with its
+    /// own `--debug-file=<tmp>/debug/sdk-<uuid>.txt`, after `--debug` when the
+    /// client also asked for debug output.
+    #[test]
+    fn fa3_08_debug_env_adds_debug_file_after_debug() {
+        std::env::set_var("DEBUG_CLAUDE_AGENT_SDK", "1");
+        let from_env = debug_file_from_env();
+        std::env::remove_var("DEBUG_CLAUDE_AGENT_SDK");
+        let path = from_env.expect("truthy DEBUG_CLAUDE_AGENT_SDK yields a debug file");
+        assert!(
+            path.ends_with(".txt") && path.contains("sdk-"),
+            "sdk-<uuid>.txt under <tmp>/debug: {path}"
+        );
+
+        let mut opts = SpawnOptions {
+            debug: true,
+            debug_file_from_env: Some(path.clone()),
+            ..SpawnOptions::default()
+        };
+        let argv = build_argv(&opts);
+        let debug = argv.iter().position(|a| a == "--debug").expect("--debug");
+        let file = argv
+            .iter()
+            .position(|a| a == &format!("--debug-file={path}"))
+            .expect("env debug file");
+        assert!(debug < file, "env debug file follows --debug: {argv:?}");
+
+        // An explicit `debugFile` wins and suppresses both `--debug` and the
+        // env-derived path.
+        opts.debug_file = Some("/var/log/client.txt".into());
+        let argv = build_argv(&opts);
+        assert!(argv.iter().any(|a| a == "--debug-file=/var/log/client.txt"));
+        assert!(!argv.iter().any(|a| a == "--debug"));
+        assert_eq!(
+            argv.iter()
+                .filter(|a| a.starts_with("--debug-file="))
+                .count(),
+            1
+        );
     }
 
     /// O-167: `DEBUG` is stripped unless `DEBUG_CLAUDE_AGENT_SDK` is truthy, in

@@ -273,6 +273,13 @@ impl MapState {
         self.caps.raw_input_rendering
     }
 
+    /// Whether the connection negotiated ACP v2 (`ClientCapabilities.v2`): the
+    /// tool reporters emit no v1 input diff, and the approval preview is a v2
+    /// diff (`ToolCallClientCapabilities.from(caps, {v2})`).
+    pub(crate) fn caps_v2(&self) -> bool {
+        self.caps.v2
+    }
+
     /// Record the client's tool-report capabilities (the terminal channel).
     pub(crate) fn set_client_caps(&mut self, caps: crate::client_caps::ClientCapabilities) {
         self.caps = caps;
@@ -368,6 +375,7 @@ impl MapState {
             tools::ShapeOptions {
                 air: self.air,
                 diff_patch: self.diff_patch,
+                v2: self.caps.v2,
                 raw_input_rendering: self.caps.raw_input_rendering,
                 plan_file: self.caps.plan_file,
                 ..tools::ShapeOptions::default()
@@ -387,17 +395,22 @@ impl MapState {
     }
 
     /// The exact patch the approval of an Edit or Write shows (upstream
-    /// `previewPatchContent` in `canUseTool`), for a `diffPatch` client only.
-    /// `None` keeps the standard tool-call content.
+    /// `previewPatchContent` in `canUseTool`), for a `diffPatch` or v2 client.
+    /// A v2 client gets the v2 form (`capabilities.v2 ? "v2" : "air"`,
+    /// `acp-agent.ts:10125-10133`); `None` keeps the standard tool-call content.
     pub(crate) fn approval_preview(&self, tool_name: &str, input: &Value) -> Option<Vec<Value>> {
-        if !self.diff_patch {
+        if !self.diff_patch && !self.caps.v2 {
             return None;
         }
         crate::diff::preview_patch_content(
             tool_name,
             input,
             self.cwd.as_deref(),
-            crate::diff::PatchForm::Air,
+            if self.caps.v2 {
+                crate::diff::PatchForm::V2
+            } else {
+                crate::diff::PatchForm::Air
+            },
         )
     }
 
@@ -416,6 +429,15 @@ impl MapState {
         let Ok(content) =
             serde_json::from_value::<Vec<ToolCallContent>>(Value::Array(preview.to_vec()))
         else {
+            // A v2 preview (`changes`/`patch`) is not a v1 content block. The
+            // surfaced call is sent raw with it (see `handle_permission`); the
+            // tracker still pins the call so a streamed refinement does not
+            // replace it, as `pinContent` does.
+            if self.caps.v2 {
+                if let Some(entry) = self.tool_tracker.get_mut(id) {
+                    entry.content_pinned = true;
+                }
+            }
             return;
         };
         if let Some(SessionUpdate::ToolCall(call)) = surfaced {
@@ -2354,11 +2376,35 @@ pub fn materialize_diff_old_text(tool_call: &mut Value) {
         };
         // A v2 diff (`changes`/`patch`) has no `oldText`: v2 forbids the v1
         // diff keys, so it is left as the agent built it.
-        if entry.get("type").and_then(Value::as_str) == Some("diff")
-            && !entry.contains_key("changes")
-            && !entry.contains_key("oldText")
-        {
+        if entry.get("type").and_then(Value::as_str) != Some("diff") {
+            continue;
+        }
+        // FA4-03: a Write diff whose streamed input has not carried `content`
+        // yet omits `newText`, like Node's `undefined` content
+        // (`reporters/file-edit.ts:42-55`). The marker is internal and never
+        // reaches a client.
+        let absent_new_text = entry
+            .get_mut("_meta")
+            .and_then(Value::as_object_mut)
+            .is_some_and(|meta| meta.remove(tools::ABSENT_NEW_TEXT_META_KEY).is_some());
+        if absent_new_text {
+            entry.remove("newText");
+            if entry
+                .get("_meta")
+                .and_then(Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                entry.remove("_meta");
+            }
+        }
+        if !entry.contains_key("changes") && !entry.contains_key("oldText") {
             entry.insert("oldText".to_string(), Value::Null);
+            // Node's object literal order is `type`, `path`, `oldText`,
+            // `newText`; keep the serialized order identical (JSON.stringify
+            // preserves insertion order).
+            if let Some(new_text) = entry.remove("newText") {
+                entry.insert("newText".to_string(), new_text);
+            }
         }
     }
 }

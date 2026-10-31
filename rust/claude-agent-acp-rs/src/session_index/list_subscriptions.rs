@@ -189,10 +189,16 @@ impl SharedForkHolds {
 pub fn parse_list_subscribe_request(value: &Value) -> Result<String, Error> {
     match value.get("cwd").and_then(Value::as_str) {
         Some(cwd) if is_absolute(cwd, super::project_dirs::Platform::host()) => Ok(cwd.to_string()),
-        _ => Err(invalid_params(
-            Some(json!({ "cwd": value.get("cwd") })),
-            "params require an absolute cwd",
-        )),
+        _ => {
+            // `RequestError.invalidParams({cwd}, …)` with `cwd` undefined:
+            // `JSON.stringify` drops the key, so only a present value (null,
+            // number, non-absolute string) appears in the error data.
+            let data = match value.get("cwd") {
+                Some(cwd) => json!({ "cwd": cwd }),
+                None => json!({}),
+            };
+            Err(invalid_params(Some(data), "params require an absolute cwd"))
+        }
     }
 }
 
@@ -2411,6 +2417,28 @@ mod tests {
             parse_list_unsubscribe_request(&json!({"subscriptionId": "x"})).expect("ok"),
             "x"
         );
+    }
+
+    /// FA1-02 — `parseListSubscribeRequest` builds `{cwd}` from the raw value
+    /// (`list-subscriptions.ts:76-81`): a missing key is `undefined` and
+    /// `JSON.stringify` drops it, so the error data is `{}`, while a present
+    /// `null`/non-string stays in the payload.
+    #[test]
+    fn fa1_02_subscribe_error_data_omits_an_absent_cwd() {
+        for (params, data) in [
+            (json!({}), json!({})),
+            (json!({"cwd": 5}), json!({"cwd": 5})),
+            (json!({"cwd": null}), json!({"cwd": null})),
+            (json!({"cwd": "relative"}), json!({"cwd": "relative"})),
+        ] {
+            let error = parse_list_subscribe_request(&params).expect_err("invalid");
+            assert_eq!(i32::from(error.code), -32602, "{params}");
+            assert_eq!(
+                error.message, "Invalid params: params require an absolute cwd",
+                "{params}"
+            );
+            assert_eq!(error.data, Some(data), "{params}");
+        }
         assert_eq!(
             parse_list_unsubscribe_request(&json!({}))
                 .expect_err("invalid")

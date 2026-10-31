@@ -460,7 +460,7 @@ async fn t6g2_a_busy_session_refuses_remote_control_before_the_user_message() {
     assert_eq!(error["code"], -32600, "invalidRequest: {error}");
     assert_eq!(
         error["message"],
-        "Remote Control can't be changed while Claude is working. Try again when the turn ends."
+        "Invalid request: Remote Control can't be changed while Claude is working. Try again when the turn ends."
     );
     assert!(
         updates
@@ -1217,5 +1217,303 @@ async fn t6g2_an_auth_failure_marks_the_query_for_a_respawn() {
     assert!(answer["result"]["messageId"].is_string(), "{answer}");
     let idle = harness.read_until_idle().await;
     assert_eq!(idle.last().expect("an idle")["stopReason"], "end_turn");
+    harness.shutdown().await;
+}
+
+/// FX1a (audit FA2 HIGH #1): a live v2 connection keeps the Edit and Write
+/// tool calls. Node builds its tool-call capabilities with `v2`
+/// (`acp-agent.ts:2831-2833`), so `WriteReporter`/`EditReporter` emit no input
+/// diff (`reporters/file-edit.ts:35-55,99-120`); the v2 `tool_call` carries
+/// title/kind/locations and `content: []`, not a v1 diff that the v2
+/// translator rejects.
+#[tokio::test]
+async fn fx1a_v2_edit_and_write_tool_calls_keep_title_kind_locations() {
+    let cwd = repo_root();
+    let edit_path = cwd.join("fx1a-v2-edit.ts");
+    let write_path = cwd.join("fx1a-v2-write.ts");
+    let edit_input = json!({
+        "file_path": edit_path.to_string_lossy(),
+        "old_string": "const value = 1;",
+        "new_string": "const value = 2;",
+    });
+    let write_input = json!({
+        "file_path": write_path.to_string_lossy(),
+        "content": "x\n",
+    });
+    let steps = vec![
+        init_step(),
+        json!({
+            "expect": {"type": "user"},
+            "emit": [
+                echo("edit it"),
+                {"type": "assistant", "parent_tool_use_id": null, "message": {
+                    "id": "msg_files", "role": "assistant", "model": "claude-sonnet-4-5",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_edit", "name": "Edit",
+                            "input": edit_input},
+                        {"type": "tool_use", "id": "toolu_write", "name": "Write",
+                            "input": write_input}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_edit",
+                        "content": "The file has been updated."},
+                    {"type": "tool_result", "tool_use_id": "toolu_write",
+                        "content": "File created successfully."}]}},
+                result("done"),
+            ],
+        }),
+    ];
+    let mut harness = Harness::start("fx1a-files", &steps);
+    let session_id = harness.open_session().await;
+    let (answer, _) = harness.prompt_until_answer(3, "edit it", &session_id).await;
+    assert!(answer["result"]["messageId"].is_string(), "{answer}");
+    let updates = harness.read_until_idle().await;
+
+    let edit = updates
+        .iter()
+        .find(|update| update["toolCallId"] == "toolu_edit")
+        .unwrap_or_else(|| panic!("the Edit tool call survives v2: {updates:?}"));
+    assert_eq!(
+        serde_json::to_string(edit).expect("serialize"),
+        serde_json::to_string(&json!({
+            "toolCallId": "toolu_edit",
+            "title": "Edit fx1a-v2-edit.ts",
+            "name": "Edit",
+            "kind": "edit",
+            "locations": [{"path": edit_path.to_string_lossy()}],
+            "rawInput": edit_input,
+            "status": "pending",
+            "content": [],
+            "sessionUpdate": "tool_call_update",
+        }))
+        .expect("serialize"),
+        "the v2 Edit tool call is the Node shape, with no v1 diff: {edit}"
+    );
+
+    let write = updates
+        .iter()
+        .find(|update| update["toolCallId"] == "toolu_write")
+        .unwrap_or_else(|| panic!("the Write tool call survives v2: {updates:?}"));
+    assert_eq!(
+        serde_json::to_string(write).expect("serialize"),
+        serde_json::to_string(&json!({
+            "toolCallId": "toolu_write",
+            "title": "Write fx1a-v2-write.ts",
+            "name": "Write",
+            "kind": "edit",
+            "locations": [{"path": write_path.to_string_lossy()}],
+            "rawInput": write_input,
+            "status": "pending",
+            "content": [],
+            "sessionUpdate": "tool_call_update",
+        }))
+        .expect("serialize"),
+        "the v2 Write tool call is the Node shape, with no v1 diff: {write}"
+    );
+    harness.shutdown().await;
+}
+
+/// FX1a (audit FA2 HIGH #1): a v2 permission request's `toolCall` carries the
+/// v2-form approval diff (`previewPatchContent(..., capabilities.v2 ? "v2" :
+/// "air")`, `acp-agent.ts:10125-10133`), not the v1 diff that
+/// `v2_permission_request` rejects (`v2/permission.rs:56`).
+#[tokio::test]
+async fn fx1a_v2_permission_request_carries_the_v2_diff() {
+    let tmp = std::env::temp_dir().join(format!("acp-fx1a-permission-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let file = tmp.join("app.ts");
+    std::fs::write(&file, "line 1\nconst value = 1;\nline 3\n").expect("write file");
+    let input = json!({
+        "file_path": file.to_string_lossy(),
+        "old_string": "const value = 1;",
+        "new_string": "const value = 2;",
+    });
+    let steps = vec![
+        init_step(),
+        json!({
+            "expect": {"type": "user"},
+            "emit": [
+                echo("edit it"),
+                {"type": "assistant", "parent_tool_use_id": null, "message": {
+                    "id": "msg_edit", "role": "assistant", "model": "claude-sonnet-4-5",
+                    "content": [{"type": "tool_use", "id": "toolu_edit", "name": "Edit",
+                        "input": input}]}},
+                {"type": "control_request", "request_id": "permreq1", "request": {
+                    "subtype": "can_use_tool", "tool_name": "Edit",
+                    "input": input, "tool_use_id": "toolu_edit",
+                    "agent_id": null, "permission_suggestions": []}},
+            ],
+        }),
+        json!({
+            "expect": {"type": "control_response",
+                "response": {"response": {"behavior": "allow"}}},
+            "emit": [
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_edit",
+                        "content": "The file has been updated."}]}},
+                result("done"),
+            ],
+        }),
+    ];
+    let mut harness = Harness::start("fx1a-permission", &steps);
+    let session_id = harness.open_session().await;
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+            "params":{"sessionId":session_id,"prompt":[{"type":"text","text":"edit it"}]}}))
+        .await;
+    let request = loop {
+        let frame = harness.read_json().await;
+        if frame.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            break frame;
+        }
+        if frame.get("id").and_then(Value::as_i64) == Some(3) && frame.get("method").is_none() {
+            assert!(frame["result"]["messageId"].is_string(), "{frame}");
+            continue;
+        }
+        assert_eq!(
+            frame.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "only session updates precede the request: {frame}"
+        );
+    };
+    let path = file.to_string_lossy().into_owned();
+    let patch = format!(
+        "diff --git {path} {path}\n--- {path}\n+++ {path}\n@@ -1,3 +1,3 @@\n line 1\n-const value = 1;\n+const value = 2;\n line 3\n"
+    );
+    let tool_call = &request["params"]["subject"]["toolCall"];
+    assert_eq!(
+        serde_json::to_string(tool_call).expect("serialize"),
+        serde_json::to_string(&json!({
+            "toolCallId": "toolu_edit",
+            "name": "Edit",
+            "status": "pending",
+            "rawInput": input,
+            "title": format!("Edit {path}"),
+            "kind": "edit",
+            "locations": [{"path": path}],
+            "content": [{
+                "type": "diff",
+                "changes": [{"operation": "modify", "path": path, "fileType": "text"}],
+                "patch": {"format": "git_patch", "text": patch},
+            }],
+        }))
+        .expect("serialize"),
+        "the v2 permission tool call carries the v2 diff: {tool_call}"
+    );
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":request["id"],
+            "result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}))
+        .await;
+    let idle = harness.read_until_idle().await;
+    assert_eq!(idle.last().expect("an idle")["stopReason"], "end_turn");
+    let _ = std::fs::remove_dir_all(&tmp);
+    harness.shutdown().await;
+}
+
+/// FX6 (audit RR1b-01): a v2 permission request can reach the adapter before
+/// the streamed `tool_use` (the biased select polls the control channel first,
+/// `session.rs:3462/5893`). Node surfaces that tool call with the approval
+/// preview as its content (`previewContent`, `ensureToolCallEmitted`,
+/// `acp-agent.ts:9907-9919`; `renderer.ts:261`), so the timeline call carries
+/// the v2 patch rather than `content: []`.
+#[tokio::test]
+async fn fx6_v2_permission_surfaced_before_stream_carries_the_v2_preview() {
+    let tmp = std::env::temp_dir().join(format!("acp-fx6-v2-preview-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let file = tmp.join("app.ts");
+    std::fs::write(&file, "line 1\nconst value = 1;\nline 3\n").expect("write file");
+    let input = json!({
+        "file_path": file.to_string_lossy(),
+        "old_string": "const value = 1;",
+        "new_string": "const value = 2;",
+    });
+    let steps = vec![
+        init_step(),
+        json!({
+            "expect": {"type": "user"},
+            "emit": [
+                echo("edit it"),
+                {"type": "control_request", "request_id": "permreq1", "request": {
+                    "subtype": "can_use_tool", "tool_name": "Edit",
+                    "input": input, "tool_use_id": "toolu_edit",
+                    "agent_id": null, "permission_suggestions": []}},
+            ],
+        }),
+        json!({
+            "expect": {"type": "control_response",
+                "response": {"response": {"behavior": "allow"}}},
+            "emit": [
+                {"type": "assistant", "parent_tool_use_id": null, "message": {
+                    "id": "msg_edit", "role": "assistant", "model": "claude-sonnet-4-5",
+                    "content": [{"type": "tool_use", "id": "toolu_edit", "name": "Edit",
+                        "input": input}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_edit",
+                        "content": "The file has been updated."}]}},
+                result("done"),
+            ],
+        }),
+    ];
+    let mut harness = Harness::start("fx6-v2-preview", &steps);
+    let session_id = harness.open_session().await;
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+            "params":{"sessionId":session_id,"prompt":[{"type":"text","text":"edit it"}]}}))
+        .await;
+    let mut updates = Vec::new();
+    let request = loop {
+        let frame = harness.read_json().await;
+        if frame.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            break frame;
+        }
+        if frame.get("id").and_then(Value::as_i64) == Some(3) && frame.get("method").is_none() {
+            assert!(frame["result"]["messageId"].is_string(), "{frame}");
+            continue;
+        }
+        assert_eq!(
+            frame.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "only session updates precede the request: {frame}"
+        );
+        updates.push(frame["params"]["update"].clone());
+    };
+    let path = file.to_string_lossy().into_owned();
+    let patch = format!(
+        "diff --git {path} {path}\n--- {path}\n+++ {path}\n@@ -1,3 +1,3 @@\n line 1\n-const value = 1;\n+const value = 2;\n line 3\n"
+    );
+    // The surfaced `tool_call` carries the v2 approval patch as Node's
+    // `previewContent` (`renderer.ts:261`), pinned until the final result.
+    let surfaced = updates
+        .iter()
+        .find(|update| update["toolCallId"] == "toolu_edit")
+        .unwrap_or_else(|| panic!("the Edit tool call is surfaced: {updates:?}"));
+    assert_eq!(
+        serde_json::to_string(surfaced).expect("serialize"),
+        serde_json::to_string(&json!({
+            "toolCallId": "toolu_edit",
+            "title": format!("Edit {path}"),
+            "name": "Edit",
+            "kind": "edit",
+            "locations": [{"path": path}],
+            "rawInput": input,
+            "status": "pending",
+            "content": [{
+                "type": "diff",
+                "changes": [{"operation": "modify", "path": path, "fileType": "text"}],
+                "patch": {"format": "git_patch", "text": patch},
+            }],
+            "sessionUpdate": "tool_call_update",
+        }))
+        .expect("serialize"),
+        "the surfaced v2 tool call carries the v2 approval patch: {surfaced}"
+    );
+    harness
+        .send_json(json!({"jsonrpc":"2.0","id":request["id"],
+            "result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}))
+        .await;
+    let idle = harness.read_until_idle().await;
+    assert_eq!(idle.last().expect("an idle")["stopReason"], "end_turn");
+    let _ = std::fs::remove_dir_all(&tmp);
     harness.shutdown().await;
 }

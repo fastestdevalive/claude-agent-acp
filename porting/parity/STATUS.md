@@ -532,3 +532,13 @@ No push, tag or squash was performed.
 - Fix rounds in T9: G5 (round 1), G6 (round 2), G7 (gate-red regression from G5b, exceeded the cap by exception).
 - Carry-over to T10 work orders: any audit item the G5 packages did not close (re-read the four audit reports against the code at the T10 head: P2a F10-F12 LOW, P3 LOW items, P1b LOW items), T7 audit items M4 M6 M7 L10 L13 unless the reports show them closed, and every FEATURES PARTIAL row (see its note).
 - Model log: all packages on DeepSeek vst subagents, at most two at a time; no Claude/Opus agents. Programs-audit auditors P1/P2 stalled once (known DeepSeek stall at ~0% CPU) and were respawned with narrower scope and a progress-based stall watcher.
+
+## TURN 10 COMPLETE (final audit) - CANDIDATE HEAD
+
+- Code head 375be16, gate OK (orchestrator run, GATE_TEST_TIMEOUT=1500, quiet host). This section's commit is docs only.
+- Counts: FEATURES 920 rows (91 module rows): DONE 905, PARTIAL 15, MISSING 0. TEST-MAP 2400 upstream cases: ported 2102, covered 131, different 170, missing 0 (the `ported` figure counts 2 notes), unclassified 0, `--forbid-unclassified` enforced by the gate. MISSING.md at zero tickets. lib tests: 2108.
+- Final audit rounds (all read-only DeepSeek auditors, per-slice, strict "vst-observable" scope from round 3): round 1 (FA1/FA2): 1 HIGH (v2 Edit/Write tool calls dropped), 7 MEDIUM, ~14 LOW; round 2 (FA3/FA3b/FA4): 1 HIGH (verbatimPrompts wire), ~8 MEDIUM, ~14 LOW; round 3 (FA5/FA6/RR1a/RR1b): 2 MEDIUM, 4 LOW; round 4 (RR2): 1 HIGH regression of our own fix (elicitation answer dropped by a steer prune) + 1 LOW; round 5 (RR3): 1 LOW, no HIGH/MEDIUM. All HIGH/MEDIUM fixed with tests that fail before the fix; the last LOW (RR3-01) fixed in FX8. Reports: porting/parity/audit-*.md.
+- Fix packages beyond the 2-per-turn cap were allowed by the vibe-station session for the final audit loop (loop ended by the "no HIGH/MEDIUM vst-observable" rule).
+- Incidents: DeepSeek stalls (known ~0% CPU) on P1/P2 audit, FX1, FA3, FX4, RR1: each respawned once with narrower scope and progress-based stall rule; no package stalled twice. FX3 committed rust/claude-agent-acp-rs/src/process.rs, which also contained another session's uncommitted edit (the foreign edit is folded into those commits; the diff was all FA3 env/argv work). The foreign uncommitted .gitignore edit was never committed.
+- Model log: every package on DeepSeek vst subagents, at most two at a time; no Claude/Opus agents.
+- Remaining PARTIAL FEATURES rows (15): see their notes ([pkg:] ids). Open user decisions: push, tag move, squash, D7 agentInfo.version, D9 url crate, D10 reqwest default-tls, D11 windows-sys, D12 NFC generated tables.

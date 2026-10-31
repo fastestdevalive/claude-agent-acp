@@ -319,7 +319,6 @@ pub fn v1_set_session_config_option_request(params: &Value) -> Result<Value, Err
         .get("configId")
         .cloned()
         .unwrap_or(Value::String("".to_string()));
-    let opt_type = map.get("type").and_then(Value::as_str);
 
     let mut out = Map::new();
     out.insert("sessionId".to_string(), session_id);
@@ -332,24 +331,63 @@ pub fn v1_set_session_config_option_request(params: &Value) -> Result<Value, Err
     }
 
     let value = map.get("value").cloned().unwrap_or(Value::Null);
+    let raw_type = map.get("type");
+
+    // `v2.SetSessionConfigOptionRequest.isId` / `isBoolean`
+    // (`guards.gen.js:929-933`): the tag must be exact AND the payload valid
+    // (`value` string for id, boolean for boolean, plus the request ids).
+    let valid_ids = map.get("sessionId").is_some_and(Value::is_string)
+        && map.get("configId").is_some_and(Value::is_string);
+    let is_id = raw_type.and_then(Value::as_str) == Some("id") && value.is_string() && valid_ids;
+    let is_boolean =
+        raw_type.and_then(Value::as_str) == Some("boolean") && value.is_boolean() && valid_ids;
 
     // v2 tags a select value with `type: "id"`; v1 leaves it untagged.
     // v2 boolean has `type: "boolean"`.
-    match opt_type {
-        None | Some("id") => {
-            out.insert("value".to_string(), value);
-            Ok(Value::Object(out))
-        }
-        Some("boolean") => {
-            out.insert("type".to_string(), Value::String("boolean".to_string()));
-            out.insert("value".to_string(), value);
-            Ok(Value::Object(out))
-        }
-        Some(other) => Err(Error::new(
-            -32602,
-            format!("Invalid params: Config option values of type {other} are not supported"),
-        )
-        .data(json!({ "type": other }))),
+    if is_id {
+        out.insert("value".to_string(), value);
+        return Ok(Value::Object(out));
+    }
+    if is_boolean {
+        out.insert("type".to_string(), Value::String("boolean".to_string()));
+        out.insert("value".to_string(), value);
+        return Ok(Value::Object(out));
+    }
+
+    // Anything else throws `invalidParams({type}, "Config option values of
+    // type ${params.type} are not supported")`. `JSON.stringify` drops an
+    // undefined `type` key, so the missing case has `data:{}`.
+    let type_text = match raw_type {
+        Some(value) => js_type_text(value),
+        None => "undefined".to_string(),
+    };
+    let data = match raw_type {
+        Some(value) => json!({ "type": value }),
+        None => json!({}),
+    };
+    Err(Error::new(
+        -32602,
+        format!("Invalid params: Config option values of type {type_text} are not supported"),
+    )
+    .data(data))
+}
+
+/// JavaScript `String(value)` for the `type` in the unsupported-value message.
+fn js_type_text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_type_text(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_string(),
     }
 }
 

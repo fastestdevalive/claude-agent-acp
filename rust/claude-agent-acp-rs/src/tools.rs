@@ -123,9 +123,35 @@ pub(crate) fn text_content(text: impl Into<String>) -> ToolCallContent {
     ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(text))))
 }
 
-/// One diff content block (`{type:"diff", path, oldText, newText}`).
-pub(crate) fn diff_content(path: &str, old_text: Option<&str>, new_text: &str) -> ToolCallContent {
-    let mut diff = Diff::new(path, new_text);
+/// The internal `_meta` key of a diff whose `newText` must not reach the wire.
+///
+/// Node's Write reporter sets `newText: write.content`, which is `undefined`
+/// while the streamed input has not carried the content yet; `JSON.stringify`
+/// then drops the key (`reporters/file-edit.ts:42-55`). Rust's `Diff` requires
+/// a `String`, so the content-less diff carries this marker and
+/// [`crate::map::materialize_diff_old_text`] removes both the marker and
+/// `newText` at emit time. The marker never reaches a client.
+pub(crate) const ABSENT_NEW_TEXT_META_KEY: &str = "claudeAcpAbsentNewText";
+
+/// One diff content block (`{type:"diff", path, oldText, newText}`). `new_text`
+/// is `None` when the input has not streamed the content yet; the emit path
+/// then omits the key like Node (`reporters/file-edit.ts:42-55`).
+pub(crate) fn diff_content(
+    path: &str,
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+) -> ToolCallContent {
+    let mut diff = match new_text {
+        Some(text) => Diff::new(path, text),
+        None => {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                ABSENT_NEW_TEXT_META_KEY.to_string(),
+                serde_json::json!(true),
+            );
+            Diff::new(path, "").meta(meta)
+        }
+    };
     if let Some(old) = old_text {
         diff = diff.old_text(old);
     }
@@ -904,12 +930,17 @@ pub fn tool_shape(name: &str, input: &Value, cwd: Option<&Path>) -> ToolShape {
 
 /// The rendering choices of one client: the AIR flavour of the reporter facts
 /// (`AskUserQuestion`'s fixed title), the replay flag, and the `diffPatch` /
-/// `rawInputRendering` / `planFile` capabilities (`ClientCapabilities`).
+/// `v2` / `rawInputRendering` / `planFile` capabilities
+/// (`ClientCapabilities`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShapeOptions {
     pub air: bool,
     pub replay: bool,
     pub diff_patch: bool,
+    /// The connection negotiated ACP v2 (`ToolCallClientCapabilities.from(...,
+    /// {v2})`): a v2 client gets no input diff, since a v2 diff cannot hold an
+    /// Edit snippet (`reporters/file-edit.ts:35-55,99-120`).
+    pub v2: bool,
     pub raw_input_rendering: bool,
     pub plan_file: bool,
 }
@@ -964,6 +995,7 @@ pub fn tool_shape_full(
         options.air,
         options.replay,
         options.diff_patch,
+        options.v2,
     );
     if !options.air || !shape.display_only {
         return shape;
@@ -991,6 +1023,7 @@ fn shape_for(
     air: bool,
     replay: bool,
     diff_patch: bool,
+    v2: bool,
 ) -> ToolShape {
     match name {
         "Agent" | "Task" => {
@@ -1057,19 +1090,21 @@ fn shape_for(
         "Write" => {
             let write = normalize_write_input(input);
             let file_path = write.file_path.filter(|path| !path.is_empty());
-            let input_diff = !diff_patch || replay;
+            // A v2 client never gets the input diff: a v2 diff names the
+            // operation, which the input does not tell (`inputDiff =
+            // capabilities.v2 ? false : …`, `reporters/file-edit.ts:35-50`).
+            let input_diff = !v2 && (!diff_patch || replay);
             let (content, display_only) = if let Some(path) = file_path {
                 // A client that negotiated diff patches gets the exact patch
                 // from the approval preview / PostToolUse hook; the input does
                 // not tell whether the file exists, so its live tool call shows
-                // no diff (`reporters/file-edit.ts:33-55`). This crate serves
-                // no v2 client and `diffPatch` only reaches AIR through the
-                // session wiring; a non-AIR client always gets the input diff.
+                // no diff (`reporters/file-edit.ts:33-55`). `diffPatch` only
+                // reaches AIR through the session wiring; a non-AIR v1 client
+                // always gets the input diff.
                 if input_diff {
-                    (
-                        vec![diff_content(path, None, write.content.unwrap_or(""))],
-                        false,
-                    )
+                    // A streamed input may not have carried `content` yet: Node
+                    // then emits a diff without `newText` (FA4-03).
+                    (vec![diff_content(path, None, write.content)], false)
                 } else {
                     (Vec::new(), false)
                 }
@@ -1100,14 +1135,16 @@ fn shape_for(
             let new_string = input.get("new_string").and_then(Value::as_str);
             let has_old = old_string.is_some_and(|s| !s.is_empty());
             let has_new = new_string.is_some_and(|s| !s.is_empty());
+            // A v2 diff cannot hold an Edit snippet, so a v2 client gets the
+            // patch from the PostToolUse hook alone (`reporters/file-edit.ts:99-120`).
             let content = match file_path {
-                Some(path) if has_old || has_new => {
+                Some(path) if !v2 && (has_old || has_new) => {
                     // `oldText: edit.old_string || null`: an empty old string
                     // is no old text, never `""` (`reporters/file-edit.ts:110-120`).
                     vec![diff_content(
                         path,
                         old_string.filter(|s| !s.is_empty()),
-                        new_string.unwrap_or(""),
+                        Some(new_string.unwrap_or("")),
                     )]
                 }
                 _ => Vec::new(),
@@ -1753,10 +1790,12 @@ fn document_placeholder(block: &Value) -> String {
                 .and_then(|source| source.get("data"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // `source.data.length` is the JS string length: UTF-16 units, so
+            // non-ASCII text reports fewer units than its UTF-8 byte count.
             format!(
                 "[document{title}: {}, {}]",
                 js_string(source.and_then(|source| source.get("media_type"))),
-                format_byte_size(data.len())
+                format_byte_size(crate::session_index::js_text::utf16_len(data))
             )
         }
         _ => format!("[document{title}]"),
@@ -3009,6 +3048,43 @@ mod tests {
         assert_eq!(diff.new_text, "canonical");
     }
 
+    /// FA4-03 — a streamed Write whose input has `file_path` but not `content`
+    /// yet emits a diff without `newText` (Node's `write.content` is
+    /// `undefined` and `JSON.stringify` drops the key,
+    /// `reporters/file-edit.ts:42-55`); an explicit empty content keeps
+    /// `newText:""`. The emit path materialises `oldText:null` and Node's key
+    /// order.
+    #[test]
+    fn fa4_write_streamed_input_diff_omits_new_text() {
+        let partial = tool_shape("Write", &json!({"file_path": "/work/a.txt"}), None);
+        let mut update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "content": serde_json::to_value(&partial.content).unwrap(),
+        });
+        crate::map::materialize_diff_old_text(&mut update);
+        assert_eq!(
+            serde_json::to_string(&update["content"]).unwrap(),
+            r#"[{"type":"diff","path":"/work/a.txt","oldText":null}]"#
+        );
+
+        let empty = tool_shape(
+            "Write",
+            &json!({"file_path": "/work/a.txt", "content": ""}),
+            None,
+        );
+        let mut update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t2",
+            "content": serde_json::to_value(&empty.content).unwrap(),
+        });
+        crate::map::materialize_diff_old_text(&mut update);
+        assert_eq!(
+            serde_json::to_string(&update["content"]).unwrap(),
+            r#"[{"type":"diff","path":"/work/a.txt","oldText":null,"newText":""}]"#
+        );
+    }
+
     /// T-42 — an empty `old_string` is no old text (`oldText: edit.old_string
     /// || null`), and the diff exists only when one side is non-empty.
     #[test]
@@ -3585,6 +3661,25 @@ mod tests {
         assert_eq!(edit.title, "Edit");
         assert!(edit.locations.is_empty());
         assert!(edit.content.is_empty());
+    }
+
+    /// FA6-02 — a text document's placeholder size is the JS string length
+    /// (UTF-16 units), not the UTF-8 byte count (`content.ts:184-190`).
+    #[test]
+    fn fa6_02_text_document_placeholder_counts_utf16_units() {
+        let placeholder = |data: &str| {
+            let blocks = generic_content(
+                &json!({"type": "document",
+                        "source": {"type": "text", "media_type": "text/plain", "data": data}}),
+                false,
+            )
+            .unwrap();
+            content_text(&blocks[0]).to_string()
+        };
+        // "héllo": 6 UTF-8 bytes, 5 UTF-16 units.
+        assert_eq!(placeholder("héllo"), "[document: text/plain, 5 B]");
+        // "a😀": 5 UTF-8 bytes, 3 UTF-16 units (the astral char is a pair).
+        assert_eq!(placeholder("a\u{1f600}"), "[document: text/plain, 3 B]");
     }
 
     /// F6a / T-38 — a Read result with image and document blocks uses

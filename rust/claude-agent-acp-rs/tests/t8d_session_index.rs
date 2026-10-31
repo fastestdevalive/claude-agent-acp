@@ -524,15 +524,99 @@ async fn t8d_delete_reports_a_copy_it_could_not_remove_and_a_retry_finishes() {
         .await
         .expect_err("a copy fails");
     assert_eq!(i32::from(error.code), -32603);
+    // RR1b-02: Node rethrows the SDK delete's filesystem error, so the client
+    // gets `EACCES: permission denied, unlink '<path>'` in `data.details`
+    // (`session-index/service.ts:672-680`), not the "was not deleted" summary.
+    assert_eq!(
+        error.data.as_ref().expect("details")["details"],
+        json!(format!(
+            "EACCES: permission denied, unlink '{}'",
+            second.display()
+        )),
+        "the delete failure is the filesystem error"
+    );
+    // RR2-02: the delete stops at the first copy it cannot remove, so only the
+    // copies the scan reached before `second` are gone. The project directories
+    // have no guaranteed listing order, so `first` is either already removed
+    // (scanned before) or still on disk (scanned after) — never both removed.
     let remaining: Vec<&PathBuf> = [&first, &second]
         .into_iter()
         .filter(|path| path.exists())
         .collect();
-    assert_eq!(remaining, vec![&second], "the undeletable copy remains");
+    assert!(
+        remaining.contains(&&second),
+        "the undeletable copy always remains"
+    );
+    assert!(
+        remaining == vec![&second] || remaining == vec![&first, &second],
+        "no copy after the failure is removed"
+    );
     let perms = std::fs::metadata(&a_dir).expect("meta").permissions();
     std::fs::set_permissions(&b_dir, perms).expect("writable");
     service.delete(&session, false).await.expect("retry");
     assert!(!first.exists() && !second.exists());
+}
+
+/// delete of a session with several transcripts > stops at the first copy it
+/// cannot remove, like Node (`session-index/service.ts:674-680`): the copies
+/// after it, the empty transcripts and the session directories stay.
+#[tokio::test]
+async fn t8d_delete_stops_at_the_first_copy_it_cannot_remove() {
+    let env = Env::new("delete-first-failure");
+    let a = env.base.join("work/a");
+    let b = env.base.join("work/b");
+    std::fs::create_dir_all(&a).expect("a");
+    std::fs::create_dir_all(&b).expect("b");
+    let session = id(1);
+    let a_str = a.to_string_lossy().into_owned();
+    let b_str = b.to_string_lossy().into_owned();
+    // The only non-empty copy cannot be removed: the SDK delete fails on it.
+    let failing = env.transcript(
+        &a_str,
+        &session,
+        &[user(&session, &a_str, "a", T0)],
+        T0 + 1000,
+    );
+    // The empty copy the SDK skips comes later, as do both session directories.
+    let empty = env.transcript(&b_str, &session, &[], T0 + 2000);
+    let a_project = env.dir_for(&a_str);
+    let b_project = env.dir_for(&b_str);
+    let a_session_dir = a_project.join(&session);
+    let b_session_dir = b_project.join(&session);
+    std::fs::create_dir_all(&a_session_dir).expect("a session dir");
+    std::fs::create_dir_all(&b_session_dir).expect("b session dir");
+    std::fs::write(a_session_dir.join("subagent.jsonl"), "{}").expect("a sidecar");
+    std::fs::write(b_session_dir.join("subagent.jsonl"), "{}").expect("b sidecar");
+    let mut perms = std::fs::metadata(&a_project).expect("meta").permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&a_project, perms).expect("readonly");
+    let service = env.service();
+    let error = service
+        .delete(&session, false)
+        .await
+        .expect_err("the first copy fails");
+    assert_eq!(i32::from(error.code), -32603);
+    // RR1b-02: Node rethrows the SDK delete's filesystem error.
+    assert_eq!(
+        error.data.as_ref().expect("details")["details"],
+        json!(format!(
+            "EACCES: permission denied, unlink '{}'",
+            failing.display()
+        )),
+        "the delete failure is the filesystem error of the first copy"
+    );
+    // RR2-02: Node stops at that failure, so the later copies and every session
+    // directory are still on disk.
+    assert!(failing.exists(), "the undeletable copy remains");
+    assert!(empty.exists(), "the later empty copy stays");
+    assert!(a_session_dir.exists(), "the first copy's session dir stays");
+    assert!(b_session_dir.exists(), "the later session dir stays");
+    // A retry finishes once the obstacle is gone.
+    let perms = std::fs::metadata(&b_project).expect("meta").permissions();
+    std::fs::set_permissions(&a_project, perms).expect("writable");
+    service.delete(&session, false).await.expect("retry");
+    assert!(!failing.exists() && !empty.exists());
+    assert!(!a_session_dir.exists() && !b_session_dir.exists());
 }
 
 /// _session/list/subscribe > sends the archive state by the agent name first,

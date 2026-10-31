@@ -96,13 +96,14 @@ pub fn client_system_prompt(system_prompt: Option<&Value>) -> Result<Option<Clie
                 data,
             ));
         }
-        parts.push(
-            block
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        );
+        // FA3-14: Node pushes `block.text` and `join("\n\n")` stringifies it.
+        // A missing/`null` text becomes the empty string (Array.join treats
+        // undefined/null as ""), everything else is JS `String()`.
+        let text = match block.get("text") {
+            None | Some(Value::Null) => String::new(),
+            Some(value) => crate::sdk_options::js_argv_text(value),
+        };
+        parts.push(text);
     }
     Ok(Some(ClientPrompt {
         mode,
@@ -244,6 +245,24 @@ mod tests {
 
     fn text_block(text: &str) -> Value {
         json!({"type": "text", "text": text})
+    }
+
+    /// FA3-14 — a non-string `text` is stringified like `Array.join`; a
+    /// missing/`null` text contributes the empty string.
+    #[test]
+    fn fa3_14_non_string_text_blocks_are_stringified() {
+        let prompt = client_system_prompt(Some(&json!({
+            "mode": "override",
+            "content": [
+                {"type": "text", "text": 5},
+                {"type": "text", "text": true},
+                {"type": "text"},
+                {"type": "text", "text": null},
+            ]
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(prompt.text, "5\n\ntrue\n\n\n\n");
     }
 
     #[test]

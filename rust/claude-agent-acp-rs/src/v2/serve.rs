@@ -83,12 +83,21 @@ fn unsupported_protocol_version_data(requested: u64) -> Value {
     json!({ "requested": requested, "supported": [1, 2] })
 }
 
-/// Read `params.protocolVersion` as a protocol version: a JSON integer in
-/// `0..=0xffff` (`protocol-router.js:386-391`). A float such as `2.0`, a
-/// string, a negative number or a missing field is not a version.
+/// Read `params.protocolVersion` as a protocol version: any finite integral
+/// number in `0..=0xffff` (`protocol-router.js:386-391`: `typeof value ===
+/// "number" && Number.isInteger(value)`). `JSON.parse("2.0")` is the integer
+/// `2`, so a serializer that writes the version as a float still routes; a
+/// string, a negative number, a fraction or a missing field is not a version.
 fn protocol_version(params: &Value) -> Option<u64> {
     let value = params.as_object()?.get("protocolVersion")?;
-    let version = value.as_u64()?;
+    let version = if let Some(integer) = value.as_u64() {
+        integer
+    } else {
+        value
+            .as_f64()
+            .filter(|number| number.is_finite() && number.fract() == 0.0 && *number >= 0.0)
+            .map(|number| number as u64)?
+    };
     (version <= MAX_PROTOCOL_VERSION).then_some(version)
 }
 

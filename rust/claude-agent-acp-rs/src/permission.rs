@@ -303,6 +303,9 @@ pub struct PermissionToolCall {
     pub title: Option<String>,
     /// `previewContent`: the exact patch a `diffPatch`/v2 client negotiated.
     pub preview_content: Option<Value>,
+    /// Whether the connection negotiated ACP v2: the tool call's own content
+    /// is built without the v1 input diff (`reporters/file-edit.ts:35-55`).
+    pub v2: bool,
     /// `blockedPath`: a path the tool may not touch, added as an extra location
     /// when the tool call does not already carry it (P-53).
     pub blocked_path: Option<String>,
@@ -323,7 +326,15 @@ pub struct PermissionToolCall {
 /// `tool_call` (P-16).
 pub fn build_permission_tool_call(input: &PermissionToolCall) -> Value {
     let cwd = input.cwd.as_deref();
-    let shape = tools::tool_shape(&input.tool_name, &input.tool_input, cwd);
+    let shape = tools::tool_shape_full(
+        &input.tool_name,
+        &input.tool_input,
+        cwd,
+        tools::ShapeOptions {
+            v2: input.v2,
+            ..tools::ShapeOptions::default()
+        },
+    );
     let title = input.title.clone().unwrap_or_else(|| shape.title.clone());
     let meta = permission_tool_call_meta(
         input.air,
@@ -528,6 +539,7 @@ pub fn ensure_tool_call_emitted(
         tools::ShapeOptions {
             air: state.is_air(),
             diff_patch: state.diff_patch(),
+            v2: state.caps_v2(),
             raw_input_rendering: state.caps_raw_input_rendering(),
             plan_file: state.plan_file(),
             ..tools::ShapeOptions::default()
@@ -1062,6 +1074,7 @@ mod tests {
                 terminal_output: false,
                 title: None,
                 preview_content: None,
+                v2: false,
                 blocked_path: None,
                 fallback_content: None,
                 mcp_server: None,

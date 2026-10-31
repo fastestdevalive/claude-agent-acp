@@ -281,7 +281,7 @@ async fn t4a3_remote_control_refused_while_working() {
     );
     assert_eq!(
         response["error"]["message"],
-        "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+        "Invalid request: Remote Control can't be changed while Claude is working. Try again when the turn ends.",
         "{response}"
     );
 
@@ -326,7 +326,7 @@ async fn t4a3_remote_control_refused_during_an_autonomous_cycle() {
     );
     assert_eq!(
         response["error"]["message"],
-        "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+        "Invalid request: Remote Control can't be changed while Claude is working. Try again when the turn ends.",
         "{response}"
     );
 
@@ -544,7 +544,7 @@ async fn t4a3_remote_control_refuses_a_second_command() {
                 );
                 assert_eq!(
                     value["message"],
-                    "Remote Control is already being changed. Try again in a moment.",
+                    "Invalid request: Remote Control is already being changed. Try again in a moment.",
                     "{value}"
                 );
                 let first = timeout(Duration::from_secs(10), remote)

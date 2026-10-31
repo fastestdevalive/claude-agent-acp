@@ -1323,6 +1323,38 @@ fn sdk_delete_error(session_id: &str) -> Error {
     })
 }
 
+/// The text Node's `fs.rm`/`fs.unlink` failure carries: libuv's
+/// `<CODE>: <strerror>, <syscall> '<path>'` (`EACCES: permission denied,
+/// unlink '/…'`). The delete rethrows every SDK delete failure that is not
+/// "not found with the copy gone" (`session-index/service.ts:672-680`), so the
+/// client gets this filesystem text, not the "was not deleted" summary.
+fn node_fs_error(error: &std::io::Error, syscall: &str, path: &Path) -> String {
+    let (code, text) = match error.kind() {
+        std::io::ErrorKind::PermissionDenied => ("EACCES", "permission denied"),
+        std::io::ErrorKind::NotFound => ("ENOENT", "no such file or directory"),
+        std::io::ErrorKind::AlreadyExists => ("EEXIST", "file already exists"),
+        std::io::ErrorKind::InvalidInput => ("EINVAL", "invalid argument"),
+        std::io::ErrorKind::WouldBlock => ("EAGAIN", "resource temporarily unavailable"),
+        std::io::ErrorKind::TimedOut => ("ETIMEDOUT", "connection timed out"),
+        std::io::ErrorKind::BrokenPipe => ("EPIPE", "broken pipe"),
+        std::io::ErrorKind::ConnectionRefused => ("ECONNREFUSED", "connection refused"),
+        std::io::ErrorKind::Interrupted => ("EINTR", "interrupted system call"),
+        _ => ("EIO", "i/o error"),
+    };
+    format!("{code}: {text}, {syscall} '{}'", path.display())
+}
+
+/// Removes one transcript copy as the SDK delete does. A copy removed meanwhile
+/// (`NotFound`) is not a failure (`isSdkNotFound(error) && !(await exists(...))`);
+/// any other failure is the filesystem error Node rethrows.
+fn remove_transcript_copy(file_path: &Path) -> Result<(), Error> {
+    match std::fs::remove_file(file_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(internal_error(&node_fs_error(&error, "unlink", file_path))),
+    }
+}
+
 fn delete_session(core: &mut IndexCore, session_id: &str, known: bool) -> Result<(), Error> {
     // A session directory can outlive its transcript: a delete that removed the
     // transcript and then failed on the directory.
@@ -1336,22 +1368,19 @@ fn delete_session(core: &mut IndexCore, session_id: &str, known: bool) -> Result
             Err(session_not_found(session_id))
         };
     }
-    let root = core.index.root().to_path_buf();
     let outcome = (|| -> Result<(), Error> {
-        // The SDK deletes one non-empty copy per call.
+        // Node's `deleteSession` rethrows the SDK delete's failure before the
+        // next copy (`session-index/service.ts:674-680`): the copies after the
+        // failing one, the empty transcripts and the session directories stay on
+        // disk, and a retry finishes once the obstacle is gone.
         for (file_path, _) in transcripts.iter().filter(|(_, size)| *size > 0) {
-            // Only "not found" with that copy gone is a copy removed meanwhile.
-            if let Err(e) = crate::session_store::delete(&root, session_id) {
-                if exists(file_path) {
-                    return Err(internal_error(&e.to_string()));
-                }
-            }
+            remove_transcript_copy(file_path)?;
         }
         // Empty transcripts, which the SDK skips, and session directories without
         // a transcript.
         for (file_path, size) in &transcripts {
             if *size == 0 {
-                let _ = std::fs::remove_file(file_path);
+                remove_transcript_copy(file_path)?;
             }
         }
         for session_dir in &session_dirs {
@@ -1367,6 +1396,8 @@ fn delete_session(core: &mut IndexCore, session_id: &str, known: bool) -> Result
             .chain(left_dirs.iter().map(|p| p.display().to_string()))
             .collect();
         if !remaining.is_empty() {
+            // A copy that vanished and came back leaves no `io::Error` to
+            // rethrow: Node's "was not deleted" summary is the fallback.
             return Err(internal_error(&format!(
                 "Session {session_id} was not deleted: {} remain",
                 remaining.join(", ")

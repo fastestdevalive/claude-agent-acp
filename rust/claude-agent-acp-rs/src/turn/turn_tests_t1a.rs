@@ -807,6 +807,108 @@ fn f16a_result_clears_model_request_marker() {
     assert!(!machine.model_request_since_result);
 }
 
+// ------------------------------------------------ FA4-01 / FA4-02 (issue #844)
+
+/// The recorded outcome of `held_machine`'s result: 3 input / 5 output tokens
+/// and no per-model rows (the frame carries no `modelUsage`).
+fn assert_recorded_settle(events: &[TurnEvent], label: &str) {
+    let settled: Vec<&TurnEvent> = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Settled { .. }))
+        .collect();
+    assert_eq!(settled.len(), 1, "{label}: exactly one settle: {events:?}");
+    let TurnEvent::Settled {
+        prompt_uuid,
+        stop_reason,
+        usage,
+        had_usage,
+        model_rows,
+    } = settled[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(prompt_uuid, "p1", "{label}");
+    assert_eq!(*stop_reason, StopReason::Cancelled, "{label}");
+    assert_eq!(
+        usage.input_tokens, 3,
+        "{label}: the result's recorded usage"
+    );
+    assert_eq!(
+        usage.output_tokens, 5,
+        "{label}: not the follow-up-inflated accumulator"
+    );
+    assert!(*had_usage, "{label}");
+    assert_eq!(
+        model_rows.to_json(),
+        serde_json::json!([]),
+        "{label}: the result's recorded quota rows"
+    );
+}
+
+/// FA4-01 — the force-cancel backstop settles a held turn whose follow-up is
+/// live with the usage and quota its own result recorded, not the live
+/// accumulator (`cancelledOutcome`, `acp-agent.ts:11886-11894`; issue #844).
+#[test]
+fn fa4_force_cancel_uses_the_held_turns_recorded_outcome() {
+    let mut machine = held_machine();
+    machine.latch_capabilities(&["request_marker_lists_v1"]);
+    machine.on_status(&serde_json::json!({"status": "requesting"}));
+    assert!(machine.model_request_since_result, "follow-up is live");
+    // The follow-up work the live accumulator would fold in.
+    machine.accumulated_usage.output_tokens += 100;
+
+    assert!(
+        settled(&machine.cancel()).is_empty(),
+        "a live follow-up leaves the held turn active"
+    );
+    assert!(machine.has_active());
+
+    let events = machine.force_cancel();
+    assert_recorded_settle(&events, "force-cancel");
+}
+
+/// FA4-02 — a clean stream end under a cancel settles the held turn with the
+/// outcome its result recorded (`cancelledOutcome`, `acp-agent.ts:5782-5792`),
+/// like the force-cancel backstop and the error path.
+#[test]
+fn fa4_stream_end_under_cancel_uses_the_held_turns_recorded_outcome() {
+    let mut machine = held_machine();
+    machine.latch_capabilities(&["request_marker_lists_v1"]);
+    machine.on_status(&serde_json::json!({"status": "requesting"}));
+    machine.accumulated_usage.output_tokens += 100;
+
+    assert!(settled(&machine.cancel()).is_empty());
+    assert!(machine.has_active());
+
+    let events = machine.on_stream_end();
+    assert_recorded_settle(&events, "stream end");
+}
+
+/// FA6-01 — the echo hand-off under a pending cancel is a third settle path:
+/// it must answer the held turn with the usage and quota its own result
+/// recorded (`cancelledOutcome`, `acp-agent.ts:11886-11894`), not the live
+/// accumulator that includes follow-up work (issue #844).
+#[test]
+fn fa6_echo_handoff_under_cancel_uses_the_held_turns_recorded_outcome() {
+    let mut machine = held_machine();
+    machine.latch_capabilities(&["request_marker_lists_v1"]);
+    machine.on_status(&serde_json::json!({"status": "requesting"}));
+    assert!(machine.model_request_since_result, "follow-up is live");
+    // The follow-up work the live accumulator would fold in.
+    machine.accumulated_usage.output_tokens += 100;
+
+    assert!(
+        settled(&machine.cancel()).is_empty(),
+        "a live follow-up leaves the held turn active"
+    );
+    assert!(machine.has_active());
+
+    machine.enqueue(Turn::new("p2".into(), false));
+    let events = machine.on_echo("p2");
+    assert_recorded_settle(&events, "echo hand-off");
+    assert!(machine.has_active(), "p2 is now active");
+}
+
 /// N-06 — a `status: requesting` that serves none of the stopped prompts reopens
 /// the window; one that names a cancelled prompt, or arrives while an orphan is
 /// outstanding, does not. Needs `request_marker_lists_v1`.

@@ -138,12 +138,12 @@ fn merge_key(key: &str, slot: &mut Value, value: Value) {
                 }
             }
         }
+        // FA3-11: the SDK unions `[...existing, ...overlay]` through a JS `Set`
+        // (`sdk.mjs` `$t`/`Fr`), so primitives dedupe by value (including
+        // duplicates already in the lower tier) and objects/arrays stay as
+        // distinct references.
         (Value::Array(target_arr), Value::Array(source_arr)) if key != "fallbackModel" => {
-            for entry in source_arr {
-                if !target_arr.contains(&entry) {
-                    target_arr.push(entry);
-                }
-            }
+            *target_arr = crate::sdk_options::js_array_union(target_arr, &source_arr);
         }
         (slot, value) => *slot = value,
     }
@@ -452,6 +452,36 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create parent");
         }
         std::fs::write(path, value.to_string()).expect("write settings");
+    }
+
+    /// FA3-11 — the array union is JS `Set` semantics: primitive duplicates
+    /// collapse (even ones already in the lower tier), while structurally
+    /// equal objects/arrays are distinct references and both survive.
+    #[test]
+    fn fa3_11_settings_array_union_matches_js_set() {
+        let mut effective = json!({
+            "permissions": {"allow": ["Read", "Read", "Bash(git:*)"]},
+            "hooks": {"SessionStart": [{"type": "command", "command": "same"}]},
+        });
+        let overlay = json!({
+            "permissions": {"allow": ["Read", "Edit"]},
+            "hooks": {"SessionStart": [{"type": "command", "command": "same"}]},
+        });
+        merge(&mut effective, overlay);
+
+        assert_eq!(
+            effective["permissions"]["allow"],
+            json!(["Read", "Bash(git:*)", "Edit"]),
+            "primitives dedupe across the concatenation"
+        );
+        assert_eq!(
+            effective["hooks"]["SessionStart"]
+                .as_array()
+                .expect("array")
+                .len(),
+            2,
+            "the same hook object in two tiers is a distinct reference in JS"
+        );
     }
 
     #[test]

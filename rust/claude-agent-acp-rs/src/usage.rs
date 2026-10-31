@@ -96,6 +96,12 @@ pub fn apply_message_delta(prev: Option<&UsageSnapshot>, delta_usage: &Value) ->
     }
 }
 
+/// JS `\w` without the `u` flag: ASCII alphanumerics plus `_`. `\b` treats `_`
+/// as a word character, so `opus_1m_pro` has no boundary around `1m` (FA4-05).
+fn is_regex_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 /// Scan string slice(s) for a `\b1m\b` word boundary token (case-insensitive).
 /// Returns `Some(1_000_000)` if found, else `None`.
 pub fn infer_context_window_from_model(texts: &[&str]) -> Option<u64> {
@@ -106,16 +112,8 @@ pub fn infer_context_window_from_model(texts: &[&str]) -> Option<u64> {
         let mut i = 0;
         while i + 1 < len {
             if (bytes[i] == b'1') && (bytes[i + 1] == b'm' || bytes[i + 1] == b'M') {
-                let prev_ok = if i == 0 {
-                    true
-                } else {
-                    !bytes[i - 1].is_ascii_alphanumeric()
-                };
-                let next_ok = if i + 2 >= len {
-                    true
-                } else {
-                    !bytes[i + 2].is_ascii_alphanumeric()
-                };
+                let prev_ok = i == 0 || !is_regex_word_byte(bytes[i - 1]);
+                let next_ok = i + 2 >= len || !is_regex_word_byte(bytes[i + 2]);
                 if prev_ok && next_ok {
                     return Some(1_000_000);
                 }
@@ -570,6 +568,16 @@ mod tests {
             None
         );
         assert_eq!(infer_context_window_from_model(&[""]), None);
+
+        // FA4-05: JS `\w` includes `_`, so these are not word boundaries
+        // (`/\b1m\b/i.test(...)` is false).
+        for text in ["opus_1m_pro", "my_1m_x", "acme_1m", "_1m_"] {
+            assert_eq!(
+                infer_context_window_from_model(&[text]),
+                None,
+                "{text} must not seed the 1M window"
+            );
+        }
     }
 
     #[test]

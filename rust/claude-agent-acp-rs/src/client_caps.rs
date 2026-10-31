@@ -86,9 +86,11 @@ pub struct ClientCapabilities {
     /// The client takes plan operations (`clientCapabilities.plan` is present):
     /// an approved ExitPlanMode plan is published as a markdown `plan_update`.
     pub plan: bool,
-    /// The client speaks ACP v2. Rust does not serve v2 yet (G10), so this is
-    /// always `false`; it exists so the tool-call capability object has the
-    /// same shape as Node's.
+    /// The connection negotiated ACP v2. The raw `clientCapabilities` never
+    /// carries this (Node builds `ToolCallClientCapabilities.from(caps, {v2})`
+    /// from the negotiated protocol, `acp-agent.ts:2831-2833`), so `initialize`
+    /// sets it on this parse after [`crate::v2::negotiate_initialize`]. It
+    /// gates the v1 input diff and the v2 approval preview of Edit/Write.
     pub v2: bool,
 }
 

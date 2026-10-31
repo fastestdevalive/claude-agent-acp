@@ -86,6 +86,13 @@ struct ActorRig {
 
 impl ActorRig {
     fn spawn(compaction: bool) -> Self {
+        Self::spawn_with_grace(compaction, Duration::from_secs(30))
+    }
+
+    /// The actor with an explicit force-cancel grace: the backstop that settles
+    /// a turn the interrupt never made yield (INV-17). A short grace makes the
+    /// force-cancel lane reachable in a bounded test.
+    fn spawn_with_grace(compaction: bool, grace: Duration) -> Self {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
@@ -103,7 +110,7 @@ impl ActorRig {
             control,
             control_in_tx,
             update_tx,
-            Duration::from_secs(30),
+            grace,
             "s1".into(),
             Arc::new(AtomicUsize::new(0)),
             None,
@@ -155,6 +162,32 @@ impl ActorRig {
             }
         }
         out
+    }
+
+    /// Wait until every command sent before this one was processed (`Cancel`,
+    /// then this barrier: one command channel preserves the order). The
+    /// forwarder here is this loop: it answers the flush barrier as the
+    /// production forwarder would.
+    async fn sync(&mut self) {
+        let (reply, mut reply_rx) = oneshot::channel();
+        self.tx.send(Command::FlushUpdates { reply }).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    res = &mut reply_rx => {
+                        res.expect("the actor keeps the reply");
+                        return;
+                    }
+                    item = self.update_rx.recv() => {
+                        if let Some(SessionOutbound::Flush(ack)) = item {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the actor answers the barrier");
     }
 
     async fn shutdown(mut self) {
@@ -762,6 +795,107 @@ fn t5fa_post_compact_records_a_summary_for_a_falsy_agent_id() {
         rig.ext.last_compaction_summary.as_deref(),
         Some("<summary>\nroot\n</summary>")
     );
+}
+
+// ---------------------------------------------------------------- F10
+
+/// FA4-07 — the force-cancel backstop closes a compaction that the held turn's
+/// follow-up started AFTER the cancel's own interrupt, like Node's abort path
+/// (`await compaction.interrupt()` before `settleActive`, `acp-agent.ts:5726`).
+#[tokio::test]
+async fn t5fa_force_cancel_closes_the_followups_compaction() {
+    let mut rig = ActorRig::spawn_with_grace(true, Duration::from_millis(300));
+    rig.prompt("p1", false);
+    rig.send(json!({"type":"user","uuid":"p1","isReplay":true,
+        "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}));
+    rig.send(json!({"type":"system","subtype":"init","session_id":"s1",
+        "capabilities":["request_marker_lists_v1"]}));
+    rig.send(
+        json!({"type":"system","subtype":"task_started","task_id":"sub1",
+        "tool_use_id":"toolu_sub1","subagent_type":"Explore"}),
+    );
+    rig.send(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"message_start","message":{"id":"m0","model":"claude-sonnet-4-5",
+            "usage":{"input_tokens":10,"output_tokens":5,
+                "cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}));
+    rig.send(result_frame("ok", false));
+    rig.send(json!({"type":"system","subtype":"status","status":"requesting"}));
+    rig.send(json!({"type":"stream_event","parent_tool_use_id":null,
+        "event":{"type":"message_start","message":{"id":"m1","model":"claude-sonnet-4-5",
+            "usage":{"input_tokens":1,"output_tokens":1,
+                "cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}));
+
+    // The follow-up's `usage_update` (used=2) proves the frames above were
+    // consumed: the turn is held and its follow-up is live.
+    let mut held = false;
+    while !held {
+        match tokio::time::timeout(Duration::from_secs(2), rig.update_rx.recv())
+            .await
+            .expect("the follow-up usage arrives")
+        {
+            Some(SessionOutbound::Update(notif)) => {
+                let update = serde_json::to_value(&notif.update).unwrap();
+                held = update["sessionUpdate"] == "usage_update" && update["used"] == 2;
+            }
+            Some(SessionOutbound::RawUpdate(value)) => {
+                let update = &value["update"];
+                held = update["sessionUpdate"] == "usage_update" && update["used"] == 2;
+            }
+            Some(_) => {}
+            None => panic!("the actor's outbound channel closed"),
+        }
+    }
+    rig.tx.send(Command::Cancel).unwrap();
+    rig.sync().await;
+    // The follow-up's dispatch proves the interrupted command's tail drained:
+    // the lifecycle accepts compaction frames again (`compaction.resume()`,
+    // `acp-agent.ts:5846-5848`), and the follow-up starts its auto-compaction
+    // AFTER the cancel's own interrupt.
+    rig.send(json!({"type":"command_lifecycle","command_uuid":"p1","state":"started"}));
+    rig.send(status("c1", json!("compacting")));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut opened = None;
+    let mut cancelled = None;
+    while cancelled.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rig.update_rx.recv())
+            .await
+            .expect("the force-cancel closes the entity")
+        {
+            Some(SessionOutbound::Update(notif)) => {
+                let update = serde_json::to_value(&notif.update).unwrap();
+                if update["sessionUpdate"] == "compaction_update" {
+                    match update["status"].as_str() {
+                        Some("in_progress") => opened = Some(update),
+                        Some("cancelled") => cancelled = Some(update),
+                        _ => {}
+                    }
+                }
+            }
+            Some(SessionOutbound::RawUpdate(value)) => {
+                let update = &value["update"];
+                if update["sessionUpdate"] == "compaction_update" {
+                    match update["status"].as_str() {
+                        Some("in_progress") => opened = Some(update.clone()),
+                        Some("cancelled") => cancelled = Some(update.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            Some(_) => {}
+            None => panic!("the actor's outbound channel closed"),
+        }
+    }
+    assert_eq!(
+        opened.expect("the follow-up opens the entity")["compactionId"],
+        "c1"
+    );
+    assert_eq!(
+        cancelled.expect("the force-cancel closes the entity")["compactionId"],
+        "c1"
+    );
+    rig.shutdown().await;
 }
 
 // ---------------------------------------------------------------- F9

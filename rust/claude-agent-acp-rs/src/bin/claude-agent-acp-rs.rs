@@ -30,11 +30,16 @@ use claude_agent_acp_rs::codec::WireTransport;
 use claude_agent_acp_rs::env_snapshot::EnvSnapshot;
 use claude_agent_acp_rs::logger::Logger;
 use claude_agent_acp_rs::process::{
-    resolve_claude_with_env, run_cli_passthrough, wait_for_shutdown_signal,
+    die_by_signal_if_requested, resolve_claude_with_env, run_cli_passthrough,
+    wait_for_shutdown_signal,
 };
 use claude_agent_acp_rs::settings;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `--cli`'s signal-death re-exec (`die_by_signal`): raise the signal before
+    // any handler exists so the process is terminated by it.
+    die_by_signal_if_requested();
+
     let raw_args: Vec<String> = std::env::args().collect();
 
     // Check for supervisor re-exec entry (--reaper <parent_pid> <target_pgid>, F41)
@@ -77,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // 2.7x lower cancel latency, and 5.5x lower steering latency compared to `current_thread`.
 #[tokio::main(flavor = "multi_thread")]
 async fn run_tokio_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let env = EnvSnapshot::from_process();
+    let mut env = EnvSnapshot::from_process();
 
     // `--cli` is checked first (`index.ts:11-13`) so that `--version`/`-v` and
     // every other flag are forwarded to the wrapped native CLI instead of being
@@ -99,18 +104,28 @@ async fn run_tokio_main(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // `CLAUDE_AGENT_LOGS` -> `<dir>/agent.log` (`index.ts:73-84`).
+    // O-03 / FA3-10: the managed-policy tier's env is applied before any SDK
+    // call, and — like Node's `await applyManagedPolicyEnv()` mutating
+    // `process.env` (`index.ts:51`) — it is folded into the adapter's own
+    // snapshot, not only the child's spawn env. Every later reader
+    // (`providers/list`, `ANTHROPIC_MODEL`, `CLAUDE_CONFIG_DIR`, the v2
+    // opt-in, executable resolution) sees the policy values.
+    let policy = settings::apply_managed_policy_env(&Logger::from_env(&env));
+    if !policy.is_empty() {
+        env = env.with_vars(policy.clone());
+    }
+
+    // `CLAUDE_AGENT_LOGS` -> `<dir>/agent.log` (`index.ts:73-84`), read after
+    // the policy mutation like Node.
     let logger = Logger::from_env(&env);
     logger.log("Claude ACP started");
 
     let mut opts = ServeOptions::from_snapshot(env)
         .with_logger(logger.enabled().then(|| Arc::new(logger.clone())));
 
-    // O-03: the managed-policy tier's env is applied before any SDK call so the
-    // spawned `claude` inherits it. It has the LOWEST priority: an explicit
-    // `extra_env` (provider env) overrides it, exactly like the Node adapter's
-    // `process.env` mutation followed by `{...process.env, ...providerEnv}`.
-    let policy = settings::apply_managed_policy_env(&logger);
+    // The spawn env keeps the policy at the LOWEST priority: an explicit
+    // `extra_env` (provider env) overrides it, exactly like Node's
+    // `{...process.env, ...providerEnv}`.
     if !policy.is_empty() {
         let mut merged = policy;
         merged.extend(opts.extra_env);

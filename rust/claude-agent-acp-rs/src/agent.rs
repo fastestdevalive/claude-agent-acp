@@ -385,13 +385,20 @@ pub fn prompt_to_claude(params: &Value, session_id: &str, uuid: &str) -> Value {
                     // Ignore blob resources (unsupported).
                 }
                 Some("image") => {
-                    let data = chunk.get("data").and_then(Value::as_str);
-                    let mime = chunk.get("mimeType").and_then(Value::as_str).unwrap_or("");
+                    // FA3b-03: Node tests `if (chunk.data)` (truthiness), so an
+                    // empty `data` falls through to the URL branch, and it emits
+                    // `media_type: chunk.mimeType` verbatim — `undefined` is
+                    // dropped by `JSON.stringify` (`acp-agent.ts:12710-12728`).
+                    let data = chunk
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .filter(|data| !data.is_empty());
                     if let Some(data) = data {
-                        content.push(json!({
-                            "type": "image",
-                            "source": {"type": "base64", "data": data, "media_type": mime}
-                        }));
+                        let mut source = json!({"type": "base64", "data": data});
+                        if let Some(mime) = chunk.get("mimeType") {
+                            source["media_type"] = mime.clone();
+                        }
+                        content.push(json!({"type": "image", "source": source}));
                     } else if let Some(uri) = chunk.get("uri").and_then(Value::as_str) {
                         if uri.starts_with("http") {
                             content.push(json!({
@@ -694,6 +701,9 @@ pub fn session_spawn_options(
         json_schema: claude.json_schema,
         debug: claude.debug,
         debug_file: claude.debug_file,
+        // FA3-08: the SDK adds a `--debug-file` of its own when the adapter's
+        // env asks for SDK debug logs and the client passed no `debugFile`.
+        debug_file_from_env: crate::process::debug_file_from_env(),
         session_mirror: claude.session_mirror,
         // The SDK's argv builder has a `--channels` branch, but the pinned SDK
         // never forwards `Options.channels` into the process transport
@@ -787,6 +797,39 @@ pub fn spawn_inputs(
         if let Some(plugin) = claude.plugins.iter().find(|plugin| plugin.kind != "local") {
             return Err(Error::internal_error().data(json!({
                 "details": format!("Unsupported plugin type: {}", plugin.kind)
+            })));
+        }
+    }
+    // Node spreads `acpAdditionalDirectories` (`acp-agent.ts:11144-11147`), so a
+    // non-iterable official field throws a TypeError out of `createSession`
+    // (plain Error -> -32603 with `data.details`), never a silent fallback.
+    if claude.invalid_additional_directories {
+        return Err(Error::internal_error().data(json!({
+            "details": "acpAdditionalDirectories is not iterable"
+        })));
+    }
+
+    // FA1-07/FA1-17: the SDK throws inside `ProcessTransport.initialize`
+    // (`if (fallbackModel) { if (model && fallbackModel === model) throw ... }`),
+    // before the child spawns. The guard runs on the raw option values: `""`
+    // and other falsy values are skipped, and `===` is strict (a number `5`
+    // never equals the string `"5"`). A plain `Error` maps to `-32603` with
+    // `data:{details}`, so `session/new` fails in Node.
+    let raw_options = params
+        .get("_meta")
+        .and_then(|meta| meta.get("claudeCode"))
+        .and_then(|claude| claude.get("options"));
+    let model_value = raw_options
+        .and_then(|options| options.get("model"))
+        .filter(|value| crate::sdk_options::js_truthy(Some(*value)));
+    let fallback_value = raw_options
+        .and_then(|options| options.get("fallbackModel"))
+        .filter(|value| crate::sdk_options::js_truthy(Some(*value)));
+    if let (Some(model), Some(fallback)) = (model_value, fallback_value) {
+        if crate::sdk_options::js_strict_eq(model, fallback) {
+            return Err(Error::internal_error().data(json!({
+                "details": "Fallback model cannot be the same as the main model. \
+                            Please specify a different model for fallbackModel option."
             })));
         }
     }
@@ -1042,7 +1085,10 @@ fn rpc_error(rpc: (String, Option<Value>)) -> Error {
 /// code -32000 for `AuthRequired`, else -32603).
 pub(crate) fn session_rpc_error(err: &SessionError) -> Error {
     if let SessionError::InvalidRequest(message) = err {
-        return Error::new(-32600, message.clone());
+        // `RequestError.invalidRequest(undefined, text)` builds
+        // `Invalid request: <text>` (`jsonrpc.js`), unlike the internal
+        // `SessionError` text (FA1-14, `acp-agent.ts:3824-3832`).
+        return Error::new(-32600, format!("Invalid request: {message}"));
     }
     if let SessionError::PromptFailed {
         kind: crate::turn::FailureKind::AuthRequired,
@@ -2391,9 +2437,13 @@ fn initialize_options_for(
     let append_system_prompt = fields.append_system_prompt;
     let exclude_dynamic_sections = fields.exclude_dynamic_sections;
     let opts = crate::sdk_options::claude_options(params);
-    // Node defaults `promptSuggestions` on unless the client passes a value
-    // (`acp-agent.ts:11235`).
-    let prompt_suggestions = opts.prompt_suggestions.unwrap_or(true);
+    // Node defaults `promptSuggestions` on, then spreads the client's raw
+    // value over it: `null`/`0`/a string reach the CLI verbatim
+    // (`acp-agent.ts:11103,11233-11236`; FA3b-05).
+    let prompt_suggestions = opts
+        .prompt_suggestions
+        .clone()
+        .unwrap_or_else(|| json!(true));
     // `forwardsSubagentText` (`acp-agent.ts:10947-10953`): native subagent
     // sessions, the historical `_meta["subagent-transcript"]` capability, or
     // the client's `forwardSubagentText` option (O-85).
@@ -2403,9 +2453,9 @@ fn initialize_options_for(
     // `perTaskStopAffordance` defaults on for the subagents RFD form; the
     // client's own option wins because it is spread after it (O-84). Undefined
     // for every other client, so the field is omitted from the request.
-    let per_task_stop_affordance = opts
-        .per_task_stop_affordance
-        .or((caps.subagent_form == Some(crate::client_caps::SubagentForm::Rfd)).then_some(true));
+    let per_task_stop_affordance = opts.per_task_stop_affordance.clone().or_else(|| {
+        (caps.subagent_form == Some(crate::client_caps::SubagentForm::Rfd)).then(|| json!(true))
+    });
     // The SDK enables checkpointing for a client that negotiated per-turn
     // file-change reports; otherwise the client's option decides
     // (`acp-agent.ts:11240`, O-136).
@@ -2420,9 +2470,11 @@ fn initialize_options_for(
         .and_then(|o| o.get("skills"))
         .filter(|v| !v.is_null())
         .cloned();
+    // FA3-03: the SDK's `verbatimPrompts:Ie=!1` is used with JS truthiness
+    // (`this.verbatimPrompts ? ...`), and the option never reaches initialize.
     let verbatim_prompts = cc_opts
         .and_then(|o| o.get("verbatimPrompts"))
-        .and_then(Value::as_bool);
+        .map(|v| crate::sdk_options::js_truthy(Some(v)));
     Ok(InitializeOptions {
         system_prompt,
         append_system_prompt,
@@ -2565,6 +2617,9 @@ fn wire_session(
     // (U-75), and must not keep the actor's command channel open.
     let write_failed_tx = session.command_sender().downgrade();
     let model_id = session.current_model_id().unwrap_or_default();
+    // FA4-06: the answer belongs to the query that issued it; a clear-context
+    // restart rebinds the handle, so the old generation is dropped.
+    let generation = control.query_generation();
     tokio::spawn(async move {
         if let Ok(res) = control
             .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
@@ -2575,6 +2630,7 @@ fn wire_session(
                 let _ = cmd_tx.send(crate::session::Command::UpdateContextWindow {
                     size: tokens,
                     model_id,
+                    generation,
                 });
             }
         }
@@ -3966,6 +4022,11 @@ pub(crate) async fn handle_v1_request(
             // v2 surface sends commands' terminals as display terminals.
             if negotiated.mode == crate::v2::ProtocolMode::V2 {
                 registry.caps.terminal_output = true;
+                // `ToolCallClientCapabilities.from(caps, {v2: this.v2})`
+                // (`acp-agent.ts:2831-2833`): the tool reporters build no v1
+                // input diff for a v2 client, and the approval preview is a
+                // v2 diff.
+                registry.caps.v2 = true;
             }
             // The session index of a client that declared `sessionIndex`.
             let notifier_connection = connection.clone();
@@ -5450,8 +5511,9 @@ pub(crate) async fn handle_v1_request(
             let session = match registry.sessions.get(&session_id) {
                 Some(s) => s.clone(),
                 None => {
-                    return responder
-                        .respond_with_error(Error::internal_error().data("Session not found"));
+                    return responder.respond_with_error(
+                        Error::internal_error().data(json!({ "details": "Session not found" })),
+                    );
                 }
             };
             // V-16: a sign-out (or a probe's identity change) recreates the query
@@ -5988,6 +6050,33 @@ mod tests {
             .any(|c| c["text"].as_str().unwrap().contains("body")));
     }
 
+    /// FA3b-03 — Node's image mapping (`acp-agent.ts:12710-12728`): an empty
+    /// `data` is falsy and falls through to the `http` URI branch; a missing
+    /// `mimeType` is dropped by `JSON.stringify` instead of becoming `""`.
+    #[test]
+    fn fa3b_image_chunk_empty_data_and_missing_mime() {
+        let params = json!({"prompt":[{"type":"image","data":"","uri":"https://x/y.png"}]});
+        let frame = prompt_to_claude(&params, "s1", "u");
+        assert_eq!(
+            serde_json::to_string(&frame["message"]["content"]).unwrap(),
+            r#"[{"type":"image","source":{"type":"url","url":"https://x/y.png"}}]"#
+        );
+
+        let params = json!({"prompt":[{"type":"image","data":"QUJD"}]});
+        let frame = prompt_to_claude(&params, "s1", "u");
+        assert_eq!(
+            serde_json::to_string(&frame["message"]["content"]).unwrap(),
+            r#"[{"type":"image","source":{"type":"base64","data":"QUJD"}}]"#
+        );
+
+        let params = json!({"prompt":[{"type":"image","data":"QUJD","mimeType":"image/png"}]});
+        let frame = prompt_to_claude(&params, "s1", "u");
+        assert_eq!(
+            serde_json::to_string(&frame["message"]["content"]).unwrap(),
+            r#"[{"type":"image","source":{"type":"base64","data":"QUJD","media_type":"image/png"}}]"#
+        );
+    }
+
     #[test]
     fn session_spawn_options_map_model_permission_session_id() {
         let serve = ServeOptions {
@@ -6482,6 +6571,40 @@ mod tests {
         );
     }
 
+    /// FA3-09 — a defined-but-null/false `agents`, `toolAliases` or
+    /// `perTaskStopAffordance` stays on the initialize wire; Node only drops
+    /// `undefined` keys.
+    #[test]
+    fn fa3_09_initialize_keeps_defined_null_values() {
+        let init = initialize_options_for(
+            &json!({"_meta": {"claudeCode": {"options": {
+                "agents": null,
+                "toolAliases": null,
+                "perTaskStopAffordance": null,
+            }}}}),
+            &ClientCapabilities::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let request = init.build_request();
+        assert_eq!(request.get("agents"), Some(&Value::Null));
+        assert_eq!(request.get("toolAliases"), Some(&Value::Null));
+        assert_eq!(request.get("perTaskStopAffordance"), Some(&Value::Null));
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(serialized.contains(r#""toolAliases":null"#), "{serialized}");
+        assert!(serialized.contains(r#""agents":null"#), "{serialized}");
+        assert!(
+            serialized.contains(r#""perTaskStopAffordance":null"#),
+            "{serialized}"
+        );
+        // Node's key order: toolAliases before agents, perTaskStopAffordance last.
+        let tool = serialized.find(r#""toolAliases""#).unwrap();
+        let agents = serialized.find(r#""agents""#).unwrap();
+        let stop = serialized.find(r#""perTaskStopAffordance""#).unwrap();
+        assert!(tool < agents && agents < stop, "{serialized}");
+    }
+
     /// O-84/O-85/O-136 — `initialize_options_for` derives the three
     /// client-tunable fields exactly like `forwardsSubagentText`,
     /// `perTaskStopAffordance` and `enableFileCheckpointing`
@@ -6502,9 +6625,9 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(init.prompt_suggestions, Some(false));
+        assert_eq!(init.prompt_suggestions, Some(json!(false)));
         assert!(init.forward_subagent_text);
-        assert_eq!(init.per_task_stop_affordance, Some(false));
+        assert_eq!(init.per_task_stop_affordance, Some(json!(false)));
         assert_eq!(init.skills, Some(json!(["custom_skill"])));
         assert_eq!(init.verbatim_prompts, Some(true));
         assert!(!init.enable_file_checkpointing);
@@ -6513,12 +6636,13 @@ mod tests {
         assert_eq!(request["forwardSubagentText"], json!(true));
         assert_eq!(request["perTaskStopAffordance"], json!(false));
         assert_eq!(request["skills"], json!(["custom_skill"]));
-        assert_eq!(request["verbatimPrompts"], json!(true));
+        // FA3-03: verbatimPrompts is not an initialize field.
+        assert!(request.get("verbatimPrompts").is_none());
 
         // A plain client: promptSuggestions defaults on, the other two are
         // absent/false.
         let bare = initialize_options_for(&json!({}), &plain, None, false).unwrap();
-        assert_eq!(bare.prompt_suggestions, Some(true));
+        assert_eq!(bare.prompt_suggestions, Some(json!(true)));
         assert_eq!(bare.per_task_stop_affordance, None);
         assert!(!bare.forward_subagent_text);
         assert!(bare.build_request().get("perTaskStopAffordance").is_none());
@@ -6527,7 +6651,7 @@ mod tests {
         // forwards nested text.
         let rfd = ClientCapabilities::from_value(Some(&json!({"subagents": {}})));
         let rfd_init = initialize_options_for(&json!({}), &rfd, None, false).unwrap();
-        assert_eq!(rfd_init.per_task_stop_affordance, Some(true));
+        assert_eq!(rfd_init.per_task_stop_affordance, Some(json!(true)));
         assert!(rfd_init.forward_subagent_text);
 
         // The client's own option wins over the RFD default.
@@ -6538,7 +6662,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(opt_out.per_task_stop_affordance, Some(false));
+        assert_eq!(opt_out.per_task_stop_affordance, Some(json!(false)));
 
         // The historical `_meta["subagent-transcript"]` capability also
         // forwards nested text.
@@ -6569,6 +6693,31 @@ mod tests {
         )
         .unwrap();
         assert!(opted_in.enable_file_checkpointing);
+    }
+
+    /// FA3b-05 — Node sets `promptSuggestions: true` and then spreads the
+    /// client's `userProvidedOptions` over it, so `null`/`0`/a string reach the
+    /// initialize request verbatim (`acp-agent.ts:11103,11233-11236`); an absent
+    /// key keeps the `true` default.
+    #[test]
+    fn fa3b_prompt_suggestions_forwards_the_raw_client_value() {
+        let plain = ClientCapabilities::default();
+        for raw in [json!(null), json!(0), json!("yes")] {
+            let params = json!({"_meta": {"claudeCode": {"options": {
+                "promptSuggestions": raw.clone()
+            }}}});
+            let init = initialize_options_for(&params, &plain, None, false).unwrap();
+            assert_eq!(init.prompt_suggestions, Some(raw.clone()));
+            assert_eq!(
+                serde_json::to_string(&init.build_request()["promptSuggestions"]).unwrap(),
+                serde_json::to_string(&raw).unwrap()
+            );
+        }
+        let bare = initialize_options_for(&json!({}), &plain, None, false).unwrap();
+        assert_eq!(
+            serde_json::to_string(&bare.build_request()["promptSuggestions"]).unwrap(),
+            "true"
+        );
     }
 
     /// O-169 (`create-session-options.test.ts` > "merges user-provided hooks
@@ -6727,6 +6876,55 @@ mod tests {
             .extra_env
             .iter()
             .any(|(key, _)| key == "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"));
+    }
+
+    /// FA1-07 — the SDK throws before spawning when `fallbackModel` equals the
+    /// main `model` (`sdk.mjs` `ProcessTransport.initialize`):
+    /// `Fallback model cannot be the same as the main model. Please specify a
+    /// different model for fallbackModel option.` The plain `Error` maps to
+    /// `-32603` with `data:{details}`, so `session/new` fails in Node.
+    #[test]
+    fn fa1_07_spawn_inputs_reject_an_equal_fallback_model() {
+        let serve = ServeOptions::default();
+        let params = json!({
+            "cwd": "/project",
+            "_meta": {"claudeCode": {"options": {
+                "model": "claude-sonnet-4-5",
+                "fallbackModel": "claude-sonnet-4-5"
+            }}}
+        });
+        let err = spawn_inputs(
+            &params,
+            Some(std::path::Path::new("/project")),
+            &serve,
+            None,
+        )
+        .expect_err("an equal fallback model must fail session creation");
+        assert_eq!(i32::from(err.code), -32603);
+        assert_eq!(
+            err.data,
+            Some(json!({
+                "details": "Fallback model cannot be the same as the main model. \
+                            Please specify a different model for fallbackModel option."
+            }))
+        );
+
+        // Different ids still spawn.
+        let params = json!({
+            "cwd": "/project",
+            "_meta": {"claudeCode": {"options": {
+                "model": "claude-sonnet-4-5",
+                "fallbackModel": "claude-opus-4-5"
+            }}}
+        });
+        let (claude, _, _) = spawn_inputs(
+            &params,
+            Some(std::path::Path::new("/project")),
+            &serve,
+            None,
+        )
+        .expect("different models spawn");
+        assert_eq!(claude.fallback_model.as_deref(), Some("claude-opus-4-5"));
     }
 
     /// M-31 partial (F4b): a resumed session whose CLI reports

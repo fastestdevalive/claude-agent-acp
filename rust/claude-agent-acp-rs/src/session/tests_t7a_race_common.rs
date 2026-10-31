@@ -136,6 +136,13 @@ impl Actor {
     /// Spawn the actor with a duplex child stdin (read back as `control_lines`)
     /// and a stream channel the test feeds.
     pub fn spawn() -> Self {
+        Self::spawn_with_grace(Duration::from_secs(30))
+    }
+
+    /// Spawn the actor with an explicit force-cancel grace: the backstop that
+    /// settles a turn the interrupt never made yield (INV-17). A short grace
+    /// makes the force-cancel lane reachable in a bounded race test.
+    pub fn spawn_with_grace(force_cancel_grace: Duration) -> Self {
         let (writer, far_end) = tokio::io::duplex(256 * 1024);
         let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
         let (tx, commands) = mpsc::unbounded_channel::<Command>();
@@ -161,7 +168,7 @@ impl Actor {
             control,
             control_in_tx.clone(),
             update_tx,
-            Duration::from_secs(30),
+            force_cancel_grace,
             "s1".into(),
             Arc::new(AtomicUsize::new(0)),
             None,

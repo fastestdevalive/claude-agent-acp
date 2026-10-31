@@ -1,6 +1,6 @@
-//! T4A3 STEP 5 (F24: O-143/O-162) — `_meta.claudeCode.options.skills` and
-//! `verbatimPrompts` reach the `initialize` control request (upstream
-//! `acp-agent.ts:1601-1640`).
+//! T4A3 STEP 5 (F24: O-143/O-162) — `_meta.claudeCode.options.skills` reaches
+//! the `initialize` control request verbatim (upstream `acp-agent.ts:1601-1640`);
+//! `verbatimPrompts` is an SDK Query option, never an initialize field (FA3-03).
 
 mod common;
 
@@ -103,10 +103,12 @@ async fn t4a3_init_options_carry_skills_and_verbatim_prompts() {
         raw["request"]["skills"], skills,
         "skills reach the initialize request verbatim: {raw}"
     );
-    assert_eq!(
-        raw["request"]["verbatimPrompts"],
-        json!(true),
-        "verbatimPrompts reaches the initialize request: {raw}"
+    // FA3-03: `verbatimPrompts` is not an initialize field (Node's
+    // `buildInitializeRequest` has none); it only marks user frames
+    // `client_composed` in the SDK. The unit tests in control.rs cover that.
+    assert!(
+        raw["request"].get("verbatimPrompts").is_none(),
+        "verbatimPrompts is not forwarded to initialize: {raw}"
     );
 
     drop(serve_task);

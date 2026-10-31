@@ -10,7 +10,8 @@
 //! `CLAUDE_CONFIG_DIR` / `$HOME/.claude`.
 //!
 //! Not ported (PARITY): git-worktree sibling projects in a `cwd` listing, the
-//! sidecar title store, the `isSidechain`-first-line archive checks of `pF`,
+//! sidecar title *writes* (owned by `session_index::service`), the
+//! `isSidechain`-first-line archive checks of `pF`,
 //! command-tag prompt filtering of `vi`, and `hu`'s 0600 fork-file mode (no
 //! platform mode code outside `process.rs`; the file is created exclusively).
 
@@ -130,29 +131,38 @@ fn project_dirs_for(root: &Path, dir: &str) -> Vec<PathBuf> {
     out
 }
 
-/// Every project directory under `root` (a listing without a `cwd`).
-fn all_project_dirs(root: &Path) -> Vec<PathBuf> {
+/// Every project directory under `root` in `readdir` order.
+fn project_dirs_readdir_order(root: &Path) -> Vec<PathBuf> {
     let Ok(read) = std::fs::read_dir(root) else {
         return Vec::new();
     };
-    let mut dirs: Vec<PathBuf> = read
-        .flatten()
+    read.flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
-        .collect();
+        .collect()
+}
+
+/// Every project directory under `root` (a listing without a `cwd`), sorted.
+pub(crate) fn all_project_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = project_dirs_readdir_order(root);
     dirs.sort();
     dirs
 }
 
-/// The (non-empty) transcripts of `session_id` under `root`, any project.
+/// The transcripts of `session_id` under `root`, any project (FA3-12).
+///
+/// Node's `findTranscript` (`resumed-session.ts:113-127`) iterates `readdir`
+/// in directory order and returns the first candidate that `access` accepts —
+/// a zero-length `<id>.jsonl` included, so an empty transcript yields an empty
+/// tail instead of falling back to another project.
 pub fn find_transcripts(root: &Path, session_id: &str) -> Vec<PathBuf> {
     if !is_session_id(session_id) {
         return Vec::new();
     }
-    all_project_dirs(root)
+    project_dirs_readdir_order(root)
         .into_iter()
         .map(|d| d.join(format!("{session_id}.jsonl")))
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0))
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
         .collect()
 }
 
@@ -396,8 +406,18 @@ fn row_of(candidate: &Candidate) -> Option<SessionRow> {
     if first_line.contains("\"isSidechain\":true") || first_line.contains("\"isSidechain\": true") {
         return None;
     }
-    let custom = last_string_field(&tail, "customTitle")
+    // `El`: the tail customTitle, else the CLI's `custom-title.json` sidecar
+    // (read only when the tail has none, `pF`), else the head customTitle, then
+    // the AI titles.
+    let tail_custom = last_string_field(&tail, "customTitle");
+    let sidecar = if tail_custom.is_none() {
+        crate::session_index::read_sidecar_title(&candidate.path, &candidate.session_id)
+    } else {
+        None
+    };
+    let custom = tail_custom
         .filter(|s| !s.is_empty())
+        .or(sidecar)
         .or_else(|| last_string_field(&head, "customTitle").filter(|s| !s.is_empty()))
         .or_else(|| last_string_field(&tail, "aiTitle").filter(|s| !s.is_empty()))
         .or_else(|| last_string_field(&head, "aiTitle").filter(|s| !s.is_empty()));
@@ -568,7 +588,13 @@ pub fn list(root: &Path, dir: Option<&str>, offset: usize, page_size: usize) -> 
 /// succeeds.
 pub fn delete(root: &Path, session_id: &str) -> Result<(), StoreError> {
     // The SDK deletes the first project directory holding a non-empty transcript.
-    if let Some(transcript) = find_transcripts(root, session_id).into_iter().next() {
+    // `find_transcripts` lists empty transcripts too (FA3-12: Node's
+    // `findTranscript` accepts them), so skip them here: an empty copy must not
+    // consume the one delete this call performs.
+    if let Some(transcript) = find_transcripts(root, session_id)
+        .into_iter()
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0))
+    {
         std::fs::remove_file(&transcript)?;
         if let Some(parent) = transcript.parent() {
             let sidecar = parent.join(session_id);
@@ -1423,14 +1449,25 @@ pub fn fork(
             json!({"type": "relocated", "sessionId": fork_id, "relocatedCwd": cwd}).to_string(),
         );
     }
-    // `nve`'s title: the tail window's customTitle first, then the head
-    // window's (the sidecar title store is not ported), then the tail and head
-    // aiTitle, then the first prompt of the head window.
+    // `nve`'s title: the tail window's customTitle first, else the CLI's
+    // `custom-title.json` sidecar (`Sl`, read only when the tail has none),
+    // else the head window's customTitle, then the tail and head aiTitle, then
+    // the first prompt of the head window.
     let head = String::from_utf8_lossy(&raw[..raw.len().min(WINDOW as usize)]).into_owned();
     let tail =
         String::from_utf8_lossy(&raw[raw.len().saturating_sub(WINDOW as usize)..]).into_owned();
-    let custom =
-        last_string_field(&tail, "customTitle").or_else(|| last_string_field(&head, "customTitle"));
+    let tail_custom = last_string_field(&tail, "customTitle");
+    let sidecar = if tail_custom.is_none() {
+        crate::session_index::read_sidecar_title(
+            &project_dir.join(format!("{source_id}.jsonl")),
+            source_id,
+        )
+    } else {
+        None
+    };
+    let custom = tail_custom
+        .or(sidecar)
+        .or_else(|| last_string_field(&head, "customTitle"));
     let title = custom
         .filter(|title| !title.is_empty())
         .or_else(|| last_string_field(&tail, "aiTitle").filter(|title| !title.is_empty()))
@@ -1669,6 +1706,27 @@ mod tests {
         assert_eq!(parse_cursor(Some("offset:7")).expect("7"), 7);
         assert!(parse_cursor(Some("page:2")).is_err());
         assert!(parse_cursor(Some("offset:")).is_err());
+    }
+
+    /// FA3-12 — a zero-length transcript is still a transcript: Node's
+    /// `findTranscript` uses `access`, so it returns the empty file (and the
+    /// resumed tail is empty) instead of skipping it.
+    #[test]
+    fn fa3_12_empty_transcript_is_found() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let project = root.join("-p");
+        std::fs::create_dir_all(&project).expect("project dir");
+        std::fs::write(project.join(format!("{A}.jsonl")), "").expect("empty transcript");
+
+        let found = find_transcripts(&root, A);
+        assert_eq!(found, vec![project.join(format!("{A}.jsonl"))]);
+
+        let other = root.join("-q");
+        std::fs::create_dir_all(&other).expect("second project");
+        std::fs::write(other.join(format!("{A}.jsonl")), "").expect("second transcript");
+        let found = find_transcripts(&root, A);
+        assert_eq!(found.len(), 2, "every project's file is listed: {found:?}");
     }
 
     #[test]
@@ -2050,6 +2108,80 @@ mod tests {
             json!("TAIL-TITLE (fork)"),
             "{lines:?}"
         );
+    }
+
+    /// FA5-01 — `session/fork` and the non-index `session/list` row honour the
+    /// CLI's `custom-title.json` sidecar when the rename record fell out of
+    /// both 64 KiB windows (`Sl`/`El`/`nve`).
+    #[test]
+    fn fa5_01_fork_and_list_row_use_custom_title_sidecar() {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("projects");
+        let work = tmp.0.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let real = std::fs::canonicalize(&work).expect("canon");
+        let real = real.to_string_lossy().into_owned();
+        let slug = project_slug(&real);
+        let filler = |from: usize, to: usize| -> String {
+            (from..to)
+                .map(|i| {
+                    json!({"type": "progress", "uuid": format!("f{i}"), "parentUuid": "u1",
+                        "sessionId": A, "timestamp": "2026-01-01T00:00:00.000Z",
+                        "data": "x".repeat(200)})
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The rename record sits past the head window and before the tail
+        // window; the sidecar still carries the title, as `_session/rename`
+        // leaves it.
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            user_line("u1", None, &real, "hello"),
+            filler(0, 400),
+            json!({"type": "custom-title", "sessionId": A, "customTitle": "Renamed"}),
+            filler(400, 800),
+            json!({"type": "progress", "uuid": "last", "parentUuid": "u1",
+                "sessionId": A, "timestamp": "2026-01-01T00:00:00.000Z", "data": "end"}),
+        );
+        assert!(
+            body.len() > (3 * WINDOW) as usize,
+            "the title is in the middle"
+        );
+        write_session(&root, &slug, A, &body, 50);
+        let sidecar_dir = root.join(&slug).join(A);
+        std::fs::create_dir_all(&sidecar_dir).expect("sidecar dir");
+        std::fs::write(
+            sidecar_dir.join("custom-title.json"),
+            json!({"customTitle": "Renamed"}).to_string(),
+        )
+        .expect("sidecar");
+
+        let page = list(&root, Some(&real), 0, 10);
+        let row = page
+            .sessions
+            .iter()
+            .find(|r| r.session_id == A)
+            .expect("row");
+        assert_eq!(row.title, "Renamed", "{row:?}");
+        assert_eq!(row.custom_title.as_deref(), Some("Renamed"));
+
+        let mut n = 0u32;
+        let mut gen = || {
+            n += 1;
+            format!("00000000-0000-4000-8000-{n:012}")
+        };
+        let fork_id = fork(&root, A, &real, &mut gen, None).expect("fork");
+        let raw = std::fs::read_to_string(root.join(&slug).join(format!("{fork_id}.jsonl")))
+            .expect("fork file");
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1]["type"], json!("custom-title"));
+        assert_eq!(lines[1]["customTitle"], json!("Renamed (fork)"));
     }
 
     /// M-32/LOW-6 — `ive` remaps compactMetadata anchors through the kept

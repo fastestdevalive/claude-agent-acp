@@ -833,11 +833,16 @@ pub fn apply_task_update(state: &mut Vec<(String, TaskStateEntry)>, input: &Valu
         .or_else(|| existing_entry.as_ref().map(|e| e.status.as_str()))
         .unwrap_or("pending")
         .to_string();
+    // Node: `input.subject ?? existing?.subject; if (!subject) return;` — an
+    // empty-string subject is falsy, so the whole update is dropped and the
+    // existing entry stays (FA4-04).
     let subject = input
         .get("subject")
         .and_then(Value::as_str)
         .or_else(|| existing_entry.as_ref().map(|e| e.subject.as_str()));
-    let Some(subj) = subject else { return };
+    let Some(subj) = subject.filter(|subject| !subject.is_empty()) else {
+        return;
+    };
 
     let active_form = input
         .get("activeForm")
@@ -1996,6 +2001,42 @@ mod tests {
         let mut state = Vec::new();
         apply_task_update(&mut state, &json!({"taskId": "5", "status": "in_progress"}));
         assert!(state.is_empty(), "no subject: no blank placeholder");
+    }
+
+    /// FA4-04 — Node's `applyTaskUpdate` resolves `input.subject ??
+    /// existing?.subject` and drops the whole update when that is falsy
+    /// (`tools.ts:296-298`): an empty-string subject neither replaces the
+    /// existing one nor applies the status.
+    #[test]
+    fn t8c_task_update_empty_subject_is_dropped() {
+        let mut state = Vec::new();
+        apply_task_create(
+            &mut state,
+            &json!({"subject": "Keep", "activeForm": "Keeping"}),
+            Some("1"),
+        );
+        apply_task_update(
+            &mut state,
+            &json!({"taskId": "1", "subject": "", "status": "completed"}),
+        );
+        assert_eq!(
+            state,
+            vec![(
+                "1".to_string(),
+                TaskStateEntry {
+                    subject: "Keep".into(),
+                    status: "pending".into(),
+                    active_form: Some("Keeping".into()),
+                    description: None,
+                }
+            )],
+            "an empty subject drops the update, including its status"
+        );
+
+        // A missing subject still keeps the existing one (the ordinary update).
+        apply_task_update(&mut state, &json!({"taskId": "1", "status": "completed"}));
+        assert_eq!(state[0].1.subject, "Keep");
+        assert_eq!(state[0].1.status, "completed");
     }
 
     /// `tools.test.ts` > "applyTaskCreate / applyTaskUpdate": insertion order

@@ -51,22 +51,34 @@ pub struct AvailableModel {
 const MODEL_FAMILY_ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
 
 /// Replace every `[<digits>m]` token and a trailing `-<digits>m` suffix.
+///
+/// FA3-15: Node's `stripContextHints` removes every `[<digits>m]` anywhere in
+/// the id (`/\[\d+m\]/gi`), not only a trailing one.
 pub fn strip_context_hints(value: &str) -> String {
-    let mut s = value.to_string();
-    while let Some(start) = s.rfind('[') {
-        let Some(rel_end) = s[start..].find(']') else {
+    let mut s = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(open) = rest.find('[') {
+        s.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            s.push_str(&rest[open..]);
+            rest = "";
             break;
         };
-        let end = start + rel_end;
-        let inner = &s[start + 1..end];
-        let digits = inner
+        let inner = &after[..close];
+        let is_hint = inner
             .strip_suffix(['m', 'M'])
-            .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
-        match digits {
-            Some(_) => s.replace_range(start..=end, ""),
-            None => break,
+            .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
+        if is_hint {
+            rest = &after[close + 1..];
+        } else {
+            // Not a hint: keep the bracket text and continue scanning after it.
+            s.push_str(&rest[open..open + 1 + close + 1]);
+            rest = &after[close + 1..];
         }
     }
+    s.push_str(rest);
+
     if let Some(dash) = s.rfind('-') {
         let suffix = &s[dash + 1..];
         if suffix
@@ -127,30 +139,28 @@ pub fn extract_model_family_version(value: &str) -> Option<String> {
             i += 1;
         }
         let major: String = chars[start..i].iter().collect();
+        let after_major = i;
         // Optional `-`/`.` followed by digits.
         if i + 1 < chars.len()
             && (chars[i] == '-' || chars[i] == '.')
             && chars[i + 1].is_ascii_digit()
         {
-            i += 1;
-            let minor_start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
+            let mut end = i + 1;
+            let minor_start = end;
+            while end < chars.len() && chars[end].is_ascii_digit() {
+                end += 1;
             }
-            let boundary_after = i == chars.len() || !is_word(chars[i]);
-            if boundary_after {
-                let minor: String = chars[minor_start..i].iter().collect();
+            if end == chars.len() || !is_word(chars[end]) {
+                let minor: String = chars[minor_start..end].iter().collect();
                 return Some(format!("{major}.{minor}"));
             }
-            // Not a version pair (`4-6x`): fall through to the bare major only
-            // if it itself ends at a boundary.
-            i = minor_start;
         }
-        let boundary_after = i == chars.len() || !is_word(chars[i]);
-        if boundary_after {
+        // The regex backtracks: when the pair fails its trailing `\b`, the bare
+        // major can still match if it ends at a boundary (`4-6x` -> "4").
+        if after_major == chars.len() || !is_word(chars[after_major]) {
             return Some(major);
         }
-        i += 1;
+        i = after_major + 1;
     }
     None
 }
@@ -1188,14 +1198,17 @@ pub fn immediate_context_window(
 
 /// Whether a background `getContextUsage` answer is still current
 /// (`refreshContextWindowInBackground`'s `stillCurrent`): the window must still
-/// be non-authoritative and the session must still be on the model the request
-/// was issued for (F5b/A-10).
+/// be non-authoritative, the session must still be on the model the request was
+/// issued for (F5b/A-10), and the child query must be the one that issued it
+/// (FA4-06; Node's `session.query === query`, `acp-agent.ts:10483-10491`).
 pub fn context_window_answer_is_current(
     authoritative: bool,
     current_model_id: &str,
     answer_model_id: &str,
+    answer_generation: u64,
+    current_generation: u64,
 ) -> bool {
-    !authoritative && current_model_id == answer_model_id
+    !authoritative && current_model_id == answer_model_id && answer_generation == current_generation
 }
 
 #[cfg(test)]
@@ -1447,6 +1460,19 @@ mod tests {
         assert!(!narrowed);
     }
 
+    /// FA3-15 — every `[<digits>m]` anywhere is stripped (Node's global regex),
+    /// not just a trailing one.
+    #[test]
+    fn fa3_15_strip_context_hints_removes_every_token() {
+        assert_eq!(
+            strip_context_hints("claude[1m]-opus[foo]"),
+            "claude-opus[foo]"
+        );
+        assert_eq!(strip_context_hints("a[2m]b[3M]c"), "abc");
+        assert_eq!(strip_context_hints("claude-opus-4-6-1m"), "claude-opus-4-6");
+        assert_eq!(strip_context_hints("claude[notahint]"), "claude[notahint]");
+    }
+
     // O-40: `-1m` canonicalizes to `[1m]`, but the tokenizer only reads a
     // literal trailing `[1m]` as a hint, and a hint anywhere else in the id is
     // not a hint at all.
@@ -1515,6 +1541,27 @@ mod tests {
             "claude-opus-4-6",
             &model("custom-opus", "Custom")
         ));
+    }
+
+    // FA1-10 (`session-model.ts:38-43`): the regex backtracks to the bare major
+    // when `[-.]<digits>` is not followed by a word boundary, so `4-6x` is "4"
+    // (Node `\b(\d+)(?:[-.](\d+))?\b`).
+    #[test]
+    fn fa1_10_family_version_backtracks_to_the_bare_major() {
+        assert_eq!(extract_model_family_version("4-6x"), Some("4".into()));
+        assert_eq!(extract_model_family_version("4.6x"), Some("4".into()));
+        assert_eq!(
+            extract_model_family_version("claude-opus-4-6x"),
+            Some("4".into())
+        );
+        // A boundary after the minor keeps the pair.
+        assert_eq!(
+            extract_model_family_version("claude-opus-4-6-opus"),
+            Some("4.6".into())
+        );
+        // A digit run inside a word has no leading boundary at all.
+        assert_eq!(extract_model_family_version("4x6"), None);
+        assert_eq!(extract_model_family_version("opus4-6x"), None);
     }
 
     // O-39: opusplan folds to opus; best/default/claude tokens drop out.
@@ -1791,9 +1838,23 @@ mod tests {
     // authoritative or the session switched models while it was in flight.
     #[test]
     fn f5b_context_window_answer_still_current() {
-        assert!(context_window_answer_is_current(false, "sonnet", "sonnet"));
-        assert!(!context_window_answer_is_current(false, "opus", "sonnet"));
-        assert!(!context_window_answer_is_current(true, "sonnet", "sonnet"));
+        assert!(context_window_answer_is_current(
+            false, "sonnet", "sonnet", 0, 0
+        ));
+        assert!(!context_window_answer_is_current(
+            false, "opus", "sonnet", 0, 0
+        ));
+        assert!(!context_window_answer_is_current(
+            true, "sonnet", "sonnet", 0, 0
+        ));
+        // FA4-06: an answer issued against a replaced child query is stale
+        // (`session.query === query`), even on the same model.
+        assert!(!context_window_answer_is_current(
+            false, "sonnet", "sonnet", 0, 1
+        ));
+        assert!(context_window_answer_is_current(
+            false, "sonnet", "sonnet", 1, 1
+        ));
     }
 
     // B-69/B-71: immediateContextWindow reads the cross-session cache first,

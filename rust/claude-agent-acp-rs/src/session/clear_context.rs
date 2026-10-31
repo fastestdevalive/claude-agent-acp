@@ -299,7 +299,7 @@ mod tests {
             agent: Some("reviewer".into()),
             effort: Some("high".into()),
             permission_mode: Some("plan".into()),
-            max_turns: Some(7),
+            max_turns: Some("7".into()),
             ..SpawnOptions::default()
         }
     }
@@ -322,7 +322,11 @@ mod tests {
         assert_eq!(spawn.agent, None, "the default agent is not pinned");
         assert_eq!(spawn.effort.as_deref(), Some("low"));
         assert_eq!(spawn.permission_mode.as_deref(), Some("acceptEdits"));
-        assert_eq!(spawn.max_turns, Some(7), "other options are kept");
+        assert_eq!(
+            spawn.max_turns,
+            Some("7".to_string()),
+            "other options are kept"
+        );
 
         let defaults = RestartParams {
             model: DEFAULT_MODEL_ID.into(),

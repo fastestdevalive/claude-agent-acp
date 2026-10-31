@@ -240,6 +240,89 @@ fn test_o86_v1_set_session_config_option_request() {
         .contains("Config option values of type _range are not supported"));
 }
 
+/// FA1-03 — `SetSessionConfigOptionRequest.isId`/`isBoolean`
+/// (`guards.gen.js:929-933`) require the exact tag AND a valid payload; a
+/// missing/null/non-string `type` (or an ill-typed `value`) falls through to
+/// `invalidParams({type}, "Config option values of type <String(type)> are not
+/// supported")` (`v2/session.ts:114-122`). `JSON.stringify` drops an undefined
+/// `type` key, so the missing case carries `data:{}`.
+#[test]
+fn fa1_03_v2_set_config_option_requires_a_valid_tag_and_payload() {
+    // Missing type: Node's `${params.type}` is "undefined" and data is `{}`.
+    let err = v1_set_session_config_option_request(&json!({
+        "sessionId": "s",
+        "configId": "mode",
+        "value": "plan"
+    }))
+    .expect_err("a missing type must be rejected");
+    assert_eq!(i32::from(err.code), -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: Config option values of type undefined are not supported"
+    );
+    assert_eq!(err.data, Some(json!({})));
+
+    // Explicit null: `${null}` is "null", data keeps the key.
+    let err = v1_set_session_config_option_request(&json!({
+        "sessionId": "s",
+        "configId": "mode",
+        "type": null,
+        "value": "plan"
+    }))
+    .expect_err("a null type must be rejected");
+    assert_eq!(i32::from(err.code), -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: Config option values of type null are not supported"
+    );
+    assert_eq!(err.data, Some(json!({"type": null})));
+
+    // A number type is stringified into the message.
+    let err = v1_set_session_config_option_request(&json!({
+        "sessionId": "s",
+        "configId": "mode",
+        "type": 5,
+        "value": "plan"
+    }))
+    .expect_err("a number type must be rejected");
+    assert_eq!(i32::from(err.code), -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: Config option values of type 5 are not supported"
+    );
+    assert_eq!(err.data, Some(json!({"type": 5})));
+
+    // A known tag with an ill-typed value matches no guard: Node reports the
+    // tag ("id"), not the value type.
+    let err = v1_set_session_config_option_request(&json!({
+        "sessionId": "s",
+        "configId": "mode",
+        "type": "id",
+        "value": 7
+    }))
+    .expect_err("an id tag with a non-string value must be rejected");
+    assert_eq!(i32::from(err.code), -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: Config option values of type id are not supported"
+    );
+    assert_eq!(err.data, Some(json!({"type": "id"})));
+
+    let err = v1_set_session_config_option_request(&json!({
+        "sessionId": "s",
+        "configId": "auto_approve",
+        "type": "boolean",
+        "value": "true"
+    }))
+    .expect_err("a boolean tag with a non-boolean value must be rejected");
+    assert_eq!(i32::from(err.code), -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: Config option values of type boolean are not supported"
+    );
+    assert_eq!(err.data, Some(json!({"type": "boolean"})));
+}
+
 #[test]
 fn test_m118_extension_methods() {
     assert!(is_extension_method("_auth/status_update"));
@@ -437,12 +520,12 @@ fn test_l4_negotiate_initialize_errors_match_upstream() {
         Some(json!({ "requested": 0, "supported": [1, 2] }))
     );
 
-    // Missing, string, float, negative and out-of-range versions are invalid
-    // params with the detail as `data` (a float 2.0 is not a version).
+    // Missing, string, fractional, negative and out-of-range versions are
+    // invalid params with the detail as `data` (`protocol-router.js:386-391`).
     for params in [
         json!({}),
         json!({ "protocolVersion": "2" }),
-        json!({ "protocolVersion": 2.0 }),
+        json!({ "protocolVersion": 2.5 }),
         json!({ "protocolVersion": -1 }),
         json!({ "protocolVersion": 70000 }),
         json!(null),
@@ -456,6 +539,17 @@ fn test_l4_negotiate_initialize_errors_match_upstream() {
                 "initialize.protocolVersion must be a valid ACP protocol version"
             ))
         );
+    }
+
+    // FA3b-02: `JSON.parse("2.0")` is the integer 2, so a serializer that
+    // writes the version as a float still routes like Node.
+    for (params, mode) in [
+        (json!({ "protocolVersion": 2.0 }), ProtocolMode::V2),
+        (json!({ "protocolVersion": 1.0 }), ProtocolMode::V1),
+        (json!({ "protocolVersion": 3.0 }), ProtocolMode::V2),
+    ] {
+        let negotiated = negotiate_initialize(&params, true).expect("integral float routes");
+        assert_eq!(negotiated.mode, mode, "{params}");
     }
 }
 
@@ -487,7 +581,19 @@ fn test_l4_route_first_frame_error_shapes() {
         "method": "initialize",
         "params": { "protocolVersion": 2.0 }
     });
-    match route_first_frame(&float_version, true) {
+    // FA3b-02 (`protocol-router.js:386-391`): `JSON.parse("2.0")` is the
+    // integer 2, so the float spelling routes to v2, as Node does.
+    assert_eq!(
+        route_first_frame(&float_version, true),
+        RouteDecision::Route(ProtocolVersion::V2)
+    );
+
+    let fractional_version = json!({
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": 2.5 }
+    });
+    match route_first_frame(&fractional_version, true) {
         RouteDecision::Reject {
             code,
             message,

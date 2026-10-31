@@ -1435,15 +1435,20 @@ impl TurnMachine {
             turn.command_started = true;
             self.seed_orphan_by_fate(&turn);
         }
+        // A held turn's force-cancel reports the usage and quota snapshot its
+        // result already recorded, not the live accumulator that may include
+        // follow-up work (`cancelledOutcome`, `acp-agent.ts:11886-11894`; issue
+        // #844). Any other turn reports the live accumulator.
+        let (usage, model_rows) = self.cancelled_outcome_usage();
         if let Some(active) = self.active.as_mut() {
             if !active.settled {
                 active.settled = true;
                 events.push(TurnEvent::Settled {
                     prompt_uuid: active.prompt_uuid.clone(),
                     stop_reason: StopReason::Cancelled,
-                    usage: self.accumulated_usage,
+                    usage,
                     had_usage: true,
-                    model_rows: self.models_snapshot(),
+                    model_rows,
                 });
             }
         }
@@ -1595,11 +1600,22 @@ impl TurnMachine {
                     // absorbed, not read as the freshly-activated turn ending
                     // (`ADP:3034-3050`).
                     self.owed_trailing_idles += 1;
-                    (
-                        StopReason::Cancelled,
-                        self.accumulated_usage,
-                        self.models_snapshot(),
-                    )
+                    // `cancelledOutcome(session, session.activeTurn)`: a held
+                    // turn keeps the usage and quota its result recorded, not
+                    // the live accumulator (`acp-agent.ts:11886-11894`, issue
+                    // #844).
+                    match prev.deferred_settle.as_ref() {
+                        Some(deferred) => (
+                            StopReason::Cancelled,
+                            deferred.usage,
+                            deferred.models.clone(),
+                        ),
+                        None => (
+                            StopReason::Cancelled,
+                            self.accumulated_usage,
+                            self.models_snapshot(),
+                        ),
+                    }
                 } else if let Some(deferred) = prev.deferred_settle.clone() {
                     // A held turn hands off with its recorded outcome and usage
                     // snapshot, not a guessed end_turn (`ADP:3051-3060`).
@@ -2354,12 +2370,20 @@ impl TurnMachine {
                 if active.deferred_settle.is_some() {
                     self.text_stretch_closed = true;
                 }
+                // A cancel ends the turn `cancelled` with the outcome its
+                // result already recorded when it was held open
+                // (`cancelledOutcome`, `acp-agent.ts:11886-11894`); any other
+                // turn settles with its deferred outcome, else the scratch
+                // `end_turn` (`acp-agent.ts:5782-5792`).
                 let (outcome, usage, model_rows) = if self.cancelled {
-                    (
-                        StopReason::Cancelled,
-                        self.accumulated_usage,
-                        self.models_snapshot(),
-                    )
+                    match active.deferred_settle {
+                        Some(deferred) => (StopReason::Cancelled, deferred.usage, deferred.models),
+                        None => (
+                            StopReason::Cancelled,
+                            self.accumulated_usage,
+                            self.models_snapshot(),
+                        ),
+                    }
                 } else if let Some(deferred) = active.deferred_settle {
                     // A held turn's result already recorded its outcome and usage
                     // snapshot — the hold settles with those (`ADP:3059`).

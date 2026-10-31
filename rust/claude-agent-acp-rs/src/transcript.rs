@@ -2177,22 +2177,30 @@ impl<'a> ReplayRun<'a> {
 
         // B-50 (`acp-agent.ts:9403-9422`): a persisted compact summary replays
         // as one completed compaction entity at its position, not as chat text.
-        // Only a client that takes ID-addressed compaction updates gets it.
+        // Only a client that takes ID-addressed compaction updates gets it, and
+        // only a top-level record with a non-empty string uuid and a recognised
+        // summary body (`parentToolUseId === null`, `typeof uuid === "string"`,
+        // `recordSummary(...)`); anything else stays ordinary transcript content.
         if self.compaction && crate::context_compaction::is_compact_summary_message(message) {
-            let content = payload.get("content").cloned().unwrap_or(Value::Null);
-            if let Some(summary) = compact_summary_text_of(&content) {
-                let compaction_id = message
-                    .get("uuid")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                self.push(json!({
-                    "sessionUpdate": "compaction_update",
-                    "compactionId": compaction_id,
-                    "status": "completed",
-                    "summary": [{ "type": "text", "text": summary }],
-                }));
+            let top_level = parent_tool_use_id_of(message).is_none();
+            let uuid = message
+                .get("uuid")
+                .and_then(Value::as_str)
+                .filter(|uuid| !uuid.is_empty());
+            if top_level {
+                if let Some(uuid) = uuid {
+                    let content = payload.get("content").cloned().unwrap_or(Value::Null);
+                    if let Some(summary) = compact_summary_text_of(&content) {
+                        self.push(json!({
+                            "sessionUpdate": "compaction_update",
+                            "compactionId": uuid,
+                            "status": "completed",
+                            "summary": [{ "type": "text", "text": summary }],
+                        }));
+                        return;
+                    }
+                }
             }
-            return;
         }
 
         if role == "assistant" && is_synthetic_login_message(message) {
@@ -3559,6 +3567,84 @@ mod tests {
             legacy[1]["update"]["sessionUpdate"],
             json!("user_message_chunk")
         );
+    }
+
+    /// FA2-B-50 (`acp-agent.ts:9403-9422`): the compaction replay requires a
+    /// top-level record (`parentToolUseId === null`), a non-empty string uuid
+    /// and a recognised summary body; otherwise the record stays transcript
+    /// content instead of becoming a `compaction_update`.
+    #[test]
+    fn fa2_b50_compact_summary_replay_guards() {
+        let summary = "<summary>\nReal summary\n</summary>";
+        let nested = json!({
+            "type": "user",
+            "uuid": "nested-uuid",
+            "parent_tool_use_id": "toolu_parent",
+            "isCompactSummary": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": summary}]}
+        });
+        let missing_uuid = json!({
+            "type": "user",
+            "isCompactSummary": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": summary}]}
+        });
+        let empty_uuid = json!({
+            "type": "user",
+            "uuid": "",
+            "isCompactSummary": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": summary}]}
+        });
+        // No recognised text: Node's `recordSummary` fails and the record
+        // replays as ordinary content instead of vanishing.
+        let no_summary_text = json!({
+            "type": "user",
+            "uuid": "image-uuid",
+            "isCompactSummary": true,
+            "message": {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "data": "", "media_type": "image/png"}}
+            ]}
+        });
+
+        for message in [nested, missing_uuid, empty_uuid] {
+            let (out, _, _) = replay_session(
+                &[message],
+                ID,
+                false,
+                false,
+                ReplaySinks {
+                    compaction: true,
+                    ..ReplaySinks::default()
+                },
+            );
+            assert!(
+                out.iter()
+                    .all(|n| n["update"]["sessionUpdate"] != "compaction_update"),
+                "{out:?}"
+            );
+            assert_eq!(
+                out.first().map(|n| &n["update"]["sessionUpdate"]),
+                Some(&json!("user_message_chunk")),
+                "{out:?}"
+            );
+        }
+
+        let (out, _, _) = replay_session(
+            &[no_summary_text],
+            ID,
+            false,
+            false,
+            ReplaySinks {
+                compaction: true,
+                ..ReplaySinks::default()
+            },
+        );
+        assert!(
+            out.iter()
+                .all(|n| n["update"]["sessionUpdate"] != "compaction_update"),
+            "{out:?}"
+        );
+        assert_eq!(out.len(), 1, "the record must not vanish: {out:?}");
+        assert_eq!(out[0]["update"]["sessionUpdate"], "user_message_chunk");
     }
 
     fn notification_text(task_id: &str, status: &str, tool_use_id: &str) -> String {

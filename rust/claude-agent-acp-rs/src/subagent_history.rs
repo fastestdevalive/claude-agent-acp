@@ -50,6 +50,9 @@ pub struct SubagentHistory {
     /// The session transcript the history was read from, so a lineage read over
     /// a cached history does not search the project directories again.
     pub transcript: Option<PathBuf>,
+    /// The `<claudeConfigDir>/projects` root, so [`read_subagent_messages`] can
+    /// retry the SDK's all-project search (`subagent-history.ts:250-268`).
+    pub projects_root: Option<PathBuf>,
 }
 
 impl SubagentHistory {
@@ -69,7 +72,12 @@ pub(crate) fn is_regular_metadata_file(path: &Path) -> bool {
 /// Finds the subagent transcripts of `session_id` (`subagentHistory`).
 #[must_use]
 pub fn subagent_history(session_id: &str, env: &EnvSnapshot) -> SubagentHistory {
-    let mut history = SubagentHistory::default();
+    let mut history = SubagentHistory {
+        // Kept even when the session has no metadata or transcript: Node's
+        // reader retries without `dir`, which searches every project directory.
+        projects_root: Some(crate::session_store::projects_root_with_env(env)),
+        ..SubagentHistory::default()
+    };
     let Some(transcript) = crate::resumed_session::find_transcript_with_env(session_id, env) else {
         return history;
     };
@@ -519,9 +527,45 @@ pub fn read_subagent_messages(
     history: &SubagentHistory,
     logger: HistoryLogger<'_>,
 ) -> Vec<Value> {
-    let Some(directory) = &history.subagents_dir else {
+    if let Some(directory) = &history.subagents_dir {
+        let messages = read_agent_chain(session_id, agent_id, directory, history, logger);
+        if !messages.is_empty() {
+            return messages;
+        }
+    }
+    // Node retries without `dir` when the session's own project directory yields
+    // nothing (`subagent-history.ts:250-268`), which makes the SDK search every
+    // project directory. A missing transcript is not logged there.
+    let Some(root) = &history.projects_root else {
         return Vec::new();
     };
+    for project in crate::session_store::all_project_dirs(root) {
+        let directory = project.join(session_id).join("subagents");
+        if history.subagents_dir.as_deref() == Some(directory.as_path()) {
+            continue;
+        }
+        let file = directory.join(format!("agent-{agent_id}.jsonl"));
+        if !std::fs::metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let messages = read_agent_chain(session_id, agent_id, &directory, history, logger);
+        if !messages.is_empty() {
+            return messages;
+        }
+    }
+    Vec::new()
+}
+
+/// The active chain of `agent_id`'s transcript in `directory`, or an empty list
+/// when it cannot be read. `history` supplies the launch metadata when known;
+/// otherwise the sibling `agent-<id>.meta.json` does.
+fn read_agent_chain(
+    session_id: &str,
+    agent_id: &str,
+    directory: &Path,
+    history: &SubagentHistory,
+    logger: HistoryLogger<'_>,
+) -> Vec<Value> {
     let file = directory.join(format!("agent-{agent_id}.jsonl"));
     // A special file (such as a FIFO) or a directory is skipped: opening it could
     // block forever or fail. Symlinks are followed like upstream.
@@ -1226,6 +1270,99 @@ mod tests {
         assert_eq!(messages[1]["message"]["content"][0]["text"], "Report.");
         // A missing transcript is an empty list, not an error.
         assert!(read_subagent_messages(SESSION, "gone", &history, None).is_empty());
+    }
+
+    /// Writes an agent transcript (and optional meta) into `directory`, with
+    /// the sidechain markers the SDK reader expects.
+    fn write_agent_transcript(
+        directory: &Path,
+        agent_id: &str,
+        meta: Option<Value>,
+        records: Vec<Value>,
+    ) {
+        std::fs::create_dir_all(directory).expect("agent dir");
+        let mut parent: Option<String> = None;
+        let mut out = String::new();
+        for record in records {
+            let mut record = record;
+            let has_parent = record.get("parentUuid").is_some();
+            if let Some(object) = record.as_object_mut() {
+                object.insert("isSidechain".to_string(), json!(true));
+                object.insert("agentId".to_string(), json!(agent_id));
+                if !has_parent {
+                    object.insert("parentUuid".to_string(), json!(parent));
+                }
+            }
+            parent = record
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            out.push_str(&record.to_string());
+            out.push('\n');
+        }
+        std::fs::write(directory.join(format!("agent-{agent_id}.jsonl")), out)
+            .expect("agent transcript");
+        if let Some(meta) = meta {
+            std::fs::write(
+                directory.join(format!("agent-{agent_id}.meta.json")),
+                meta.to_string(),
+            )
+            .expect("meta");
+        }
+    }
+
+    /// FA2-B-102 (`subagent-history.ts:250-268`): when the session's own
+    /// project directory yields no messages, the reader retries without `dir`,
+    /// so the SDK searches every project directory; a subagent transcript kept
+    /// under another project is still restored.
+    #[test]
+    fn fa2_b102_falls_back_to_another_project_directory() {
+        let fx = fixture("cross-project");
+        // The session transcript is in the fixture project; nothing else is.
+        write_session(&fx, vec![user("u1", "Go")], vec![]);
+        let other = fx
+            .dir
+            .join("projects")
+            .join("-other-proj")
+            .join(SESSION)
+            .join("subagents");
+        write_agent_transcript(
+            &other,
+            "echoer1",
+            Some(meta("launch-echoer", "echoer")),
+            vec![user("e1", "Work")],
+        );
+
+        let history = subagent_history(SESSION, &fx.env);
+        assert!(history.agents.is_empty(), "{history:?}");
+        let messages = read_subagent_messages(SESSION, "echoer1", &history, None);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0]["uuid"], json!("e1"));
+        assert_eq!(messages[0]["session_id"], json!(SESSION));
+        assert_eq!(messages[0]["parent_tool_use_id"], json!("launch-echoer"));
+    }
+
+    /// FA2-B-102: a subagent whose metadata file is missing still has its
+    /// transcript (the SDK's all-project search finds it); only the launch
+    /// metadata is unknown, so `parent_tool_use_id` is null.
+    #[test]
+    fn fa2_b102_reads_an_agent_whose_meta_file_is_missing() {
+        let fx = fixture("no-meta");
+        write_session(&fx, vec![user("u1", "Go")], vec![]);
+        let subagents = fx
+            .dir
+            .join("projects")
+            .join("-tmp-proj")
+            .join(SESSION)
+            .join("subagents");
+        write_agent_transcript(&subagents, "echoer1", None, vec![user("e1", "Work")]);
+
+        let history = subagent_history(SESSION, &fx.env);
+        assert!(history.agents.is_empty(), "{history:?}");
+        let messages = read_subagent_messages(SESSION, "echoer1", &history, None);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0]["uuid"], json!("e1"));
+        assert_eq!(messages[0]["parent_tool_use_id"], Value::Null);
     }
 
     /// `native-subagents.test.ts` > RFD restore > "keeps an agent that the
