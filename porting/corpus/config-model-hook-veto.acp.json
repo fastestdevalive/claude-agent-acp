@@ -1,0 +1,9 @@
+{
+  "permission": "allow",
+  "env": {"ANTHROPIC_MODEL": "opus"},
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}}
+  ]
+}

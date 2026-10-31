@@ -8,12 +8,14 @@ mod common;
 use common::{read_json, repo_root, run_recorder_with_init, rust_agent_binary};
 
 /// Scripts that record their own `initialize` control_request.
-const INIT_SCRIPTS: [&str; 5] = [
+const INIT_SCRIPTS: [&str; 7] = [
     "system-prompt-append",
     "system-prompt-override",
     "system-prompt-load",
     "custom-instructions",
     "system-prompt-combined",
+    "system-prompt-meta-string",
+    "system-prompt-meta-preset",
 ];
 
 /// 1.3 / 3.1 (INV-39) — for every system-prompt script the Rust initialize request carries

@@ -4,7 +4,7 @@ feature: claude-master
 worktree: /Users/gb/.vibe-station/projects/claude-acp-rust-eval/worktrees/care-1
 base: aff399a (branch feat/rust-port, macOS; only `.gitignore` is dirty and stays uncommitted)
 pin: porting/UPSTREAM_VERSION = 0.94.0 (tag v0.94.0 = 7bcbfc7a)
-executor: ONE haiku terminal-mode LEAD (vst mode mode-1789474690627-p55ag, channel tmux) fanning out to haiku terminal subagents
+executor: SUPERSEDED by RE-PLAN v2 (end of file): FIVE sequential deepseek vst subagent turns (mode-1792593073043-0d981); haiku lead and agy-medium dropped; the Sonnet orchestrator implements NOTHING
 orchestrator: Sonnet (re-runs the gate per commit, runs Opus audits at checkpoints)
 inputs: ROADMAP.md (62 packages), plan-parity-infra.md, plan-rust-live-divergences.md, plan-rust-air-gaps.md, plan-rust-parity-fixes.md, <scratch>/prompts/lead-common.md
 ---
@@ -726,3 +726,46 @@ Test files not covered by a "matching module" rule (each is ALSO read by the nam
 | `rust/claude-agent-acp-rs/tests/{parity_maps,race_suite,live_smoke,shutdown,bench_runtime}.rs` | **New** | Stages 2,5,12 | programs |
 | `rust/{acp-recorder,fake-claude}/src/*` | **Modified** | Stage 5, 11 | elicitation reply, multi-spawn, v2 variant |
 | `.vibekit/feature-plans/pending/claude-master/.sdlc-state.yaml` | **New** | now | master state |
+
+
+---
+
+## RE-PLAN v2 — five deepseek turns (SUPERSEDES stages 2-13 executor/parallelism; scope, order and acceptance text above still bind)
+
+> User decision: every implementation turn is a deepseek vst subagent (`mode-1792593073043-0d981`); no haiku, no agy-medium, no implementation by the Sonnet orchestrator (hazard fixes and Opus-review fixes included). Orchestrator only: spawn/respawn, gate, re-run checks, commit, Opus review, STATUS.
+
+### Rules for the five turns (revised after the Opus plan review, one round: `S/review-replan5.md`, 12 edits applied)
+
+- **Turn** = one coherent package list. **EVERY group (commit unit) runs in its OWN FRESH deepseek subagent** (`vst agent create` per group, terminated after its result is consumed; never send a follow-up group to an old session; a stall = fresh respawn resuming at the first unticked checkpoint from `porting/parity/turn-N-progress.md` and the current tree state). User correction after T1-G1b. Every session id is logged in STATUS.md model log. (Orchestrator interpretation; stated to the user in chat.)
+- **Groups** = commit units. After each group the subagent writes `READY:<group>` in `turn-N-progress.md` and ends its turn; the orchestrator gates + commits, then continues. `turn-N-progress.md` is committed with each group and deleted by the last commit of the turn.
+- **Work-order per group** (written by the orchestrator, prompt-writing only): row IDs, upstream file:line, Rust file:line, failing-first test names, corpus names for `capture.sh`, exact acceptance commands, file scope from the card `rust:` line. Fixed prompt preamble `S/prompts/ds-common.md`.
+- **Turns are sequential** T1 -> T5; **inside a turn up to 2 deepseek sessions run in parallel (user decision), each in its OWN isolated git worktree** (lane A = main tree, lane B = detached worktree outside the repo, no UUID in its path, Node oracle via `UPSTREAM_CACHE_DIR`), only for file-disjoint groups; lane subagents flip their FEATURES rows in place but never edit header counts/STATUS/turn-1-progress (the orchestrator recomputes and merges with `git apply --3way`, gates, commits one group at a time). "Primary files" below are NOT exclusive.
+- **Failure accounting (per GROUP):** first attempt + ONE fresh respawn (not a nudge); a second failure of the same group => STOP and tell the user, no model switch. A red gate may be sent back at most 2 times; the 3rd red counts as a failure. **Stall rule:** no `READY` and no working-tree change for 15 min, or output containing tool-call-shaped text with no tool run => stall. Hazard rule "an `inv_16|23|29|30|31|steer_*` test needs a non-mechanical edit" => STOP and tell the user.
+- **Stall mitigation in every prompt:** "run each command with the real tool and show its output; never print a tool call as text"; narrow file scope.
+- **Subagent limits:** no git write commands; own `CARGO_TARGET_DIR` outside the repo (orchestrator detached gates run WITHOUT it, from a path with no UUID segment); no pkill by name; no env VALUES printed; `porting/record-real.sh` untouched.
+- **Guards restated in prompts:** G7 only `rust/`, `porting/`, `skills/`, `.vibekit/`, root `.gitignore`; G9 platform `cfg` ONLY in `process.rs` (F2b signals, F5a MDM/registry, F41 PDEATHSIG/kqueue/Job Object); G10 `agent-client-protocol` stays 2.1.0 (v2 F38-F40 and F2c `$/cancel_request` are hand-rolled serde in `v2/**`/`agent.rs`, no crate bump); no new `JsonPath::new`; fixtures only via `bash porting/capture.sh`; NO new `#[ignore]` or corpus-exclusion list without a DECISIONS-FOR-USER entry (gate check); `PARITY_LIVE=1` is opt-in, run by orchestrator/user, never a fixture source, never `record-real.sh`.
+- **Per group:** failing-first non-vacuous tests; Node-captured corpus scenario for wire behaviour; FEATURES.md rows + STATUS flipped in the same diff; each group ports the upstream test cases of the rows it flips and marks them in TEST-MAP in the same diff (T5 G3 handles only the residue).
+- **Orchestrator per group:** full gate (plain + polluted, detached, no UUID path, no CARGO_TARGET_DIR) re-run by me, `JsonPath::new` count 0, G7/G9/G10, then commit. Hazard groups (all of T2, F23a/c, F36, F39): `--lib turn` before+after plus fresh-Opus review of the UNCOMMITTED diff before commit.
+- **Turn boundary:** tell the user in chat; STATUS.md model log names the subagent id per turn/group.
+- **Pre-T1 step (WIP):** the uncommitted PC-1 review fix (c) (`map.rs` finish_result_tool_tracker + test) and the `todo-perm-settle` corpus + `differential.rs` repro are committed as ONE separate PC-1 commit after T1-G0 makes them gate-green (fmt); T2-G1 deletes the `HAZARD_PENDING` exclusion and un-ignores `inv_24_todo_perm_settle`.
+- **Honest sizing:** ~650 non-DONE rows (T1 ~220, T2 ~150, T3 ~180, T4 ~93, T5 programs); if a group cannot be finished it is split as a continuation of the same turn, never a 6th turn and never deferred; if infeasible the orchestrator reports to the user.
+
+### Turn table (primary files are sequential, not exclusive)
+
+| Turn | Packages (FEATURES `[pkg:]` tags) | Primary files | Groups (in order; each one commit unit) | Opus |
+|------|-----------------------------------|---------------|------------------------------------------|------|
+| **T1 Foundations + config + rendering** | PC-1 leftovers (U-26, T-22, T-23, T-25, T-77), PC-2, PC-3, PC-4, INFRA-1, LD-1..3, AG-1/3/4, F1, F2a-c, F3a, **F3b (all)**, F4a-b, F5a-b, F41, F42, CONC-1 (decision measured), F6a-b, FX-1/3/4/5 | `sdk_options.rs session_config.rs settings.rs permission*.rs tools.rs agent.rs control.rs process.rs env_snapshot.rs system_prompt.rs usage.rs quota.rs air.rs session.rs hooks.rs map.rs(render) bin/* fake-claude acp-recorder`, `rust/scripts/parity/**`, `porting/**` | G0 make WIP gate-green (fmt) -> G1 INFRA-1+F1 -> G2 PC-1 leftovers/PC-2/PC-3 -> G3 F3a -> G4 F2a/F2b/F2c(+LD-3 D7) -> G5 F3b -> G6 F4a/F4b+FX-1 -> G7 F5a/F41/F5b+FX-5 -> G8 CONC-1 -> G9 LD-1..3 -> G10 F6b/F6a+FX-3/FX-4 -> G11 AG-1/3/4 -> G12 F42 -> G13 PC-4 | `OPUS-DIFF` G5, G7 |
+| **T2 Turn machine + settle path (HAZARD, one package per group)** | T-21, AG-2, F7a, F7b, F12, F13, F14, F15, F16a, F16b, F16c, F17, F18, F25, F24, F19, F20, F21, F22 (strict ROADMAP order) | `turn.rs session.rs unfinished.rs async_tasks.rs hooks.rs resumed_session.rs map.rs transcript.rs` | G1 T-21 (+delete HAZARD_PENDING, un-ignore) -> AG-2 -> F7a -> F7b -> F12 -> F13 -> F14 -> F15 -> F16a -> F16b -> F16c -> F17 -> F18 -> F25 -> F24 -> F19 -> F20 -> F21 -> F22 (each its own group) | fresh Opus on EVERY group + `--lib turn` before/after |
+| **T3 Elicitation, sessions, auth, rendering rest** | F8, F9, F10, FX-2, F11, F23a-c, F26a-b, F27a-b, F28, F29, F30, F31, F32, F33, F34 | `session_store.rs session_methods.rs auth_status.rs transcript.rs agent.rs permission*.rs tools.rs map.rs(render) settings.rs` + new modules | G1 F8/F9 -> G2 F10+FX-2 -> G3 F11 -> G4 F23a -> G5 F23b -> G6 F23c -> G7 F26-F28 -> G8 F29-F31 -> G9 F32/F33 -> G10 F34 | `OPUS-DIFF` + `--lib turn` F23a, F23c; Opus F23b, F34 |
+| **T4 Subagents + ACP v2** | F35a-c, F36, F37, F38a-b, F39, F40 | new `subagent*.rs`, `v2/**`, `async_tasks.rs`, `agent.rs` router hooks | G1 F35a -> G2 F35b -> G3 F35c -> G4 F36 -> G5 F37 -> G6 F38a -> G7 F38b -> G8 F39 (hazard) -> G9 F40 | Opus F35b, F36 (+turn), F39 (+turn) |
+| **T5 Programs, corpus, final** | CONC-2 (B-17, B-63, Q-82), F43, F44, F45 residue, INFRA-2 (D-03), INFRA-3 (Q-01), MODULE-MAP, DECISIONS, F46 audit-fix continuations | `rust/**`, `porting/**`, `skills/**`, `.vibekit/**` only (G7) | G1 CONC-2 audit table + race suite >=200 (CONC-1 decided in T1) -> G2 corpus completion + gated `PARITY_LIVE=1` smoke (opt-in) -> G3 TEST-MAP residue + INFRA-2/3 -> G4 MODULE-MAP + docs + DECISIONS -> G5.. audit-fix continuations | `PROGRAMS-AUDIT`, `FINAL-AUDIT` fresh Opus rounds until clean, then `CANDIDATE-HEAD` to user + vst verifier |
+
+### Acceptance (unchanged, binding)
+
+- [ ] T1 done (`CHECKPOINT: TURN-1`) — session ids: ____
+- [ ] T2 done — session ids: ____
+- [ ] T3 done — session ids: ____
+- [ ] T4 done — session ids: ____
+- [ ] T5 done, FINAL-AUDIT clean, CANDIDATE-HEAD announced — session ids: ____
+- [ ] Zero PARTIAL/MISSING in FEATURES.md except DECISIONS-FOR-USER (technically impossible) items
+- [ ] No push / tag / squash; `.gitignore` never committed

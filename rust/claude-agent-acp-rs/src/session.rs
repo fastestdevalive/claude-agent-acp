@@ -44,7 +44,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCallStatus,
+    ContentBlock, ContentChunk, MessageId, SessionNotification, SessionUpdate, TextContent,
+    ToolCallStatus,
 };
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -53,7 +54,7 @@ use crate::air::AirClient;
 use crate::async_tasks::AsyncTaskRuntime;
 use crate::control::{Control, ControlOptions, InitializeOptions, RequestHandler};
 use crate::dispatch::{self, Route, StreamMsg};
-use crate::map::{self, MapState, MsgRole};
+use crate::map::{self, MapState};
 use crate::permission;
 use crate::permission_options;
 use crate::process::{self, SpawnOptions, Timings};
@@ -74,9 +75,23 @@ pub enum SessionError {
         /// this is true (`errorKindData(lastAssistantError)`, phase 9).
         assistant_had_error: bool,
     },
+    /// The child exited after an error `result`. `sdk.mjs` `readMessages`
+    /// replaces the transport error with
+    /// `Error("Claude Code returned an error result: <text>")` (F3a (f)).
+    #[error("Claude Code returned an error result: {text}")]
+    ChildErrorResult { text: String },
+    /// A defining `setModel` failure on a fresh session (`session-model.ts:574`):
+    /// Node throws the SDK error, which the ACP router reports as
+    /// `Internal error` with the message in `data.details`.
+    #[error("{0}")]
+    ModelSwitchFailed(String),
     #[error("failed to start the session: {0}")]
     Start(String),
 }
+
+/// The SDK's prefix for a child-exit error that follows an error `result`
+/// (`sdk.mjs` `readMessages`).
+pub(crate) const CHILD_EXIT_PREFIX: &str = "Claude Code returned an error result: ";
 
 /// One item on the session → agent outbound channel (phase 9 flush barrier).
 ///
@@ -216,12 +231,22 @@ pub(crate) enum Command {
         error: String,
         reply: oneshot::Sender<Result<bool, String>>,
     },
-    /// Update context window size from background get_context_usage or initialize info.
-    UpdateContextWindow { size: u64 },
+    /// Update context window size from background get_context_usage. `model_id`
+    /// is the model the request was issued for: the answer is dropped if the
+    /// session switched models meanwhile (F5b/A-10 `stillCurrent`).
+    UpdateContextWindow { size: u64, model_id: String },
     /// Initialize session config state after initialize handshake.
     InitConfig {
         config: crate::session_config::SessionConfigState,
     },
+    /// Seed the actor's slash-command list from the initialize handshake (D5 /
+    /// Decision 9). The proactive advertisement already went out; this is the
+    /// source for every later `commands_changed` / `system/init` re-advertise.
+    InitCommands { commands: Vec<Value> },
+    /// Read the actor's current command list (B-118: an already-live
+    /// `session/resume` re-advertises what the actor holds, not the
+    /// creation-time snapshot).
+    CommandsSnapshot { reply: oneshot::Sender<Vec<Value>> },
     /// Set permission mode (`session/set_mode`).
     SetMode {
         mode_id: String,
@@ -234,12 +259,24 @@ pub(crate) enum Command {
         result: Result<(), String>,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// ExitPlanMode's setMode selection effect: Node `publishCurrent` +
-    /// `updateConfigOption` after an ExitPlanMode allow-with-setMode (no CLI
-    /// control request — the mode is applied to session state only, and
-    /// `current_mode_update` + `config_option_update` are published to the
-    /// client).
-    ExitPlanModeApplied { mode: String },
+    /// The client's answer to a pending permission request, resolved by the
+    /// actor. Node evaluates `isAutoUnavailable` AFTER the client answers
+    /// (`acp-agent.ts:10219`), against the model current at that moment, so the
+    /// actor owns the decision (it holds the live config). It applies
+    /// `applyPermissionFallback` (`session-mode.ts:196-221`), publishes the
+    /// advisory warning for any rewrite, publishes the ExitPlanMode mode
+    /// updates, and then resolves `reply` (Node publishes before returning the
+    /// permission result). Carrying `reply` here means a `Cancel` that aborts
+    /// the permission task after the client answered cannot drop the allow
+    /// (INV-27).
+    PermissionAnswered {
+        value: Value,
+        ctx: Arc<permission_options::OptionsContext>,
+        request_id: String,
+        tool_use_id: String,
+        tool_input: Value,
+        reply: oneshot::Sender<Value>,
+    },
     /// Set config option (`session/set_config_option`).
     SetConfigOption {
         config_id: String,
@@ -281,6 +318,13 @@ pub(crate) enum Command {
             >,
         >,
     },
+    /// Seed the Task* state rebuilt by a `session/load` replay (PC-2.3), plus
+    /// the last plan published during it for the AIR dedupe.
+    SeedTaskState {
+        state: Vec<(String, crate::hooks::TaskStateEntry)>,
+        last_published: Option<String>,
+        reply: oneshot::Sender<()>,
+    },
     /// Inbound `hook_callback` control_request (Decision 12).
     HookCallback {
         request_id: String,
@@ -304,8 +348,13 @@ pub struct SessionOptions {
     /// the connection Registry. Async-task updates (item 3.5) run only when the
     /// client advertised AIR `asyncTasks`.
     pub air: Option<AirClient>,
+    /// The full `initialize.clientCapabilities` parse (ROADMAP F2a), threaded
+    /// from the connection Registry.
+    pub caps: crate::client_caps::ClientCapabilities,
     /// Environment snapshot for hermetic adapter reads.
     pub env: crate::env_snapshot::EnvSnapshot,
+    /// The adapter logger (`CLAUDE_AGENT_LOGS`); `None` when logging is off.
+    pub logger: Option<std::sync::Arc<crate::logger::Logger>>,
 }
 
 impl SessionOptions {
@@ -316,7 +365,9 @@ impl SessionOptions {
             timings,
             initialize,
             air: None,
+            caps: crate::client_caps::ClientCapabilities::default(),
             env: crate::env_snapshot::EnvSnapshot::default(),
+            logger: None,
         }
     }
 
@@ -327,10 +378,24 @@ impl SessionOptions {
         self
     }
 
+    /// Set the full client-capability parse (ROADMAP F2a).
+    #[must_use]
+    pub fn with_caps(mut self, caps: crate::client_caps::ClientCapabilities) -> Self {
+        self.caps = caps;
+        self
+    }
+
     /// Set the environment snapshot.
     #[must_use]
     pub fn with_env(mut self, env: crate::env_snapshot::EnvSnapshot) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Attach the adapter logger (N-05 plugin-error logging).
+    #[must_use]
+    pub fn with_logger(mut self, logger: Option<std::sync::Arc<crate::logger::Logger>>) -> Self {
+        self.logger = logger;
         self
     }
 }
@@ -412,6 +477,7 @@ impl Session {
             session_id.clone(),
             hw,
             opts.air.clone(),
+            opts.caps.clone(),
             opts.spawn
                 .default_cwd
                 .clone()
@@ -419,6 +485,7 @@ impl Session {
                 .unwrap_or_default(),
             resumed,
             opts.env.clone(),
+            opts.logger.clone(),
         ));
 
         // Phase-4 initialize handshake. The actor loop is already running so it
@@ -436,7 +503,6 @@ impl Session {
             .iter()
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
             .collect();
-        let models = sdk_models.clone();
 
         let cwd = opts
             .spawn
@@ -446,6 +512,18 @@ impl Session {
             .unwrap_or_default();
         let settings = crate::settings::load(&cwd, &opts.env);
 
+        // F5b: the backend key scopes the cross-session context-window cache.
+        // It is derived from the exact env handed to the SDK (the adapter env
+        // with the spawn overrides on top), matching Node's `providerCacheKeyFor`.
+        let provider_env = opts
+            .spawn
+            .extra_env
+            .iter()
+            .fold(opts.env.clone(), |env, (key, value)| {
+                env.with_var(key.clone(), value.clone())
+            });
+        let provider_cache_key = crate::session_model::provider_cache_key_for(&provider_env);
+
         let is_resumed = opts.spawn.resume.is_some();
         // MAJOR 2 / P4: read the resumed tail WITH the model (acp-agent.js:8290-8293),
         // so the resumed-model hint actually reaches `get_available_models` and
@@ -454,26 +532,70 @@ impl Session {
             crate::resumed_session::read_resumed_tail_with_env(id, true, &opts.env).model
         });
 
-        let (available_models, current_model_id, needs_set_model) =
-            crate::session_config::get_available_models(
-                &models,
+        // F5b: apply the user's `availableModels` allowlist (with `modelOverrides`
+        // as the surfaced/setModel target) and managed `deniedModels`, then the
+        // gateway narrowing point. The `providers/set` listing that feeds
+        // `narrowToGatewayModels` arrives with F33; with no listing the SDK list
+        // passes through unchanged.
+        let settings_models = match settings.available_models.as_deref() {
+            Some(allowlist) => crate::session_model::apply_available_models_allowlist(
                 &sdk_models,
-                settings.model.as_deref(),
-                opts.env.get("ANTHROPIC_MODEL"),
-                is_resumed,
-                resumed_model_hint.as_deref(),
-            );
+                allowlist,
+                settings.model_overrides.as_ref(),
+                &settings.managed_denied_models,
+                opts.env.get("ANTHROPIC_CUSTOM_MODEL_OPTION"),
+            ),
+            None => sdk_models.clone(),
+        };
+        let (models, narrowed_by_gateway) =
+            crate::session_model::narrow_models_for_gateway(settings_models, None, None);
+        let selection = crate::session_model::get_available_models(
+            &models,
+            &sdk_models,
+            settings.effective.get("model"),
+            opts.env.get("ANTHROPIC_MODEL"),
+            is_resumed,
+            resumed_model_hint.as_deref(),
+            narrowed_by_gateway,
+        );
+        if let Some(diagnostic) = selection.diagnostic.as_deref() {
+            // Node's `logger.error` for a non-string settings.model.
+            eprintln!("{diagnostic}");
+        }
+        let mut current_model_id = selection.current_model_id.clone();
 
-        if needs_set_model {
+        if !selection.skip_set_model {
             let outcome = control
                 .send_request(json!({
                     "subtype": "set_model",
                     "model": &current_model_id,
                 }))
                 .await;
-            if !is_resumed {
-                if let Err(e) = outcome {
-                    return Err(SessionError::Start(format!("set_model failed: {e}")));
+            if let Err(e) = outcome {
+                let error = e.to_string();
+                match crate::session_model::resolve_model_switch_failure(
+                    is_resumed,
+                    selection.switch_to_listed,
+                    &error,
+                    &models,
+                    &selection.model_before_switch,
+                    resumed_model_hint.as_deref(),
+                ) {
+                    crate::session_model::ModelSwitchFailure::Fail(message) => {
+                        return Err(SessionError::ModelSwitchFailed(message));
+                    }
+                    crate::session_model::ModelSwitchFailure::StayOn(fallback) => {
+                        if is_resumed {
+                            eprintln!(
+                                "Failed to re-assert model \"{current_model_id}\" on resume: {error}"
+                            );
+                        } else {
+                            eprintln!(
+                                "Model switch to \"{current_model_id}\" failed or was vetoed by a PreModelSwitch hook; staying on the default model: {error}"
+                            );
+                        }
+                        current_model_id = fallback;
+                    }
                 }
             }
         }
@@ -543,7 +665,7 @@ impl Session {
 
         let config_options = crate::session_config::build_config_options(
             &modes,
-            &available_models,
+            &selection.available_models,
             &current_model_id,
             &model_infos,
             current_effort.as_deref(),
@@ -574,7 +696,7 @@ impl Session {
 
         let config_state = crate::session_config::SessionConfigState {
             modes: modes.clone(),
-            available_models: available_models.clone(),
+            available_models: selection.available_models.clone(),
             current_model_id: current_model_id.clone(),
             model_infos: model_infos.clone(),
             config_options: config_options.clone(),
@@ -585,10 +707,17 @@ impl Session {
             is_air,
             ultracode: settings.ultracode,
             pre_plan_mode: None,
+            provider_cache_key,
         };
 
         let _ = tx.send(Command::InitConfig {
             config: config_state,
+        });
+        // D5 (Decision 9): the actor keeps the initialize handshake's command
+        // list so a `system/init` terminal-command latch or a later
+        // `commands_changed` can rebuild the advertisement without a round-trip.
+        let _ = tx.send(Command::InitCommands {
+            commands: info.commands.clone(),
         });
 
         Ok((
@@ -621,10 +750,31 @@ impl Session {
         &self.session_id
     }
 
+    /// The model the session is currently on, read from the config options
+    /// snapshot (F5b/A-10: the background context-window refresh captures it so
+    /// an answer for a model the session left is dropped).
+    pub fn current_model_id(&self) -> Option<String> {
+        self.config_options
+            .iter()
+            .find(|option| option.id == crate::session_model::MODEL_CONFIG_ID)
+            .map(|option| option.current_value.clone())
+    }
+
     /// The `commands` array from the `initialize` handshake — the source for
     /// the proactive `available_commands_update` (phase 15, Item 1).
     pub fn commands(&self) -> &[Value] {
         &self.commands
+    }
+
+    /// The actor's CURRENT command list: the initialize handshake's, replaced
+    /// by every `commands_changed` frame (D5 / B-118). Falls back to the
+    /// creation-time snapshot when the actor is gone.
+    pub async fn live_commands(&self) -> Vec<Value> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::CommandsSnapshot { reply }).is_err() {
+            return self.commands.clone();
+        }
+        rx.await.unwrap_or_else(|_| self.commands.clone())
     }
 
     /// The session account from the `initialize` handshake, if any.
@@ -760,6 +910,25 @@ impl Session {
         reply_rx.await.map_err(|_| "Session ended".to_string())?
     }
 
+    /// Seed the Task* state rebuilt by a `session/load` replay (PC-2.3) so the
+    /// live actor continues from the replayed plan (Node shares its
+    /// `taskState` map with the replay).
+    pub async fn seed_task_state(
+        &self,
+        state: Vec<(String, crate::hooks::TaskStateEntry)>,
+        last_published: Option<String>,
+    ) -> Result<(), String> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::SeedTaskState {
+                state,
+                last_published,
+                reply,
+            })
+            .map_err(|_| "Session ended".to_string())?;
+        reply_rx.await.map_err(|_| "Session ended".to_string())
+    }
+
     /// Fetch the actor's LIVE modes + config options (MAJOR 5).
     pub async fn live_state(
         &self,
@@ -782,8 +951,13 @@ impl Session {
 /// channel (phase 10). A `can_use_tool` request is routed to the session actor
 /// via [`Command::Permission`] (which owns the `MapState` needed to
 /// `ensure_tool_call_emitted`); the reply resolves with the `control_response`.
-/// Any other subtype falls through to the default `{subtype:"error"}` response
-/// (4.6 / 4.T9).
+///
+/// The handler models the SDK's `processControlRequest` dispatch for the
+/// subtypes the adapter does not own (F3a): the `Z4` machine-only subtypes and
+/// a `request_user_dialog` with no dialog handler return `None` (write
+/// nothing); an `elicitation` with no handler answers the SDK default
+/// `{action:"decline"}`; every other subtype answers an `error` response
+/// carrying the thrown message (`Unsupported control request subtype: X`).
 fn build_permission_request_handler(
     command_tx: mpsc::UnboundedSender<Command>,
 ) -> Arc<RequestHandler> {
@@ -812,9 +986,9 @@ fn build_permission_request_handler(
                     frame,
                     reply: reply_tx,
                 });
-                reply_rx.await.unwrap_or_else(|_| {
+                Some(reply_rx.await.unwrap_or_else(|_| {
                     permission::deny_control_response(&request_id, &tool_use_id)
-                })
+                }))
             } else if subtype == "hook_callback" {
                 let callback_id = frame
                     .pointer("/request/callback_id")
@@ -837,14 +1011,43 @@ fn build_permission_request_handler(
                     tool_use_id,
                     reply: reply_tx,
                 });
-                reply_rx
-                    .await
-                    .unwrap_or_else(|_| crate::hooks::hook_control_response_error(&request_id))
-            } else {
-                json!({
+                Some(
+                    reply_rx
+                        .await
+                        .unwrap_or_else(|_| crate::hooks::hook_control_response_error(&request_id)),
+                )
+            } else if crate::control::SUPPRESSED_SUBTYPES.contains(&subtype)
+                || subtype == "request_user_dialog"
+            {
+                // F3a (a): `Z4` is never answered; a dialog with no handler
+                // stays silent so a capable client (F23b) or the worker's park
+                // deadline settles it.
+                None
+            } else if subtype == "elicitation" {
+                // F3a (b): the SDK's auto-decline is a SUCCESS verdict.
+                Some(json!({
                     "type": "control_response",
-                    "response": { "subtype": "error", "request_id": request_id },
-                })
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": { "action": "decline" },
+                    },
+                }))
+            } else {
+                // F3a (c) / R-07: every error verdict carries the message.
+                let name = if subtype.is_empty() {
+                    "undefined"
+                } else {
+                    subtype
+                };
+                Some(json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "error",
+                        "request_id": request_id,
+                        "error": format!("Unsupported control request subtype: {name}"),
+                    },
+                }))
             }
         })
     }))
@@ -864,9 +1067,11 @@ async fn run(
     session_id: String,
     high_water: Arc<AtomicUsize>,
     air: Option<AirClient>,
+    caps: crate::client_caps::ClientCapabilities,
     cwd: PathBuf,
     resumed: bool,
     env: crate::env_snapshot::EnvSnapshot,
+    logger: Option<std::sync::Arc<crate::logger::Logger>>,
 ) {
     // The `_process` handle is held only for its lifetime (it owns the child and
     // kills it on drop); the actor loop itself never touches it, so the core
@@ -885,9 +1090,11 @@ async fn run(
         session_id,
         high_water,
         air,
+        caps,
         cwd,
         resumed,
         env,
+        logger,
     )
     .await
 }
@@ -907,16 +1114,23 @@ async fn run_loop(
     session_id: String,
     high_water: Arc<AtomicUsize>,
     air: Option<AirClient>,
+    caps: crate::client_caps::ClientCapabilities,
     cwd: PathBuf,
     resumed: bool,
     env: crate::env_snapshot::EnvSnapshot,
+    logger: Option<std::sync::Arc<crate::logger::Logger>>,
 ) {
-    let mut ext = SessionExt::new(air, cwd, env);
+    let mut ext = SessionExt::new(air, cwd, env)
+        .with_caps(caps)
+        .with_logger(logger);
     let mut machine = TurnMachine::new();
     if resumed {
         machine.mark_resumed();
     }
     let mut map_state = MapState::default();
+    // Decision 6: every client gets the session cwd so tool titles/locations
+    // are cwd-relative (Node passes `session.cwd` at every report site).
+    map_state.set_cwd(ext.cwd.clone());
     if ext.air.is_some() {
         map_state.configure_air(ext.cwd.clone());
     }
@@ -931,6 +1145,11 @@ async fn run_loop(
     // Node's `lastAssistantError`, reset per prompt; phase 9). The wire
     // `data.errorKind` is only attached when this is true.
     let mut assistant_had_error = false;
+    // `sdk.mjs` `lastErrorResultText`: the diagnostic carried by the most recent
+    // error `result` frame (cleared by every non-error result). A child that
+    // exits after one reports `Claude Code returned an error result: <text>`
+    // instead of the generic end-of-stream message (F3a (f)).
+    let mut last_error_result_text: Option<String> = None;
     // Subagent attribution (10.5): `task_id -> parentToolUseId` for live
     // background tasks, mirroring the Node's `liveBackgroundTasks` so a
     // subagent's `can_use_tool` is attributed to the Agent/Task tool call that
@@ -971,7 +1190,9 @@ async fn run_loop(
                         &update_tx,
                         &session_id,
                         &high_water,
-                        assistant_had_error,                    );
+                        assistant_had_error,
+                        None,
+                    );
                 }
             }
             cmd = commands.recv() => {
@@ -1013,7 +1234,9 @@ async fn run_loop(
                         &update_tx,
                         &session_id,
                         &high_water,
-                        assistant_had_error,                    );
+                        assistant_had_error,
+                        None,
+                    );
                         // Arm the force-cancel backstop at most once per turn
                         // (11.2, INV-22): if the interrupt below doesn't make the
                         // SDK yield (a wedged TaskOutput block, #680), the active
@@ -1079,6 +1302,7 @@ async fn run_loop(
                             &session_id,
                             &high_water,
                             assistant_had_error,
+                            None,
                         );
                         for uuid in machine.take_abandoned() {
                             if control
@@ -1116,6 +1340,7 @@ async fn run_loop(
                             &session_id,
                             &high_water,
                             assistant_had_error,
+                            None,
                         );
                         emit_raw_updates(tasks.finish_all("stopped"), &update_tx, &session_id);
                         let (flush_tx, flush_rx) = oneshot::channel();
@@ -1148,6 +1373,10 @@ async fn run_loop(
                             .map(|m| m.id.clone())
                             .collect();
                         let pre_plan_mode = ext.config.pre_plan_mode.as_deref();
+                        // The Auto-unavailable decision is made when the client
+                        // ANSWERS (`Command::PermissionAnswered`), not here: the
+                        // model can change while the dialog is open
+                        // (`acp-agent.ts:10219`).
                         let home_dir = ext.env.get_path("HOME");
                         handle_permission(
                             frame,
@@ -1261,17 +1490,24 @@ async fn run_loop(
                         emit_raw_updates(stopped.updates, &update_tx, &session_id);
                         if let Some(name) = stopped.notice_name {
                             // The only acknowledgement the user gets: the SDK
-                            // injects nothing for a stopped task. Rust has no
-                            // `notices`, so it lands in the transcript.
-                            let notice = SessionNotification::new(
-                                session_id.clone(),
-                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                    ContentBlock::Text(TextContent::new(format!(
-                                        "**Task stopped by user:** {name}."
-                                    ))),
-                                )),
+                            // injects nothing for a stopped task. A client on
+                            // the notice contract gets a live `notice`; every
+                            // other client gets the bold-label transcript line.
+                            let notice = crate::notices::SessionNotice::new(
+                                "info",
+                                "Task stopped by user",
+                                Some(format!("{name}.")),
                             );
-                            let _ = update_tx.send(SessionOutbound::Update(notice));
+                            let update = crate::notices::notice_or_transcript_update(
+                                &notice,
+                                ext.supports_notices(),
+                                None,
+                                None,
+                            );
+                            let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                                "sessionId": session_id,
+                                "update": update,
+                            })));
                         }
                         // The response must not overtake its updates: resolve it
                         // behind a Flush barrier (INV-20).
@@ -1286,42 +1522,45 @@ async fn run_loop(
                         tasks.release_stop(&task_id);
                         let _ = reply.send(Err(error));
                     }
-                    Command::UpdateContextWindow { size } => {
+                    Command::InitCommands { commands } => {
+                        ext.commands = commands;
+                    }
+                    Command::CommandsSnapshot { reply } => {
+                        let _ = reply.send(ext.commands.clone());
+                    }
+                    Command::UpdateContextWindow { size, model_id } => {
                         // MAJOR 1 / P4 (acp-agent.js:7884-7891): the background
                         // get_context_usage answer only refines a NON-authoritative
                         // window. Once the window is authoritative (seeded from the
                         // model row, learned from `result.modelUsage`/cache), the
-                        // background result is dropped.
-                        if !ext.usage.authoritative {
-                            ext.usage.update_window_if_positive(Some(size));
-                        }
+                        // background result is dropped. F5b/A-10: it is also
+                        // dropped when the session switched models while the
+                        // request was in flight (`stillCurrent`).
+                        apply_context_window_answer(
+                            &mut ext.usage,
+                            &ext.config.current_model_id,
+                            size,
+                            &model_id,
+                        );
                     }
                     Command::InitConfig { config } => {
-                        // MAJOR 1 / P4: seed the context window at session creation
-                        // from the current model's row (id/displayName/description
-                        // heuristic -> 1M, else the default), mirroring Node's
-                        // `immediateContextWindow` (acp-agent.js:10577-10585). The
-                        // cross-session `contextWindowCache` is a PARITY pending row.
-                        if let Some(info) = config
+                        // MAJOR 1 / P4 + F5b/B-71: seed the context window at
+                        // session creation with `immediateContextWindow`: the
+                        // cross-session cached authoritative value (keyed by the
+                        // backend and the model's resolved id), else the
+                        // id/displayName/description heuristic, else the default.
+                        ext.usage.provider_cache_key = config.provider_cache_key.clone();
+                        let info = config
                             .model_infos
                             .iter()
-                            .find(|m| m.value == config.current_model_id)
-                        {
-                            let texts = [
-                                info.resolved_model.as_deref(),
-                                Some(info.value.as_str()),
-                                Some(info.display_name.as_str()),
-                                Some(info.description.as_str()),
-                            ];
-                            let seed = crate::usage::infer_context_window_from_model(
-                                &texts.into_iter().flatten().collect::<Vec<_>>(),
-                            );
-                            if let Some(size) = seed {
-                                if !ext.usage.authoritative {
-                                    ext.usage.context_window = size;
-                                }
-                            }
-                        }
+                            .find(|m| m.value == config.current_model_id);
+                        let seeded = crate::session_model::immediate_context_window(
+                            &config.provider_cache_key,
+                            &config.current_model_id,
+                            info,
+                        );
+                        ext.usage.context_window = seeded.size;
+                        ext.usage.authoritative = seeded.authoritative;
                         ext.config = config;
                     }
                     Command::SetMode { mode_id, reply } => {
@@ -1354,7 +1593,7 @@ async fn run_loop(
                                 .await;
                             let mode_result = match outcome {
                                 Ok(_) => Ok(()),
-                                Err(_) => Err("Invalid Mode".to_string()),
+                                Err(e) => Err(permission_mode_error(&e)),
                             };
                             let _ = command_tx.send(Command::ModeApplied {
                                 effective_mode,
@@ -1390,16 +1629,12 @@ async fn run_loop(
                                 if effective_mode != requested_mode {
                                     if requested_mode == "auto" && !ext.auto_mode_fallback_warning_shown {
                                         ext.auto_mode_fallback_warning_shown = true;
-                                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
-                                            "sessionId": session_id,
-                                            "update": {
-                                                "sessionUpdate": "agent_message_chunk",
-                                                "content": {
-                                                    "type": "text",
-                                                    "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
-                                                }
-                                            }
-                                        })));
+                                        let _ = update_tx.send(SessionOutbound::RawUpdate(
+                                            auto_mode_fallback_update(
+                                                &session_id,
+                                                ext.supports_notices(),
+                                            ),
+                                        ));
                                     }
                                     let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
                                         "sessionId": session_id,
@@ -1427,32 +1662,25 @@ async fn run_loop(
                             }
                         }
                     }
-                    Command::ExitPlanModeApplied { mode } => {
-                        // Node `publishCurrent` + `updateConfigOption` after an
-                        // ExitPlanMode allow-with-setMode (`acp-agent.js:7665-7677`):
-                        // update the session mode/config state and publish both
-                        // updates to the client. No CLI control request is issued
-                        // (unlike `session/set_mode`).
-                        ext.config.modes.current_mode_id = mode.clone();
-                        for opt in &mut ext.config.config_options {
-                            if opt.id == crate::session_config::MODE_CONFIG_ID {
-                                opt.current_value = mode.clone();
-                            }
-                        }
-                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "current_mode_update",
-                                "currentModeId": mode,
-                            }
-                        })));
-                        let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "config_option_update",
-                                "configOptions": ext.config.config_options,
-                            }
-                        })));
+                    Command::PermissionAnswered { value, ctx, request_id, tool_use_id, tool_input, reply } => {
+                        // Node resolves the answer after the client's response
+                        // (`acp-agent.js:10219-10237`): the Auto check uses the
+                        // model current NOW, the fallback rewrite warns for any
+                        // tool, and an ExitPlanMode allow publishes the mode
+                        // updates before the permission result returns.
+                        let response = resolve_permission_answer(
+                            PermissionAnswer {
+                                value: &value,
+                                ctx: &ctx,
+                                request_id: &request_id,
+                                tool_use_id: &tool_use_id,
+                                tool_input: &tool_input,
+                            },
+                            &mut ext,
+                            &update_tx,
+                            &session_id,
+                        );
+                        let _ = reply.send(response);
                     }
                     Command::SetConfigOption {
                         config_id,
@@ -1525,7 +1753,7 @@ async fn run_loop(
                                     .await;
                                 let mode_result = match outcome {
                                     Ok(_) => Ok(()),
-                                    Err(_) => Err("Invalid Mode".to_string()),
+                                    Err(e) => Err(permission_mode_error(&e)),
                                 };
                                 let _ = command_tx.send(Command::ConfigModeApplied {
                                     requested_mode,
@@ -1605,16 +1833,12 @@ async fn run_loop(
                                 }
                                 if requested_mode == "auto" && effective_mode != requested_mode && !ext.auto_mode_fallback_warning_shown {
                                     ext.auto_mode_fallback_warning_shown = true;
-                                    let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
-                                        "sessionId": session_id,
-                                        "update": {
-                                            "sessionUpdate": "agent_message_chunk",
-                                            "content": {
-                                                "type": "text",
-                                                "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
-                                            }
-                                        }
-                                    })));
+                                    let _ = update_tx.send(SessionOutbound::RawUpdate(
+                                        auto_mode_fallback_update(
+                                            &session_id,
+                                            ext.supports_notices(),
+                                        ),
+                                    ));
                                 }
                                 let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
                                     "sessionId": session_id,
@@ -1650,13 +1874,18 @@ async fn run_loop(
                                 if model_changed {
                                     ext.config.current_model_id = model_val.clone();
                                     let new_model_info = ext.config.model_infos.iter().find(|m| m.value == model_val).cloned();
-                                    // MAJOR 1 / P4: re-seed the context window on a model
-                                    // switch (acp-agent.js:7917-7919) — sized from the new
-                                    // model's row heuristic unless already authoritative.
-                                    let seed = context_window_seed(new_model_info.as_ref(), &model_val);
-                                    ext.usage.context_window =
-                                        seed.unwrap_or(crate::usage::DEFAULT_CONTEXT_WINDOW);
-                                    ext.usage.authoritative = false;
+                                    // F5b/A-05/B-71: re-seed the context window on a
+                                    // model switch with `immediateContextWindow` — the
+                                    // cached authoritative window for (backend, resolved
+                                    // model id), else the text heuristic, else the
+                                    // default (acp-agent.ts:10524-10527). No IPC here.
+                                    let seeded = crate::session_model::immediate_context_window(
+                                        &ext.usage.provider_cache_key,
+                                        &model_val,
+                                        new_model_info.as_ref(),
+                                    );
+                                    ext.usage.context_window = seeded.size;
+                                    ext.usage.authoritative = seeded.authoritative;
                                 }
                                 let new_model_info = ext.config.model_infos.iter().find(|m| m.value == model_val).cloned();
                                 let mut mode_downgraded = false;
@@ -1739,9 +1968,20 @@ async fn run_loop(
                                 }
                                 let downgraded_to = mode_downgraded.then_some(crate::session_config::AUTO_MODE_FALLBACK);
                                 let updates = if notify_client {
-                                    external_switch_updates(&session_id, &ext.config.config_options, downgraded_to, warn)
+                                    external_switch_updates(
+                                        &session_id,
+                                        &ext.config.config_options,
+                                        downgraded_to,
+                                        warn,
+                                        ext.supports_notices(),
+                                    )
                                 } else {
-                                    fallback_updates(&session_id, downgraded_to, warn)
+                                    fallback_updates(
+                                        &session_id,
+                                        downgraded_to,
+                                        warn,
+                                        ext.supports_notices(),
+                                    )
                                 };
                                 for update in updates {
                                     let _ = update_tx.send(SessionOutbound::RawUpdate(update));
@@ -1749,15 +1989,14 @@ async fn run_loop(
                                 if model_changed {
                                     let control = control.clone();
                                     let tx = command_tx.clone();
+                                    let model_id = model_val.clone();
                                     tokio::spawn(async move {
                                         if let Ok(res) = control
                                             .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
                                             .await
                                         {
-                                            if let Some(raw) = crate::control::raw_max_tokens(&res) {
-                                                if raw > 0 {
-                                                    let _ = tx.send(Command::UpdateContextWindow { size: raw });
-                                                }
+                                            if let Some(raw) = crate::usage::raw_max_tokens(&res) {
+                                                let _ = tx.send(Command::UpdateContextWindow { size: raw, model_id });
                                             }
                                         }
                                     });
@@ -1806,6 +2045,18 @@ async fn run_loop(
                             ext.config.config_options.clone(),
                         )));
                     }
+                    Command::SeedTaskState {
+                        state,
+                        last_published,
+                        reply,
+                    } => {
+                        // PC-2.3: adopt the Task* state rebuilt by the replay.
+                        // Node's `forgetPublishedTaskPlan` clears the AIR dedupe
+                        // before the replay, and the replayed plans refill it.
+                        ext.task_state = state;
+                        ext.last_published_task_plan = last_published;
+                        let _ = reply.send(());
+                    }
                     Command::HookCallback {
                         request_id,
                         callback_id,
@@ -1835,7 +2086,27 @@ async fn run_loop(
             msg = stream.recv() => {
                 let Some(line) = msg else {
                     // Stream EOF / codec death (8.9): settle/reject every turn.
-                    let events = machine.on_stream_end();
+                    // The child is gone: stop answering any inbound request
+                    // still queued in the control stream (`sdk.mjs`
+                    // `cleanupPerformed`).
+                    let _ = control.close();
+                    let mut events = machine.on_stream_end();
+                    if let Some(text) = last_error_result_text.take() {
+                        // `sdk.mjs` `readMessages` replaces the child-exit error
+                        // with `lastErrorResultText`; every queued prompt is
+                        // rejected with it (`failAllTurns(error)`).
+                        let message = format!("{CHILD_EXIT_PREFIX}{text}");
+                        for event in &mut events {
+                            if let TurnEvent::Failed {
+                                kind: FailureKind::SessionEnded,
+                                message: rejected,
+                                ..
+                            } = event
+                            {
+                                *rejected = message.clone();
+                            }
+                        }
+                    }
                     settle_events(
                         events,
                         &mut map_state,
@@ -1844,11 +2115,16 @@ async fn run_loop(
                         &update_tx,
                         &session_id,
                         &high_water,
-                        assistant_had_error,                    );
+                        assistant_had_error,
+                        None,
+                    );
                     // 3.5: close every live async task at teardown (`finish_all`).
                     emit_raw_updates(tasks.finish_all("stopped"), &update_tx, &session_id);
                     break;
                 };
+                if line.get("type").and_then(Value::as_str) == Some("result") {
+                    last_error_result_text = error_result_text(&line);
+                }
                 dispatch_stream(
                     StreamMsg::new(line),
                     &control_in_tx,
@@ -1885,7 +2161,10 @@ fn publish_task_plan(
 ) {
     let entries = crate::hooks::task_state_to_plan_entries(&ext.task_state);
 
-    if ext.air_supports("air") {
+    // U-26 (tools.ts:330-352): the dedupe applies to every AIR client, i.e. every
+    // client that declared `_meta.jetbrains.air` as an object (air-extension.ts:119-121),
+    // not only one that also lists an `air` capability. Non-AIR clients get every plan.
+    if ext.air.is_some() {
         let serialized = serde_json::to_string(&entries).unwrap_or_default();
         if ext.last_published_task_plan.as_deref() == Some(&serialized) {
             return;
@@ -1923,30 +2202,43 @@ fn auto_mode_downgrade_needed(info: Option<&crate::session_config::ModelInfo>) -
     info.is_some_and(|m| m.supports_auto_mode != Some(true))
 }
 
-/// Review PC-1 (5): the context-window seed for a switched-to model. A listed model is read from
-/// its fields; an unlisted id is inferred from the id itself (acp-agent.ts:13729-13747).
-fn context_window_seed(
-    info: Option<&crate::session_config::ModelInfo>,
-    model_val: &str,
-) -> Option<u64> {
-    match info {
-        Some(m) => {
-            let texts = [
-                m.resolved_model.as_deref(),
-                Some(m.value.as_str()),
-                Some(m.display_name.as_str()),
-                Some(m.description.as_str()),
-            ];
-            crate::usage::infer_context_window_from_model(
-                &texts.into_iter().flatten().collect::<Vec<_>>(),
-            )
-        }
-        None => crate::usage::infer_context_window_from_model(&[model_val]),
-    }
+// Review PC-1 (5): the context-window seed for a switched-to model now lives
+// in [`crate::session_model::immediate_context_window`] (F5b/B-71).
+
+/// The auto-mode fallback advisory: a live `notice` for a client on the notice
+/// contract, else the bold-label transcript line (`session-mode.ts:287-308`).
+fn auto_mode_fallback_update(session_id: &str, supports_notices: bool) -> Value {
+    const TITLE: &str = "Auto mode unavailable";
+    const REASON: &str =
+        "the selected model does not support Auto mode; using Accept edits instead.";
+    let notice = crate::notices::SessionNotice::new(
+        "warning",
+        TITLE,
+        Some(crate::notices::sentence_case(REASON)),
+    );
+    // The transcript override keeps the lowercase reason; the notice itself
+    // capitalises the fragment because it stands alone after the title.
+    let transcript_notice =
+        crate::notices::SessionNotice::new("warning", TITLE, Some(REASON.to_string()));
+    let transcript = crate::notices::notice_transcript_text(&transcript_notice);
+    json!({
+        "sessionId": session_id,
+        "update": crate::notices::notice_or_transcript_update(
+            &notice,
+            supports_notices,
+            Some(&transcript),
+            None,
+        ),
+    })
 }
 
 /// The current_mode_update and fallback warning of a model-driven auto-mode downgrade.
-fn fallback_updates(session_id: &str, downgraded_to: Option<&str>, warn: bool) -> Vec<Value> {
+fn fallback_updates(
+    session_id: &str,
+    downgraded_to: Option<&str>,
+    warn: bool,
+    supports_notices: bool,
+) -> Vec<Value> {
     let Some(mode) = downgraded_to else {
         return Vec::new();
     };
@@ -1955,16 +2247,7 @@ fn fallback_updates(session_id: &str, downgraded_to: Option<&str>, warn: bool) -
         "update": {"sessionUpdate": "current_mode_update", "currentModeId": mode},
     })];
     if warn {
-        out.push(json!({
-            "sessionId": session_id,
-            "update": {
-                "sessionUpdate": "agent_message_chunk",
-                "content": {
-                    "type": "text",
-                    "text": "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
-                }
-            }
-        }));
+        out.push(auto_mode_fallback_update(session_id, supports_notices));
     }
     out
 }
@@ -1977,8 +2260,9 @@ fn external_switch_updates(
     config_options: &[crate::session_config::ConfigOption],
     downgraded_to: Option<&str>,
     warn: bool,
+    supports_notices: bool,
 ) -> Vec<Value> {
-    let mut out = fallback_updates(session_id, downgraded_to, warn);
+    let mut out = fallback_updates(session_id, downgraded_to, warn, supports_notices);
     out.push(json!({
         "sessionId": session_id,
         "update": {"sessionUpdate": "config_option_update", "configOptions": config_options},
@@ -2125,8 +2409,18 @@ fn handle_hook_callback(
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
         crate::hooks::TASK_CREATED_HOOK_ID => {
-            if let Some(task_id) = input.get("task_id").and_then(Value::as_str) {
-                if let Some(task_subject) = input.get("task_subject").and_then(Value::as_str) {
+            // T-77 (tools.ts:467, 470): an empty task_id or task_subject is rejected
+            // before the state is touched or a plan published.
+            if let Some(task_id) = input
+                .get("task_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                if let Some(task_subject) = input
+                    .get("task_subject")
+                    .and_then(Value::as_str)
+                    .filter(|subject| !subject.is_empty())
+                {
                     if !ext.task_state.iter().any(|(id, _)| id == task_id) {
                         ext.task_state.push((
                             task_id.to_string(),
@@ -2147,7 +2441,11 @@ fn handle_hook_callback(
             let _ = reply.send(crate::hooks::hook_control_response_success(request_id));
         }
         crate::hooks::TASK_COMPLETED_HOOK_ID => {
-            if let Some(task_id) = input.get("task_id").and_then(Value::as_str) {
+            if let Some(task_id) = input
+                .get("task_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
                 if let Some((_, entry)) = ext.task_state.iter_mut().find(|(id, _)| id == task_id) {
                     if entry.status != "completed" {
                         entry.status = "completed".to_string();
@@ -2253,6 +2551,7 @@ fn handle_session_frame(
                     session_id,
                     high_water,
                     *assistant_had_error,
+                    None,
                 );
             }
             // Phase 15 (Item 3): a `user` frame also carries tool results. When
@@ -2338,35 +2637,17 @@ fn handle_session_frame(
                                     }
                                     if !is_err {
                                         let input = tool_use.get("input").unwrap_or(&Value::Null);
-                                        if name == "TaskCreate" {
-                                            let parsed_id = crate::hooks::parse_task_create_output(
-                                                &block["content"],
-                                            );
-                                            crate::hooks::apply_task_create(
-                                                &mut ext.task_state,
-                                                input,
-                                                parsed_id.as_deref(),
-                                            );
+                                        // T-22/T-23: TaskCreate, TaskUpdate and TaskList mutate
+                                        // the task state (the parser prefers `tool_use_result`);
+                                        // TaskGet is read-only and stays silent.
+                                        if crate::hooks::apply_task_tool_result(
+                                            &mut ext.task_state,
+                                            name,
+                                            input,
+                                            &message_tool_use_result,
+                                            &block["content"],
+                                        ) {
                                             publish_task_plan(session_id, ext, update_tx);
-                                        } else if name == "TaskUpdate" {
-                                            // PC-1.5: the success gate and status fallback live in hooks.rs.
-                                            if crate::hooks::apply_task_update_output(
-                                                &mut ext.task_state,
-                                                input,
-                                                &message_tool_use_result,
-                                                &block["content"],
-                                            ) {
-                                                publish_task_plan(session_id, ext, update_tx);
-                                            }
-                                        } else if name == "TaskList" {
-                                            // PC-1.5: unparseable output leaves the state untouched.
-                                            if crate::hooks::apply_task_list_output(
-                                                &mut ext.task_state,
-                                                &message_tool_use_result,
-                                                &block["content"],
-                                            ) {
-                                                publish_task_plan(session_id, ext, update_tx);
-                                            }
                                         }
                                     }
                                 }
@@ -2374,7 +2655,7 @@ fn handle_session_frame(
                         }
                     }
                 }
-                let updates = map::map_consolidated(&content, MsgRole::User, map_state);
+                let updates = map::map_user_frame(&line, map_state);
                 note_tool_updates(&updates, true, machine.foreground_target(), map_state);
                 emit_updates(&map_state.filter_updates(updates), update_tx, session_id);
             }
@@ -2384,14 +2665,33 @@ fn handle_session_frame(
             // turn that `on_result` may promote or settle).
             let autonomous = machine.result_is_autonomous(&line);
 
-            // Decision 9 / 2.1: update context window if matchingModelUsage has contextWindow > 0
+            // Decision 9 / 2.1 + F5b/N-30: update the context window when the
+            // matching `modelUsage` entry has a positive `contextWindow`, and
+            // seed the cross-session cache keyed by (backend, resolved model id)
+            // plus the assistant message's own spelling (acp-agent.ts:6973-7003).
             if let Some(model_usage) = line.get("modelUsage") {
-                if let Some(ref current_model) = ext.usage.last_model {
-                    if let Some((_key, val)) =
-                        crate::usage::get_matching_model_usage(model_usage, current_model)
+                if let Some(current_model) = ext.usage.last_model.clone() {
+                    if let Some((key, val)) =
+                        crate::usage::get_matching_model_usage(model_usage, &current_model)
                     {
                         let cw = val.get("contextWindow").and_then(Value::as_u64);
-                        ext.usage.update_window_if_positive(cw);
+                        if ext.usage.update_window_if_positive(cw) {
+                            let window = cw.unwrap_or_default();
+                            let provider_key = &ext.usage.provider_cache_key;
+                            crate::session_model::cache_context_window(
+                                &crate::session_model::context_window_cache_key(provider_key, key),
+                                window,
+                            );
+                            if key != current_model {
+                                crate::session_model::cache_context_window(
+                                    &crate::session_model::context_window_cache_key(
+                                        provider_key,
+                                        &current_model,
+                                    ),
+                                    window,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2444,11 +2744,77 @@ fn handle_session_frame(
                 session_id,
                 high_water,
                 *assistant_had_error,
+                line.get("uuid").and_then(Value::as_str),
             );
         }
         "system" => {
             let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or("");
             match subtype {
+                // Plugin load failures (CLI 2.1.283+) have no ACP surface; log
+                // them so a missing plugin isn't silent
+                // (`acp-agent.ts:5999-6001`). Deduped on the serialized list,
+                // like `session.loggedPluginErrors`.
+                "init" => {
+                    // D5 (Decision 9, `acp-agent.ts:5976-5998`): latch the
+                    // terminal-bound slash command names. The session/new
+                    // advertisement runs before any init frame is observed, so
+                    // a first latch (or a genuine change) re-publishes the
+                    // now-filtered list. Advisory only: a failed re-advertise
+                    // never fails the turn (Node logs and continues).
+                    if let Some(terminal) = line
+                        .get("terminal_slash_commands")
+                        .and_then(Value::as_array)
+                    {
+                        let names: Vec<String> = terminal
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect();
+                        if ext.terminal_slash_commands.as_ref() != Some(&names) {
+                            ext.terminal_slash_commands = Some(names.clone());
+                            let commands = Value::Array(ext.commands.clone());
+                            emit_commands_changed(&commands, &names, update_tx, session_id);
+                        }
+                    }
+                    if let Some(errors) = line.get("plugin_errors").and_then(Value::as_array) {
+                        if !errors.is_empty() {
+                            let serialized = serde_json::to_string(errors).unwrap_or_default();
+                            if ext.logged_plugin_errors.as_deref() != Some(&serialized) {
+                                ext.logged_plugin_errors = Some(serialized);
+                                if let Some(logger) = &ext.logger {
+                                    for error in errors {
+                                        // Node template-literal rendering: a
+                                        // missing field prints `undefined`; a
+                                        // falsy `path` is omitted.
+                                        let plugin = error
+                                            .get("plugin")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("undefined");
+                                        let kind = error
+                                            .get("type")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("undefined");
+                                        let path = error
+                                            .get("path")
+                                            .and_then(Value::as_str)
+                                            .filter(|path| !path.is_empty());
+                                        let message = error
+                                            .get("message")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("undefined");
+                                        let mut text =
+                                            format!("Plugin {plugin} failed to load ({kind})");
+                                        if let Some(path) = path {
+                                            text.push_str(&format!(" from {path}"));
+                                        }
+                                        text.push_str(&format!(": {message}"));
+                                        logger.error(&text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 "task_started" => {
                     let task_id = line.get("task_id").and_then(Value::as_str).unwrap_or("");
                     let is_subagent = line.get("subagent_type").is_some();
@@ -2488,6 +2854,7 @@ fn handle_session_frame(
                             session_id,
                             high_water,
                             *assistant_had_error,
+                            None,
                         );
                     }
                     // 3.5: async-task terminal / update. A `task_notification`
@@ -2578,11 +2945,21 @@ fn handle_session_frame(
                             session_id,
                             high_water,
                             *assistant_had_error,
+                            None,
                         );
                     }
                 }
                 "commands_changed" => {
-                    emit_commands_changed(&line, update_tx, session_id);
+                    // D5 (Decision 9, `acp-agent.ts:6266-6288`): the frame's
+                    // command list is authoritative and replaces the stored
+                    // one; the advertisement filters it with the latched
+                    // terminal list. Node also resets `session.skillPaths`
+                    // here; the Rust port has no skill-path cache (no AIR
+                    // skill meta is emitted), so the reset is vacuous.
+                    let commands = line.get("commands").cloned().unwrap_or(Value::Null);
+                    ext.commands = commands.as_array().cloned().unwrap_or_default();
+                    let terminal = ext.terminal_slash_commands.clone().unwrap_or_default();
+                    emit_commands_changed(&commands, &terminal, update_tx, session_id);
                 }
                 _ => {}
             }
@@ -2782,11 +3159,102 @@ fn handle_session_frame(
     }
 }
 
+/// Node `isAutoUnavailable` (`session-mode.ts:324-330`): a listed current model
+/// that does not advertise Auto. An unlisted model is not downgraded.
+fn model_lacks_auto(config: &crate::session_config::SessionConfigState) -> bool {
+    config
+        .model_infos
+        .iter()
+        .find(|m| m.value == config.current_model_id)
+        .is_some_and(|m| m.supports_auto_mode != Some(true))
+}
+
+/// The client's answer to a pending permission request, as resolved by the
+/// actor (the actor owns the live model and mode state).
+struct PermissionAnswer<'a> {
+    value: &'a Value,
+    ctx: &'a permission_options::OptionsContext,
+    request_id: &'a str,
+    tool_use_id: &'a str,
+    tool_input: &'a Value,
+}
+
+/// Resolve the client's permission answer the way Node does after
+/// `requestPermissionFromClient` (`acp-agent.ts:10219-10237`): evaluate
+/// `isAutoUnavailable` against the CURRENT model, apply
+/// `applyPermissionFallback` (`session-mode.ts:196-221`), publish the advisory
+/// warning for ANY rewrite (once per session), publish the ExitPlanMode mode
+/// updates, and return the `control_response` for the CLI.
+fn resolve_permission_answer(
+    answer: PermissionAnswer<'_>,
+    ext: &mut SessionExt,
+    update_tx: &mpsc::UnboundedSender<SessionOutbound>,
+    session_id: &str,
+) -> Value {
+    let mut ctx = answer.ctx.clone();
+    ctx.auto_unavailable = model_lacks_auto(&ext.config);
+    let (response, fallback) = permission::permission_control_response_with_fallback(
+        answer.value,
+        &ctx,
+        answer.request_id,
+        answer.tool_use_id,
+        answer.tool_input,
+    );
+    // `publishFallbackWarning` (`session-mode.ts:287-308`) runs whenever the
+    // rewrite happened, for any tool, and only once per session.
+    if fallback && !ext.auto_mode_fallback_warning_shown {
+        ext.auto_mode_fallback_warning_shown = true;
+        let _ = update_tx.send(SessionOutbound::RawUpdate(auto_mode_fallback_update(
+            session_id,
+            ext.supports_notices(),
+        )));
+    }
+    // ExitPlanMode mode effect (Node `acp-agent.js:7665-7677`): an allow with a
+    // session `setMode` update publishes current_mode_update +
+    // config_option_update to the client (no CLI control request).
+    if ctx.tool_name == "ExitPlanMode" && response["response"]["response"]["behavior"] == "allow" {
+        if let Some(perms) = response["response"]["response"]["updatedPermissions"].as_array() {
+            if let Some(mode) = perms.iter().find_map(|u| {
+                if u.get("type").and_then(Value::as_str) == Some("setMode")
+                    && u.get("destination").and_then(Value::as_str) == Some("session")
+                {
+                    u.get("mode").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            }) {
+                ext.config.modes.current_mode_id = mode.to_string();
+                for opt in &mut ext.config.config_options {
+                    if opt.id == crate::session_config::MODE_CONFIG_ID {
+                        opt.current_value = mode.to_string();
+                    }
+                }
+                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": mode,
+                    }
+                })));
+                let _ = update_tx.send(SessionOutbound::RawUpdate(json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": ext.config.config_options,
+                    }
+                })));
+            }
+        }
+    }
+    response
+}
+
 /// Handle an inbound `can_use_tool` control_request (10.1–10.5).
 ///
 /// Emits the `tool_call` if the client has not seen it yet (`ensureToolCallEmitted`,
-/// INV-20 / #851), then spawns a task (D14) that sends `session/request_permission`,
-/// maps the outcome to the `control_response` (10.3 / 10.4) and resolves `reply`.
+/// INV-20 / #851), then spawns a task (D14) that sends `session/request_permission`
+/// and hands the client's answer to the actor (`Command::PermissionAnswered`),
+/// which maps it to the `control_response` (10.3 / 10.4) and resolves `reply`.
 /// The actor never awaits the client round-trip inline (INV-27).
 #[allow(clippy::too_many_arguments)]
 fn handle_permission(
@@ -2822,6 +3290,7 @@ fn handle_permission(
         &can.tool_use_id,
         parent.as_deref(),
         map_state,
+        Some(cwd),
     ) {
         // 3.7: a permission-surfaced top-level call is foreground work.
         note_tool_updates(
@@ -2844,6 +3313,7 @@ fn handle_permission(
         &can.tool_input,
         &can.tool_use_id,
         parent.as_deref(),
+        Some(cwd),
     );
     // 3.6 (Decision 7): build the ACP options from the P7 permission_option
     // module (Node's `buildClaudePermissionOptions`), and the request params.
@@ -2859,6 +3329,9 @@ fn handle_permission(
         no_persistent_rule: can.no_persistent_rule,
         default_to_no: can.default_to_no,
         available_modes: available_modes.to_vec(),
+        // Placeholder: the actor sets this from the live model when the answer
+        // arrives (`resolve_permission_answer`).
+        auto_unavailable: false,
         pre_plan_mode: pre_plan_mode.map(String::from),
         context_used_percent,
         home_dir: home_dir.map(|p| p.to_path_buf()),
@@ -2871,54 +3344,39 @@ fn handle_permission(
     let params = Value::Object(params);
 
     // Spawn the round-trip (D14): ask the agent layer to send
-    // `session/request_permission` and await the outcome, map it, resolve `reply`
-    // (the `control.rs` on-request task writes the response frame). The handle is
-    // registered so `Command::Cancel` can abort it (CUJ 2, INV-27).
+    // `session/request_permission` and await the client's answer. The answer is
+    // handed to the actor (`Command::PermissionAnswered`), which resolves the
+    // `control_response` (the `control.rs` on-request task writes the frame).
+    // The command carries `reply`, so a `Cancel` that aborts this task after the
+    // client answered still delivers the allow (INV-27); the handle is registered
+    // so a Cancel before the answer aborts the round-trip (CUJ 2).
     let update_tx = update_tx.clone();
     let ctx = Arc::new(ctx);
     let command_tx = command_tx.clone();
     let handle = tokio::spawn(async move {
         let (ptx, prx) = oneshot::channel();
         let _ = update_tx.send(SessionOutbound::RequestPermission { params, reply: ptx });
-        let response = match prx.await {
-            Ok(Ok(value)) => permission::permission_control_response(
-                &value,
-                &ctx,
-                &can.request_id,
-                &can.tool_use_id,
-                &can.tool_input,
-            ),
+        match prx.await {
+            Ok(Ok(value)) => {
+                let _ = command_tx.send(Command::PermissionAnswered {
+                    value,
+                    ctx,
+                    request_id: can.request_id.clone(),
+                    tool_use_id: can.tool_use_id.clone(),
+                    tool_input: can.tool_input.clone(),
+                    reply,
+                });
+            }
             // The request errored or the round-trip was dropped (e.g. the client
             // closed / cancelled): refuse the tool (R28 deny) so the turn settles
             // on the next `result` (INV-21).
             Ok(Err(_)) | Err(_) => {
-                permission::deny_control_response(&can.request_id, &can.tool_use_id)
-            }
-        };
-        // ExitPlanMode mode effect (Node `acp-agent.js:7665-7677`): an allow with
-        // a session `setMode` update publishes current_mode_update +
-        // config_option_update to the client (no CLI control request). Routed
-        // through the actor so session mode/config state is updated (INV-27).
-        if ctx.tool_name == "ExitPlanMode"
-            && response["response"]["response"]["behavior"] == "allow"
-        {
-            if let Some(perms) = response["response"]["response"]["updatedPermissions"].as_array() {
-                if let Some(mode) = perms.iter().find_map(|u| {
-                    if u.get("type").and_then(Value::as_str) == Some("setMode")
-                        && u.get("destination").and_then(Value::as_str) == Some("session")
-                    {
-                        u.get("mode").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                }) {
-                    let _ = command_tx.send(Command::ExitPlanModeApplied {
-                        mode: mode.to_string(),
-                    });
-                }
+                let _ = reply.send(permission::deny_control_response(
+                    &can.request_id,
+                    &can.tool_use_id,
+                ));
             }
         }
-        let _ = reply.send(response);
     });
     pending_permissions.insert(request_id, handle);
 }
@@ -2933,6 +3391,7 @@ fn handle_events(
     session_id: &str,
     high_water: &AtomicUsize,
     assistant_had_error: bool,
+    final_message_id: Option<&str>,
 ) {
     // A `FinalText` precedes its turn's `Settled` in the same batch; collect it
     // and hand it to the prompt task so it can forward the chunk before the
@@ -2941,9 +3400,15 @@ fn handle_events(
     for event in events {
         match event {
             TurnEvent::FinalText { text } => {
-                let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                    ContentBlock::Text(TextContent::new(text)),
-                ));
+                // D11 (Decision 10): Node stamps `messageIdForGrouping(result)`
+                // = the result frame's `uuid` on the result-text chunk
+                // (`acp-agent.ts:5301`); the result line is in scope at the
+                // `"result"` arm, which passes it down here.
+                let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                if let Some(id) = final_message_id.filter(|id| !id.is_empty()) {
+                    chunk = chunk.message_id(MessageId::new(id.to_string()));
+                }
+                let update = SessionUpdate::AgentMessageChunk(chunk);
                 let notif = SessionNotification::new(session_id.to_string(), update);
                 final_texts.push(notif);
             }
@@ -3029,10 +3494,17 @@ fn handle_events(
                 message,
             } => {
                 if let Some(reply) = pending.remove(prompt_uuid) {
-                    let err = SessionError::PromptFailed {
-                        kind: *kind,
-                        message: message.clone(),
-                        assistant_had_error,
+                    // F3a (f): the end-of-stream rejection rewritten from
+                    // `lastErrorResultText` keeps its own SDK error identity.
+                    let err = match message.strip_prefix(CHILD_EXIT_PREFIX) {
+                        Some(text) => SessionError::ChildErrorResult {
+                            text: text.to_string(),
+                        },
+                        None => SessionError::PromptFailed {
+                            kind: *kind,
+                            message: message.clone(),
+                            assistant_had_error,
+                        },
                     };
                     if *kind == FailureKind::IncompleteToolCall {
                         // E-12: the closing `tool_call_update`s (and the turn's
@@ -3053,6 +3525,43 @@ fn handle_events(
                 high_water.fetch_max(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// The SDK's `lastErrorResultText` for one `result` frame (`sdk.mjs`
+/// `readMessages`): the `result` text for a `success` subtype, else the trimmed
+/// non-empty `errors` joined with `"; "`; `None` for a non-error result or an
+/// empty diagnostic.
+fn error_result_text(result: &Value) -> Option<String> {
+    if result.get("is_error").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let subtype = result.get("subtype").and_then(Value::as_str).unwrap_or("");
+    let text = if subtype == "success" {
+        result
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    } else {
+        result
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default()
+    };
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
@@ -3130,6 +3639,7 @@ fn settle_events(
     session_id: &str,
     high_water: &AtomicUsize,
     assistant_had_error: bool,
+    final_message_id: Option<&str>,
 ) {
     // Node's `activateTurn` clears `session.cancelled`, ending the stopped-work
     // window whenever a turn activates (whether by user echo or ensure_active_turn).
@@ -3150,21 +3660,19 @@ fn settle_events(
         session_id,
         high_water,
         assistant_had_error,
+        final_message_id,
     );
 }
 
-/// Emit a `commands_changed` system frame as an `AvailableCommandsUpdate`.
+/// Emit a `commands_changed` / `system/init` command list as an
+/// `AvailableCommandsUpdate`, filtered by the latched terminal-bound names.
 fn emit_commands_changed(
-    line: &Value,
+    commands: &Value,
+    terminal: &[String],
     update_tx: &mpsc::UnboundedSender<SessionOutbound>,
     session_id: &str,
 ) {
-    let commands = line.get("commands").cloned().unwrap_or(Value::Null);
-    let terminal = line
-        .get("terminal_commands")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let update = map::map_commands_changed(&commands, &terminal);
+    let update = map::map_commands_changed(commands, terminal);
     // Decision 8: raw JSON so a command without an argument hint carries
     // `input: null` like Node (the typed update would omit the field).
     emit_raw_updates(
@@ -3186,6 +3694,27 @@ fn emit_updates(
     }
 }
 
+/// Apply a `get_context_usage` answer to the session's window (D1 / Decision
+/// 1): only while the window is not authoritative AND the session is still on
+/// the model the request was issued for (Node's `stillCurrent`,
+/// `acp-agent.ts:7876-7880`). Returns whether the window changed.
+fn apply_context_window_answer(
+    usage: &mut crate::usage::UsageState,
+    current_model_id: &str,
+    size: u64,
+    answer_model_id: &str,
+) -> bool {
+    if crate::session_model::context_window_answer_is_current(
+        usage.authoritative,
+        current_model_id,
+        answer_model_id,
+    ) {
+        usage.update_window_if_positive(Some(size))
+    } else {
+        false
+    }
+}
+
 /// The error text of a `control_response` whose `response.subtype` is `error`
 /// (the CLI refused the request), else `None`.
 fn control_response_error(receipt: &Value) -> Option<String> {
@@ -3200,6 +3729,15 @@ fn control_response_error(receipt: &Value) -> Option<String> {
             .unwrap_or("control request failed")
             .to_string(),
     )
+}
+
+/// The error text of a rejected `set_permission_mode`: keep the CLI's
+/// non-empty message, else `Invalid Mode` (`session-mode.ts:254-263`).
+fn permission_mode_error(err: &crate::control::ControlError) -> String {
+    match err {
+        crate::control::ControlError::Remote(message) if !message.is_empty() => message.clone(),
+        _ => "Invalid Mode".to_string(),
+    }
 }
 
 /// Send a batch of untyped AIR async-task updates (item 3.4/3.5), each wrapped
@@ -3276,15 +3814,69 @@ mod tests {
         assert!(!auto_mode_downgrade_needed(Some(&auto)));
     }
 
+    // F3a (f): the SDK's `lastErrorResultText` (sdk.mjs `readMessages`): the
+    // `result` text on a `success` subtype, the trimmed non-empty `errors`
+    // joined with `"; "` otherwise, and `None` for a non-error result.
+    #[test]
+    fn error_result_text_matches_sdk_last_error_result_text() {
+        assert_eq!(
+            error_result_text(&json!({"type":"result","subtype":"success","is_error":true,
+                "result":"boom"})),
+            Some("boom".to_string())
+        );
+        assert_eq!(
+            error_result_text(&json!({"type":"result","subtype":"error_during_execution",
+                "is_error":true,"errors":["  first  ","", "second"]})),
+            Some("first; second".to_string())
+        );
+        assert_eq!(
+            error_result_text(
+                &json!({"type":"result","subtype":"success","is_error":false,
+                "result":"ok"})
+            ),
+            None
+        );
+        assert_eq!(
+            error_result_text(&json!({"type":"result","subtype":"success","is_error":true,
+                "result":""})),
+            None,
+            "an empty diagnostic clears the SDK's lastErrorResultText"
+        );
+    }
+
+    // F3a / A-19: a rejected set_permission_mode keeps the CLI's non-empty
+    // message and only falls back to "Invalid Mode" (session-mode.ts:254-263).
+    #[test]
+    fn permission_mode_error_preserves_cli_message() {
+        assert_eq!(
+            permission_mode_error(&crate::control::ControlError::Remote(
+                "mode not allowed".to_string()
+            )),
+            "mode not allowed"
+        );
+        assert_eq!(
+            permission_mode_error(&crate::control::ControlError::Remote(String::new())),
+            "Invalid Mode"
+        );
+        assert_eq!(
+            permission_mode_error(&crate::control::ControlError::Closed),
+            "Invalid Mode"
+        );
+    }
+
     // Review PC-1 (5): an unlisted id's context window is inferred from the id itself
     // (acp-agent.ts:13729-13747).
     #[test]
     fn context_window_seed_reads_the_unlisted_id() {
-        assert_eq!(
-            context_window_seed(None, "claude-opus-4-7[1m]"),
-            Some(1_000_000)
-        );
-        assert_eq!(context_window_seed(None, "claude-opus-4-7"), None);
+        // F5b/B-71: an unlisted id is seeded from the id alone; the heuristic
+        // miss falls back to the default window, not to `None`.
+        let hinted =
+            crate::session_model::immediate_context_window("", "claude-opus-4-7[1m]", None);
+        assert_eq!(hinted.size, 1_000_000);
+        assert!(!hinted.authoritative);
+        let plain = crate::session_model::immediate_context_window("", "claude-opus-4-7", None);
+        assert_eq!(plain.size, crate::usage::DEFAULT_CONTEXT_WINDOW);
+        assert!(!plain.authoritative);
     }
 
     // Review PC-1 (3): on an external switch the mode update and warning come before the
@@ -3292,13 +3884,23 @@ mod tests {
     #[test]
     fn external_switch_updates_publish_config_last() {
         let opts: Vec<crate::session_config::ConfigOption> = Vec::new();
-        let updates = external_switch_updates("s", &opts, Some("acceptEdits"), true);
+        let updates = external_switch_updates("s", &opts, Some("acceptEdits"), true, false);
         let kinds: Vec<&str> = updates
             .iter()
             .filter_map(|u| u["update"]["sessionUpdate"].as_str())
             .collect();
         assert_eq!(kinds.first(), Some(&"current_mode_update"));
         assert_eq!(kinds.last(), Some(&"config_option_update"));
+        // A client on the notice contract gets the live notice instead of the
+        // bold transcript line (F2a).
+        let noticed = external_switch_updates("s", &opts, Some("acceptEdits"), true, true);
+        assert_eq!(noticed[1]["update"]["sessionUpdate"], "notice");
+        assert_eq!(noticed[1]["update"]["severity"], "warning");
+        assert_eq!(noticed[1]["update"]["title"], "Auto mode unavailable");
+        assert_eq!(
+            noticed[1]["update"]["description"],
+            "The selected model does not support Auto mode; using Accept edits instead."
+        );
     }
 
     // PC-1.5 (acp-agent.ts:13226-13245): a Task* call a permission prompt surfaced is resolved
@@ -3313,6 +3915,116 @@ mod tests {
         let failed =
             task_permission_resolution("toolu_TK2", "TaskUpdate", true, &json!("boom"), None);
         assert_eq!(failed["status"], "failed");
+    }
+
+    // U-26 (tools.ts:330-352, air-extension.ts:119-121): the plan dedupe is for every
+    // client that declared `_meta.jetbrains.air` as an object, even without a version or
+    // capabilities list; a non-AIR client gets every plan.
+    #[test]
+    fn air_plan_dedupe_uses_meta_presence_not_the_capabilities_list() {
+        let caps = json!({"_meta": {"jetbrains": {"air": {}}}});
+        let air = crate::air::AirClient::from_client_capabilities(&caps);
+        assert!(air.is_some(), "an empty air object is still an AIR client");
+        let mut ext = SessionExt::new(
+            air,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        ext.task_state.push((
+            "1".to_string(),
+            crate::hooks::TaskStateEntry {
+                subject: "Task".into(),
+                status: "pending".into(),
+                active_form: None,
+                description: None,
+            },
+        ));
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+        publish_task_plan("s", &mut ext, &update_tx);
+        publish_task_plan("s", &mut ext, &update_tx);
+        let air_plans = std::iter::from_fn(|| update_rx.try_recv().ok())
+            .filter(|out| {
+                matches!(
+                    out,
+                    SessionOutbound::RawUpdate(v)
+                        if v["update"]["sessionUpdate"] == "plan"
+                )
+            })
+            .count();
+        assert_eq!(
+            air_plans, 1,
+            "the unchanged plan is skipped for an AIR client"
+        );
+
+        let mut plain = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        plain.task_state = ext.task_state.clone();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+        publish_task_plan("s", &mut plain, &update_tx);
+        publish_task_plan("s", &mut plain, &update_tx);
+        let plain_plans = std::iter::from_fn(|| update_rx.try_recv().ok())
+            .filter(|out| {
+                matches!(
+                    out,
+                    SessionOutbound::RawUpdate(v)
+                        if v["update"]["sessionUpdate"] == "plan"
+                )
+            })
+            .count();
+        assert_eq!(plain_plans, 2, "a non-AIR client gets every plan");
+    }
+
+    // T-77 (tools.ts:452-485): TaskCreated rejects an empty task_id or task_subject
+    // before touching the task state or publishing a plan.
+    #[test]
+    fn task_created_hook_rejects_empty_id_or_subject() {
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        let mut map_state = MapState::default();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let mut run = |input: Value, ext: &mut SessionExt| {
+            let (reply, _reply_rx) = oneshot::channel();
+            handle_hook_callback(
+                HookCall {
+                    request_id: "r",
+                    callback_id: crate::hooks::TASK_CREATED_HOOK_ID,
+                    input: &input,
+                    tool_use_id: None,
+                },
+                &mut map_state,
+                ext,
+                HookIo {
+                    update_tx: &update_tx,
+                    command_tx: &command_tx,
+                    session_id: "s",
+                },
+                reply,
+            );
+        };
+        run(json!({"task_id": "", "task_subject": "X"}), &mut ext);
+        assert!(ext.task_state.is_empty());
+        run(json!({"task_id": "1", "task_subject": ""}), &mut ext);
+        assert!(ext.task_state.is_empty());
+        run(json!({"task_id": "1", "task_subject": "A"}), &mut ext);
+        assert_eq!(ext.task_state.len(), 1);
+        assert_eq!(ext.task_state[0].1.subject, "A");
+        let plans = std::iter::from_fn(|| update_rx.try_recv().ok())
+            .filter(|out| {
+                matches!(
+                    out,
+                    SessionOutbound::RawUpdate(v)
+                        if v["update"]["sessionUpdate"] == "plan"
+                )
+            })
+            .count();
+        assert_eq!(plans, 1, "only the valid hook publishes a plan");
     }
 
     // PC-1.1 (acp-agent.ts:10724 syncModelAfterExternalSwitch): a PostModelSwitch hook
@@ -3438,7 +4150,7 @@ mod tests {
         machine.enqueue(Turn::new("p1".into(), false));
         let _ = machine.on_echo("p1");
         let events = machine.on_result(&json!({"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"ok","usage":{}}), false);
-        handle_events(&events, &mut pending, &utx, "s", &hw, false);
+        handle_events(&events, &mut pending, &utx, "s", &hw, false, None);
 
         // p2 queued + echoed (next echo).
         machine.enqueue(Turn::new("p2".into(), false));
@@ -3546,7 +4258,7 @@ mod tests {
                 had_usage,
                 model_rows: Default::default(),
             }];
-            handle_events(&events, &mut pending, update_tx, "s1", hw, false);
+            handle_events(&events, &mut pending, update_tx, "s1", hw, false, None);
             reply_rx.await.expect("reply sent").expect("prompt ok")
         }
 
@@ -3619,7 +4331,7 @@ mod tests {
             had_usage: true,
             model_rows: Default::default(),
         }];
-        handle_events(&events, &mut pending, &update_tx, "s1", &hw, false);
+        handle_events(&events, &mut pending, &update_tx, "s1", &hw, false, None);
         let reply = reply_rx.await.expect("reply sent").expect("prompt ok");
         let quota = reply.quota.expect("quota present");
         assert_eq!(
@@ -3638,6 +4350,80 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// D11 (Decision 10) — the result-text chunk carries the result frame's
+    /// `uuid` as its `messageId` (`messageIdForGrouping(result)`,
+    /// `acp-agent.ts:5301`).
+    #[tokio::test]
+    async fn inv_72_final_text_carries_result_uuid() {
+        let (update_tx, _update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pending.insert("p1".to_string(), reply_tx);
+        let events = vec![
+            TurnEvent::FinalText {
+                text: "context output".to_string(),
+            },
+            TurnEvent::Settled {
+                prompt_uuid: "p1".to_string(),
+                stop_reason: crate::turn::StopReason::EndTurn,
+                usage: crate::turn::Usage::default(),
+                had_usage: false,
+                model_rows: Default::default(),
+            },
+        ];
+        handle_events(
+            &events,
+            &mut pending,
+            &update_tx,
+            "s1",
+            &hw,
+            false,
+            Some("result-uuid-1"),
+        );
+        let reply = reply_rx.await.expect("reply sent").expect("prompt ok");
+        let chunk = match &reply.updates[0].update {
+            SessionUpdate::AgentMessageChunk(chunk) => chunk,
+            other => panic!("expected an agent_message_chunk, got {other:?}"),
+        };
+        assert_eq!(
+            chunk.message_id.as_ref().map(|id| id.0.to_string()),
+            Some("result-uuid-1".to_string())
+        );
+    }
+
+    /// D11 (Decision 10) — a result frame without a `uuid` leaves the chunk
+    /// unstamped (the existing `context-echo-less` fixture shape).
+    #[tokio::test]
+    async fn inv_72_final_text_without_uuid_has_none() {
+        let (update_tx, _update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut pending: HashMap<String, oneshot::Sender<Result<PromptReply, SessionError>>> =
+            HashMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pending.insert("p1".to_string(), reply_tx);
+        let events = vec![
+            TurnEvent::FinalText {
+                text: "context output".to_string(),
+            },
+            TurnEvent::Settled {
+                prompt_uuid: "p1".to_string(),
+                stop_reason: crate::turn::StopReason::EndTurn,
+                usage: crate::turn::Usage::default(),
+                had_usage: false,
+                model_rows: Default::default(),
+            },
+        ];
+        handle_events(&events, &mut pending, &update_tx, "s1", &hw, false, None);
+        let reply = reply_rx.await.expect("reply sent").expect("prompt ok");
+        let chunk = match &reply.updates[0].update {
+            SessionUpdate::AgentMessageChunk(chunk) => chunk,
+            other => panic!("expected an agent_message_chunk, got {other:?}"),
+        };
+        assert!(chunk.message_id.is_none());
     }
 
     /// 8.T11-style unit: stream end settles the active turn and rejects queued
@@ -4445,9 +5231,11 @@ mod tests {
             "s1".into(),
             Arc::new(AtomicUsize::new(0)),
             None,
+            crate::client_caps::ClientCapabilities::default(),
             std::env::temp_dir(),
             false,
             crate::env_snapshot::EnvSnapshot::empty(),
+            None,
         ));
         let (ltx, mut lrx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
@@ -4592,9 +5380,11 @@ mod tests {
             "s1".into(),
             hw,
             None,
+            crate::client_caps::ClientCapabilities::default(),
             std::env::temp_dir(),
             false,
             crate::env_snapshot::EnvSnapshot::empty(),
+            None,
         ));
 
         // Reader: turn the duplex "stdin" (b) into whole lines.
@@ -4699,6 +5489,300 @@ mod tests {
         );
     }
 
+    /// G2c-fix 1 (INV-27): the client's permission answer is resolved by the
+    /// actor and the answer command carries the `control_response` reply. A
+    /// `Cancel` that aborts the permission task after the client answered must
+    /// therefore still deliver the allow to the CLI: with the old `ack` the task
+    /// suspended between the command and the reply, and the abort dropped the
+    /// reply, so control.rs wrote the R28 deny while the client and the session
+    /// state had already moved to the new mode (client/CLI divergence).
+    #[tokio::test]
+    async fn permission_answer_survives_cancel_between_the_command_and_the_reply() {
+        use tokio::time::timeout;
+
+        let mut map_state = MapState::default();
+        let mut live_background: HashMap<String, String> = HashMap::new();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let mut pending_permissions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Command>();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle_permission(
+            json!({"type":"control_request","request_id":"permreq1","request":{
+                "subtype":"can_use_tool","tool_name":"ExitPlanMode",
+                "input":{"plan":"x"},"tool_use_id":"toolu_1",
+                "permission_suggestions":[]}}),
+            reply_tx,
+            None,
+            &mut map_state,
+            &mut live_background,
+            &update_tx,
+            "s",
+            &mut pending_permissions,
+            std::path::Path::new("/repo"),
+            &[
+                "default".to_string(),
+                "acceptEdits".to_string(),
+                "plan".to_string(),
+                "auto".to_string(),
+                "bypassPermissions".to_string(),
+            ],
+            None,
+            None,
+            None,
+            &command_tx,
+        );
+
+        // The `session/request_permission` outbound; answer it with the manual
+        // approve option (an allow + setMode default).
+        let permission_reply = loop {
+            let outbound = timeout(Duration::from_secs(5), update_rx.recv())
+                .await
+                .expect("a permission outbound is emitted")
+                .expect("outbound stream open");
+            if let SessionOutbound::RequestPermission { reply, .. } = outbound {
+                break reply;
+            }
+        };
+        permission_reply
+            .send(Ok(
+                json!({"outcome":{"outcome":"selected","optionId":"exit-plan-default"}}),
+            ))
+            .expect("the permission round-trip is waiting");
+
+        // The permission task queues the answer and returns; the reply lives in
+        // the command, not in the task.
+        let answer = timeout(Duration::from_secs(5), command_rx.recv())
+            .await
+            .expect("the answer command is queued")
+            .expect("command stream open");
+        let Command::PermissionAnswered {
+            value,
+            ctx,
+            request_id,
+            tool_use_id,
+            tool_input,
+            reply,
+        } = answer
+        else {
+            panic!("the client's answer must be resolved by the actor");
+        };
+
+        // `Command::Cancel` aborts every pending permission task. The task has
+        // already returned, and the reply must survive the abort.
+        for handle in pending_permissions.values() {
+            handle.abort();
+        }
+        pending_permissions.clear();
+
+        // The actor resolves the answer after the abort: allow + mode update.
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        let response = resolve_permission_answer(
+            PermissionAnswer {
+                value: &value,
+                ctx: &ctx,
+                request_id: &request_id,
+                tool_use_id: &tool_use_id,
+                tool_input: &tool_input,
+            },
+            &mut ext,
+            &update_tx,
+            "s",
+        );
+        assert_eq!(response["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            response["response"]["response"]["updatedPermissions"],
+            json!([{"type":"setMode","mode":"default","destination":"session"}])
+        );
+        reply
+            .send(response)
+            .expect("the reply must survive the aborted permission task");
+        let delivered = timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("the CLI reply resolves")
+            .expect("the reply is the allow");
+        assert_eq!(
+            delivered["response"]["response"]["behavior"], "allow",
+            "the CLI must still receive the allow after the cancel"
+        );
+        // The mode update reached the client (the client and the CLI agree).
+        let mut saw_mode = false;
+        while let Ok(outbound) = update_rx.try_recv() {
+            if let SessionOutbound::RawUpdate(v) = outbound {
+                if v["update"]["sessionUpdate"] == "current_mode_update" {
+                    assert_eq!(v["update"]["currentModeId"], "default");
+                    saw_mode = true;
+                }
+            }
+        }
+        assert!(saw_mode, "the ExitPlanMode mode update is published");
+    }
+
+    /// G2c-fix 3 (Node `acp-agent.ts:10219`): `isAutoUnavailable` is evaluated
+    /// when the client's answer arrives, against the model current at that
+    /// moment — not when the request was created. A model switch while the
+    /// dialog is open must therefore rewrite the Auto allow to Accept edits and
+    /// publish the advisory.
+    #[tokio::test]
+    async fn auto_fallback_uses_the_model_current_when_the_client_answers() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::timeout;
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(a, control_in_rx, ControlOptions { on_request: None });
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let (_stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx,
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            hw,
+            None,
+            crate::client_caps::ClientCapabilities::default(),
+            std::env::temp_dir(),
+            false,
+            crate::env_snapshot::EnvSnapshot::empty(),
+            None,
+        ));
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+
+        let config_for =
+            |model: &str, supports_auto: bool| crate::session_config::SessionConfigState {
+                modes: crate::session_config::ModesState {
+                    current_mode_id: "default".into(),
+                    available_modes: [
+                        "default",
+                        "acceptEdits",
+                        "plan",
+                        "auto",
+                        "bypassPermissions",
+                    ]
+                    .into_iter()
+                    .map(|id| crate::session_config::ModeInfo {
+                        id: id.into(),
+                        name: id.into(),
+                        description: String::new(),
+                        _meta: None,
+                    })
+                    .collect(),
+                },
+                current_model_id: model.into(),
+                model_infos: vec![crate::session_config::ModelInfo {
+                    value: model.into(),
+                    display_name: model.into(),
+                    supports_auto_mode: Some(supports_auto),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+        let sync = || {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(Command::GetState { reply: reply_tx }).unwrap();
+            reply_rx
+        };
+        // The session starts on a model that supports Auto.
+        tx.send(Command::InitConfig {
+            config: config_for("model-with-auto", true),
+        })
+        .unwrap();
+        timeout(Duration::from_secs(5), sync())
+            .await
+            .expect("InitConfig is processed")
+            .expect("GetState reply")
+            .expect("state");
+
+        // A permission request is created while the model supports Auto.
+        let (preply_tx, preply_rx) = oneshot::channel();
+        tx.send(Command::Permission {
+            frame: json!({"type":"control_request","request_id":"permreq1","request":{
+                "subtype":"can_use_tool","tool_name":"ExitPlanMode",
+                "input":{"plan":"x"},"tool_use_id":"toolu_1",
+                "permission_suggestions":[]}}),
+            reply: preply_tx,
+        })
+        .unwrap();
+        let permission_reply = loop {
+            let outbound = timeout(Duration::from_secs(5), update_rx.recv())
+                .await
+                .expect("a permission outbound is emitted")
+                .expect("outbound stream open");
+            if let SessionOutbound::RequestPermission { reply, .. } = outbound {
+                break reply;
+            }
+        };
+
+        // While the dialog is open the model switches to one without Auto.
+        tx.send(Command::InitConfig {
+            config: config_for("model-without-auto", false),
+        })
+        .unwrap();
+        timeout(Duration::from_secs(5), sync())
+            .await
+            .expect("the second InitConfig is processed")
+            .expect("GetState reply")
+            .expect("state");
+
+        // The client picks Auto after the switch: the answer-time model lacks
+        // it, so Node rewrites to Accept edits and warns.
+        permission_reply
+            .send(Ok(
+                json!({"outcome":{"outcome":"selected","optionId":"exit-plan-auto"}}),
+            ))
+            .expect("the permission round-trip is waiting");
+        let response = timeout(Duration::from_secs(5), preply_rx)
+            .await
+            .expect("the permission answer resolves")
+            .expect("reply resolved");
+        assert_eq!(response["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            response["response"]["response"]["updatedPermissions"],
+            json!([{"type":"setMode","mode":"acceptEdits","destination":"session"}]),
+            "the Auto allow is rewritten against the model current at answer time"
+        );
+
+        let mut updates = Vec::new();
+        while let Ok(outbound) = update_rx.try_recv() {
+            if let SessionOutbound::RawUpdate(v) = outbound {
+                updates.push(v);
+            }
+        }
+        let warning = updates
+            .iter()
+            .position(|v| v["update"]["sessionUpdate"] == "agent_message_chunk")
+            .expect("the fallback warning is published");
+        let mode = updates
+            .iter()
+            .position(|v| {
+                v["update"]["sessionUpdate"] == "current_mode_update"
+                    && v["update"]["currentModeId"] == "acceptEdits"
+            })
+            .expect("current_mode_update acceptEdits");
+        assert!(
+            warning < mode,
+            "Node publishes the warning before the mode update"
+        );
+    }
+
     /// Review follow-up 3.17-D — the cancel's `cancel_async_message` frames go
     /// out in `take_abandoned()` ORDER with the EXACT uuid VALUES on the wire
     /// (2.13 / E-8), and the `interrupt` follows all of them for 2+ uuids.
@@ -4728,9 +5812,11 @@ mod tests {
             "s1".into(),
             hw,
             None,
+            crate::client_caps::ClientCapabilities::default(),
             std::env::temp_dir(),
             false,
             crate::env_snapshot::EnvSnapshot::empty(),
+            None,
         ));
 
         // Reader: turn the duplex "stdin" (b) into whole lines.
@@ -4953,9 +6039,11 @@ mod tests {
             "s1".into(),
             hw.clone(),
             None,
+            crate::client_caps::ClientCapabilities::default(),
             std::env::temp_dir(),
             false,
             crate::env_snapshot::EnvSnapshot::empty(),
+            None,
         ));
         // Drain the child stdin so the duplex never fills up (the actor writes
         // the prompt user frame and the interrupt request to it).
@@ -5907,5 +6995,347 @@ mod tests {
 
         // No update is sent to the client
         assert!(update_rx.try_recv().is_err());
+    }
+
+    // F5b/N-30: a result's `matchingModelUsage` (>0 guard) updates the live
+    // window and seeds the cross-session cache under the resolved modelUsage
+    // key and the assistant message's own (bare) spelling.
+    #[test]
+    fn f5b_result_usage_seeds_cross_session_cache() {
+        let provider = "f5b-result-cache";
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        ext.usage.provider_cache_key = provider.to_string();
+        ext.usage.last_model = Some("claude-sonnet-5".to_string());
+        let mut machine = TurnMachine::new();
+        let mut map_state = MapState::default();
+        let mut live_background = HashMap::new();
+        let mut pending = HashMap::new();
+        let (utx, _urx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let hw = Arc::new(AtomicUsize::new(0));
+        let mut emitted = false;
+        let mut had_error = false;
+        let mut tasks = AsyncTaskRuntime::new(false);
+        handle_session_frame(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "ok",
+                "modelUsage": {"claude-sonnet-5[1m]": {"contextWindow": 1000000}},
+                "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted,
+            &mut had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+            &mut ext,
+        );
+        assert_eq!(ext.usage.context_window, 1_000_000);
+        assert!(ext.usage.authoritative);
+        assert_eq!(
+            crate::session_model::cached_context_window(
+                &crate::session_model::context_window_cache_key(provider, "claude-sonnet-5[1m]")
+            ),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            crate::session_model::cached_context_window(
+                &crate::session_model::context_window_cache_key(provider, "claude-sonnet-5")
+            ),
+            Some(1_000_000)
+        );
+
+        // A non-positive window never reaches the cache or overwrites the live
+        // window (third-party backends can report 0).
+        ext.usage.last_model = Some("claude-opus-5".to_string());
+        handle_session_frame(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "ok",
+                "modelUsage": {"claude-opus-5": {"contextWindow": 0}},
+                "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+            }),
+            &mut machine,
+            &mut map_state,
+            &mut live_background,
+            &mut pending,
+            &mut emitted,
+            &mut had_error,
+            &utx,
+            "s",
+            &hw,
+            &mut tasks,
+            &mut ext,
+        );
+        assert_eq!(ext.usage.context_window, 1_000_000);
+        assert_eq!(
+            crate::session_model::cached_context_window(
+                &crate::session_model::context_window_cache_key(provider, "claude-opus-5")
+            ),
+            None
+        );
+    }
+
+    // F5b/A-10: the InitConfig seed reads the cross-session cache for the same
+    // (backend, resolved model) before falling back to the heuristic, and a
+    // cached window marks the live window authoritative.
+    #[test]
+    fn f5b_init_config_seed_reads_cached_window() {
+        let provider = "f5b-init-cache";
+        crate::session_model::cache_context_window(
+            &crate::session_model::context_window_cache_key(provider, "claude-sonnet-5[1m]"),
+            967_000,
+        );
+        let mut ext = SessionExt::new(
+            None,
+            PathBuf::new(),
+            crate::env_snapshot::EnvSnapshot::empty(),
+        );
+        let config = crate::session_config::SessionConfigState {
+            current_model_id: "sonnet".to_string(),
+            model_infos: vec![crate::session_config::ModelInfo {
+                value: "sonnet".to_string(),
+                display_name: "Sonnet".to_string(),
+                description: String::new(),
+                resolved_model: Some("claude-sonnet-5[1m]".to_string()),
+                ..Default::default()
+            }],
+            provider_cache_key: provider.to_string(),
+            ..Default::default()
+        };
+        let seeded = crate::session_model::immediate_context_window(
+            &config.provider_cache_key,
+            &config.current_model_id,
+            config
+                .model_infos
+                .iter()
+                .find(|m| m.value == config.current_model_id),
+        );
+        ext.usage.provider_cache_key = config.provider_cache_key.clone();
+        ext.usage.context_window = seeded.size;
+        ext.usage.authoritative = seeded.authoritative;
+        assert_eq!(ext.usage.context_window, 967_000);
+        assert!(ext.usage.authoritative);
+    }
+
+    /// Spawn a bare session actor (no child process) and return its command
+    /// sender, outbound receiver, stream sender, and the control writer's
+    /// sender (kept alive by the caller).
+    fn spawn_bare_actor() -> (
+        mpsc::UnboundedSender<Command>,
+        mpsc::UnboundedReceiver<SessionOutbound>,
+        mpsc::UnboundedSender<Value>,
+        mpsc::UnboundedSender<Value>,
+    ) {
+        let (a, _b) = tokio::io::duplex(64 * 1024);
+        let (control_in_tx, control_in_rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, commands) = mpsc::unbounded_channel::<Command>();
+        let control = Control::spawn(a, control_in_rx, ControlOptions { on_request: None });
+        let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionOutbound>();
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(run_loop(
+            commands,
+            tx.clone(),
+            stream_rx,
+            control,
+            control_in_tx.clone(),
+            update_tx,
+            Duration::from_secs(30),
+            "s1".into(),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            crate::client_caps::ClientCapabilities::default(),
+            std::env::temp_dir(),
+            false,
+            crate::env_snapshot::EnvSnapshot::empty(),
+            None,
+        ));
+        (tx, update_rx, stream_tx, control_in_tx)
+    }
+
+    /// Barrier: wait until the actor has processed every command sent before
+    /// this point.
+    async fn actor_barrier(tx: &mpsc::UnboundedSender<Command>) {
+        let (reply, rx) = oneshot::channel();
+        tx.send(Command::CommandsSnapshot { reply })
+            .expect("actor alive");
+        let _ = rx.await;
+    }
+
+    /// Collect every `available_commands_update` raw update currently queued.
+    fn drain_commands(update_rx: &mut mpsc::UnboundedReceiver<SessionOutbound>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(item) = update_rx.try_recv() {
+            if let SessionOutbound::RawUpdate(value) = item {
+                if value["update"]["sessionUpdate"] == "available_commands_update" {
+                    out.push(value["update"]["availableCommands"].clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn command_names(commands: &Value) -> Vec<String> {
+        commands
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(String::from))
+            .collect()
+    }
+
+    /// D5 (Decision 9, `acp-agent.ts:5976-5998`) — a `system/init` frame's
+    /// `terminal_slash_commands` latches and re-publishes the filtered list.
+    #[tokio::test]
+    async fn inv_73_init_frame_republishes_filtered_list() {
+        let (tx, mut update_rx, stream_tx, _control_in_tx) = spawn_bare_actor();
+        tx.send(Command::InitCommands {
+            commands: json!([
+                {"name": "compact", "description": "Compress the conversation history"},
+                {"name": "doctor", "description": "Run a system diagnostics check"},
+                {"name": "help", "description": "Display help for commands"},
+            ])
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        })
+        .unwrap();
+        actor_barrier(&tx).await;
+        stream_tx
+            .send(json!({
+                "type": "system",
+                "subtype": "init",
+                "terminal_slash_commands": ["doctor"],
+            }))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let published = drain_commands(&mut update_rx);
+        assert_eq!(published.len(), 1, "a first latch re-advertises once");
+        assert_eq!(
+            command_names(&published[0]),
+            vec!["compact", "help", "mcp", "remote-control"],
+            "the latched terminal-bound name is hidden"
+        );
+    }
+
+    /// D5 (Decision 9) — an init frame whose list equals the latched one
+    /// publishes nothing (Node's `JSON.stringify` equality check).
+    #[tokio::test]
+    async fn inv_73_unchanged_terminal_list_publishes_nothing() {
+        let (tx, mut update_rx, stream_tx, _control_in_tx) = spawn_bare_actor();
+        tx.send(Command::InitCommands {
+            commands: json!([{"name": "doctor", "description": "Run a check"}])
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .unwrap();
+        let init = json!({
+            "type": "system",
+            "subtype": "init",
+            "terminal_slash_commands": ["doctor"],
+        });
+        stream_tx.send(init.clone()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            drain_commands(&mut update_rx).len(),
+            1,
+            "first latch publishes"
+        );
+        stream_tx.send(init).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            drain_commands(&mut update_rx).is_empty(),
+            "an unchanged terminal list must not re-advertise"
+        );
+    }
+
+    /// D5 (Decision 9, `acp-agent.ts:6266-6288`) — `commands_changed` replaces
+    /// the stored list and filters it with the LATCHED terminal list.
+    #[tokio::test]
+    async fn inv_73_commands_changed_uses_stored_terminal_list() {
+        let (tx, mut update_rx, stream_tx, _control_in_tx) = spawn_bare_actor();
+        tx.send(Command::InitCommands {
+            commands: json!([{"name": "doctor", "description": "Run a check"}])
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .unwrap();
+        stream_tx
+            .send(json!({
+                "type": "system",
+                "subtype": "init",
+                "terminal_slash_commands": ["doctor"],
+            }))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = drain_commands(&mut update_rx);
+        stream_tx
+            .send(json!({
+                "type": "system",
+                "subtype": "commands_changed",
+                "commands": [
+                    {"name": "doctor", "description": "Run a check"},
+                    {"name": "help", "description": "Display help"},
+                ],
+            }))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let published = drain_commands(&mut update_rx);
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            command_names(&published[0]),
+            vec!["help", "mcp", "remote-control"],
+            "the frame's list replaces the stored one and keeps the terminal filter"
+        );
+    }
+
+    /// D1 (Decision 1) — the background refresh applies ONCE and marks the
+    /// window authoritative; a later authoritative source (`result.modelUsage`)
+    /// still overrides, and a second refresh is ignored.
+    #[test]
+    fn inv_70_refresh_applies_once_and_sets_authoritative() {
+        let mut usage = crate::usage::UsageState::default();
+        assert!(!usage.authoritative);
+        assert_eq!(usage.context_window, crate::usage::DEFAULT_CONTEXT_WINDOW);
+
+        assert!(apply_context_window_answer(
+            &mut usage, "m1", 1_000_000, "m1"
+        ));
+        assert_eq!(usage.context_window, 1_000_000);
+        assert!(usage.authoritative);
+
+        // A second refresh after the window became authoritative is dropped.
+        assert!(!apply_context_window_answer(
+            &mut usage, "m1", 200_000, "m1"
+        ));
+        assert_eq!(usage.context_window, 1_000_000);
+
+        // `result.modelUsage` still overrides (it is authoritative by nature).
+        assert!(usage.update_window_if_positive(Some(500_000)));
+        assert_eq!(usage.context_window, 500_000);
+        assert!(usage.authoritative);
+
+        // And a refresh answering for a model the session left is dropped.
+        assert!(!apply_context_window_answer(
+            &mut usage, "m2", 900_000, "m1"
+        ));
+        assert_eq!(usage.context_window, 500_000);
     }
 }

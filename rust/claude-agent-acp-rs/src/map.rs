@@ -108,11 +108,18 @@ pub struct MapState {
 }
 
 impl MapState {
+    /// Store the session working directory for EVERY client (Decision 6). It
+    /// relativises the tool titles/locations (`toDisplayPath`) and locates an
+    /// AIR skill's `SKILL.md`; Node passes `session.cwd` at every report site.
+    pub(crate) fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cwd = Some(cwd);
+    }
+
     /// Mark the session as an AIR one (rust-air-gaps G11) with its working
     /// directory. `MapState::default()` stays a non-AIR session.
     pub(crate) fn configure_air(&mut self, cwd: PathBuf) {
         self.air = true;
-        self.cwd = Some(cwd);
+        self.set_cwd(cwd);
     }
 
     /// Open the stopped-work window after a cancel (Decision 18): a late
@@ -496,13 +503,73 @@ struct StreamedBlock {
     text: String,
 }
 
+/// The per-frame attribution the mapper threads through one message
+/// (Decision 8):
+///
+/// - `parent` — the frame's `parent_tool_use_id` when it is a STRING (D14);
+///   `null` / missing means the main conversation, never a stamp.
+/// - `structured` — the message-level `tool_use_result`, honoured only when the
+///   message holds exactly one `tool_result` block (D4 / R6).
+/// - `non_exec` — the parsed `tool_result_meta` sidecar by tool-call id (D15).
+#[derive(Debug, Default)]
+struct FrameCtx {
+    parent: Option<String>,
+    structured: Option<Value>,
+    non_exec: HashMap<String, crate::tool_meta::NonExecution>,
+}
+
+impl FrameCtx {
+    /// The attribution of a frame: its string parent id only.
+    fn of_frame(frame: &Value) -> Self {
+        Self {
+            parent: frame
+                .get("parent_tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ..Self::default()
+        }
+    }
+
+    /// The attribution of a `user` frame: parent, the single-result structured
+    /// `tool_use_result` and the `tool_result_meta` sidecar.
+    fn of_user_frame(frame: &Value, content: &Value) -> Self {
+        let mut ctx = Self::of_frame(frame);
+        let tool_result_count = match content {
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .count(),
+            _ => 0,
+        };
+        if tool_result_count == 1 {
+            ctx.structured = frame.get("tool_use_result").cloned();
+        }
+        ctx.non_exec = crate::tool_meta::parse_tool_result_meta(
+            frame.get("tool_result_meta").unwrap_or(&Value::Null),
+        );
+        ctx
+    }
+}
+
 /// Map a consolidated Claude message's `content` into ACP `SessionUpdate`s
-/// (7.1, 7.3, 7.5, 7.6). `content` is either a JSON string (a whole-message
-/// text) or a JSON array of content blocks — the two shapes `claude` emits.
+/// (7.1, 7.3, 7.5, 7.6) with no frame attribution. `content` is either a JSON
+/// string (a whole-message text) or a JSON array of content blocks — the two
+/// shapes `claude` emits.
 pub fn map_consolidated(
     content: &Value,
     role: MsgRole,
     state: &mut MapState,
+) -> Vec<SessionUpdate> {
+    map_consolidated_ctx(content, role, state, &FrameCtx::default())
+}
+
+/// [`map_consolidated`] with the frame attribution of a `user` / `assistant` /
+/// `stream_event` frame.
+fn map_consolidated_ctx(
+    content: &Value,
+    role: MsgRole,
+    state: &mut MapState,
+    ctx: &FrameCtx,
 ) -> Vec<SessionUpdate> {
     let mut out = Vec::new();
     match content {
@@ -514,12 +581,25 @@ pub fn map_consolidated(
         }
         Value::Array(blocks) => {
             for block in blocks {
-                map_block(block, role, state, &mut out);
+                map_block(block, role, state, &mut out, ctx);
             }
         }
         _ => {}
     }
     out
+}
+
+/// Map a consolidated `user` frame (a `tool_result` echo) the way Node does
+/// (`toAcpNotifications`, `acp-agent.js:9955-10280`): the parent attribution,
+/// the single-result `tool_use_result` and the `tool_result_meta` sidecar ride
+/// along to the tool updates. The echo-skip itself stays in the session actor.
+pub fn map_user_frame(frame: &Value, state: &mut MapState) -> Vec<SessionUpdate> {
+    let content = frame
+        .pointer("/message/content")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let ctx = FrameCtx::of_user_frame(frame, &content);
+    map_consolidated_ctx(&content, MsgRole::User, state, &ctx)
 }
 
 /// Map a consolidated `assistant` message the way Node does (rust-parity-fixes
@@ -546,7 +626,12 @@ pub fn map_consolidated_assistant(frame: &Value, state: &mut MapState) -> Vec<Se
         // subagent text, and a post-cancel remainder is dropped.
         drop_text_thinking(&content)
     };
-    let updates = map_consolidated(&content, MsgRole::Assistant, state);
+    let updates = map_consolidated_ctx(
+        &content,
+        MsgRole::Assistant,
+        state,
+        &FrameCtx::of_frame(frame),
+    );
     // Node groups every chunk under the message id (`messageIdForGrouping`,
     // `acp-agent.js:9789-9800`): the API message id, else the SDK frame uuid.
     let message_id = frame
@@ -638,7 +723,13 @@ fn drop_text_thinking(content: &Value) -> Value {
 }
 
 /// Map one consolidated content block into `out` (7.1, 7.3, 7.5, 7.6).
-fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<SessionUpdate>) {
+fn map_block(
+    block: &Value,
+    role: MsgRole,
+    state: &mut MapState,
+    out: &mut Vec<SessionUpdate>,
+    ctx: &FrameCtx,
+) {
     let name = block["name"].as_str().unwrap_or("");
     match block["type"].as_str() {
         Some("tool_use") | Some("server_tool_use") | Some("mcp_tool_use") => {
@@ -655,7 +746,7 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
                     block.clone(),
                 );
             } else {
-                if let Some(update) = tool_call_from_use(block, state) {
+                if let Some(update) = tool_call_from_use(block, state, ctx) {
                     out.push(update);
                 }
             }
@@ -688,8 +779,10 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
                 // (acp-agent.ts:4592-4603), so the turn must not report it as stuck.
                 state.emitted.remove(id);
                 state.books.forget(id);
+                // Review PC-1 (c): finishResult (acp-agent.ts:13181) for every tool_result.
+                state.finish_result_tool_tracker(id, false);
             } else {
-                if let Some(update) = tool_update_from_result(block, state) {
+                if let Some(update) = tool_update_from_result(block, state, ctx) {
                     out.push(update);
                 }
             }
@@ -706,7 +799,11 @@ fn map_block(block: &Value, role: MsgRole, state: &mut MapState, out: &mut Vec<S
 /// refining `ToolCallUpdate` when the id was already emitted (7.7 dedupe).
 /// Phase 9: shapes `kind`/`title`/`locations`/`content` and the `_meta`
 /// `claudeCode` from `tools::tool_shape`/`tools::tool_meta`.
-fn tool_call_from_use(block: &Value, state: &mut MapState) -> Option<SessionUpdate> {
+fn tool_call_from_use(
+    block: &Value,
+    state: &mut MapState,
+    ctx: &FrameCtx,
+) -> Option<SessionUpdate> {
     let id = block["id"].as_str().unwrap_or("").to_string();
     let name = block["name"].as_str().unwrap_or("Other").to_string();
     let raw_input = block.get("input").cloned();
@@ -714,7 +811,7 @@ fn tool_call_from_use(block: &Value, state: &mut MapState) -> Option<SessionUpda
     if state.emitted.contains(&id) {
         // Already surfaced (streamed block, or consolidated after streaming) —
         // refine rather than emit a duplicate ToolCall (7.7).
-        return tool_call_update_refine(id, &name, raw_input, state);
+        return tool_call_update_refine(id, &name, raw_input, state, ctx);
     }
     state.emitted.insert(id.clone());
     state.tool_use_cache.insert(id.clone(), block.clone());
@@ -723,7 +820,7 @@ fn tool_call_from_use(block: &Value, state: &mut MapState) -> Option<SessionUpda
     }
 
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = tools::tool_shape(&name, &input);
+    let shape = tools::tool_shape(&name, &input, state.cwd.as_deref());
     // AIR gets `rawInput` once it is complete; every other client gets the
     // input as it stands, also the empty input at the stream start.
     let sent_raw_input = if state.air && state.input_incomplete {
@@ -743,6 +840,7 @@ fn tool_call_from_use(block: &Value, state: &mut MapState) -> Option<SessionUpda
         ),
     );
     let mut meta = state.use_meta(&name, &input);
+    crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
     if state.air && name.starts_with("mcp__") {
         meta.insert("is_mcp_tool_call".to_string(), Value::Bool(true));
     }
@@ -761,7 +859,11 @@ fn tool_call_from_use(block: &Value, state: &mut MapState) -> Option<SessionUpda
 }
 
 /// 7.3 — a `tool_result` block becomes a completing `ToolCallUpdate`.
-fn tool_update_from_result(block: &Value, state: &mut MapState) -> Option<SessionUpdate> {
+fn tool_update_from_result(
+    block: &Value,
+    state: &mut MapState,
+    ctx: &FrameCtx,
+) -> Option<SessionUpdate> {
     let id = block["tool_use_id"].as_str().unwrap_or("").to_string();
     let name = state
         .tool_use_cache
@@ -788,9 +890,43 @@ fn tool_update_from_result(block: &Value, state: &mut MapState) -> Option<Sessio
         .and_then(|use_block| use_block.get("input").cloned())
         .unwrap_or(Value::Null);
 
-    let mut raw_output = block.get("content").cloned();
     let result_input = block.get("content").cloned().unwrap_or(Value::Null);
-    let mut content = tools::tool_result_content(&name, &result_input, is_error);
+    let result_meta = crate::tool_meta::meta_with_parent_and_nonexec(
+        &name,
+        ctx.non_exec.get(&id),
+        ctx.parent.as_deref(),
+    );
+    if name == "ExitPlanMode" {
+        // The reporter (`reporters/interaction.ts:51-72`) owns the title, the
+        // display copy and the raw output; an accepted plan's title replaces
+        // "Approve Plan", and AIR keeps the approval text out of `rawOutput`.
+        let result = tools::exit_plan_mode_result(block.get("content"), is_error, state.air);
+        let mut fields = ToolCallUpdateFields::new().status(status);
+        if let Some(title) = result.title {
+            fields = fields.title(title);
+        }
+        if let Some(content) = result.content {
+            fields = fields.content(content);
+        }
+        if let Some(raw_output) = result.raw_output {
+            fields = fields.raw_output(raw_output);
+        }
+        let fields = state.track_tool_call_update(&id, &fields)?;
+        let hook_pending = state.pending_hooks.contains(&id);
+        state.finish_result_tool_tracker(&id, hook_pending);
+        return Some(SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(id, fields).meta(result_meta),
+        ));
+    }
+
+    let mut raw_output = block.get("content").cloned();
+    let mut content = tools::tool_result_content(
+        &name,
+        &use_input,
+        ctx.structured.as_ref(),
+        &result_input,
+        is_error,
+    );
     if state.air {
         // AIR shows a read or a search that names a path as the list of viewed
         // files, which does not show the text of the result: it stays out. AIR
@@ -826,7 +962,7 @@ fn tool_update_from_result(block: &Value, state: &mut MapState) -> Option<Sessio
     let hook_pending = state.pending_hooks.contains(&id);
     state.finish_result_tool_tracker(&id, hook_pending);
     Some(SessionUpdate::ToolCallUpdate(
-        ToolCallUpdate::new(id, fields).meta(tools::tool_meta(&name, &result_input)),
+        ToolCallUpdate::new(id, fields).meta(result_meta),
     ))
 }
 
@@ -839,9 +975,10 @@ fn tool_call_update_refine(
     name: &str,
     raw_input: Option<Value>,
     state: &mut MapState,
+    ctx: &FrameCtx,
 ) -> Option<SessionUpdate> {
     let input = raw_input.clone().unwrap_or(Value::Null);
-    let shape = tools::tool_shape(name, &input);
+    let shape = tools::tool_shape(name, &input, state.cwd.as_deref());
     let mut fields = ToolCallUpdateFields::new()
         .kind(shape.kind)
         .title(shape.title)
@@ -853,8 +990,10 @@ fn tool_call_update_refine(
         fields = fields.raw_input(raw_input);
     }
     let fields = state.track_tool_call_update(&id, &fields)?;
+    let mut meta = state.use_meta(name, &input);
+    crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
     Some(SessionUpdate::ToolCallUpdate(
-        ToolCallUpdate::new(id, fields).meta(state.use_meta(name, &input)),
+        ToolCallUpdate::new(id, fields).meta(meta),
     ))
 }
 
@@ -963,7 +1102,7 @@ fn plan_from_todo_write(block: &Value) -> Option<SessionUpdate> {
 /// the CLI already offers a non-terminal one.
 pub fn map_commands_changed(
     commands: &Value,
-    terminal_commands: &Value,
+    terminal_commands: &[String],
 ) -> AvailableCommandsUpdate {
     const UNSUPPORTED: &[&str] = &[
         "clear",
@@ -975,10 +1114,9 @@ pub fn map_commands_changed(
         "release-notes",
         "todos",
     ];
-    let terminal_names: HashSet<&str> = terminal_commands
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|c| c["name"].as_str()).collect())
-        .unwrap_or_default();
+    // D5 (Decision 9): `system/init.terminal_slash_commands` is an array of
+    // NAMES (`acp-agent.ts:12583-12586` filters by `command.name`), not objects.
+    let terminal_names: HashSet<&str> = terminal_commands.iter().map(String::as_str).collect();
 
     let mut avail = Vec::new();
     let mut has_non_terminal_remote_control = false;
@@ -1090,6 +1228,9 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
         .as_str()
         .unwrap_or("")
         .to_string();
+    // A subagent's stream frames stamp `parentToolUseId` on every update
+    // (`stampParentToolUseId`, `acp-agent.js:10363`).
+    let ctx = FrameCtx::of_frame(message);
 
     match event["type"].as_str() {
         Some("content_block_start") => {
@@ -1103,10 +1244,11 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
             // is marked emitted so the consolidated message dedupes (7.7).
             // The input of a streamed tool_use block is still incomplete here.
             state.input_incomplete = is_tool_use_block(block);
-            let mapped = map_consolidated(
+            let mapped = map_consolidated_ctx(
                 &Value::Array(vec![block.clone()]),
                 MsgRole::Assistant,
                 state,
+                &ctx,
             );
             state.input_incomplete = false;
             apply_stream_message_id(mapped, &state.current_stream_message_id)
@@ -1115,7 +1257,7 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
             let delta = &event["delta"];
             if delta["type"].as_str() == Some("input_json_delta") {
                 let index = event["index"].as_u64().unwrap_or(0);
-                input_json_delta(state, &stream_key, index, delta)
+                input_json_delta(state, &stream_key, index, delta, &ctx)
             } else {
                 // Record the text/thinking that reaches the client so the
                 // consolidated message can diff against it (Decision 18).
@@ -1133,10 +1275,11 @@ pub fn map_stream_event(message: &Value, state: &mut MapState) -> Vec<SessionUpd
                 }
                 // A text/thinking delta maps like a one-block assistant message.
                 apply_stream_message_id(
-                    map_consolidated(
+                    map_consolidated_ctx(
                         &Value::Array(vec![delta.clone()]),
                         MsgRole::Assistant,
                         state,
+                        &ctx,
                     ),
                     &state.current_stream_message_id,
                 )
@@ -1231,6 +1374,7 @@ fn input_json_delta(
     stream_key: &str,
     index: u64,
     delta: &Value,
+    ctx: &FrameCtx,
 ) -> Vec<SessionUpdate> {
     let Some(streamed) = state
         .streamed_inputs
@@ -1265,7 +1409,7 @@ fn input_json_delta(
     let id = streamed.id.clone();
     let name = streamed.name.clone();
     // Refine, never duplicate: this is a tool_call_update, not a tool_call.
-    streamed_input_refinement(state, &id, &name, input)
+    streamed_input_refinement(state, &id, &name, input, ctx)
         .into_iter()
         .collect()
 }
@@ -1279,10 +1423,12 @@ fn streamed_input_refinement(
     id: &str,
     name: &str,
     input: Value,
+    ctx: &FrameCtx,
 ) -> Option<SessionUpdate> {
-    let shape = tools::tool_shape(name, &input);
+    let shape = tools::tool_shape(name, &input, state.cwd.as_deref());
     // The `_meta` reads the recovered partial input (`partialRefinement`).
-    let meta = state.use_meta(name, &input);
+    let mut meta = state.use_meta(name, &input);
+    crate::tool_meta::stamp_parent(&mut meta, ctx.parent.as_deref());
     let mut fields = ToolCallUpdateFields::new()
         .kind(shape.kind)
         .title(shape.title);
@@ -1363,6 +1509,37 @@ fn is_task_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Review PC-1 (c): a Task* tool_result releases the field tracker entry, as Node's
+    // finishResult does for every tool_result (acp-agent.ts:13181; field-tracker.ts:127-132).
+    #[test]
+    fn task_tool_result_releases_the_field_tracker() {
+        let mut state = MapState::default();
+        let task =
+            json!({"type": "tool_use", "id": "toolu_TR1", "name": "TaskUpdate", "input": {}});
+        state.mark_emitted("toolu_TR1".to_string(), task);
+        state.seed_tool_tracker(
+            "toolu_TR1".to_string(),
+            TrackedToolCall::initial(
+                ToolKind::Other,
+                "task".to_string(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+        );
+        assert!(state.tool_tracker.contains_key("toolu_TR1"));
+        let result = json!({"type": "tool_result", "tool_use_id": "toolu_TR1", "content": "ok"});
+        let mut out = Vec::new();
+        map_block(
+            &result,
+            MsgRole::User,
+            &mut state,
+            &mut out,
+            &FrameCtx::default(),
+        );
+        assert!(!state.tool_tracker.contains_key("toolu_TR1"));
+    }
 
     // PC-1.2 (acp-agent.ts ensureToolCallEmitted, 9799-9811; tools.ts hasHookCallback): a call
     // first surfaced by a permission prompt still has its PostToolUse hook pending, except
@@ -1462,8 +1639,7 @@ mod tests {
         // entry points.
         let mode = map_mode_update("plan");
         assert_eq!(kind(&mode), "current_mode_update");
-        let commands =
-            map_commands_changed(&json!([{"name": "x", "description": "d"}]), &json!([]));
+        let commands = map_commands_changed(&json!([{"name": "x", "description": "d"}]), &[]);
         assert_eq!(
             kind(&SessionUpdate::AvailableCommandsUpdate(commands)),
             "available_commands_update"
@@ -1881,7 +2057,7 @@ mod tests {
             {"name": "cost", "description": "Show usage cost"},
             {"name": "todos", "description": "Manage todos"},
         ]);
-        let result = map_commands_changed(&commands, &json!([]));
+        let result = map_commands_changed(&commands, &[]);
         assert_eq!(
             names(&result),
             vec![
@@ -1914,7 +2090,7 @@ mod tests {
         assert_eq!(wire["sessionUpdate"], "available_commands_update");
 
         // Empty commands -> only the appended mcp + remote-control.
-        let empty = map_commands_changed(&json!([]), &json!([]));
+        let empty = map_commands_changed(&json!([]), &[]);
         assert_eq!(
             names(&empty),
             vec!["mcp", "remote-control"],
@@ -1925,7 +2101,7 @@ mod tests {
         // the CLI's entry stays in place and only mcp is appended after it.
         let with_rc = map_commands_changed(
             &json!([{"name": "remote-control", "description": "already here"}]),
-            &json!([]),
+            &[],
         );
         assert_eq!(
             names(&with_rc),
@@ -1935,12 +2111,43 @@ mod tests {
         // But a terminal-bound remote-control is dropped and the adapter's appended.
         let rc_terminal = map_commands_changed(
             &json!([{"name": "remote-control", "description": "t"}]),
-            &json!([{"name": "remote-control", "description": "t"}]),
+            &["remote-control".to_string()],
         );
         assert_eq!(
             names(&rc_terminal),
             vec!["mcp", "remote-control"],
             "a terminal remote-control is replaced by the adapter's"
+        );
+    }
+
+    /// D5 (Decision 9) — `terminal_slash_commands` is a list of NAMES from
+    /// `system/init`; those commands are hidden from the advertisement (S-04)
+    /// and the adapter's own remote-control entry stands in for the CLI's.
+    #[test]
+    fn inv_73_terminal_commands_filter_by_name() {
+        let names = |u: &AvailableCommandsUpdate| -> Vec<String> {
+            serde_json::to_value(u)
+                .ok()
+                .and_then(|v| v.get("availableCommands").cloned())
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|c| c.get("name").and_then(serde_json::Value::as_str))
+                .map(String::from)
+                .collect()
+        };
+        let commands = json!([
+            {"name": "compact", "description": "Compress the conversation history"},
+            {"name": "doctor", "description": "Run a system diagnostics check"},
+            {"name": "color", "description": "Set the terminal color"},
+            {"name": "help", "description": "Display help for commands"},
+        ]);
+        let terminal = vec!["doctor".to_string(), "color".to_string()];
+        let result = map_commands_changed(&commands, &terminal);
+        assert_eq!(
+            names(&result),
+            vec!["compact", "help", "mcp", "remote-control"],
+            "terminal-bound names are filtered by name before the MCP rename"
         );
     }
 
@@ -2103,7 +2310,7 @@ mod tests {
             "tool_use_id": "toolu_HK1",
             "content": "output"
         });
-        let _ = tool_update_from_result(&result_chunk, &mut state);
+        let _ = tool_update_from_result(&result_chunk, &mut state, &FrameCtx::default());
 
         // Tracker entry is KEPT because hook is pending
         assert_eq!(state.tracked_tool_calls(), 1);
@@ -2113,5 +2320,213 @@ mod tests {
 
         // Now tracker entry is removed
         assert_eq!(state.tracked_tool_calls(), 0);
+    }
+
+    /// D14 (inv_76) — a subagent's `tool_call` and its refining / completing
+    /// updates carry `_meta.claudeCode.parentToolUseId`; the top-level call does
+    /// not, and `null`/missing means no stamp (`acp-agent.js:552,9958,10363`).
+    #[test]
+    fn inv_76_parent_stamped_on_tool_call_and_updates() {
+        let mut state = MapState::default();
+        let child_frame = json!({
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_TASK",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_CHILD", "name": "Read",
+                 "input": {"file_path": "/work/a.txt"}}
+            ]}
+        });
+        let updates = map_consolidated_assistant(&child_frame, &mut state);
+        let SessionUpdate::ToolCall(tc) = &updates[0] else {
+            panic!("expected a tool_call, got {:?}", updates[0]);
+        };
+        let meta = serde_json::to_value(tc.meta.clone().unwrap_or_default()).unwrap();
+        assert_eq!(meta["claudeCode"]["parentToolUseId"], "toolu_TASK");
+        assert_eq!(meta["claudeCode"]["toolName"], "Read");
+
+        // The completing update keeps the parent stamp.
+        let result_frame = json!({
+            "type": "user",
+            "parent_tool_use_id": "toolu_TASK",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_CHILD", "content": "file"}
+            ]}
+        });
+        let updates = map_user_frame(&result_frame, &mut state);
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected a tool_call_update, got {:?}", updates[0]);
+        };
+        let meta = serde_json::to_value(update.meta.clone().unwrap_or_default()).unwrap();
+        assert_eq!(meta["claudeCode"]["parentToolUseId"], "toolu_TASK");
+
+        // A top-level frame carries no parent key at all.
+        let mut state = MapState::default();
+        let top_frame = json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_TOP", "name": "Bash",
+                 "input": {"command": "ls"}}
+            ]}
+        });
+        let updates = map_consolidated_assistant(&top_frame, &mut state);
+        let SessionUpdate::ToolCall(tc) = &updates[0] else {
+            panic!("expected a tool_call");
+        };
+        let meta = serde_json::to_value(tc.meta.clone().unwrap_or_default()).unwrap();
+        assert!(
+            meta["claudeCode"].get("parentToolUseId").is_none(),
+            "{meta}"
+        );
+
+        // A stream event of the subagent stamps the parent too.
+        let mut state = MapState::default();
+        let start = json!({
+            "type": "stream_event",
+            "parent_tool_use_id": "toolu_TASK",
+            "event": {"type": "content_block_start", "index": 0,
+                      "content_block": {"type": "tool_use", "id": "toolu_S",
+                                        "name": "Bash", "input": {}}}
+        });
+        let updates = map_stream_event(&start, &mut state);
+        let SessionUpdate::ToolCall(tc) = &updates[0] else {
+            panic!("expected a tool_call");
+        };
+        let meta = serde_json::to_value(tc.meta.clone().unwrap_or_default()).unwrap();
+        assert_eq!(meta["claudeCode"]["parentToolUseId"], "toolu_TASK");
+    }
+
+    /// D15 (inv_77) — the `tool_result_meta` sidecar stamps
+    /// `nonExecutionKind` / `userFeedback` on the completing update, in Node's
+    /// key order, and an unknown kind is preserved (`acp-agent.js:10124,10162`).
+    #[test]
+    fn inv_77_non_execution_kind_and_feedback() {
+        let mut state = MapState::default();
+        let use_frame = json!([{
+            "type": "tool_use", "id": "toolu_DENY", "name": "Edit",
+            "input": {"file_path": "/work/a.txt", "old_string": "a", "new_string": "b"}
+        }]);
+        let _ = map_consolidated(&use_frame, MsgRole::Assistant, &mut state);
+        let frame = json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_DENY", "is_error": true,
+                 "content": "The user doesn't want to proceed with this tool use."}
+            ]},
+            "tool_result_meta": [
+                {"id": "toolu_DENY", "non_execution_kind": "user-rejected",
+                 "user_feedback": "not now"}
+            ]
+        });
+        let updates = map_user_frame(&frame, &mut state);
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected a tool_call_update, got {:?}", updates[0]);
+        };
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+        // The denied Edit shows the fenced error text.
+        let content = update.fields.content.clone().unwrap_or_default();
+        assert_eq!(content.len(), 1);
+        let meta = serde_json::to_value(update.meta.clone().unwrap_or_default()).unwrap();
+        let keys: Vec<&String> = meta["claudeCode"].as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            vec!["toolName", "nonExecutionKind", "userFeedback"],
+            "Node's key order: toolName, nonExecutionKind, userFeedback"
+        );
+        assert_eq!(meta["claudeCode"]["toolName"], "Edit");
+        assert_eq!(meta["claudeCode"]["nonExecutionKind"], "user-rejected");
+        assert_eq!(meta["claudeCode"]["userFeedback"], "not now");
+    }
+
+    #[test]
+    fn inv_77_unknown_kind_preserved() {
+        let mut state = MapState::default();
+        let use_frame = json!([{
+            "type": "tool_use", "id": "toolu_X", "name": "Bash", "input": {"command": "ls"}
+        }]);
+        let _ = map_consolidated(&use_frame, MsgRole::Assistant, &mut state);
+        let frame = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_X", "content": "ok"}
+            ]},
+            "tool_result_meta": [
+                {"id": "toolu_X", "non_execution_kind": "some-future-kind"}
+            ]
+        });
+        let updates = map_user_frame(&frame, &mut state);
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected a tool_call_update");
+        };
+        let meta = serde_json::to_value(update.meta.clone().unwrap_or_default()).unwrap();
+        assert_eq!(meta["claudeCode"]["nonExecutionKind"], "some-future-kind");
+        assert!(meta["claudeCode"].get("userFeedback").is_none());
+    }
+
+    /// D4 — the single-`tool_result` guard: a message with two results carries
+    /// no structured result, one result does (`acp-agent.js:9962-9971`).
+    #[test]
+    fn inv_75_user_frame_structured_single_result_guard() {
+        let mut state = MapState::default();
+        let use_frame = json!([{
+            "type": "tool_use", "id": "toolu_R1", "name": "Read", "input": {"file_path": "/w/a"}
+        }]);
+        let _ = map_consolidated(&use_frame, MsgRole::Assistant, &mut state);
+        let frame = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_R1",
+                 "content": "     1\traw\n<system-reminder>x</system-reminder>"}
+            ]},
+            "tool_use_result": {"type": "text",
+                "file": {"content": "clean", "startLine": 1, "numLines": 1, "totalLines": 1}}
+        });
+        let updates = map_user_frame(&frame, &mut state);
+        let SessionUpdate::ToolCallUpdate(update) = &updates[0] else {
+            panic!("expected a tool_call_update");
+        };
+        let content = update.fields.content.clone().unwrap_or_default();
+        let ToolCallContent::Content(c) = &content[0] else {
+            panic!("expected content");
+        };
+        let ContentBlock::Text(t) = &c.content else {
+            panic!("expected text");
+        };
+        assert_eq!(t.text.as_str(), "```\n1\tclean\n```");
+
+        // Two tool_result blocks: the sidecar cannot be attributed.
+        let mut state = MapState::default();
+        for id in ["toolu_A", "toolu_B"] {
+            let _ = map_consolidated(
+                &json!([{"type": "tool_use", "id": id, "name": "Read",
+                         "input": {"file_path": "/w/a"}}]),
+                MsgRole::Assistant,
+                &mut state,
+            );
+        }
+        let frame = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_A", "content": "one"},
+                {"type": "tool_result", "tool_use_id": "toolu_B", "content": "two"}
+            ]},
+            "tool_use_result": {"type": "text", "file": {"content": "clean"}}
+        });
+        let updates = map_user_frame(&frame, &mut state);
+        for update in &updates {
+            let SessionUpdate::ToolCallUpdate(update) = update else {
+                continue;
+            };
+            let content = update.fields.content.clone().unwrap_or_default();
+            let ToolCallContent::Content(c) = &content[0] else {
+                panic!("expected content");
+            };
+            let ContentBlock::Text(t) = &c.content else {
+                panic!("expected text");
+            };
+            assert_eq!(t.text.as_str(), "```\none\n```");
+            break;
+        }
     }
 }

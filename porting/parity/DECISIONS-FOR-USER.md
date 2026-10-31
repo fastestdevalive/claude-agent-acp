@@ -49,3 +49,18 @@ nothing here blocks work.
 - **What:** (a) Amends D5: an advertisement row whose methods are unserved is PARTIAL (C-14 goal, C-49 providers); an advertisement whose behaviour is served or separately tracked is DONE (C-05, C-06, C-09). (b) U-26 and P-10 were downgraded to PARTIAL as the round-3 audit asked. The round-3 flips of O-10 and O-20 to DONE were refuted by verification against upstream and Rust, so they stay PARTIAL with the verified gap. (c) FX-6 is removed: B-20 is DONE and no row remains for it. (d) Module rows are PARTIAL where a behaviour row they cite is PARTIAL (14 rows), so module status and behaviour status agree.
 - **Why:** an unserved advertisement is a live wire gap and must not read as DONE; a refuted DONE claim must not be published; a module row cannot be DONE while its behaviour is MISSING or PARTIAL.
 - **Alternatives:** keep C-49 as DONE with the gap only in M-128 (one gap, reported once); keep module rows MISSING and add a note.
+
+## D7 — The version string stays composed (`<crate>+upstream.0.94.0`), not the plain npm pin
+
+- **What:** C-01 (`agentInfo.version`) and O-01 (`--version`/`-v`/`-V`) report
+  `<CARGO_PKG_VERSION>+upstream.0.94.0` (`build.rs`, `agent.rs`), while the Node
+  adapter reports the bare package version `0.94.0`. The differential normalises
+  the fixture side to the composed value; this is a deliberate divergence
+  awaiting a user decision, not a port gap.
+- **Why:** the composed string keeps the Rust crate's own version and the pinned
+  upstream tag visible in one place; collapsing it to `0.94.0` would make the
+  Rust crate claim the npm package's identity. The Node fixture remains
+  authoritative for every other field.
+- **Alternatives:** print the bare pin (`0.94.0`) from the binary and
+  `agentInfo.version` to match Node byte-for-byte (one-line change in `build.rs`
+  and the normaliser in `tests/common/mod.rs`).

@@ -406,18 +406,12 @@ fn explicit_expect_wins_over_auto_ack() {
     );
 }
 
-/// Path to the compiled `fake-claude` binary, building it on demand.
+/// Path to the `fake-claude` binary built for this test run. Cargo exports
+/// `CARGO_BIN_EXE_<name>` for integration tests of a binary crate, so this is
+/// always the binary compiled from the current source (a stale
+/// `../target/debug/fake-claude` from an earlier build must never be replayed).
 fn fake_claude_binary() -> std::path::PathBuf {
-    let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/fake-claude");
-    if !bin.exists() {
-        let status = Command::new("cargo")
-            .args(["build", "--bin", "fake-claude", "--manifest-path"])
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml"))
-            .status()
-            .expect("failed to spawn cargo build for fake-claude");
-        assert!(status.success(), "cargo build --bin fake-claude failed");
-    }
-    bin
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake-claude"))
 }
 
 /// Spawn fake-claude under a scrubbed environment mirroring `capture.sh`'s `env -i`.
@@ -528,4 +522,140 @@ fn cwd_placeholder_expands() {
     assert_eq!(frame["bare"], cwd.as_str());
     assert_eq!(frame["path"], format!("{cwd}/a.txt"));
     assert_eq!(frame["n"], 1);
+}
+
+/// F1 — `$REQ.n` resolves the n-th previous matched frame's `request_id`
+/// (`$REQ.1` = previous, `$REQ.2` = the one before).
+#[test]
+fn req_n_placeholder_indexes_backwards() {
+    let transcript = mk_transcript(concat!(
+        r#"{"expect":{"type":"control_request","request":{"subtype":"a"}},"emit":[{"type":"x","req":"$REQ"}]}"#,
+        "\n",
+        r#"{"expect":{"type":"control_request","request":{"subtype":"b"}},"emit":[{"type":"y","req":"$REQ"}]}"#,
+        "\n",
+        r#"{"expect":{"type":"control_request","request":{"subtype":"c"}},"emit":[{"type":"z","prev1":"$REQ.1","prev2":"$REQ.2"}]}"#,
+        "\n"
+    ));
+    let stdin = concat!(
+        r#"{"type":"control_request","request_id":"R-A","request":{"subtype":"a"}}"#,
+        "\n",
+        r#"{"type":"control_request","request_id":"R-B","request":{"subtype":"b"}}"#,
+        "\n",
+        r#"{"type":"control_request","request_id":"R-C","request":{"subtype":"c"}}"#,
+        "\n"
+    );
+    let (out, result) = run_replay(&transcript, stdin);
+    assert_eq!(result.unwrap(), 3);
+    let frames: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(frames[2]["prev1"], "R-B");
+    assert_eq!(frames[2]["prev2"], "R-A");
+}
+
+/// F1 — spawn a fake-claude process with an optional spawn cursor.
+fn run_fake_claude_with(script: &Path, cursor: Option<&Path>, stdin: &str) -> (String, bool) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let bin = fake_claude_binary();
+    let mut cmd = fake_claude_cmd(&bin);
+    cmd.env("FAKE_CLAUDE_SCRIPT", script);
+    if let Some(cursor) = cursor {
+        cmd.env("FAKE_CLAUDE_CURSOR", cursor);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn fake-claude");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait for fake-claude");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        output.status.success(),
+    )
+}
+
+/// F1 multi-spawn: a second process after a restart reads the NEXT transcript
+/// segment (the spawn cursor advances), while the first reads segment 0.
+#[test]
+fn multi_spawn_reads_next_segment() {
+    let dir = std::env::temp_dir().join(format!("fake-claude-multi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("multi.transcript.jsonl");
+    std::fs::write(
+        &script,
+        concat!(
+            r#"{"expect":{"type":"user","message":{"content":[{"type":"text","text":"first"}]}},"emit":[{"type":"result","subtype":"success","n":1}]}"#,
+            "\n",
+            r#"{"segment":1}"#,
+            "\n",
+            r#"{"expect":{"type":"user","message":{"content":[{"type":"text","text":"second"}]}},"emit":[{"type":"result","subtype":"success","n":2}]}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let cursor = dir.join("spawn.cursor");
+
+    let (out1, ok1) = run_fake_claude_with(
+        &script,
+        Some(&cursor),
+        "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n",
+    );
+    assert!(ok1, "first spawn must succeed, got: {out1}");
+    let frame1: serde_json::Value = serde_json::from_str(out1.lines().next().unwrap()).unwrap();
+    assert_eq!(frame1["n"], 1, "first spawn replays segment 0");
+
+    let (out2, ok2) = run_fake_claude_with(
+        &script,
+        Some(&cursor),
+        "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"second\"}]}}\n",
+    );
+    assert!(ok2, "second spawn must succeed, got: {out2}");
+    let frame2: serde_json::Value = serde_json::from_str(out2.lines().next().unwrap()).unwrap();
+    assert_eq!(frame2["n"], 2, "second spawn replays segment 1");
+    assert_eq!(
+        std::fs::read_to_string(&cursor).unwrap().trim(),
+        "2",
+        "cursor advanced once per spawn"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// F1 — without `FAKE_CLAUDE_CURSOR` a multi-segment transcript still replays
+/// segment 0 on every spawn (existing fixtures unchanged, no repo writes).
+#[test]
+fn multi_spawn_without_cursor_replays_first_segment() {
+    let dir = std::env::temp_dir().join(format!("fake-claude-nocursor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("multi.transcript.jsonl");
+    std::fs::write(
+        &script,
+        concat!(
+            r#"{"expect":{"type":"user","message":{"content":[{"type":"text","text":"first"}]}},"emit":[{"type":"result","subtype":"success","n":1}]}"#,
+            "\n",
+            r#"{"segment":1}"#,
+            "\n",
+            r#"{"expect":{"type":"user","message":{"content":[{"type":"text","text":"second"}]}},"emit":[{"type":"result","subtype":"success","n":2}]}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let stdin =
+        "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n";
+    for _ in 0..2 {
+        let (out, ok) = run_fake_claude_with(&script, None, stdin);
+        assert!(ok, "spawn must succeed, got: {out}");
+        let frame: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(frame["n"], 1, "segment 0 replays on every spawn");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

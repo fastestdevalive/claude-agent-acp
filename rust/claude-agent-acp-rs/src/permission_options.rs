@@ -68,6 +68,11 @@ pub struct OptionsContext {
     /// The set of available mode ids (`sessionModes.availableModeIds`), used by
     /// ExitPlanMode to decide which elevated modes (auto / bypass) to offer.
     pub available_modes: Vec<String>,
+    /// Whether the current model lacks Auto (`sessionModes.isAutoUnavailable`).
+    /// Node's `applyPermissionFallback` (`session-mode.ts:196-215`) rewrites a
+    /// `setMode auto` allow to Accept edits, and the caller publishes the
+    /// fallback warning before the mode update.
+    pub auto_unavailable: bool,
     /// The session's pre-plan mode (`session.prePlanMode`), used by
     /// ExitPlanMode to lead with bypass when the session was in bypass before
     /// entering plan mode.
@@ -238,13 +243,12 @@ fn is_inside(directory: &Path, candidate: &Path) -> bool {
 
 /// Build the ACP `options` array for a `can_use_tool` request, port of
 /// `buildClaudePermissionOptions` + `buildUnsortedClaudePermissionOptions`
-/// (`dist/permissions/options.js`), with the decline-first ordering applied
-/// when `defaultToNo` is set.
+/// (`dist/permissions/options.js`). Node sorts on every call: approvals
+/// before "other" before the reject options, and the decline-first order when
+/// `defaultToNo` is set (`options.ts:25-33`).
 pub fn build_options(ctx: &OptionsContext) -> Vec<Value> {
     let mut options = build_unsorted_options(ctx);
-    if ctx.default_to_no {
-        options.sort_by_key(|opt| option_order(opt, true));
-    }
+    options.sort_by_key(|opt| option_order(opt, ctx.default_to_no));
     options
 }
 
@@ -1085,6 +1089,7 @@ mod tests {
             no_persistent_rule: false,
             default_to_no: false,
             available_modes: Vec::new(),
+            auto_unavailable: false,
             pre_plan_mode: None,
             context_used_percent: None,
             home_dir: None,
@@ -1402,10 +1407,11 @@ mod tests {
         assert!(apply_selection("bogus", &generic).is_err());
     }
 
-    /// Fix 1 (BLOCKER) — ExitPlanMode builds Node's option set exactly: the
-    /// elevated auto/bypass modes lead, then the default manual-approve option,
-    /// then "No, keep planning". With `input.plan` an additional clear-context
-    /// option leads (Decision 7).
+    /// Fix 1 (BLOCKER) — ExitPlanMode builds Node's option set exactly. Node
+    /// sorts every call (`options.ts:29-32`), so the manual-approve
+    /// `allow_once` leads, then the elevated auto/bypass modes and the
+    /// clear-context form, then "No, keep planning". With `input.plan` an
+    /// additional clear-context option is offered (Decision 7).
     #[test]
     fn inv_60_options_exit_plan_mode() {
         let modes = [
@@ -1419,46 +1425,58 @@ mod tests {
         assert_eq!(
             ids(&options),
             vec![
+                "exit-plan-default",
                 "exit-plan-auto",
                 "exit-plan-bypass",
-                "exit-plan-default",
                 "reject",
             ]
         );
-        assert_eq!(options[0]["name"], "Yes, and use auto mode");
-        assert_eq!(options[1]["name"], "Yes, and bypass permissions");
-        assert_eq!(options[2]["name"], "Yes, manually approve edits");
+        assert_eq!(options[0]["name"], "Yes, manually approve edits");
+        assert_eq!(options[1]["name"], "Yes, and use auto mode");
+        assert_eq!(options[2]["name"], "Yes, and bypass permissions");
         assert_eq!(options[3]["name"], "No, keep planning");
 
-        // With a plan, a clear-context option (preferred auto) leads.
+        // With a plan, the clear-context option (preferred auto) follows the
+        // `allow_once` default in build order.
         let options = build_options(&exit_ctx(json!({"plan": "ship it"}), &modes, None));
         assert_eq!(
-            options[0],
+            ids(&options),
+            vec![
+                "exit-plan-default",
+                "exit-plan-clear-auto",
+                "exit-plan-auto",
+                "exit-plan-bypass",
+                "reject",
+            ]
+        );
+        assert_eq!(
+            options[1],
             json!({
                 "optionId": "exit-plan-clear-auto",
                 "name": "Yes, clear context and use auto mode",
                 "kind": "allow_always",
             })
         );
-        assert_eq!(options[1]["optionId"], "exit-plan-auto");
 
-        // Pre-plan bypass leads with bypassPermissions and its clear-context form.
+        // Pre-plan bypass builds bypassPermissions and its clear-context form
+        // first, then auto; the sort keeps the `allow_once` default leading.
         let options = build_options(&exit_ctx(
             json!({"plan": "x"}),
             &modes,
             Some("bypassPermissions"),
         ));
-        assert_eq!(options[0]["optionId"], "exit-plan-clear-bypass");
-        assert_eq!(options[1]["optionId"], "exit-plan-bypass");
-        assert_eq!(options[2]["optionId"], "exit-plan-auto");
-        assert_eq!(options[3]["optionId"], "exit-plan-default");
+        assert_eq!(options[0]["optionId"], "exit-plan-default");
+        assert_eq!(options[1]["optionId"], "exit-plan-clear-bypass");
+        assert_eq!(options[2]["optionId"], "exit-plan-bypass");
+        assert_eq!(options[3]["optionId"], "exit-plan-auto");
+        assert_eq!(options[4]["optionId"], "reject");
 
         // Context-used percent is rendered in the clear-context label only.
         let mut c = exit_ctx(json!({"plan": "x"}), &modes, None);
         c.context_used_percent = Some(35);
         let options = build_options(&c);
         assert_eq!(
-            options[0]["name"],
+            options[1]["name"],
             "Yes, clear context (35% used) and use auto mode"
         );
 
@@ -1466,7 +1484,7 @@ mod tests {
         let options = build_options(&exit_ctx(json!({}), &["default", "acceptEdits"], None));
         assert_eq!(
             ids(&options),
-            vec!["exit-plan-accept-edits", "exit-plan-default", "reject"]
+            vec!["exit-plan-default", "exit-plan-accept-edits", "reject"]
         );
     }
 

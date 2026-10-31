@@ -15,19 +15,22 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use agent_client_protocol::schema::v1::StopReason;
 use agent_client_protocol::{Agent, ConnectTo, ConnectionTo, Error, Result, UntypedMessage};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::air::AirClient;
 use crate::auth_status::{spawn_auth_actor, AuthCmd, AuthHandle, AuthPush};
+use crate::client_caps::ClientCapabilities;
 use crate::control::InitializeOptions;
 use crate::map;
 use crate::process::{SpawnOptions, Timings};
 use crate::session::{Session, SessionError, SessionOptions, SessionOutbound};
 use crate::session_methods;
+use crate::session_timing::SessionTiming;
 use crate::system_prompt;
 
 /// The `agentInfo` returned by `initialize`, matching the Node adapter (the
@@ -54,6 +57,9 @@ pub struct ServeOptions {
     pub timings: Timings,
     /// Environment snapshot the adapter reads through (hermetic by default).
     pub env: crate::env_snapshot::EnvSnapshot,
+    /// The file logger (`CLAUDE_AGENT_LOGS`, `index.ts:73-84`). `None` (the
+    /// default) means diagnostics are not written anywhere.
+    pub logger: Option<std::sync::Arc<crate::logger::Logger>>,
 }
 
 impl ServeOptions {
@@ -81,6 +87,7 @@ impl ServeOptions {
             extra_env: Vec::new(),
             default_cwd,
             timings,
+            logger: logger_from_env(&env),
             env,
         }
     }
@@ -90,6 +97,22 @@ impl ServeOptions {
         self.env = env;
         self
     }
+
+    /// Attach a file logger (the stdio binary builds one from `CLAUDE_AGENT_LOGS`).
+    #[must_use]
+    pub fn with_logger(mut self, logger: Option<std::sync::Arc<crate::logger::Logger>>) -> Self {
+        self.logger = logger;
+        self
+    }
+}
+
+/// The optional file logger for an environment snapshot (`index.ts:73-84`):
+/// only when `CLAUDE_AGENT_LOGS` selects a directory.
+fn logger_from_env(
+    env: &crate::env_snapshot::EnvSnapshot,
+) -> Option<std::sync::Arc<crate::logger::Logger>> {
+    let logger = crate::logger::Logger::from_env(env);
+    logger.enabled().then(|| std::sync::Arc::new(logger))
 }
 
 /// The AIR capability list advertised verbatim from Node (research X-2 /
@@ -107,6 +130,137 @@ const AIR_CAPABILITIES: &[&str] = &[
     "planFile",
 ];
 
+/// The process entrypoint (`process.execPath`) and the adapter's own
+/// arguments (`process.argv.slice(1)` in Node, minus the script entrypoint).
+/// Used for `_meta["terminal-auth"]`.
+fn process_entrypoint() -> (String, Vec<String>) {
+    let executable = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let argv = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    (executable, argv)
+}
+
+/// The terminal auth methods, mirroring `initialize` (`acp-agent.ts:2869-2947`).
+///
+/// The remote branch (`NO_BROWSER`/`SSH_*`/`CLAUDE_CODE_REMOTE`) offers the
+/// TUI login instead of the browser redirect; the non-remote branch offers the
+/// subscription and Console logins. A client that only declared
+/// `_meta["terminal-auth"]` gets the same methods with the launch command.
+fn terminal_auth_methods(
+    caps: &ClientCapabilities,
+    env: &crate::env_snapshot::EnvSnapshot,
+    executable: &str,
+    argv: &[String],
+) -> Vec<Value> {
+    let supports_terminal = caps.auth_terminal;
+    let supports_meta = caps.meta_terminal_auth;
+    if !supports_terminal && !supports_meta {
+        return Vec::new();
+    }
+
+    // `--hide-claude-auth` belongs to F34; until then Claude auth is not
+    // hidden.
+    let hidden = false;
+    let is_remote = env.flag("NO_BROWSER")
+        || env.flag("SSH_CONNECTION")
+        || env.flag("SSH_CLIENT")
+        || env.flag("SSH_TTY")
+        || env.flag("CLAUDE_CODE_REMOTE");
+
+    let terminal_auth = |extra: &[&str], label: &str| -> Value {
+        let args: Vec<String> = argv
+            .iter()
+            .cloned()
+            .chain(extra.iter().map(|arg| (*arg).to_string()))
+            .collect();
+        json!({
+            "command": executable,
+            "args": args,
+            "label": label,
+        })
+    };
+
+    if is_remote {
+        let mut method = json!({
+            "description": "Run `claude /login` in the terminal",
+            "name": "Log in with Claude",
+            "id": "claude-login",
+            "type": "terminal",
+            "args": ["--cli"],
+        });
+        if supports_meta {
+            method["_meta"] = json!({
+                "terminal-auth": terminal_auth(&["--cli"], "Claude Login"),
+            });
+        }
+        if !hidden && (supports_terminal || supports_meta) {
+            return vec![method];
+        }
+        return Vec::new();
+    }
+
+    let mut claude_login = json!({
+        "description": "Use Claude subscription ",
+        "name": "Claude Subscription",
+        "id": "claude-ai-login",
+        "type": "terminal",
+        "args": ["--cli", "auth", "login", "--claudeai"],
+    });
+    let mut console_login = json!({
+        "description": "Use Anthropic Console (API usage billing)",
+        "name": "Anthropic Console",
+        "id": "console-login",
+        "type": "terminal",
+        "args": ["--cli", "auth", "login", "--console"],
+    });
+    if supports_meta {
+        claude_login["_meta"] = json!({
+            "terminal-auth": terminal_auth(
+                &["--cli", "auth", "login", "--claudeai"],
+                "Claude Login",
+            ),
+        });
+        console_login["_meta"] = json!({
+            "terminal-auth": terminal_auth(
+                &["--cli", "auth", "login", "--console"],
+                "Anthropic Console Login",
+            ),
+        });
+    }
+
+    let mut methods = Vec::new();
+    if !hidden && (supports_terminal || supports_meta) {
+        methods.push(claude_login);
+    }
+    if supports_terminal || supports_meta {
+        methods.push(console_login);
+    }
+    methods
+}
+
+/// The custom-gateway auth methods, offered only when the client declared
+/// `auth._meta.gateway === true` (`acp-agent.ts:2844-2867`).
+fn gateway_auth_methods() -> Vec<Value> {
+    vec![
+        json!({
+            "id": "gateway",
+            "name": "Custom model gateway",
+            "description": "Use a custom gateway to authenticate and access models",
+            "_meta": {"gateway": {"protocol": "anthropic"}},
+        }),
+        json!({
+            "id": "gateway-bedrock",
+            "name": "Custom model gateway",
+            "description": "Use a custom gateway to authenticate and access models",
+            "_meta": {"gateway": {"protocol": "bedrock"}},
+        }),
+    ]
+}
+
 /// The `initialize` response, byte-matching the Node adapter at the pinned
 /// upstream version (modulo ignored volatile fields); `agentInfo.version` is
 /// composed from `porting/UPSTREAM_VERSION` (Decision 3).
@@ -116,7 +270,18 @@ const AIR_CAPABILITIES: &[&str] = &[
 /// `sessionCapabilities.subagents` (E-3/E-4); the `authStatus` marker (E-2,
 /// R75-3) and the `systemPrompt` advertise (E-3, honouring is Phase 3) are
 /// always present.
-fn initialize_response(air: Option<&AirClient>) -> Value {
+///
+/// `caps` is the full client-capability parse (ROADMAP F2a): it decides the
+/// auth methods. `env` is the hermetic snapshot that gates the remote login
+/// branch, and `executable`/`argv` are the process entrypoint used by
+/// `_meta["terminal-auth"]`.
+fn initialize_response(
+    air: Option<&AirClient>,
+    caps: &ClientCapabilities,
+    env: &crate::env_snapshot::EnvSnapshot,
+    executable: &str,
+    argv: &[String],
+) -> Value {
     let is_air = air.is_some();
     let mut session_caps = serde_json::Map::new();
     session_caps.insert("additionalDirectories".into(), json!({}));
@@ -128,6 +293,11 @@ fn initialize_response(air: Option<&AirClient>) -> Value {
     session_caps.insert("systemPrompt".into(), json!({ "mode": { "override": {} } }));
     if is_air {
         session_caps.insert("subagents".into(), json!({}));
+    }
+
+    let mut auth_methods = terminal_auth_methods(caps, env, executable, argv);
+    if caps.auth_gateway {
+        auth_methods.extend(gateway_auth_methods());
     }
 
     let mut meta = serde_json::Map::new();
@@ -160,7 +330,7 @@ fn initialize_response(air: Option<&AirClient>) -> Value {
             "sessionCapabilities": Value::Object(session_caps),
         },
         "agentInfo": agent_info(),
-        "authMethods": [],
+        "authMethods": auth_methods,
         "_meta": Value::Object(meta),
     })
 }
@@ -350,38 +520,99 @@ pub fn session_spawn_options(
             .unwrap_or_else(|| vec!["user".into(), "project".into(), "local".into()]),
         disallowed_tools,
         tools: claude.tools,
+        thinking: claude.thinking,
+        mcp_config: claude.mcp_config,
+        executable_args: claude.executable_args,
+        plugins: claude.plugins,
+        plugin_delivery: claude.plugin_delivery,
+        persist_session: claude.persist_session,
+        project_config_root: claude.project_config_root,
         extra_args: claude.extra_args,
+        settings_arg: claude.settings_arg,
         permission_prompt_tool: true,
         allow_dangerously_skip_permissions: allow_bypass,
         replay_user_messages: true,
         include_partial_messages: true,
         env_snapshot: serve.env.clone(),
-        ..SpawnOptions::default()
     }
 }
 
 /// Resolve the spawn inputs for a `session/new|load` request (Decision 2/3/4):
-/// `_meta.claudeCode.options`, the permission mode (explicit > resumed >
-/// settings; Phase 1 has no explicit/resumed source), and whether bypass is
-/// available.
+/// `_meta.claudeCode.options`, the programmatic settings tier, thinking, the
+/// permission mode (explicit > resumed > settings; Phase 1 has no explicit/
+/// resumed source), and whether bypass is available.
 ///
 /// Node IGNORES `_meta.claudeCode.options.permissionMode` (X3): the mode comes
 /// from settings only. `allow_bypass` combines root/`IS_SANDBOX`, the settings'
-/// `disableBypassPermissionsMode` and the client's
+/// `disableBypassPermissionMode` and the client's
 /// `allowDangerouslySkipPermissions !== false` (R6).
+///
+/// The programmatic settings tier (`_meta...settings` + `CLAUDE_MODEL_CONFIG` +
+/// `sandbox`) is resolved here because it can fail (unreadable/invalid settings
+/// file, invalid `CLAUDE_MODEL_CONFIG`, invalid `pluginDelivery`, unsupported
+/// plugin type) exactly where the Node adapter throws before spawning.
+///
+/// # Errors
+/// A settings file cannot be read/parsed, `CLAUDE_MODEL_CONFIG` is invalid, or
+/// `pluginDelivery`/`plugins` are unsupported.
 pub fn spawn_inputs(
     params: &Value,
     cwd: Option<&std::path::Path>,
     serve: &ServeOptions,
     resumed_id: Option<&str>,
-) -> (crate::sdk_options::ClaudeOptions, String, bool) {
+) -> Result<(crate::sdk_options::ClaudeOptions, String, bool), Error> {
     let dir = cwd
         .map(std::path::Path::to_path_buf)
         .or_else(|| serve.default_cwd.clone())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
     let settings = crate::settings::load(&dir, &serve.env);
-    let claude = crate::sdk_options::claude_options(params);
+    let mut claude = crate::sdk_options::claude_options(params);
+
+    // Programmatic settings tier: `_meta.claudeCode.options.settings` (path or
+    // object) merged over `CLAUDE_MODEL_CONFIG`, then the sandbox option.
+    claude.settings_arg = crate::sdk_options::resolve_settings_arg(
+        &dir,
+        &serve.env,
+        claude.settings.as_ref(),
+        claude.sandbox.as_ref(),
+    )
+    .map_err(|details| Error::internal_error().data(json!({ "details": details })))?;
+
+    // Thinking: a user `thinking` option overrides `MAX_THINKING_TOKENS`; the
+    // legacy `maxThinkingTokens` is the SDK's fallback when neither is set.
+    if !claude.has_thinking {
+        claude.thinking =
+            crate::sdk_options::resolve_thinking(serve.env.get("MAX_THINKING_TOKENS"));
+    }
+    if claude.thinking.is_none() {
+        if let Some(tokens) = claude.max_thinking_tokens {
+            claude.thinking = Some(if tokens == 0 {
+                crate::sdk_options::ThinkingConfig::Disabled
+            } else {
+                crate::sdk_options::ThinkingConfig::Enabled {
+                    budget_tokens: Some(tokens),
+                    display: None,
+                }
+            });
+        }
+    }
+
+    // The SDK rejects an unknown `pluginDelivery` and a non-local plugin
+    // before spawning (unless plugins are delivered over initialize).
+    if claude.invalid_plugin_delivery {
+        return Err(Error::internal_error().data(json!({
+            "details": "Invalid pluginDelivery. Expected 'argv' or 'initialize'."
+        })));
+    }
+    if claude.plugin_delivery == crate::sdk_options::PluginDelivery::Argv {
+        if let Some(plugin) = claude.plugins.iter().find(|plugin| plugin.kind != "local") {
+            return Err(Error::internal_error().data(json!({
+                "details": format!("Unsupported plugin type: {}", plugin.kind)
+            })));
+        }
+    }
+
     let is_sandbox = serve
         .env
         .get("IS_SANDBOX")
@@ -397,30 +628,95 @@ pub fn spawn_inputs(
         tail.permission_mode
     });
 
-    let permission_mode = crate::permission_mode::resolve_initial_permission_mode(
+    let resumed_value = resumed_mode.as_deref().map(Value::from);
+    let permission_mode = crate::permission_mode::resolve_initial_permission_mode_logged(
         None,
-        resumed_mode.as_deref(),
-        settings.default_mode.as_deref(),
+        resumed_value.as_ref(),
+        settings.default_mode_value.as_ref(),
+        serve.logger.as_deref(),
         allow_bypass,
     );
-    (claude, permission_mode, allow_bypass)
+    Ok((claude, permission_mode, allow_bypass))
+}
+
+/// A validated `_session/steering` request (`parseSteerRequest`,
+/// `acp-agent.ts:708-738`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteerRequest {
+    pub session_id: String,
+    /// The content blocks (handed to `prompt_to_claude`).
+    pub prompt: Vec<Value>,
+    /// `_meta.steering.idleBehavior` when the client opted into the host-owned
+    /// fallback (`"promptRequired"`).
+    pub prompt_required: bool,
+}
+
+/// Port of `parseSteerRequest` (`acp-agent.ts:708-738`).
+///
+/// Every rejection is `RequestError.invalidParams(undefined, "<text>")`: code
+/// `-32602`, message `"Invalid params: <text>"`, and **no** `data` — unlike the
+/// older Rust shape that put the text in `data`.
+///
+/// `params` must be an object (JS arrays are objects too, so an array falls
+/// through to the `sessionId` check, exactly like destructuring it); `sessionId`
+/// must be a non-empty string; `prompt` must be a non-empty array; and
+/// `_meta.steering.idleBehavior`, when present, must be the string
+/// `"promptRequired"` (a non-string value is rejected, not ignored).
+pub fn parse_steer_request(params: &Value) -> Result<SteerRequest, Error> {
+    let invalid = |text: &str| Error::new(-32602, format!("Invalid params: {text}"));
+    if params.is_null() || params.is_string() || params.is_number() || params.is_boolean() {
+        return Err(invalid("steer params must be an object"));
+    }
+    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+        return Err(invalid("steer params require a non-empty sessionId"));
+    };
+    if session_id.is_empty() {
+        return Err(invalid("steer params require a non-empty sessionId"));
+    }
+    let Some(prompt) = params.get("prompt").and_then(Value::as_array) else {
+        return Err(invalid("steer params require a non-empty prompt array"));
+    };
+    if prompt.is_empty() {
+        return Err(invalid("steer params require a non-empty prompt array"));
+    }
+    // `_meta` is read only when it is an object; `steering` likewise. A
+    // present-but-non-string `idleBehavior` is not `undefined`, so it is
+    // rejected (`acp-agent.ts:729-733`).
+    let idle_behavior = params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("steering"))
+        .and_then(Value::as_object)
+        .and_then(|steering| steering.get("idleBehavior"));
+    let prompt_required = match idle_behavior {
+        None => false,
+        Some(Value::String(value)) if value == "promptRequired" => true,
+        Some(_) => return Err(invalid("unsupported steering idleBehavior")),
+    };
+    Ok(SteerRequest {
+        session_id: session_id.to_string(),
+        prompt: prompt.clone(),
+        prompt_required,
+    })
 }
 
 /// Decide the `_session/steering` outcome (R32 / B1 row).
 ///
-/// Validates `idleBehavior` (`_meta.steering.idleBehavior`): any value other
-/// than `"promptRequired"` → `invalidParams` ("unsupported steering
-/// idleBehavior"). Then, given whether a turn is in flight, maps to the wire
-/// outcome:
+/// `idle_behavior` is validated by [`parse_steer_request`] before routing, so
+/// this only maps whether a turn is in flight to the wire outcome:
 ///
 /// - in flight → `{outcome:"injected"}` (the caller injects at `now` priority),
 /// - idle + `promptRequired` → `{outcome:"promptRequired", reason:"noRunningTurn"}`,
 /// - idle, no opt-in → `{outcome:"startedNewTurn"}` (detached new turn).
 ///
-/// `idle_behavior` is `None` when `_meta.steering.idleBehavior` is absent.
+/// A non-`promptRequired` value still yields the same `invalidParams` shape if
+/// a caller passes one (the unit-test seam).
 pub fn steer_outcome(turn_in_flight: bool, idle_behavior: Option<&str>) -> Result<Value, Error> {
     if idle_behavior.is_some_and(|b| b != "promptRequired") {
-        return Err(Error::invalid_params().data("unsupported steering idleBehavior"));
+        return Err(Error::new(
+            -32602,
+            "Invalid params: unsupported steering idleBehavior",
+        ));
     }
     if turn_in_flight {
         Ok(json!({ "outcome": "injected" }))
@@ -505,6 +801,24 @@ fn session_error_to_rpc(err: &SessionError) -> (String, Option<Value>) {
             };
             (message, data)
         }
+        // A plain `Error` reaches the ACP router as `Internal error` with the
+        // message in `data.details` (jsonrpc `errorToResult`), unlike the
+        // adapter's own `internalErrorForClient` messages below.
+        SessionError::ChildErrorResult { text } => {
+            return (
+                "Internal error".to_string(),
+                Some(json!({"details": format!("Claude Code returned an error result: {text}")})),
+            );
+        }
+        // A defining model-pin failure: Node throws the SDK `Error`, so the
+        // router reports `Internal error` with the thrown message as details
+        // (F5b/A-06).
+        SessionError::ModelSwitchFailed(message) => {
+            return (
+                "Internal error".to_string(),
+                Some(json!({"details": message})),
+            );
+        }
         SessionError::Closed => (crate::turn::SESSION_ENDED_MESSAGE.to_string(), None),
         SessionError::Start(m) => (m.clone(), None),
     };
@@ -534,6 +848,7 @@ pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOption
         sessions: std::collections::HashMap::new(),
         session_tx,
         air: None,
+        caps: ClientCapabilities::default(),
         auth: None,
     };
     Agent
@@ -562,6 +877,76 @@ pub async fn serve(transport: impl ConnectTo<Agent> + 'static, opts: ServeOption
         )
         .connect_to(transport)
         .await
+}
+
+/// A handle to a running [`serve`] loop (`serve.ts:29-34`, V-20).
+///
+/// The owner of the process can stop the adapter cleanly: [`dispose`] asks the
+/// loop to end, which drops the connection and its session registry; every
+/// session actor's `claude` child is disposed by its `kill_on_drop` handle when
+/// the runtime tears the actor down. [`closed`] resolves when the loop ended,
+/// either because the transport closed or after [`dispose`].
+pub struct ServeHandle {
+    shutdown: watch::Sender<bool>,
+    /// `None` once [`ServeHandle::closed`] consumed the completion signal, so a
+    /// second call returns immediately instead of polling a completed oneshot.
+    done: Option<oneshot::Receiver<()>>,
+}
+
+impl ServeHandle {
+    /// Ask the serve loop to stop and dispose its sessions.
+    pub fn dispose(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Wait for the serve loop to end (natural close or after [`dispose`]).
+    /// Idempotent: once the loop has ended, later calls return immediately.
+    pub async fn closed(&mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.await;
+        }
+    }
+}
+
+/// Start [`serve`] on the current runtime and return a [`ServeHandle`].
+///
+/// This is the library-level `serveAcp(...)` shape: `closed` is the connection
+/// lifetime, `dispose` is the owner's shutdown request.
+pub fn serve_handle(transport: impl ConnectTo<Agent> + 'static, opts: ServeOptions) -> ServeHandle {
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (done_tx, done) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = serve_with_shutdown(transport, opts, shutdown_rx).await;
+        let _ = done_tx.send(());
+    });
+    ServeHandle {
+        shutdown,
+        done: Some(done),
+    }
+}
+
+/// [`serve`] that also ends when `shutdown` flips to `true`.
+pub async fn serve_with_shutdown(
+    transport: impl ConnectTo<Agent> + 'static,
+    opts: ServeOptions,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    tokio::select! {
+        res = serve(transport, opts) => res,
+        _ = shutdown_requested(&mut shutdown) => Ok(()),
+    }
+}
+
+/// Resolve once `shutdown` is (or becomes) `true`.
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
 }
 
 /// Handle an ACP notification. `session/cancel` is routed to the owning session
@@ -593,6 +978,9 @@ struct Registry {
     /// The parsed AIR client declaration from `initialize` (Decision 11),
     /// `Some` only when the client declared `_meta.jetbrains.air`.
     air: Option<AirClient>,
+    /// The full `initialize.clientCapabilities` parse (ROADMAP F2a), threaded
+    /// into every session's [`crate::session_ext::SessionExt`].
+    caps: ClientCapabilities,
     /// The auth-status actor, spawned by the first `initialize` (G2).
     auth: Option<AuthHandle>,
 }
@@ -656,39 +1044,35 @@ fn publish_session_account(registry: &Registry, cwd: PathBuf, session: &Session)
 fn validate_cwd(cwd: Option<&str>) -> Result<(), Error> {
     let Some(cwd) = cwd else { return Ok(()) };
     let path = std::path::Path::new(cwd);
+    // `RequestError.invalidParams` renders the message as
+    // `Invalid params: <text>` (`acp-agent.ts:10925-10942`, jsonrpc.js:1032).
+    let invalid = |text: String| {
+        Error::new(-32602, format!("Invalid params: {text}")).data(json!({ "cwd": cwd }))
+    };
     if !path.is_absolute() {
-        return Err(Error::new(
-            -32602,
-            format!("`cwd` must be an absolute path, but received: {cwd}"),
-        )
-        .data(json!({ "cwd": cwd })));
+        return Err(invalid(format!(
+            "`cwd` must be an absolute path, but received: {cwd}"
+        )));
     }
     // A single `stat` is a fast syscall, not "large-file I/O"; inline is fine
     // (rust-coding §4 concerns whole-file blocking reads).
     let Ok(meta) = std::fs::metadata(path) else {
-        return Err(Error::new(
-            -32602,
-            format!("`cwd` does not exist on the machine running the agent: {cwd}"),
-        )
-        .data(json!({ "cwd": cwd })));
+        return Err(invalid(format!(
+            "`cwd` does not exist on the machine running the agent: {cwd}"
+        )));
     };
     if !meta.is_dir() {
-        return Err(
-            Error::new(-32602, format!("`cwd` is not a directory: {cwd}"))
-                .data(json!({ "cwd": cwd })),
-        );
+        return Err(invalid(format!("`cwd` is not a directory: {cwd}")));
     }
     Ok(())
 }
 
 /// Validate the optional `systemPrompt` (after `validate_cwd`, before any spawn)
-/// and fold it plus AIR `customInstructions` into the `initialize` options
-/// (rust-air-gaps G3/G5, Decision 10).
+/// and fold it, the legacy `_meta.systemPrompt` and AIR `customInstructions`
+/// into the `initialize` options (rust-air-gaps G3/G5, Decision 10; F4a
+/// O-133).
 fn initialize_options_for(params: &Value) -> Result<InitializeOptions, Error> {
-    let client_prompt = system_prompt::client_system_prompt(params.get("systemPrompt"))?;
-    let custom = system_prompt::air_custom_instructions(params.get("_meta"));
-    let (system_prompt, append_system_prompt) =
-        system_prompt::sdk_initialize_fields(client_prompt.as_ref(), custom.as_deref());
+    let (system_prompt, append_system_prompt) = system_prompt::initialize_fields(params)?;
     let opts = crate::sdk_options::claude_options(params);
     let prompt_suggestions = opts.prompt_suggestions.unwrap_or(true);
     Ok(InitializeOptions {
@@ -719,20 +1103,23 @@ fn register_session(
         .session_tx
         .send((session_id.to_string(), session.clone()));
 
-    // Decision 9 / 2.1: background get_context_usage {detail:"summary"} spawned after register.
+    // Decision 9 / 2.1 + F5b/A-10: background get_context_usage {detail:"summary"}
+    // spawned after register. The request is tagged with the model it was issued
+    // for, so an answer arriving after a model switch is dropped (`stillCurrent`).
     let control = session.control().clone();
     let cmd_tx = session.command_sender().clone();
+    let model_id = session.current_model_id().unwrap_or_default();
     tokio::spawn(async move {
         if let Ok(res) = control
             .send_request(json!({"subtype": "get_context_usage", "detail": "summary"}))
             .await
         {
-            let raw_max = crate::control::raw_max_tokens(&res);
+            let raw_max = crate::usage::raw_max_tokens(&res);
             if let Some(tokens) = raw_max {
-                if tokens > 0 {
-                    let _ =
-                        cmd_tx.send(crate::session::Command::UpdateContextWindow { size: tokens });
-                }
+                let _ = cmd_tx.send(crate::session::Command::UpdateContextWindow {
+                    size: tokens,
+                    model_id,
+                });
             }
         }
     });
@@ -781,6 +1168,33 @@ fn register_session(
     });
 }
 
+/// Which resumed-session method is being served. It decides whether the stored
+/// history is replayed (`session/load` only) and the session-timing operation
+/// name (`session-timing.ts`; a resume creates a session like `session/new`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumedKind {
+    Load,
+    Resume,
+    Fork,
+}
+
+impl ResumedKind {
+    /// Only `session/load` replays the stored history (`acp-agent.ts:3153-3164`).
+    fn replay(self) -> bool {
+        self == Self::Load
+    }
+
+    /// The `[session/<op>]` operation: `load` and `fork` have their own timers;
+    /// a resume creates a session, so it reports as `create`.
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Resume => "create",
+            Self::Fork => "fork",
+        }
+    }
+}
+
 /// Start (or restart) the session `session_id` from its stored transcript
 /// (`--resume`) and answer a `session/load`, `session/resume` or `session/fork`
 /// request; the new session is registered and its proactive command list sent.
@@ -791,19 +1205,29 @@ async fn start_resumed(
     opts: &ServeOptions,
     responder: agent_client_protocol::Responder<Value>,
     connection: &ConnectionTo<agent_client_protocol::Client>,
-    replay: bool,
+    kind: ResumedKind,
 ) -> Result<(), Error> {
+    let replay = kind.replay();
+    let started = Instant::now();
+    let mut timing =
+        SessionTiming::with_started_at(opts.logger.clone(), kind.operation(), &session_id, started);
     let cwd_str = params.get("cwd").and_then(Value::as_str);
     if let Err(e) = validate_cwd(cwd_str) {
         return responder.respond_with_error(e);
     }
+    timing.phase("validate-cwd", "");
     let initialize = match initialize_options_for(params) {
         Ok(initialize) => initialize,
         Err(e) => return responder.respond_with_error(e),
     };
     let cwd = cwd_str.map(PathBuf::from);
     let (claude, permission_mode, allow_bypass) =
-        spawn_inputs(params, cwd.as_deref(), opts, Some(&session_id));
+        match spawn_inputs(params, cwd.as_deref(), opts, Some(&session_id)) {
+            Ok(inputs) => inputs,
+            Err(e) => return responder.respond_with_error(e),
+        };
+    timing.phase("resume-transcript", "");
+    timing.phase("settings", "");
     let mut spawn = session_spawn_options(
         opts,
         cwd,
@@ -818,9 +1242,38 @@ async fn start_resumed(
     let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
     let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
         .with_air(registry.air.clone())
-        .with_env(opts.env.clone());
-    match Session::start(sess_opts, session_id.clone()).await {
+        .with_caps(registry.caps.clone())
+        .with_env(opts.env.clone())
+        .with_logger(opts.logger.clone());
+    // PC-2.2 / B-02: the replay runs while the CLI starts (Node
+    // `createSessionWhileReplaying`) and reads the transcript off the async
+    // runtime; the response waits for both, so the replay frames still precede
+    // it.
+    let air = registry.air.is_some();
+    let replay_future = async {
+        let messages = crate::transcript::session_messages_async(&opts.env, &session_id).await;
+        let (notifications, task_state, last_published) =
+            crate::transcript::replay_with_task_state(&messages, &session_id, air);
+        for value in notifications {
+            if let Ok(msg) = UntypedMessage::new("session/update", value) {
+                let _ = connection.send_notification(msg);
+            }
+        }
+        (task_state, last_published)
+    };
+    let no_replay: (Vec<(String, crate::hooks::TaskStateEntry)>, Option<String>) =
+        (Vec::new(), None);
+    let (start_result, replayed) = if replay {
+        tokio::join!(Session::start(sess_opts, session_id.clone()), replay_future)
+    } else {
+        (
+            Session::start(sess_opts, session_id.clone()).await,
+            no_replay,
+        )
+    };
+    match start_result {
         Ok((session, update_rx)) => {
+            timing.phase("session-ready", "");
             publish_session_account(registry, auth_cwd, &session);
             // Phase 15 (Item 1): upstream sends a proactive
             // `available_commands_update` with the REAL command list right
@@ -832,22 +1285,21 @@ async fn start_resumed(
             let commands = session.commands().to_vec();
             let modes = session.modes().clone();
             let config_options = session.config_options().to_vec();
-            register_session(registry, &session_id, session, update_rx, connection);
             // rust-parity-fixes 3.5 (Decision 14, P10): a `session/load` replays
             // the stored history BEFORE the response (Node `loadSession` →
             // `replaySessionHistory`); `session/resume` and `session/fork` do
-            // not. Each replayed message becomes a `session/update` (user /
-            // assistant chunks, tool calls/results).
+            // not. The replay frames were sent by `replay_future`; PC-2.3 seeds
+            // the Task* state it rebuilt into the live actor so a status-only
+            // TaskUpdate after the load still applies.
             if replay {
-                let messages = crate::transcript::session_messages(&opts.env, &session_id);
-                for value in crate::transcript::replay_notifications(&messages, &session_id) {
-                    if let Ok(msg) = UntypedMessage::new("session/update", value) {
-                        let _ = connection.send_notification(msg);
-                    }
-                }
+                let (task_state, last_published) = replayed;
+                let _ = session.seed_task_state(task_state, last_published).await;
+                timing.phase("replay", "");
             }
+            register_session(registry, &session_id, session, update_rx, connection);
+            timing.phase("register", "");
             responder.respond(session_response(&session_id, &modes, &config_options))?;
-            let update = map::map_commands_changed(&json!(commands), &json!([]));
+            let update = map::map_commands_changed(&json!(commands), &[]);
             // Decision 8: raw JSON with `input: null` for commands without a
             // hint (the typed update would omit the field).
             let value = json!({
@@ -887,7 +1339,17 @@ async fn handle_request(
             registry.air = params
                 .get("clientCapabilities")
                 .and_then(AirClient::from_client_capabilities);
-            responder.respond(initialize_response(registry.air.as_ref()))?;
+            // Parse the full capability set once (ROADMAP F2a): auth methods,
+            // notices, config options and the tool-call choices all read it.
+            registry.caps = ClientCapabilities::from_value(params.get("clientCapabilities"));
+            let (executable, argv) = process_entrypoint();
+            responder.respond(initialize_response(
+                registry.air.as_ref(),
+                &registry.caps,
+                &opts.env,
+                &executable,
+                &argv,
+            ))?;
             // G2 (Decision 11): learn the auth identity in the background AFTER
             // the response (Node `initialize` never waits on the CLI probe);
             // `_auth/status_update` is pushed only when the read lands.
@@ -899,6 +1361,9 @@ async fn handle_request(
             Ok(())
         }
         "session/new" => {
+            // Session timing (`session-timing.ts`, B-01): coarse phases at the
+            // agent layer (validate-cwd/settings/register).
+            let create_started = Instant::now();
             let cwd_str = params.get("cwd").and_then(Value::as_str);
             if let Err(e) = validate_cwd(cwd_str) {
                 return responder.respond_with_error(e);
@@ -909,8 +1374,23 @@ async fn handle_request(
             };
             let cwd = cwd_str.map(PathBuf::from);
             let (claude, permission_mode, allow_bypass) =
-                spawn_inputs(&params, cwd.as_deref(), opts, None);
+                match spawn_inputs(&params, cwd.as_deref(), opts, None) {
+                    Ok(inputs) => inputs,
+                    Err(e) => return responder.respond_with_error(e),
+                };
             let session_id = claude.resume.clone().unwrap_or_else(uuid_v4);
+            let resumed = claude.resume.is_some();
+            let mut timing = SessionTiming::with_started_at(
+                opts.logger.clone(),
+                "create",
+                &session_id,
+                create_started,
+            );
+            timing.phase("validate-cwd", "");
+            if resumed {
+                timing.phase("resume-transcript", "");
+            }
+            timing.phase("settings", "");
             let spawn = session_spawn_options(
                 opts,
                 cwd,
@@ -923,7 +1403,9 @@ async fn handle_request(
             let auth_cwd = spawn.default_cwd.clone().unwrap_or_default();
             let sess_opts = SessionOptions::new(spawn, opts.timings.clone(), initialize)
                 .with_air(registry.air.clone())
-                .with_env(opts.env.clone());
+                .with_caps(registry.caps.clone())
+                .with_env(opts.env.clone())
+                .with_logger(opts.logger.clone());
             match Session::start(sess_opts, session_id.clone()).await {
                 Ok((session, update_rx)) => {
                     publish_session_account(registry, auth_cwd, &session);
@@ -938,8 +1420,9 @@ async fn handle_request(
                     let modes = session.modes().clone();
                     let config_options = session.config_options().to_vec();
                     register_session(registry, &session_id, session, update_rx, &connection);
+                    timing.phase("register", "");
                     responder.respond(session_response(&session_id, &modes, &config_options))?;
-                    let update = map::map_commands_changed(&json!(commands), &json!([]));
+                    let update = map::map_commands_changed(&json!(commands), &[]);
                     // Decision 8: raw JSON with `input: null` for commands
                     // without a hint (the typed update would omit the field).
                     let value = json!({
@@ -969,12 +1452,23 @@ async fn handle_request(
             // `acp-agent.js:1583-1587`); `session/resume` does not.
             if let Some(session) = registry.sessions.get(&session_id) {
                 if replay {
-                    let messages = crate::transcript::session_messages(&opts.env, &session_id);
-                    for value in crate::transcript::replay_notifications(&messages, &session_id) {
+                    let messages =
+                        crate::transcript::session_messages_async(&opts.env, &session_id).await;
+                    let (notifications, task_state, last_published) =
+                        crate::transcript::replay_with_task_state(
+                            &messages,
+                            &session_id,
+                            registry.air.is_some(),
+                        );
+                    for value in notifications {
                         if let Ok(msg) = UntypedMessage::new("session/update", value) {
                             let _ = connection.send_notification(msg);
                         }
                     }
+                    // Node forgets the published plan before a replay and shares
+                    // the live `taskState` with it; seed the rebuilt state so the
+                    // live actor continues from it.
+                    let _ = session.seed_task_state(task_state, last_published).await;
                 }
                 // MAJOR 5 (acp-agent.js:8186-8190): return the actor's LIVE
                 // state — after `set_config_option mode plan` a resume must
@@ -996,11 +1490,13 @@ async fn handle_request(
                     }
                 }
                 // Node's `afterSetupResponse` re-sends the proactive
-                // `available_commands_update` after an already-live
-                // `session/load` (`acp-agent.js:1593`), after the response.
-                if replay {
-                    let commands = session.commands().to_vec();
-                    let update = map::map_commands_changed(&json!(commands), &json!([]));
+                // `available_commands_update` after EVERY setup response,
+                // including an already-live `session/load` AND `session/resume`
+                // (`acp-agent.ts:3144-3149,10434-10439`); B-118. The update
+                // follows the response, like Node's `setTimeout(..., 0)`.
+                {
+                    let commands = session.live_commands().await;
+                    let update = map::map_commands_changed(&json!(commands), &[]);
                     let value = json!({
                         "sessionId": session_id.clone(),
                         "update": map::available_commands_json(&update),
@@ -1018,7 +1514,11 @@ async fn handle_request(
                 opts,
                 responder,
                 &connection,
-                replay,
+                if replay {
+                    ResumedKind::Load
+                } else {
+                    ResumedKind::Resume
+                },
             )
             .await
         }
@@ -1060,7 +1560,7 @@ async fn handle_request(
                 opts,
                 responder,
                 &connection,
-                false,
+                ResumedKind::Fork,
             )
             .await
         }
@@ -1227,6 +1727,10 @@ async fn handle_request(
                     reply,
                 });
                 let _ = done.await;
+                // F5b/B-69: 1M-context entitlement can differ per account/tier,
+                // so windows learned under one login must not seed sessions
+                // under the next.
+                crate::session_model::clear_context_window_cache();
                 let _ = responder.respond(json!({}));
             });
             Ok(())
@@ -1263,10 +1767,30 @@ async fn handle_request(
             // ordering the cancel relies on. Only the settlement is awaited on
             // a spawned task so the connection is never blocked while a turn is
             // in flight (Node's `prompt()` returns immediately).
-            let reply_rx = session.send_prompt(uuid, frame, is_local_only);
+            let mut reply_rx = session.send_prompt(uuid, frame, is_local_only);
+            // F2c / M-52: Node's `runPromptWithCancellation`
+            // (`acp-agent.ts:13528-13552`) listens for `$/cancel_request` on
+            // this prompt's request signal and routes it to the same
+            // `agent.cancel` path as `session/cancel`. The crate already
+            // records the notification on the request's cancellation marker,
+            // so watch that marker and cancel the owning session; the prompt
+            // then settles `cancelled` (never a `request_cancelled` error).
+            let cancellation = responder.cancellation();
+            let cancel_session = session.clone();
             let connection = connection.clone();
             tokio::spawn(async move {
-                let reply = reply_rx.await.unwrap_or_else(|_| Err(SessionError::Closed));
+                let first = tokio::select! {
+                    reply = &mut reply_rx => Some(reply),
+                    () = cancellation.cancelled() => None,
+                };
+                let reply = match first {
+                    Some(reply) => reply,
+                    None => {
+                        let _ = cancel_session.cancel().await;
+                        (&mut reply_rx).await
+                    }
+                }
+                .unwrap_or_else(|_| Err(SessionError::Closed));
                 match reply {
                     Ok(reply) => {
                         // Forward this turn's streaming updates (e.g. a
@@ -1324,32 +1848,15 @@ async fn handle_request(
             // R32 / B1 row. A steered message is injected into the running turn
             // at `now` priority via the control writer, or the host-owned
             // `promptRequired` fallback is reported when idle.
-            let session_id = params
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            if session_id.is_empty() {
-                return responder.respond_with_error(
-                    Error::invalid_params().data("steer params require a non-empty sessionId"),
-                );
-            }
-            let prompt = params.get("prompt").and_then(Value::as_array);
-            if prompt.is_none_or(Vec::is_empty) {
-                return responder.respond_with_error(
-                    Error::invalid_params().data("steer params require a non-empty prompt array"),
-                );
-            }
-            let idle_behavior = params
-                .pointer("/_meta/steering/idleBehavior")
-                .and_then(Value::as_str);
-            // Reject an unsupported `idleBehavior` before routing to the actor
-            // (the R32 invalidParams case; `steer_outcome` guards it too).
-            if idle_behavior.is_some_and(|b| b != "promptRequired") {
-                return responder.respond_with_error(
-                    Error::invalid_params().data("unsupported steering idleBehavior"),
-                );
-            }
+            //
+            // `parseSteerRequest` (`acp-agent.ts:708-738`) validates BEFORE any
+            // session lookup, and every rejection is `Invalid params: <text>`
+            // with no `data`.
+            let steer = match parse_steer_request(&params) {
+                Ok(steer) => steer,
+                Err(e) => return responder.respond_with_error(e),
+            };
+            let session_id = steer.session_id;
             let session = match registry.sessions.get(&session_id) {
                 Some(s) => s.clone(),
                 None => {
@@ -1357,16 +1864,16 @@ async fn handle_request(
                         .respond_with_error(Error::internal_error().data("Session not found"));
                 }
             };
-            let first_text = prompt
-                .and_then(|a| a.first())
+            let first_text = steer
+                .prompt
+                .first()
                 .and_then(|c| c.get("text"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let is_local_only = is_local_only_command(first_text);
-            let is_prompt_required = idle_behavior == Some("promptRequired");
             let uuid = uuid_v4();
             let frame = prompt_to_claude(&params, &session_id, &uuid);
-            let reply_rx = session.steer(uuid, frame, is_local_only, is_prompt_required);
+            let reply_rx = session.steer(uuid, frame, is_local_only, steer.prompt_required);
             tokio::spawn(async move {
                 let outcome = reply_rx
                     .await
@@ -1589,9 +2096,10 @@ mod tests {
         let err = validate_cwd(Some("relative/dir")).expect_err("relative must be rejected");
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["code"], -32602);
+        // F2c / M-01: `RequestError.invalidParams` prefixes the message.
         assert_eq!(
             v["message"],
-            "`cwd` must be an absolute path, but received: relative/dir"
+            "Invalid params: `cwd` must be an absolute path, but received: relative/dir"
         );
         assert_eq!(v["data"]["cwd"], "relative/dir");
 
@@ -1601,6 +2109,10 @@ mod tests {
         let err = validate_cwd(Some(&missing_str)).expect_err("missing must be rejected");
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["code"], -32602);
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Invalid params: "));
         assert!(v["message"].as_str().unwrap().contains("does not exist"));
         assert_eq!(v["data"]["cwd"], missing_str);
 
@@ -1611,6 +2123,10 @@ mod tests {
         let err = validate_cwd(Some(&file_str)).expect_err("a file is not a directory");
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["code"], -32602);
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Invalid params: "));
         assert!(v["message"].as_str().unwrap().contains("not a directory"));
         let _ = std::fs::remove_file(&file);
     }
@@ -1646,6 +2162,22 @@ mod tests {
             kind,
             Some("no_result"),
             "idle-without-result must attach errorKind no_result even with no assistant error: {data:?}"
+        );
+    }
+
+    /// F3a (f) — a child that exits after an error `result` rejects with the
+    /// SDK's replacement text; the ACP router wraps a plain `Error` as
+    /// `Internal error` + `data.details` (jsonrpc `errorToResult`).
+    #[test]
+    fn child_exit_error_result_wire_shape() {
+        let err = SessionError::ChildErrorResult {
+            text: "model overloaded".to_string(),
+        };
+        let (message, data) = session_error_to_rpc(&err);
+        assert_eq!(message, "Internal error");
+        assert_eq!(
+            data,
+            Some(json!({"details": "Claude Code returned an error result: model overloaded"}))
         );
     }
 
@@ -1705,5 +2237,279 @@ mod tests {
 
         let started = steer_outcome(false, None).expect("ok");
         assert_eq!(started, json!({ "outcome": "startedNewTurn" }));
+    }
+
+    /// F2c / M-20 — `parseSteerRequest` (`acp-agent.ts:708-738`): every
+    /// rejection is `Invalid params: <text>` with NO `data`, and a
+    /// present-but-non-string `idleBehavior` is rejected instead of ignored.
+    #[test]
+    fn inv_52_steer_request_error_shape() {
+        let ok = parse_steer_request(&json!({
+            "sessionId": "s1",
+            "prompt": [{"type": "text", "text": "hi"}],
+            "_meta": {"steering": {"idleBehavior": "promptRequired"}}
+        }))
+        .expect("valid steer");
+        assert_eq!(ok.session_id, "s1");
+        assert_eq!(ok.prompt.len(), 1);
+        assert!(ok.prompt_required);
+
+        let default = parse_steer_request(&json!({
+            "sessionId": "s1",
+            "prompt": [{"type": "text", "text": "hi"}]
+        }))
+        .expect("valid steer");
+        assert!(!default.prompt_required);
+        // `_meta`/`steering` that are not objects (and arrays) leave the
+        // default: JS reads `idleBehavior` as undefined.
+        for meta in [
+            json!(null),
+            json!({"steering": null}),
+            json!({"steering": []}),
+        ] {
+            let params = json!({
+                "sessionId": "s1",
+                "prompt": [{"type": "text", "text": "hi"}],
+                "_meta": meta
+            });
+            let steer = parse_steer_request(&params).expect("default steer");
+            assert!(!steer.prompt_required, "{params}");
+        }
+
+        let steer = |params: &Value| parse_steer_request(params).expect_err("must reject");
+        for (params, text) in [
+            (json!(null), "steer params must be an object"),
+            (json!("x"), "steer params must be an object"),
+            (json!(5), "steer params must be an object"),
+            (json!(true), "steer params must be an object"),
+            // A JS array is an object, so it falls through to `sessionId`.
+            (json!([]), "steer params require a non-empty sessionId"),
+            (
+                json!({"prompt": [{"type": "text", "text": "hi"}]}),
+                "steer params require a non-empty sessionId",
+            ),
+            (
+                json!({"sessionId": 7, "prompt": []}),
+                "steer params require a non-empty sessionId",
+            ),
+            (
+                json!({"sessionId": "", "prompt": []}),
+                "steer params require a non-empty sessionId",
+            ),
+            (
+                json!({"sessionId": "s1"}),
+                "steer params require a non-empty prompt array",
+            ),
+            (
+                json!({"sessionId": "s1", "prompt": []}),
+                "steer params require a non-empty prompt array",
+            ),
+            (
+                json!({"sessionId": "s1", "prompt": "text"}),
+                "steer params require a non-empty prompt array",
+            ),
+            (
+                json!({"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}],
+                       "_meta": {"steering": {"idleBehavior": "x"}}}),
+                "unsupported steering idleBehavior",
+            ),
+            (
+                json!({"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}],
+                       "_meta": {"steering": {"idleBehavior": 7}}}),
+                "unsupported steering idleBehavior",
+            ),
+            (
+                json!({"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}],
+                       "_meta": {"steering": {"idleBehavior": null}}}),
+                "unsupported steering idleBehavior",
+            ),
+            (
+                json!({"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}],
+                       "_meta": {"steering": {"idleBehavior": {"a": 1}}}}),
+                "unsupported steering idleBehavior",
+            ),
+        ] {
+            let err = steer(&params);
+            let v = serde_json::to_value(&err).expect("serializes");
+            assert_eq!(v["code"], -32602, "{params}");
+            assert_eq!(v["message"], format!("Invalid params: {text}"), "{params}");
+            assert!(v.get("data").is_none(), "no data: {params} -> {v}");
+        }
+
+        // The `steer_outcome` seam keeps the same wire shape.
+        let err = steer_outcome(false, Some("x")).expect_err("must reject");
+        let v = serde_json::to_value(&err).expect("serializes");
+        assert_eq!(v["code"], -32602);
+        assert_eq!(
+            v["message"],
+            "Invalid params: unsupported steering idleBehavior"
+        );
+        assert!(v.get("data").is_none(), "no data: {v}");
+    }
+
+    /// ROADMAP F2a: the `initialize.authMethods` branches
+    /// (`acp-agent.ts:2844-2947`), with the env injected hermetically.
+    fn auth_methods(capabilities: Value, env: &[(&str, &str)]) -> Value {
+        let caps = ClientCapabilities::from_value(Some(&capabilities));
+        let env = crate::env_snapshot::EnvSnapshot::from_pairs(
+            env.iter().map(|(key, value)| (*key, *value)),
+        );
+        let argv = vec!["dist/index.js".to_string()];
+        initialize_response(None, &caps, &env, "/usr/bin/node", &argv)["authMethods"].clone()
+    }
+
+    #[test]
+    fn auth_methods_plain_client_are_empty() {
+        assert_eq!(auth_methods(json!({}), &[]), json!([]));
+    }
+
+    #[test]
+    fn auth_terminal_offers_subscription_and_console() {
+        let methods = auth_methods(json!({"auth": {"terminal": true}}), &[]);
+        assert_eq!(
+            methods,
+            json!([
+                {
+                    "description": "Use Claude subscription ",
+                    "name": "Claude Subscription",
+                    "id": "claude-ai-login",
+                    "type": "terminal",
+                    "args": ["--cli", "auth", "login", "--claudeai"]
+                },
+                {
+                    "description": "Use Anthropic Console (API usage billing)",
+                    "name": "Anthropic Console",
+                    "id": "console-login",
+                    "type": "terminal",
+                    "args": ["--cli", "auth", "login", "--console"]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn meta_terminal_auth_offers_the_launch_command_without_auth_terminal() {
+        let methods = auth_methods(json!({"_meta": {"terminal-auth": true}}), &[]);
+        assert_eq!(methods.as_array().map(Vec::len), Some(2));
+        assert_eq!(methods[0]["id"], "claude-ai-login");
+        assert_eq!(
+            methods[0]["_meta"]["terminal-auth"],
+            json!({
+                "command": "/usr/bin/node",
+                "args": ["dist/index.js", "--cli", "auth", "login", "--claudeai"],
+                "label": "Claude Login"
+            })
+        );
+        assert_eq!(methods[1]["id"], "console-login");
+        assert_eq!(
+            methods[1]["_meta"]["terminal-auth"],
+            json!({
+                "command": "/usr/bin/node",
+                "args": ["dist/index.js", "--cli", "auth", "login", "--console"],
+                "label": "Anthropic Console Login"
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_methods_are_gated_on_auth_meta_gateway() {
+        let methods = auth_methods(json!({"auth": {"_meta": {"gateway": true}}}), &[]);
+        assert_eq!(
+            methods,
+            json!([
+                {
+                    "id": "gateway",
+                    "name": "Custom model gateway",
+                    "description": "Use a custom gateway to authenticate and access models",
+                    "_meta": {"gateway": {"protocol": "anthropic"}}
+                },
+                {
+                    "id": "gateway-bedrock",
+                    "name": "Custom model gateway",
+                    "description": "Use a custom gateway to authenticate and access models",
+                    "_meta": {"gateway": {"protocol": "bedrock"}}
+                }
+            ])
+        );
+        // A non-strict value does not opt in.
+        assert_eq!(
+            auth_methods(json!({"auth": {"_meta": {"gateway": "yes"}}}), &[]),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn remote_environment_offers_the_tui_login() {
+        for key in [
+            "NO_BROWSER",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "CLAUDE_CODE_REMOTE",
+        ] {
+            let methods = auth_methods(json!({"auth": {"terminal": true}}), &[(key, "1")]);
+            assert_eq!(
+                methods,
+                json!([{
+                    "description": "Run `claude /login` in the terminal",
+                    "name": "Log in with Claude",
+                    "id": "claude-login",
+                    "type": "terminal",
+                    "args": ["--cli"]
+                }]),
+                "{key} must select the remote login"
+            );
+        }
+        // An empty value is falsy in Node, so it is not remote.
+        let methods = auth_methods(json!({"auth": {"terminal": true}}), &[("NO_BROWSER", "")]);
+        assert_eq!(methods[0]["id"], "claude-ai-login");
+    }
+
+    #[test]
+    fn remote_meta_terminal_auth_carries_the_cli_args() {
+        let methods = auth_methods(
+            json!({"auth": {"terminal": true}, "_meta": {"terminal-auth": true}}),
+            &[("NO_BROWSER", "1")],
+        );
+        assert_eq!(
+            methods,
+            json!([{
+                "description": "Run `claude /login` in the terminal",
+                "name": "Log in with Claude",
+                "id": "claude-login",
+                "type": "terminal",
+                "args": ["--cli"],
+                "_meta": {
+                    "terminal-auth": {
+                        "command": "/usr/bin/node",
+                        "args": ["dist/index.js", "--cli"],
+                        "label": "Claude Login"
+                    }
+                }
+            }])
+        );
+    }
+
+    #[test]
+    fn terminal_methods_precede_the_gateway_methods() {
+        let methods = auth_methods(
+            json!({"auth": {"terminal": true, "_meta": {"gateway": true}}}),
+            &[],
+        );
+        let ids: Vec<&str> = methods
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|method| method["id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "claude-ai-login",
+                "console-login",
+                "gateway",
+                "gateway-bedrock"
+            ]
+        );
     }
 }

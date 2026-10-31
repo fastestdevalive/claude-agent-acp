@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "capture_init": true,
+  "steps": [
+    {"call": "request", "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "auth": {"terminal": false}, "session": {"notices": {}}, "_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}}}}},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "start bg", "no_wait": true},
+    {"call": "request", "method": "_session/async_task/stop", "params": {"sessionId": "$SESSION", "asyncTaskId": "bg1"}, "after_recv_contains": "async_task_spawned"},
+    {"call": "session/wait"}
+  ]
+}

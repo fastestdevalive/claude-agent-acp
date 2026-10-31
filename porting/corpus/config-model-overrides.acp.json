@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "settings.json", "from": "seeds/settings-model-overrides.json"}
+  ],
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD", "mcpServers": []}}
+  ]
+}

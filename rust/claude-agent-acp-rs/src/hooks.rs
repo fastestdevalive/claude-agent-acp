@@ -297,37 +297,45 @@ pub struct TaskStateEntry {
     pub description: Option<String>,
 }
 
-/// Parses the created task ID from TaskCreate tool output.
-pub fn parse_task_create_output(val: &Value) -> Option<String> {
-    if let Some(id) = val.pointer("/task/id").and_then(Value::as_str) {
-        return Some(id.to_string());
+/// Parses the created task ID from TaskCreate tool output (Node `parseTaskCreateOutput`):
+/// a structured `{"task":{"id":"…"}}` carried by the object, its JSON-string form, or a
+/// text block, else the human-readable `Task #<id> created successfully: <subject>` form.
+pub fn parse_task_create_output(content: &Value) -> Option<String> {
+    let structured = json_candidates(content).into_iter().find_map(|value| {
+        value
+            .pointer("/task/id")
+            .and_then(Value::as_str)
+            .map(String::from)
+    });
+    if structured.is_some() {
+        return structured;
     }
-    let text = if let Some(s) = val.as_str() {
-        s
-    } else if let Some(arr) = val.as_array() {
-        arr.iter()
-            .find_map(|b| b.get("text").and_then(Value::as_str))
-            .unwrap_or("")
-    } else {
-        ""
-    };
-    let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix("Task #") {
-        if let Some(idx) = rest.find(" created successfully: ") {
-            return Some(rest[..idx].to_string());
-        }
-    }
-    None
+    tool_output_texts(content).into_iter().find_map(|text| {
+        let rest = text.trim().strip_prefix("Task #")?;
+        let idx = rest.find(" created successfully: ")?;
+        let id = &rest[..idx];
+        let subject = &rest[idx + " created successfully: ".len()..];
+        // Node's regex needs a non-empty, whitespace-free id (`\S+`) and a
+        // non-empty single-line subject (`(.+)`).
+        (!id.is_empty()
+            && !id.contains(char::is_whitespace)
+            && !subject.is_empty()
+            && !subject.contains(['\n', '\r']))
+        .then(|| id.to_string())
+    })
 }
 
-/// Applies a TaskCreate tool call to the task state.
+/// Applies a TaskCreate tool call to the task state. The id comes only from the
+/// output (Node `applyTaskCreate` never falls back to `input.taskId`), and an
+/// empty id is rejected like Node's `if (!taskId)`.
 pub fn apply_task_create(
     state: &mut Vec<(String, TaskStateEntry)>,
     input: &Value,
     task_id: Option<&str>,
 ) {
-    let task_id = task_id.or_else(|| input.get("taskId").and_then(Value::as_str));
-    let Some(id) = task_id else { return };
+    let Some(id) = task_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
     let subject = input.get("subject").and_then(Value::as_str).unwrap_or("");
     let active_form = input
         .get("activeForm")
@@ -658,6 +666,32 @@ pub fn apply_task_list(
                 description: existing.and_then(|e| e.description.clone()),
             },
         ));
+    }
+}
+
+/// Applies one Task* tool result to the task state, mirroring Node's TaskCreate /
+/// TaskUpdate / TaskList branches (acp-agent.ts:13237-13290). Returns whether a plan
+/// should be published. TaskGet is read-only: it neither mutates the state nor
+/// publishes a plan, so any other tool name returns false.
+pub fn apply_task_tool_result(
+    state: &mut Vec<(String, TaskStateEntry)>,
+    name: &str,
+    input: &Value,
+    tool_use_result: &Value,
+    content: &Value,
+) -> bool {
+    match name {
+        "TaskCreate" => {
+            // Node parses the message-level `tool_use_result` first, then the
+            // content, and publishes a plan even when the output has no id.
+            let task_id = parse_task_create_output(tool_use_result)
+                .or_else(|| parse_task_create_output(content));
+            apply_task_create(state, input, task_id.as_deref());
+            true
+        }
+        "TaskUpdate" => apply_task_update_output(state, input, tool_use_result, content),
+        "TaskList" => apply_task_list_output(state, tool_use_result, content),
+        _ => false,
     }
 }
 
@@ -1252,5 +1286,219 @@ mod tests {
         ));
         assert_eq!(state.len(), 1);
         assert_eq!(state[0].0, "9");
+    }
+
+    // T-25 (tools.ts:274-287): TaskCreate needs the OUTPUT task id; an input
+    // `taskId` is never a fallback.
+    #[test]
+    fn pc1_5_task_create_needs_an_output_id() {
+        let mut state = Vec::new();
+        let input = json!({"taskId": "1", "subject": "A", "description": "D"});
+        apply_task_create(&mut state, &input, None);
+        assert!(state.is_empty());
+        apply_task_create(&mut state, &input, Some("1"));
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].1.subject, "A");
+        assert_eq!(state[0].1.status, "pending");
+    }
+
+    // T-23 (tools.ts:126-155): every TaskCreate output form Node accepts: a
+    // structured object, its JSON-string form, JSON carried by text blocks
+    // (skipping unrelated JSON), and the human-readable text form.
+    #[test]
+    fn pc1_5_task_create_parses_structured_and_text_output() {
+        assert_eq!(
+            parse_task_create_output(&json!({"task": {"id": "1", "subject": "X"}})),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            parse_task_create_output(&json!(r#"{"task":{"id":"2","subject":"Y"}}"#)),
+            Some("2".to_string())
+        );
+        assert_eq!(
+            parse_task_create_output(&json!([
+                {"type": "text", "text": r#"{"metadata":"unrelated"}"#},
+                {"type": "text", "text": r#"{"task":{"id":"3"}}"#}
+            ])),
+            Some("3".to_string())
+        );
+        assert_eq!(
+            parse_task_create_output(&json!("Task #42 created successfully: Run tests")),
+            Some("42".to_string())
+        );
+        assert_eq!(parse_task_create_output(&json!("not json")), None);
+        assert_eq!(
+            parse_task_create_output(&json!([{"type": "text", "text": "not json"}])),
+            None
+        );
+        assert_eq!(
+            parse_task_create_output(&json!(r#"{"task":{"subject":"X"}}"#)),
+            None
+        );
+        // Node's regex needs a non-empty, whitespace-free id and a non-empty subject.
+        assert_eq!(
+            parse_task_create_output(&json!("Task # created successfully: X")),
+            None
+        );
+        assert_eq!(
+            parse_task_create_output(&json!("Task #1 created successfully: ")),
+            None
+        );
+    }
+
+    // T-23 (acp-agent.ts:13237-13246): TaskCreate prefers the message-level
+    // `tool_use_result` over the tool_result content and still publishes a plan
+    // when the output carries no id (Node sets shouldEmitTaskPlan unconditionally).
+    #[test]
+    fn pc1_5_task_create_prefers_tool_use_result() {
+        let mut state = Vec::new();
+        let input = json!({"subject": "A", "description": ""});
+        assert!(apply_task_tool_result(
+            &mut state,
+            "TaskCreate",
+            &input,
+            &json!({"task": {"id": "result"}}),
+            &json!({"task": {"id": "content"}})
+        ));
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].0, "result");
+
+        let mut state = Vec::new();
+        assert!(apply_task_tool_result(
+            &mut state,
+            "TaskCreate",
+            &input,
+            &Value::Null,
+            &json!("nope")
+        ));
+        assert!(state.is_empty());
+    }
+
+    // T-23 (tools.ts:260-269): a failed delete is an unsuccessful update even
+    // though the text names no task.
+    #[test]
+    fn pc1_5_task_update_failed_delete_text_output_is_not_applied() {
+        let mut state = one_task("pending");
+        let input = json!({"taskId": "1", "status": "deleted"});
+        assert!(!apply_task_update_output(
+            &mut state,
+            &input,
+            &Value::Null,
+            &json!("Failed to delete task")
+        ));
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].1.status, "pending");
+    }
+
+    // T-23 (tools.ts:155-172): TaskUpdate parses a structured JSON string and
+    // prefers `tool_use_result` over the content.
+    #[test]
+    fn pc1_5_task_update_parses_json_string_and_prefers_tool_use_result() {
+        let mut state = one_task("pending");
+        let input = json!({"taskId": "1", "status": "completed"});
+        let string_result = json!(r#"{"success":true,"taskId":"1","updatedFields":["status"]}"#);
+        assert!(apply_task_update_output(
+            &mut state,
+            &input,
+            &Value::Null,
+            &string_result
+        ));
+        assert_eq!(state[0].1.status, "completed");
+
+        let mut state = one_task("pending");
+        let content = json!({"success": true, "taskId": "1", "updatedFields": ["status"]});
+        let tool_use_result =
+            json!({"success": false, "taskId": "1", "updatedFields": [], "error": "nope"});
+        assert!(!apply_task_update_output(
+            &mut state,
+            &input,
+            &tool_use_result,
+            &content
+        ));
+        assert_eq!(state[0].1.status, "pending");
+    }
+
+    // T-23 (tools.ts:173-244): TaskList parses a structured JSON string and an
+    // empty structured list clears the state.
+    #[test]
+    fn pc1_5_task_list_parses_json_string_and_structured_empty() {
+        let mut state = one_task("in_progress");
+        let string_result = json!(r#"{"tasks":[{"id":"1","subject":"A","status":"completed"}]}"#);
+        assert!(apply_task_list_output(
+            &mut state,
+            &Value::Null,
+            &string_result
+        ));
+        assert_eq!(state[0].1.status, "completed");
+
+        let mut state = one_task("pending");
+        assert!(apply_task_list_output(
+            &mut state,
+            &Value::Null,
+            &json!({"tasks": []})
+        ));
+        assert!(state.is_empty());
+    }
+
+    // T-22 (tools.ts:308-321): TaskList replaces the snapshot in output order
+    // and keeps the richer local fields of the tasks it still holds.
+    #[test]
+    fn pc1_5_task_list_uses_the_output_order() {
+        let mut state = vec![
+            (
+                "2".to_string(),
+                TaskStateEntry {
+                    subject: "Two".into(),
+                    status: "pending".into(),
+                    active_form: Some("Twoing".into()),
+                    description: Some("d2".into()),
+                },
+            ),
+            (
+                "1".to_string(),
+                TaskStateEntry {
+                    subject: "One".into(),
+                    status: "pending".into(),
+                    active_form: None,
+                    description: None,
+                },
+            ),
+            (
+                "3".to_string(),
+                TaskStateEntry {
+                    subject: "Gone".into(),
+                    status: "completed".into(),
+                    active_form: None,
+                    description: None,
+                },
+            ),
+        ];
+        let content = json!("#1 [in_progress] One\n#2 [completed] Two\n#4 [pending] Four");
+        assert!(apply_task_list_output(&mut state, &Value::Null, &content));
+        let ids: Vec<&str> = state.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["1", "2", "4"]);
+        assert_eq!(state[0].1.status, "in_progress");
+        assert_eq!(state[1].1.active_form.as_deref(), Some("Twoing"));
+        assert_eq!(state[1].1.description.as_deref(), Some("d2"));
+        assert_eq!(state[2].1.subject, "Four");
+    }
+
+    // T-22 (acp-agent.ts:13237-13290): TaskGet is read-only, so its result
+    // neither mutates the task state nor publishes a plan.
+    #[test]
+    fn pc1_5_task_get_result_is_silent() {
+        let mut state = one_task("in_progress");
+        let input = json!({"taskId": "1"});
+        let content = json!({"task": {"id": "1", "subject": "Changed", "status": "completed"}});
+        assert!(!apply_task_tool_result(
+            &mut state,
+            "TaskGet",
+            &input,
+            &Value::Null,
+            &content
+        ));
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].1.subject, "Build");
+        assert_eq!(state[0].1.status, "in_progress");
     }
 }

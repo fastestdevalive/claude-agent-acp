@@ -157,6 +157,10 @@ pub struct SpawnOptions {
     /// `--key`, otherwise `--key`,`value` (or `--key=value` when the value
     /// starts with `-`). Emitted after `--session-id`.
     pub extra_args: Vec<(String, Option<String>)>,
+    /// The SDK's programmatic settings tier (`--settings`): appended after the
+    /// user `extraArgs` and `--replay-user-messages`, or overriding a user
+    /// `settings` key in place (O-49/O-129/O-130).
+    pub settings_arg: Option<String>,
     /// `--include-partial-messages`.
     pub include_partial_messages: bool,
     /// `--permission-prompt-tool stdio`.
@@ -165,6 +169,19 @@ pub struct SpawnOptions {
     pub allow_dangerously_skip_permissions: bool,
     /// `--replay-user-messages` (plus the SDK's trailing empty value).
     pub replay_user_messages: bool,
+    /// `--thinking=adaptive|disabled`, `--max-thinking-tokens=<n>` and
+    /// `--thinking-display=<d>` (O-62/O-117/O-118).
+    pub thinking: Option<crate::sdk_options::ThinkingConfig>,
+    /// The `--mcp-config` JSON payload (WB-13/O-131).
+    pub mcp_config: Option<String>,
+    /// `_meta.claudeCode.options.executableArgs`, prepended to the SDK argv.
+    pub executable_args: Vec<String>,
+    /// `--plugin-dir` / `--plugin-dir-no-mcp` entries (O-123).
+    pub plugins: Vec<crate::sdk_options::Plugin>,
+    /// `--await-initialize` when plugins are delivered over initialize.
+    pub plugin_delivery: crate::sdk_options::PluginDelivery,
+    /// `--no-session-persistence` when explicitly `persistSession:false` (O-124).
+    pub persist_session: Option<bool>,
     /// Environment snapshot for executable resolution.
     pub env_snapshot: crate::env_snapshot::EnvSnapshot,
 }
@@ -194,10 +211,17 @@ impl Default for SpawnOptions {
             disallowed_tools: Vec::new(),
             tools: None,
             extra_args: Vec::new(),
+            settings_arg: None,
             include_partial_messages: false,
             permission_prompt_tool: false,
             allow_dangerously_skip_permissions: false,
             replay_user_messages: false,
+            thinking: None,
+            mcp_config: None,
+            executable_args: Vec::new(),
+            plugins: Vec::new(),
+            plugin_delivery: crate::sdk_options::PluginDelivery::Argv,
+            persist_session: None,
             env_snapshot: crate::env_snapshot::EnvSnapshot::default(),
         }
     }
@@ -212,13 +236,44 @@ impl Default for SpawnOptions {
 /// `--permission-mode=<m>`; `--resume=`, `--setting-sources=`, `--session-id=`
 /// and the trailing `""` after `--replay-user-messages` are unchanged.
 pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
-    let mut argv: Vec<String> = vec![
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-        "--input-format".into(),
-        "stream-json".into(),
-    ];
+    // `executableArgs` are prepended before the SDK's fixed prefix
+    // (`sdk.mjs` ProcessTransport: `[...executableArgs, ...W]`).
+    let mut argv: Vec<String> = opts.executable_args.clone();
+    argv.extend(
+        [
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+        ]
+        .map(String::from),
+    );
+
+    if let Some(thinking) = &opts.thinking {
+        use crate::sdk_options::ThinkingConfig;
+        match thinking {
+            ThinkingConfig::Enabled {
+                budget_tokens: Some(budget),
+                ..
+            } => argv.push(format!("--max-thinking-tokens={budget}")),
+            ThinkingConfig::Enabled {
+                budget_tokens: None,
+                ..
+            }
+            | ThinkingConfig::Adaptive { .. } => argv.push("--thinking=adaptive".into()),
+            ThinkingConfig::Disabled => argv.push("--thinking=disabled".into()),
+        }
+        let display = match thinking {
+            ThinkingConfig::Adaptive { display } | ThinkingConfig::Enabled { display, .. } => {
+                display.as_deref()
+            }
+            ThinkingConfig::Disabled => None,
+        };
+        if let Some(display) = display {
+            argv.push(format!("--thinking-display={display}"));
+        }
+    }
 
     if let Some(effort) = &opts.effort {
         argv.push(format!("--effort={effort}"));
@@ -275,6 +330,13 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         }
     }
 
+    // `oy("--mcp-config", JSON.stringify({mcpServers}))`: the payload does not
+    // start with `-`, so it is a separate token (O-131 / WB-13).
+    if let Some(config) = &opts.mcp_config {
+        argv.push("--mcp-config".into());
+        argv.push(config.clone());
+    }
+
     argv.push(format!(
         "--setting-sources={}",
         opts.setting_sources.join(",")
@@ -312,29 +374,71 @@ pub fn build_argv(opts: &SpawnOptions) -> Vec<String> {
         argv.push(format!("--add-dir={}", dir.display()));
     }
 
+    // Plugins: `--await-initialize` when delivered over initialize, else one
+    // `--plugin-dir`/`--plugin-dir-no-mcp` per local plugin (O-123/O-158).
+    if opts.plugin_delivery == crate::sdk_options::PluginDelivery::Initialize
+        && !opts.plugins.is_empty()
+    {
+        argv.push("--await-initialize".into());
+    } else {
+        for plugin in &opts.plugins {
+            // Only `local` plugins reach here (validated before spawning).
+            let flag = if plugin.skip_mcp_discovery {
+                "--plugin-dir-no-mcp"
+            } else {
+                "--plugin-dir"
+            };
+            argv.push(format!(
+                "{flag}={}",
+                plugin.path.as_deref().unwrap_or_default()
+            ));
+        }
+    }
+
     if let Some(session_id) = &opts.session_id {
         argv.push(format!("--session-id={session_id}"));
     }
 
+    if opts.persist_session == Some(false) {
+        argv.push("--no-session-persistence".into());
+    }
+
     for (key, value) in &opts.extra_args {
-        match value {
-            None => argv.push(format!("--{key}")),
-            Some(v) if v.len() > 1 && v.starts_with('-') => argv.push(format!("--{key}={v}")),
-            Some(v) => {
-                argv.push(format!("--{key}"));
-                argv.push(v.clone());
-            }
+        let overridden = if key == "settings" {
+            opts.settings_arg.as_deref()
+        } else {
+            None
+        };
+        push_extra_arg(&mut argv, key, overridden.or(value.as_deref()));
+    }
+
+    // The SDK's `extraArgs` always ends with `replay-user-messages`, and the
+    // programmatic `settings` tier is appended after it (or overrides an
+    // existing user `settings` key in place).
+    if opts.replay_user_messages {
+        push_extra_arg(&mut argv, "replay-user-messages", Some(""));
+    }
+    if let Some(settings) = &opts.settings_arg {
+        if !opts.extra_args.iter().any(|(key, _)| key == "settings") {
+            push_extra_arg(&mut argv, "settings", Some(settings));
         }
     }
 
-    if opts.replay_user_messages {
-        // The SDK pushes `--replay-user-messages` and an empty trailing value
-        // via `Tk(extraArgs)` AFTER the user keys (R3).
-        argv.push("--replay-user-messages".into());
-        argv.push(String::new());
-    }
-
     argv
+}
+
+/// Encode one `extraArgs` entry exactly like the SDK's `oy` helper: a `None`
+/// value is a bare `--key`; a value longer than one char that starts with `-`
+/// becomes `--key=value`; anything else (including `""`) is `--key`, `value`.
+fn push_extra_arg(argv: &mut Vec<String>, key: &str, value: Option<&str>) {
+    match value {
+        None => argv.push(format!("--{key}")),
+        Some(v) if v.len() > 1 && v.starts_with('-') => argv.push(format!("--{key}={v}")),
+        Some(v) => {
+            argv.push(format!("--{key}"));
+            argv.push(v.to_string());
+        }
+    }
 }
 
 /// Errors produced while spawning or driving the child process.
@@ -501,6 +605,12 @@ impl Process {
 enum Signal {
     Term,
     Kill,
+    /// Only used by the unix `--cli` relay (`index.ts:18-26`).
+    #[cfg(unix)]
+    Interrupt,
+    /// Only used by the unix `--cli` relay (`index.ts:18-26`).
+    #[cfg(unix)]
+    Hangup,
 }
 
 /// Platform-specific group signalling. All `cfg` lives in `process.rs` (G9).
@@ -514,6 +624,8 @@ async fn signal_group_impl(child: &mut Child, signal: Signal) -> Result<(), Spaw
     let sig = match signal {
         Signal::Term => NixSignal::SIGTERM,
         Signal::Kill => NixSignal::SIGKILL,
+        Signal::Interrupt => NixSignal::SIGINT,
+        Signal::Hangup => NixSignal::SIGHUP,
     };
     killpg(Pid::from_raw(pid as i32), sig)
         .map_err(|e| SpawnError::Signal(std::io::Error::other(format!("killpg: {e}"))))
@@ -530,11 +642,28 @@ async fn signal_group_impl(child: &mut Child, _signal: Signal) -> Result<(), Spa
         .map_err(|e| SpawnError::Signal(std::io::Error::other(format!("child.kill: {e}"))))
 }
 
+/// The SDK version the pinned adapter embeds in the child env when the host
+/// does not set `CLAUDE_AGENT_SDK_VERSION` (`sdk.mjs` 0.3.303).
+pub const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.303";
+
+/// JS truthiness for `DEBUG_CLAUDE_AGENT_SDK` (`Te()` in the SDK): a boolean
+/// true, or a case-insensitive `1`/`true`/`yes`/`on`.
+fn env_truthy(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+    }
+}
+
 /// Compute fixed environment variables for the child process.
 ///
 /// `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_SDK_READS_SESSION_STATE` are set
 /// ONLY when absent from both the parent environment and `extra_env` (mirroring
-/// Node SDK behavior).
+/// Node SDK behavior). `CLAUDE_AGENT_SDK_VERSION` follows the same rule
+/// (O-167).
 pub fn compute_claude_env_defaults(
     parent_vars: impl IntoIterator<Item = (String, String)>,
     extra_env: &[(String, String)],
@@ -552,6 +681,16 @@ pub fn compute_claude_env_defaults(
         defaults.push(("CLAUDE_CODE_ENTRYPOINT", "sdk-ts"));
     }
 
+    let has_sdk_version = extra_env
+        .iter()
+        .any(|(k, v)| k == "CLAUDE_AGENT_SDK_VERSION" && !v.is_empty())
+        || parent_map
+            .get("CLAUDE_AGENT_SDK_VERSION")
+            .is_some_and(|v| !v.is_empty());
+    if !has_sdk_version {
+        defaults.push(("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION));
+    }
+
     defaults.push(("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"));
 
     let has_sdk_reads = extra_env
@@ -567,13 +706,31 @@ pub fn compute_claude_env_defaults(
     defaults
 }
 
+/// The `DEBUG` override from the merged env (O-167): `Some("1")` when
+/// `DEBUG_CLAUDE_AGENT_SDK` is truthy, else `None` (the SDK deletes `DEBUG`).
+pub fn compute_debug_override(
+    parent_vars: impl IntoIterator<Item = (String, String)>,
+    extra_env: &[(String, String)],
+) -> Option<&'static str> {
+    let parent_map: std::collections::HashMap<String, String> = parent_vars.into_iter().collect();
+    let value = extra_env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "DEBUG_CLAUDE_AGENT_SDK")
+        .map(|(_, v)| v.as_str())
+        .or_else(|| parent_map.get("DEBUG_CLAUDE_AGENT_SDK").map(String::as_str));
+    env_truthy(value).then_some("1")
+}
+
 /// Apply the fixed `claude` environment (B2): merge `extra_env`, set
 /// `CLAUDE_CODE_ENTRYPOINT`, set `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`,
-/// remove `NODE_OPTIONS`. Cross-platform; no `cfg` needed here.
+/// remove `NODE_OPTIONS`, and normalise `DEBUG` (O-167): the SDK deletes
+/// `DEBUG` unless `DEBUG_CLAUDE_AGENT_SDK` is truthy, in which case it forces
+/// `DEBUG=1`. Cross-platform; no `cfg` needed here.
 ///
-/// Note: this only ADDS/overrides environment variables. The [`Command`] is
-/// never `.env_clear()`ed, so the child inherits the full parent process env by
-/// default — exactly the Node adapter's `{ ...process.env, ...providerEnv }`
+/// Note: this only ADDS/OVERRIDES/REMOVES environment variables. The [`Command`]
+/// is never `.env_clear()`ed, so the child inherits the full parent process env
+/// by default — exactly the Node adapter's `{ ...process.env, ...providerEnv }`
 /// (`acp-agent.js:4851`). It does NOT restrict which env vars reach `claude`.
 fn apply_claude_env(cmd: &mut Command, extra_env: &[(String, String)]) {
     for (k, v) in extra_env {
@@ -581,6 +738,14 @@ fn apply_claude_env(cmd: &mut Command, extra_env: &[(String, String)]) {
     }
     for (k, v) in compute_claude_env_defaults(std::env::vars(), extra_env) {
         cmd.env(k, v);
+    }
+    match compute_debug_override(std::env::vars(), extra_env) {
+        Some(debug) => {
+            cmd.env("DEBUG", debug);
+        }
+        None => {
+            cmd.env_remove("DEBUG");
+        }
     }
     cmd.env_remove("NODE_OPTIONS");
 }
@@ -812,7 +977,8 @@ fn current_os() -> Os {
     Os::Windows
 }
 
-/// A future that resolves when the host requests shutdown: SIGTERM on unix.
+/// A future that resolves when the host requests shutdown: SIGINT or SIGTERM
+/// on unix (`index.ts:98-104` installs the same handler for both).
 ///
 /// On non-unix platforms there is no SIGTERM; the future never resolves
 /// (shutdown happens only via stdin EOF), matching the D12 platform split.
@@ -821,11 +987,22 @@ fn current_os() -> Os {
 #[cfg(unix)]
 pub async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    match signal(SignalKind::terminate()) {
-        Ok(mut term) => {
-            term.recv().await;
+    let interrupt = signal(SignalKind::interrupt());
+    let terminate = signal(SignalKind::terminate());
+    match (interrupt, terminate) {
+        (Ok(mut interrupt), Ok(mut terminate)) => {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
         }
-        Err(_) => {
+        (Ok(mut interrupt), Err(_)) => {
+            interrupt.recv().await;
+        }
+        (Err(_), Ok(mut terminate)) => {
+            terminate.recv().await;
+        }
+        (Err(_), Err(_)) => {
             // No handler could be installed; park (shutdown via stdin EOF).
             std::future::pending::<()>().await;
         }
@@ -836,6 +1013,138 @@ pub async fn wait_for_shutdown_signal() {
 #[cfg(not(unix))]
 pub async fn wait_for_shutdown_signal() {
     std::future::pending::<()>().await
+}
+
+/// Run the wrapped native `claude` CLI (`--cli`, `index.ts:13-42`).
+///
+/// The child inherits this process's stdin/stdout/stderr. SIGINT/SIGTERM
+/// (plus SIGHUP on unix) are forwarded to it, and its exit code is mirrored.
+/// A child killed by a signal exits with the conventional `128+N` (the value
+/// the upstream's re-raise produces), since resetting the signal disposition
+/// safely is not available under `#![forbid(unsafe_code)]`.
+#[cfg(unix)]
+pub async fn run_cli_passthrough(binary: &Path, args: &[String]) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut child = match Command::new(binary)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+
+    let mut interrupt = signal(SignalKind::interrupt()).ok();
+    let mut terminate = signal(SignalKind::terminate()).ok();
+    let mut hangup = signal(SignalKind::hangup()).ok();
+
+    // Node's `if (!child.killed) child.kill(sig)` forwards only the first
+    // signal: `child.killed` is latched by the first `kill()` call.
+    let mut relayed = false;
+
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(status) => {
+                        if let Some(signal) = status.signal() {
+                            return 128 + signal;
+                        }
+                        return status.code().unwrap_or(1);
+                    }
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return 1;
+                    }
+                }
+            }
+            _ = recv_signal(&mut interrupt) => {
+                if !relayed {
+                    forward_to_child(&mut child, Signal::Interrupt);
+                    relayed = true;
+                }
+            }
+            _ = recv_signal(&mut terminate) => {
+                if !relayed {
+                    forward_to_child(&mut child, Signal::Term);
+                    relayed = true;
+                }
+            }
+            _ = recv_signal(&mut hangup) => {
+                if !relayed {
+                    forward_to_child(&mut child, Signal::Hangup);
+                    relayed = true;
+                }
+            }
+        }
+    }
+}
+
+/// Windows `--cli`: inherit stdio, mirror the exit code, and forward Ctrl-C to
+/// the child's job object (`child.kill()` tears the tree down).
+#[cfg(windows)]
+pub async fn run_cli_passthrough(binary: &Path, args: &[String]) -> i32 {
+    let mut child = match Command::new(binary)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    tokio::select! {
+        status = child.wait() => match status {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(err) => {
+                eprintln!("{err}");
+                1
+            }
+        },
+        _ = tokio::signal::ctrl_c() => {
+            let _ = child.kill().await;
+            1
+        }
+    }
+}
+
+/// Wait for the next signal on an optional stream; park forever when the
+/// handler could not be installed.
+#[cfg(unix)]
+async fn recv_signal(stream: &mut Option<tokio::signal::unix::Signal>) -> bool {
+    match stream {
+        Some(stream) => stream.recv().await.is_some(),
+        None => std::future::pending::<bool>().await,
+    }
+}
+
+/// Forward a signal to the wrapped CLI's pid (Node `child.kill(sig)`), never to
+/// the adapter's own process group.
+#[cfg(unix)]
+fn forward_to_child(child: &mut Child, signal: Signal) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+    use nix::sys::signal::{kill, Signal as NixSignal};
+    use nix::unistd::Pid;
+    let sig = match signal {
+        Signal::Term => NixSignal::SIGTERM,
+        Signal::Kill => NixSignal::SIGKILL,
+        Signal::Interrupt => NixSignal::SIGINT,
+        Signal::Hangup => NixSignal::SIGHUP,
+    };
+    let _ = kill(Pid::from_raw(pid as i32), sig);
 }
 
 #[cfg(test)]
@@ -878,6 +1187,7 @@ mod tests {
             defs,
             vec![
                 ("CLAUDE_CODE_ENTRYPOINT", "sdk-ts"),
+                ("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION),
                 ("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"),
                 ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
             ]
@@ -887,6 +1197,7 @@ mod tests {
         let parent_with_vars = vec![
             ("CLAUDE_CODE_ENTRYPOINT".into(), "custom-ts".into()),
             ("CLAUDE_CODE_SDK_READS_SESSION_STATE".into(), "0".into()),
+            ("CLAUDE_AGENT_SDK_VERSION".into(), "9.9.9".into()),
         ];
         let defs = compute_claude_env_defaults(parent_with_vars, &empty_extra);
         assert_eq!(defs, vec![("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")]);
@@ -895,10 +1206,38 @@ mod tests {
         let extra_with_vars = vec![
             ("CLAUDE_CODE_ENTRYPOINT".into(), "user-ep".into()),
             ("claude_code_sdk_reads_session_state".into(), "1".into()),
+            ("CLAUDE_AGENT_SDK_VERSION".into(), "1.2.3".into()),
         ];
         let empty_parent: Vec<(String, String)> = Vec::new();
         let defs = compute_claude_env_defaults(empty_parent, &extra_with_vars);
         assert_eq!(defs, vec![("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")]);
+
+        // An EMPTY `CLAUDE_AGENT_SDK_VERSION` is treated as unset (JS falsy).
+        let extra_empty_version = vec![("CLAUDE_AGENT_SDK_VERSION".into(), String::new())];
+        let defs = compute_claude_env_defaults(Vec::new(), &extra_empty_version);
+        assert!(defs.iter().any(|(k, _)| *k == "CLAUDE_AGENT_SDK_VERSION"));
+    }
+
+    /// O-167: `DEBUG` is stripped unless `DEBUG_CLAUDE_AGENT_SDK` is truthy, in
+    /// which case it is forced to `1` (extra_env overrides the parent).
+    #[test]
+    fn inv_57_debug_env_override() {
+        let none: Vec<(String, String)> = Vec::new();
+        assert_eq!(compute_debug_override(Vec::new(), &none), None);
+
+        let parent_debug = vec![("DEBUG".into(), "1".into())];
+        assert_eq!(compute_debug_override(parent_debug, &none), None);
+
+        let parent_flag = vec![("DEBUG_CLAUDE_AGENT_SDK".into(), "1".into())];
+        assert_eq!(compute_debug_override(parent_flag, &none), Some("1"));
+
+        let extra_flag = vec![("DEBUG_CLAUDE_AGENT_SDK".into(), "TRUE".into())];
+        assert_eq!(compute_debug_override(Vec::new(), &extra_flag), Some("1"));
+
+        // A falsy extra_env value overrides a truthy parent value.
+        let parent_flag = vec![("DEBUG_CLAUDE_AGENT_SDK".into(), "1".into())];
+        let extra_off = vec![("DEBUG_CLAUDE_AGENT_SDK".into(), "0".into())];
+        assert_eq!(compute_debug_override(parent_flag, &extra_off), None);
     }
 
     #[test]

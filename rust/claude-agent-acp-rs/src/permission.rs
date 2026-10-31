@@ -291,8 +291,9 @@ pub fn build_tool_call(
     tool_input: &Value,
     tool_use_id: &str,
     parent_tool_use_id: Option<&str>,
+    cwd: Option<&std::path::Path>,
 ) -> Value {
-    let shape = tools::tool_shape(tool_name, tool_input);
+    let shape = tools::tool_shape(tool_name, tool_input, cwd);
     let mut tc = serde_json::Map::new();
     tc.insert("toolCallId".into(), Value::String(tool_use_id.to_string()));
     // E-9: the request_permission `toolCall` carries the programmatic tool name
@@ -346,6 +347,7 @@ pub fn ensure_tool_call_emitted(
     tool_use_id: &str,
     parent_tool_use_id: Option<&str>,
     state: &mut MapState,
+    cwd: Option<&std::path::Path>,
 ) -> Option<SessionUpdate> {
     if state.has_emitted(tool_use_id) {
         return None;
@@ -355,7 +357,7 @@ pub fn ensure_tool_call_emitted(
         json!({"type": "tool_use", "id": tool_use_id, "name": tool_name, "input": tool_input}),
     );
 
-    let shape = tools::tool_shape(tool_name, tool_input);
+    let shape = tools::tool_shape(tool_name, tool_input, cwd);
     // 2.9 (X-7): a surfaced `tool_call` seeds the field tracker.
     state.seed_tool_tracker(
         tool_use_id.to_string(),
@@ -506,17 +508,88 @@ pub fn permission_control_response(
     tool_use_id: &str,
     input: &Value,
 ) -> Value {
+    permission_control_response_with_fallback(response, ctx, request_id, tool_use_id, input).0
+}
+
+/// Node's `applyPermissionFallback` (`session-mode.ts:196-221`): whether an
+/// allow's decoded `updatedPermissions` carries a `setMode auto` that the model
+/// cannot honour. The caller rewrites it to Accept edits and publishes the
+/// advisory warning for ANY tool (`acp-agent.ts:10219-10223`).
+pub(crate) fn fallback_rewrite_applies(
+    ctx: &permission_options::OptionsContext,
+    outcome: &SelectionOutcome,
+) -> bool {
+    ctx.auto_unavailable
+        && matches!(
+            outcome,
+            SelectionOutcome::Allow {
+                updated_permissions: Some(updates),
+                ..
+            } if updates.iter().any(|update| {
+                update.get("type").and_then(Value::as_str) == Some("setMode")
+                    && update.get("mode").and_then(Value::as_str) == Some("auto")
+            })
+        )
+}
+
+/// Like [`permission_control_response`], but also reports whether Node's
+/// `applyPermissionFallback` rewrote an Auto allow to Accept edits. The actor
+/// uses the flag to publish the fallback warning for every rewrite (not only
+/// the ExitPlanMode path).
+pub fn permission_control_response_with_fallback(
+    response: &Value,
+    ctx: &permission_options::OptionsContext,
+    request_id: &str,
+    tool_use_id: &str,
+    input: &Value,
+) -> (Value, bool) {
     let option_id = match selected_option_id(response) {
         Some(id) => id,
-        None => return deny_control_response(request_id, tool_use_id),
+        None => return (deny_control_response(request_id, tool_use_id), false),
     };
     // Node `decodeClaudePermissionResponse` (`permissions/response.js:5-8`): a
     // selected option id that was never offered is rejected exactly like Node's
     // thrown `Permission option was not offered` — refuse the tool.
     if !permission_options::option_was_offered(ctx, option_id) {
-        return deny_control_response(request_id, tool_use_id);
+        return (deny_control_response(request_id, tool_use_id), false);
     }
-    match permission_options::apply_selection(option_id, ctx) {
+    let selection = permission_options::apply_selection(option_id, ctx);
+    let fallback = match &selection {
+        Ok(outcome) => fallback_rewrite_applies(ctx, outcome),
+        Err(_) => false,
+    };
+    let selection = selection.map(|outcome| {
+        // Node `applyPermissionFallback` (`session-mode.ts:196-215`) runs on
+        // every permission result: an allow that activates Auto on a model
+        // without it is rewritten to Accept edits. The caller publishes the
+        // fallback warning before the mode update.
+        match outcome {
+            SelectionOutcome::Allow {
+                updated_permissions,
+                permanent,
+            } => SelectionOutcome::Allow {
+                updated_permissions: updated_permissions.map(|updates| {
+                    updates
+                        .into_iter()
+                        .map(|mut update| {
+                            if ctx.auto_unavailable
+                                && update.get("type").and_then(Value::as_str) == Some("setMode")
+                                && update.get("mode").and_then(Value::as_str) == Some("auto")
+                            {
+                                if let Some(object) = update.as_object_mut() {
+                                    object.insert("mode".into(), json!("acceptEdits"));
+                                }
+                            }
+                            update
+                        })
+                        .collect()
+                }),
+                permanent,
+            },
+            other => other,
+        }
+    });
+    let value = match selection {
         Ok(SelectionOutcome::Allow {
             updated_permissions,
             permanent,
@@ -548,12 +621,13 @@ pub fn permission_control_response(
             }
         }
         Err(_) => deny_control_response(request_id, tool_use_id),
-    }
+    };
+    (value, fallback)
 }
 
 /// Extract the chosen `optionId` from a `session/request_permission` response,
 /// or `None` when the outcome was not `selected` (cancelled or malformed).
-fn selected_option_id(response: &Value) -> Option<&str> {
+pub(crate) fn selected_option_id(response: &Value) -> Option<&str> {
     let nested = match response.get("outcome") {
         Some(Value::Object(nested)) => nested,
         _ => return None,
@@ -650,13 +724,14 @@ mod tests {
             "t1",
             Some("parent"),
             &mut air,
+            None,
         );
         assert_eq!(
             meta_of(bash),
             json!({"claudeCode": {"toolName": "Bash", "parentToolUseId": "parent"},
                    "jetbrains": {"air": {"version": 1, "commandTitle": "List"}}})
         );
-        let mcp = ensure_tool_call_emitted("mcp__s__t", &json!({}), "t2", None, &mut air);
+        let mcp = ensure_tool_call_emitted("mcp__s__t", &json!({}), "t2", None, &mut air, None);
         assert_eq!(
             meta_of(mcp),
             json!({"claudeCode": {"toolName": "mcp__s__t"},
@@ -664,7 +739,7 @@ mod tests {
                    "is_mcp_tool_call": true})
         );
         let mut plain = MapState::default();
-        let mcp = ensure_tool_call_emitted("mcp__s__t", &json!({}), "t3", None, &mut plain);
+        let mcp = ensure_tool_call_emitted("mcp__s__t", &json!({}), "t3", None, &mut plain, None);
         assert_eq!(
             meta_of(mcp),
             json!({"claudeCode": {"toolName": "mcp__s__t"}})
@@ -678,12 +753,14 @@ mod tests {
     fn inv_20_permission_after_toolcall() {
         let mut state = MapState::default();
         let input = json!({"command": "echo hi"});
-        let first = ensure_tool_call_emitted("Bash", &input, "toolu_01PERM", None, &mut state);
+        let first =
+            ensure_tool_call_emitted("Bash", &input, "toolu_01PERM", None, &mut state, None);
         assert!(
             matches!(&first, Some(SessionUpdate::ToolCall(tc)) if tc.tool_call_id.to_string() == "toolu_01PERM"),
             "an unseen tool id must first emit a ToolCall"
         );
-        let second = ensure_tool_call_emitted("Bash", &input, "toolu_01PERM", None, &mut state);
+        let second =
+            ensure_tool_call_emitted("Bash", &input, "toolu_01PERM", None, &mut state, None);
         assert!(
             second.is_none(),
             "a re-emission for an already-surfaced id must be a no-op (the streamed path refines)"
@@ -761,6 +838,7 @@ mod tests {
             &json!({"command":"ls"}),
             "toolu_SUB",
             Some("toolu_PARENT"),
+            None,
         );
         assert_eq!(
             tc["_meta"]["claudeCode"]["parentToolUseId"],
@@ -775,6 +853,7 @@ mod tests {
             "toolu_SUB",
             Some("toolu_PARENT"),
             &mut state,
+            None,
         );
         let SessionUpdate::ToolCall(tc) = emitted.unwrap() else {
             panic!("expected a ToolCall");
@@ -793,7 +872,7 @@ mod tests {
     fn inv_21_request_options_yes_no_only() {
         let params = build_request_permission(
             "sess1",
-            build_tool_call("Bash", &json!({"command":"ls"}), "toolu_1", None),
+            build_tool_call("Bash", &json!({"command":"ls"}), "toolu_1", None, None),
             None,
         );
         assert_eq!(
@@ -928,6 +1007,7 @@ mod tests {
                 "auto".into(),
                 "bypassPermissions".into(),
             ],
+            auto_unavailable: false,
             pre_plan_mode: None,
             context_used_percent: None,
             home_dir: None,
@@ -971,6 +1051,27 @@ mod tests {
             "user_permanent"
         );
 
+        // P-33: when the model lacks Auto, Node's `applyPermissionFallback`
+        // rewrites the allow's `setMode auto` to Accept edits; the
+        // classification stays permanent.
+        let mut fallback_ctx = ctx(json!({}));
+        fallback_ctx.auto_unavailable = true;
+        let value = permission_control_response(
+            &resp("exit-plan-auto"),
+            &fallback_ctx,
+            "r1",
+            "toolu_1",
+            &json!({}),
+        );
+        assert_eq!(
+            value["response"]["response"]["updatedPermissions"],
+            json!([{"type":"setMode","mode":"acceptEdits","destination":"session"}])
+        );
+        assert_eq!(
+            value["response"]["response"]["decisionClassification"],
+            "user_permanent"
+        );
+
         // "keep planning" (reject) -> deny with interrupt:true.
         let value = permission_control_response(
             &resp("reject"),
@@ -997,5 +1098,46 @@ mod tests {
         );
         assert_eq!(value["response"]["response"]["behavior"], "deny");
         assert!(value["response"]["response"]["updatedPermissions"].is_null());
+    }
+
+    /// G2c-fix 4: Node's `applyPermissionFallback` rewrites and warns for ANY
+    /// tool (`acp-agent.ts:10219-10223`, `session-mode.ts:196-221`), not only
+    /// ExitPlanMode. The flag is derived from the decoded `updatedPermissions`,
+    /// so a CLI-suggested `setMode auto` on any tool is reported.
+    #[test]
+    fn fallback_rewrite_applies_to_any_tool() {
+        let ctx = |auto_unavailable: bool| permission_options::OptionsContext {
+            tool_name: "Bash".to_string(),
+            display_name: None,
+            input: json!({"command": "ls"}),
+            cwd: "/repo".into(),
+            change_set: None,
+            no_persistent_rule: false,
+            default_to_no: false,
+            available_modes: vec!["default".into(), "acceptEdits".into(), "auto".into()],
+            auto_unavailable,
+            pre_plan_mode: None,
+            context_used_percent: None,
+            home_dir: None,
+        };
+        let set_mode = |mode: &str| permission_options::SelectionOutcome::Allow {
+            updated_permissions: Some(vec![json!({
+                "type": "setMode",
+                "mode": mode,
+                "destination": "session",
+            })]),
+            permanent: true,
+        };
+        assert!(fallback_rewrite_applies(&ctx(true), &set_mode("auto")));
+        assert!(!fallback_rewrite_applies(&ctx(false), &set_mode("auto")));
+        assert!(!fallback_rewrite_applies(
+            &ctx(true),
+            &set_mode("acceptEdits")
+        ));
+        let deny = permission_options::SelectionOutcome::Deny {
+            message: "no".into(),
+            interrupt: false,
+        };
+        assert!(!fallback_rewrite_applies(&ctx(true), &deny));
     }
 }

@@ -1,0 +1,8 @@
+{
+  "permission": "allow",
+  "capture_init": true,
+  "steps": [
+    {"call": "request", "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "auth": {"terminal": false}, "_meta": {"terminal-auth": true}}}},
+    {"call": "session/new"}
+  ]
+}

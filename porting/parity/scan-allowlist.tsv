@@ -1,0 +1,8 @@
+# scan-allowlist.tsv — justified scanner-vs-grep line differences (Decision 11)
+# Format: <file><TAB><line><TAB><reason>
+# Only lines whose case title is generated at runtime need an entry; a
+# mismatched line set (a missed or spurious case) is never allow-listed.
+src/tests/create-session-options.test.ts	125	loop-generated title (method x limit loops, 6 runtime cases)
+src/tests/create-session-options.test.ts	145	loop-generated title (method x limit loops, 6 runtime cases)
+src/tests/session-hooks.test.ts	169	dynamic describe title chosen by loop (CLAUDE_MODEL_CONFIG on/off)
+src/tests/session-hooks.test.ts	181	dynamic describe title chosen by loop (CLAUDE_MODEL_CONFIG on/off)

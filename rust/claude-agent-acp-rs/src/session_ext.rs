@@ -8,16 +8,22 @@
 
 use std::path::PathBuf;
 
+use serde_json::Value;
+
 use crate::air::AirClient;
+use crate::client_caps::ClientCapabilities;
 use crate::session_config::SessionConfigState;
 use crate::usage::UsageState;
 
-/// Actor-owned extension state: the parsed AIR client declaration, working
-/// directory, usage state, and config state.
+/// Actor-owned extension state: the parsed AIR client declaration, the full
+/// client-capability parse, working directory, usage state, and config state.
 #[derive(Debug)]
 pub struct SessionExt {
     /// The parsed AIR client declaration, if the client is AIR.
     pub air: Option<AirClient>,
+    /// The full `initialize.clientCapabilities` parse (ROADMAP F2a), stored so
+    /// later packages (notices, config options, tool calls) read it once.
+    pub caps: ClientCapabilities,
     /// The session's working directory.
     pub cwd: PathBuf,
     /// Context window and usage update state (rust-parity-fixes Decision 9).
@@ -37,6 +43,21 @@ pub struct SessionExt {
     /// The root session's latest PostCompact `compact_summary` (acp-agent.ts:11350-11360
     /// `contextCompaction.recordSummary`); consumed by the compaction update path (F20).
     pub last_compaction_summary: Option<String>,
+    /// The adapter logger (`CLAUDE_AGENT_LOGS`); `None` when logging is off.
+    pub logger: Option<std::sync::Arc<crate::logger::Logger>>,
+    /// Serialized init `plugin_errors` last logged, so a repeated init frame is
+    /// not logged twice (`acp-agent.ts:1083,5999-6001`).
+    pub logged_plugin_errors: Option<String>,
+    /// The full slash-command list, seeded from the initialize handshake and
+    /// replaced by every `commands_changed` frame (D5 / Decision 9). Node keeps
+    /// it in `session.query.supportedCommands()`; the ACP advertisement is
+    /// built from it plus the terminal-bound names below.
+    pub commands: Vec<Value>,
+    /// Names the CLI tagged terminal-bound on `system/init`; filtered out of
+    /// the advertisement (D5 / S-04, `acp-agent.ts:5976-5998`). `None` until a
+    /// first init frame latches a list (Node's `session.terminalSlashCommands`
+    /// is `undefined` before that, so an empty list still counts as a change).
+    pub terminal_slash_commands: Option<Vec<String>>,
 }
 
 impl SessionExt {
@@ -48,6 +69,7 @@ impl SessionExt {
     ) -> Self {
         Self {
             air,
+            caps: ClientCapabilities::default(),
             cwd,
             usage: UsageState::default(),
             config: SessionConfigState::default(),
@@ -57,11 +79,34 @@ impl SessionExt {
             auto_mode_fallback_warning_shown: false,
             env,
             last_compaction_summary: None,
+            logger: None,
+            logged_plugin_errors: None,
+            commands: Vec::new(),
+            terminal_slash_commands: None,
         }
+    }
+
+    /// Attach the adapter logger (N-05 plugin-error logging).
+    #[must_use]
+    pub fn with_logger(mut self, logger: Option<std::sync::Arc<crate::logger::Logger>>) -> Self {
+        self.logger = logger;
+        self
     }
 
     /// Whether the client declared the AIR capability `name`.
     pub fn air_supports(&self, name: &str) -> bool {
         self.air.as_ref().is_some_and(|air| air.supports(name))
+    }
+
+    /// Set the full client-capability parse (ROADMAP F2a).
+    #[must_use]
+    pub fn with_caps(mut self, caps: ClientCapabilities) -> Self {
+        self.caps = caps;
+        self
+    }
+
+    /// Whether the client can present live notices.
+    pub fn supports_notices(&self) -> bool {
+        self.caps.supports_notices()
     }
 }

@@ -441,9 +441,10 @@ async fn inv_cwd_validation_on_session_new_wire() {
                 let err = resp.expect_err("relative cwd must be rejected");
                 let v = serde_json::to_value(&err).unwrap();
                 assert_eq!(v["code"], -32602);
+                // F2c / M-01: `RequestError.invalidParams` prefixes the text.
                 assert_eq!(
                     v["message"],
-                    "`cwd` must be an absolute path, but received: relative/dir"
+                    "Invalid params: `cwd` must be an absolute path, but received: relative/dir"
                 );
                 assert_eq!(v["data"]["cwd"], "relative/dir");
 

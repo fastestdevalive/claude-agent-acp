@@ -121,6 +121,61 @@ pub fn air_custom_instructions(meta: Option<&Value>) -> Option<String> {
         .map(String::from)
 }
 
+/// The legacy `_meta.systemPrompt` extension (`acp-agent.ts:11060-11080`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetaPrompt {
+    /// A non-empty string replaces the built-in preset entirely.
+    Replace(String),
+    /// An object is merged into the preset: `type`/`preset` are locked to
+    /// `preset`/`claude_code`, every other key (e.g. `append`) is forwarded.
+    Preset {
+        /// `append` (a string, when present).
+        append: Option<String>,
+    },
+}
+
+/// Read `_meta.systemPrompt` (legacy): a non-empty string replaces the preset,
+/// an object merges into it, everything else (falsy / array) is ignored.
+pub fn meta_system_prompt(meta: Option<&Value>) -> Option<MetaPrompt> {
+    match meta?.get("systemPrompt")? {
+        Value::String(text) if !text.is_empty() => Some(MetaPrompt::Replace(text.clone())),
+        Value::Object(object) => Some(MetaPrompt::Preset {
+            append: object
+                .get("append")
+                .and_then(Value::as_str)
+                .map(String::from),
+        }),
+        _ => None,
+    }
+}
+
+/// Resolve the `initialize` control_request system-prompt fields from a
+/// `session/new|load` params object, mirroring the adapter's precedence
+/// (`acp-agent.ts:11054-11080`):
+///
+/// 1. the preset `claude_code` (plus AIR `customInstructions` as `append`);
+/// 2. `_meta.systemPrompt` (string replaces, object merges);
+/// 3. the ACP `systemPrompt` field wins over the `_meta` extension.
+///
+/// Returns `(systemPrompt, appendSystemPrompt)` in SDK initialize-request form:
+/// a replacing string becomes `[text]`; a preset contributes only `append`.
+///
+/// # Errors
+/// The ACP `systemPrompt` fails validation (unsupported mode / non-text block).
+pub fn initialize_fields(params: &Value) -> Result<(Option<Value>, Option<String>), Error> {
+    let client_prompt = client_system_prompt(params.get("systemPrompt"))?;
+    let custom = air_custom_instructions(params.get("_meta"));
+    // The spec's `systemPrompt` takes precedence over `_meta.systemPrompt`.
+    if let Some(prompt) = client_prompt.as_ref() {
+        return Ok(sdk_initialize_fields(Some(prompt), custom.as_deref()));
+    }
+    Ok(match meta_system_prompt(params.get("_meta")) {
+        Some(MetaPrompt::Replace(text)) => (Some(json!([text])), None),
+        Some(MetaPrompt::Preset { append }) => (None, append),
+        None => (None, custom),
+    })
+}
+
 /// The SDK's translation of the options into the `initialize` control_request
 /// fields `(systemPrompt, appendSystemPrompt)`:
 ///
@@ -308,5 +363,67 @@ mod tests {
         assert_eq!(air_custom_instructions(Some(&not_string)), None);
         let other = json!({"customInstructions": "x"});
         assert_eq!(air_custom_instructions(Some(&other)), None);
+    }
+
+    /// O-133: legacy `_meta.systemPrompt`: a string replaces the preset, an
+    /// object merges into it (append forwarded), and the ACP `systemPrompt`
+    /// wins over both.
+    #[test]
+    fn inv_39_meta_system_prompt() {
+        // String replaces.
+        assert_eq!(
+            meta_system_prompt(Some(&json!({"systemPrompt": "You are a pirate."}))),
+            Some(MetaPrompt::Replace("You are a pirate.".into()))
+        );
+        let params = json!({"_meta": {"systemPrompt": "You are a pirate."}});
+        assert_eq!(
+            initialize_fields(&params).unwrap(),
+            (Some(json!(["You are a pirate."])), None)
+        );
+
+        // Object merges into the preset (append forwarded; type/preset locked).
+        let params = json!({"_meta": {"systemPrompt": {"append": "Extra.", "type": "custom"}}});
+        assert_eq!(
+            initialize_fields(&params).unwrap(),
+            (None, Some("Extra.".into()))
+        );
+        // An object without append contributes nothing (the preset stays).
+        let params = json!({"_meta": {"systemPrompt": {}}});
+        assert_eq!(initialize_fields(&params).unwrap(), (None, None));
+
+        // Falsy / non-string / array values are ignored.
+        for meta in [json!({"systemPrompt": ""}), json!({"systemPrompt": []})] {
+            assert_eq!(meta_system_prompt(Some(&meta)), None);
+        }
+
+        // The preset still carries AIR customInstructions when `_meta` does
+        // not override it.
+        let params = json!({
+            "_meta": {"jetbrains": {"air": {"customInstructions": "AIR"}}}
+        });
+        assert_eq!(
+            initialize_fields(&params).unwrap(),
+            (None, Some("AIR".into()))
+        );
+
+        // ACP `systemPrompt` wins over `_meta.systemPrompt`.
+        let params = json!({
+            "systemPrompt": {"mode": "override",
+                             "content": [text_block("ACP")]},
+            "_meta": {"systemPrompt": "meta"}
+        });
+        assert_eq!(
+            initialize_fields(&params).unwrap(),
+            (Some(json!(["ACP"])), None)
+        );
+        let params = json!({
+            "systemPrompt": {"mode": "append",
+                             "content": [text_block("ACP")]},
+            "_meta": {"systemPrompt": "meta"}
+        });
+        assert_eq!(
+            initialize_fields(&params).unwrap(),
+            (None, Some("ACP".into()))
+        );
     }
 }

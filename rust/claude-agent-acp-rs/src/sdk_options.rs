@@ -1,19 +1,78 @@
 //! `_meta.claudeCode.options` -> typed spawn inputs (rust-parity-fixes
-//! Decision 2, P1/P2).
+//! Decision 2, P1/P2; ROADMAP F4a).
 //!
 //! Node spreads `userProvidedOptions` (`_meta.claudeCode.options`) into the SDK
 //! options and the SDK maps them to `claude` argv/env. This module is the pure
-//! typed mapper: it parses the option keys listed in the System Boundaries table
-//! into a [`ClaudeOptions`], which `agent.rs` folds into [`SpawnOptions`]; the
-//! argv order and extraArgs/env encoding are exercised by the unit tests here.
+//! typed mapper: it parses the option keys into a [`ClaudeOptions`], which
+//! `agent.rs` folds into [`crate::process::SpawnOptions`]; the argv order and
+//! extraArgs/env encoding are exercised by the unit tests here.
 //!
-//! Unknown keys (`callbacks`, `hooks`, `mcpServers`, `plugins`, `agents`,
-//! `sandbox`, `settings`, `thinking`) are ignored and documented as PARITY
-//! `pending`.
+//! The ACP `mcpServers` array and the programmatic settings tier are resolved
+//! here too: `mcpServers` becomes the SDK's `--mcp-config` JSON (WB-13) and
+//! `_meta.claudeCode.options.settings` (path or object) is merged with
+//! `CLAUDE_MODEL_CONFIG` and the `sandbox` option into the `--settings` extra
+//! arg, exactly like `acp-agent.ts:11175-11205` + the SDK's `F4`/`U4`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+/// The SDK's `ThinkingConfig` (`_meta.claudeCode.options.thinking`, or the
+/// legacy `MAX_THINKING_TOKENS` env var via [`resolve_thinking`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkingConfig {
+    /// `{type:"adaptive", display?}` -> `--thinking=adaptive`.
+    Adaptive { display: Option<String> },
+    /// `{type:"enabled", budgetTokens?, display?}` -> `--max-thinking-tokens=<n>`
+    /// (or `--thinking=adaptive` when the budget is absent).
+    Enabled {
+        budget_tokens: Option<u64>,
+        display: Option<String>,
+    },
+    /// `{type:"disabled"}` -> `--thinking=disabled`.
+    Disabled,
+}
+
+/// `_meta.claudeCode.options.pluginDelivery` (SDK default `argv`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginDelivery {
+    #[default]
+    Argv,
+    Initialize,
+}
+
+/// One `_meta.claudeCode.options.plugins` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plugin {
+    /// `type` (only `local` is supported by the SDK).
+    pub kind: String,
+    /// `path` for a `local` plugin.
+    pub path: Option<String>,
+    /// `skipMcpDiscovery` -> `--plugin-dir-no-mcp` instead of `--plugin-dir`.
+    pub skip_mcp_discovery: bool,
+}
+
+/// One ACP `mcpServers` entry mapped to the SDK's `McpServerConfig`
+/// (`acp-agent.ts:11029-11053`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServer {
+    /// `{type:"stdio", command, args?, env?}`.
+    Stdio {
+        command: String,
+        args: Option<Vec<String>>,
+        env: Option<Vec<(String, String)>>,
+    },
+    /// `{type:"http", url, headers?}`.
+    Http {
+        url: String,
+        headers: Option<Vec<(String, String)>>,
+    },
+    /// `{type:"sse", url, headers?}`.
+    Sse {
+        url: String,
+        headers: Option<Vec<(String, String)>>,
+    },
+}
 
 /// Parsed `_meta.claudeCode.options`.
 #[derive(Debug, Clone, Default)]
@@ -34,12 +93,44 @@ pub struct ClaudeOptions {
     pub agent: Option<String>,
     pub include_hook_events: bool,
     pub additional_directories: Vec<PathBuf>,
-    pub persist_session: bool,
+    /// `persistSession`; only an explicit `false` emits `--no-session-persistence`.
+    pub persist_session: Option<bool>,
     pub strict_mcp_config: bool,
     pub prompt_suggestions: Option<bool>,
     pub allow_dangerously_skip_permissions: Option<bool>,
     pub setting_sources: Option<Vec<String>>,
     pub resume: Option<String>,
+    /// `thinking` option (SDK `ThinkingConfig`); `has_thinking` records whether
+    /// the key was present, so an explicit (even invalid) value suppresses the
+    /// `MAX_THINKING_TOKENS` fallback exactly like the Node spread.
+    pub thinking: Option<ThinkingConfig>,
+    pub has_thinking: bool,
+    /// Legacy `maxThinkingTokens` (SDK fallback when `thinking` is absent).
+    pub max_thinking_tokens: Option<u64>,
+    /// `executableArgs`, prepended to the child argv.
+    pub executable_args: Vec<String>,
+    /// `plugins` entries.
+    pub plugins: Vec<Plugin>,
+    /// `pluginDelivery`; [`PluginDelivery::Argv`] unless the client says
+    /// `initialize`.
+    pub plugin_delivery: PluginDelivery,
+    /// Set when `pluginDelivery` is neither `argv` nor `initialize` (the SDK
+    /// throws before spawning).
+    pub invalid_plugin_delivery: bool,
+    /// `projectConfigRoot` -> `--project-config-root=<r>`.
+    pub project_config_root: Option<String>,
+    /// `_meta.disableBuiltInTools === true` -> `tools: []` unless
+    /// `options.tools` is present (legacy shorthand).
+    pub disable_built_in_tools: bool,
+    /// Raw `_meta.claudeCode.options.settings` (a path string or an object).
+    pub settings: Option<Value>,
+    /// Raw `_meta.claudeCode.options.sandbox` (merged into the settings tier).
+    pub sandbox: Option<Value>,
+    /// The pre-serialised `--mcp-config` payload (`{"mcpServers":{...}}`), or
+    /// `None` when no server was supplied.
+    pub mcp_config: Option<String>,
+    /// The `--settings` extra-arg value (JSON), resolved by `spawn_inputs`.
+    pub settings_arg: Option<String>,
 }
 
 fn opt_str(opts: &Value, key: &str) -> Option<String> {
@@ -53,6 +144,475 @@ fn opt_str_ary(opts: &Value, key: &str) -> Vec<String> {
             a.iter()
                 .filter_map(Value::as_str)
                 .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `[{name, value}]` -> `[(name, value)]` in array order (Node
+/// `Object.fromEntries`).
+fn name_value_pairs(value: &Value) -> Vec<(String, String)> {
+    value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("name").and_then(Value::as_str)?.to_string(),
+                        entry.get("value").and_then(Value::as_str)?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse `params.mcpServers` (ACP) into SDK server configs.
+///
+/// Mirrors `acp-agent.ts:11029-11053`: an entry with `type:"http"|"sse"` is an
+/// HTTP/SSE server, an entry WITHOUT a `type` key is stdio, and any other
+/// explicit type is ignored.
+fn parse_mcp_servers(value: Option<&Value>) -> Vec<(String, McpServer)> {
+    let Some(servers) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for server in servers {
+        let Some(object) = server.as_object() else {
+            continue;
+        };
+        let Some(name) = object.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        match object.get("type").and_then(Value::as_str) {
+            Some(kind @ ("http" | "sse")) => {
+                let Some(url) = object.get("url").and_then(Value::as_str) else {
+                    continue;
+                };
+                let headers = object.get("headers").map(name_value_pairs);
+                let config = if kind == "http" {
+                    McpServer::Http {
+                        url: url.to_string(),
+                        headers,
+                    }
+                } else {
+                    McpServer::Sse {
+                        url: url.to_string(),
+                        headers,
+                    }
+                };
+                out.push((name.to_string(), config));
+            }
+            None if !object.contains_key("type") => {
+                let Some(command) = object.get("command").and_then(Value::as_str) else {
+                    continue;
+                };
+                let args = object.get("args").and_then(Value::as_array).map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                });
+                let env = object.get("env").map(name_value_pairs);
+                out.push((
+                    name.to_string(),
+                    McpServer::Stdio {
+                        command: command.to_string(),
+                        args,
+                        env,
+                    },
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// JSON-escape one string (Node `JSON.stringify`).
+fn json_string(value: &str) -> String {
+    serde_json::to_string(&Value::String(value.to_string()))
+        .unwrap_or_else(|_| String::from("\"\""))
+}
+
+/// Serialise `[(key, value)]` in insertion order (Node object key order).
+fn pairs_json(pairs: &[(String, String)]) -> String {
+    let mut out = String::from("{");
+    for (index, (key, value)) in pairs.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_string(key));
+        out.push(':');
+        out.push_str(&json_string(value));
+    }
+    out.push('}');
+    out
+}
+
+/// Serialise one SDK `McpServerConfig` with the exact key order Node builds
+/// (`{type,url,headers}` / `{type,command,args,env}`); absent optionals are
+/// omitted like `JSON.stringify` does with `undefined`.
+fn server_json(server: &McpServer) -> String {
+    match server {
+        McpServer::Http { url, headers } => {
+            let mut out = format!("{{\"type\":\"http\",\"url\":{}", json_string(url));
+            if let Some(headers) = headers {
+                out.push_str(",\"headers\":");
+                out.push_str(&pairs_json(headers));
+            }
+            out.push('}');
+            out
+        }
+        McpServer::Sse { url, headers } => {
+            let mut out = format!("{{\"type\":\"sse\",\"url\":{}", json_string(url));
+            if let Some(headers) = headers {
+                out.push_str(",\"headers\":");
+                out.push_str(&pairs_json(headers));
+            }
+            out.push('}');
+            out
+        }
+        McpServer::Stdio { command, args, env } => {
+            let mut out = format!("{{\"type\":\"stdio\",\"command\":{}", json_string(command));
+            if let Some(args) = args {
+                out.push_str(",\"args\":");
+                out.push_str(&serde_json::to_string(args).unwrap_or_else(|_| String::from("[]")));
+            }
+            if let Some(env) = env {
+                out.push_str(",\"env\":");
+                out.push_str(&pairs_json(env));
+            }
+            out.push('}');
+            out
+        }
+    }
+}
+
+/// Merge `_meta.claudeCode.options.mcpServers` (SDK-format object) with the ACP
+/// `mcpServers` array into the `--mcp-config` JSON payload.
+///
+/// Node spreads the user object first, then the ACP servers, so a same-named
+/// ACP server overrides the user one (`acp-agent.ts:11252-11255`). An empty
+/// merge yields no flag (`Object.keys(O).length > 0`).
+fn mcp_config_json(user: &Map<String, Value>, acp: &[(String, McpServer)]) -> Option<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (name, value) in user {
+        let serialized = acp
+            .iter()
+            .find(|(acp_name, _)| acp_name == name)
+            .map(|(_, server)| server_json(server))
+            .unwrap_or_else(|| {
+                serde_json::to_string(value).unwrap_or_else(|_| String::from("null"))
+            });
+        entries.push((name.clone(), serialized));
+    }
+    for (name, server) in acp {
+        if !user.contains_key(name) {
+            entries.push((name.clone(), server_json(server)));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    for (index, (name, serialized)) in entries.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&json_string(name));
+        body.push(':');
+        body.push_str(serialized);
+    }
+    Some(format!("{{\"mcpServers\":{{{body}}}}}"))
+}
+
+/// Parse the SDK `thinking` option.
+fn parse_thinking(value: &Value) -> Option<ThinkingConfig> {
+    let display = value
+        .get("display")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    match value.get("type").and_then(Value::as_str) {
+        Some("adaptive") => Some(ThinkingConfig::Adaptive { display }),
+        Some("enabled") => Some(ThinkingConfig::Enabled {
+            budget_tokens: value.get("budgetTokens").and_then(Value::as_u64),
+            display,
+        }),
+        Some("disabled") => Some(ThinkingConfig::Disabled),
+        _ => None,
+    }
+}
+
+/// JS `Number.parseInt(raw, 10)`: leading whitespace and an optional sign are
+/// skipped, then the decimal-digit prefix is consumed; no digits -> `None`.
+fn js_parse_int_radix10(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim_start();
+    let (negative, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let magnitude: i64 = digits[..end].parse().ok()?;
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// `resolveThinkingConfig` (`acp-agent.ts:13756-13768`): unset -> `None`;
+/// `0` -> disabled; a positive integer -> a fixed token budget; anything else
+/// (NaN / negative) is ignored.
+pub fn resolve_thinking(raw: Option<&str>) -> Option<ThinkingConfig> {
+    let parsed = js_parse_int_radix10(raw?)?;
+    if parsed < 0 {
+        return None;
+    }
+    if parsed == 0 {
+        Some(ThinkingConfig::Disabled)
+    } else {
+        Some(ThinkingConfig::Enabled {
+            budget_tokens: u64::try_from(parsed).ok(),
+            display: None,
+        })
+    }
+}
+
+/// `parseModelConfig` (`acp-agent.ts:13769-13780`): `CLAUDE_MODEL_CONFIG` must
+/// be a JSON object; only `modelOverrides`/`availableModels` are kept, and an
+/// empty result means "no tier".
+///
+/// # Errors
+/// The raw value is not valid JSON, or is not a JSON object.
+fn parse_model_config(raw: Option<&str>) -> Result<Option<Value>, String> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed: Value =
+        serde_json::from_str(raw).map_err(|error| format!("CLAUDE_MODEL_CONFIG: {error}"))?;
+    if !parsed.is_object() {
+        return Err(String::from("CLAUDE_MODEL_CONFIG must be a JSON object"));
+    }
+    let mut out = Map::new();
+    for key in ["modelOverrides", "availableModels"] {
+        if let Some(value) = parsed.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(if out.is_empty() {
+        None
+    } else {
+        Some(Value::Object(out))
+    })
+}
+
+/// Path keys whose arrays are concatenated by the SDK's `U4` sandbox merge.
+const SANDBOX_ARRAY_MERGE: [&str; 5] = [
+    "filesystem.denyRead",
+    "filesystem.denyWrite",
+    "network.deniedDomains",
+    "credentials.files",
+    "credentials.envVars",
+];
+/// Path keys that must be replaced, never deep-merged (`U4`).
+const SANDBOX_NO_MERGE: [&str; 2] = ["ripgrep", "network.tlsTerminate"];
+
+/// Deep merge of a settings-file `sandbox` object with the `sandbox` option
+/// (`U4`): objects merge recursively, the listed array keys concatenate with
+/// duplicates removed, the `no-merge` keys and everything else replace.
+fn merge_sandbox(base: &Value, overlay: &Value, path: &str) -> Value {
+    let mut merged = match base {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
+    let Some(overlay) = overlay.as_object() else {
+        return Value::Object(merged);
+    };
+    for (key, value) in overlay {
+        if matches!(key.as_str(), "__proto__" | "constructor" | "prototype") {
+            continue;
+        }
+        let full = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        let existing = merged.get(key).cloned();
+        if SANDBOX_ARRAY_MERGE.contains(&full.as_str()) {
+            if let (Some(Value::Array(existing)), Value::Array(overlay)) = (&existing, value) {
+                let mut array = existing.clone();
+                for item in overlay {
+                    if !array.contains(item) {
+                        array.push(item.clone());
+                    }
+                }
+                merged.insert(key.clone(), Value::Array(array));
+                continue;
+            }
+        }
+        if !SANDBOX_NO_MERGE.contains(&full.as_str()) {
+            if let (Some(existing @ Value::Object(_)), Value::Object(_)) = (&existing, value) {
+                merged.insert(key.clone(), merge_sandbox(existing, value, &full));
+                continue;
+            }
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    Value::Object(merged)
+}
+
+/// The SDK's `F4(extraArgs, sandbox)`: fold the sandbox option into the
+/// programmatic settings tier and return the resulting settings document.
+fn apply_sandbox(settings: &Value, sandbox: &Value) -> Value {
+    let mut document = match settings {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
+    let mut merged = merge_sandbox(document.get("sandbox").unwrap_or(&Value::Null), sandbox, "");
+
+    let credentials_deny = sandbox
+        .get("credentials")
+        .and_then(|c| c.get("files"))
+        .and_then(Value::as_array)
+        .is_some_and(|files| {
+            files
+                .iter()
+                .any(|file| file.get("mode").and_then(Value::as_str) == Some("deny"))
+        });
+    let has_filesystem = sandbox.get("filesystem").is_some() || credentials_deny;
+    let filesystem_disabled_is_explicit = sandbox
+        .get("filesystem")
+        .and_then(|f| f.get("disabled"))
+        .is_some();
+    if has_filesystem && !filesystem_disabled_is_explicit {
+        if let Some(filesystem) = merged.get_mut("filesystem").and_then(Value::as_object_mut) {
+            if filesystem.get("disabled") == Some(&Value::Bool(true)) {
+                filesystem.remove("disabled");
+            }
+        }
+    }
+
+    let network = sandbox.get("network");
+    let restricts_network = network.is_some_and(|network| {
+        network.get("allowedDomains").is_some()
+            || network
+                .get("deniedDomains")
+                .and_then(Value::as_array)
+                .is_some_and(|domains| !domains.is_empty())
+            || network.get("strictAllowlist") == Some(&Value::Bool(true))
+    });
+    if restricts_network {
+        if let (Some(network), Some(merged_network)) = (
+            network,
+            merged.get_mut("network").and_then(Value::as_object_mut),
+        ) {
+            for key in ["httpProxyPort", "socksProxyPort"] {
+                if network.get(key).is_none() {
+                    merged_network.remove(key);
+                }
+            }
+        }
+    }
+
+    if sandbox.get("enabled") == Some(&Value::Bool(true)) {
+        if let Value::Object(map) = &mut merged {
+            if map.get("failIfUnavailable").is_none() {
+                map.insert(String::from("failIfUnavailable"), Value::Bool(true));
+            }
+        }
+    }
+
+    document.insert(String::from("sandbox"), merged);
+    Value::Object(document)
+}
+
+/// Resolve the programmatic settings tier (`acp-agent.ts:11175-11205`):
+/// `_meta.claudeCode.options.settings` (a file path resolved against `cwd`, or
+/// an inline object) is merged over `CLAUDE_MODEL_CONFIG`, then the `sandbox`
+/// option is folded in by the SDK's `F4`. The result is the `--settings` value.
+///
+/// # Errors
+/// The settings file cannot be read / parsed, or `CLAUDE_MODEL_CONFIG` is
+/// invalid (the Node adapter throws before spawning).
+pub fn resolve_settings_arg(
+    cwd: &Path,
+    env: &crate::env_snapshot::EnvSnapshot,
+    settings: Option<&Value>,
+    sandbox: Option<&Value>,
+) -> Result<Option<String>, String> {
+    let provided = match settings.filter(|value| !matches!(value, Value::Null | Value::Bool(false)))
+    {
+        None => None,
+        Some(Value::String(path)) => {
+            let path = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                cwd.join(path)
+            };
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("failed to read settings file: {error}"))?;
+            Some(
+                serde_json::from_str::<Value>(&text)
+                    .map_err(|error| format!("invalid settings JSON: {error}"))?,
+            )
+        }
+        Some(value) => Some(value.clone()),
+    };
+
+    let model_config = parse_model_config(env.get("CLAUDE_MODEL_CONFIG"))?;
+    let mut configured = match (model_config, provided) {
+        (Some(model_config), Some(provided)) => {
+            let mut merged = model_config.as_object().cloned().unwrap_or_default();
+            if let Value::Object(provided) = provided {
+                for (key, value) in provided {
+                    merged.insert(key, value);
+                }
+            }
+            Some(Value::Object(merged))
+        }
+        (Some(model_config), None) => Some(model_config),
+        (None, provided) => provided,
+    };
+
+    if let Some(sandbox) = sandbox.filter(|value| value.is_object()) {
+        let base = configured
+            .take()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        configured = Some(apply_sandbox(&base, sandbox));
+    }
+
+    Ok(
+        configured
+            .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"))),
+    )
+}
+
+/// Parse `_meta.claudeCode.options.plugins`.
+fn parse_plugins(opts: &Value) -> Vec<Plugin> {
+    opts.get("plugins")
+        .and_then(Value::as_array)
+        .map(|plugins| {
+            plugins
+                .iter()
+                .filter_map(|plugin| {
+                    let object = plugin.as_object()?;
+                    Some(Plugin {
+                        kind: object
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        path: object.get("path").and_then(Value::as_str).map(String::from),
+                        skip_mcp_discovery: object
+                            .get("skipMcpDiscovery")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -119,6 +679,49 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         dirs
     };
 
+    let disable_built_in_tools = params
+        .get("_meta")
+        .and_then(|m| m.get("disableBuiltInTools"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let tools = match opts.get("tools") {
+        // An explicit array wins over `disableBuiltInTools` (`??` in Node).
+        Some(Value::Array(tools)) => Some(
+            tools
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        ),
+        // A non-array `tools` value (e.g. a preset object) is the SDK default.
+        Some(_) => None,
+        None if disable_built_in_tools => Some(Vec::new()),
+        None => None,
+    };
+
+    let thinking_present = opts.get("thinking").is_some();
+    let thinking = opts
+        .get("thinking")
+        .filter(|value| value.is_object() || value.is_boolean())
+        .and_then(parse_thinking);
+
+    let user_mcp_servers = opts
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let acp_mcp_servers = parse_mcp_servers(params.get("mcpServers"));
+
+    let plugin_delivery_raw = opts.get("pluginDelivery");
+    let (plugin_delivery, invalid_plugin_delivery) = match plugin_delivery_raw {
+        None => (PluginDelivery::Argv, false),
+        Some(Value::String(value)) if value == "argv" => (PluginDelivery::Argv, false),
+        Some(Value::String(value)) if value == "initialize" => (PluginDelivery::Initialize, false),
+        // Any other value (including `null`) makes the SDK throw.
+        Some(_) => (PluginDelivery::Argv, true),
+    };
+
     ClaudeOptions {
         model: opt_str(&opts, "model"),
         betas: opt_str_ary(&opts, "betas"),
@@ -126,14 +729,7 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
         env,
         allowed_tools: opt_str_ary(&opts, "allowedTools"),
         disallowed_tools: opt_str_ary(&opts, "disallowedTools"),
-        tools: {
-            let t = opt_str_ary(&opts, "tools");
-            if t.is_empty() && opts.get("tools").is_none() {
-                None
-            } else {
-                Some(t)
-            }
-        },
+        tools,
         effort: opt_str(&opts, "effort"),
         max_turns: opts
             .get("maxTurns")
@@ -147,10 +743,7 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         additional_directories,
-        persist_session: opts
-            .get("persistSession")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        persist_session: opts.get("persistSession").and_then(Value::as_bool),
         strict_mcp_config: opts
             .get("strictMcpConfig")
             .and_then(Value::as_bool)
@@ -168,6 +761,19 @@ pub fn claude_options(params: &Value) -> ClaudeOptions {
             }
         },
         resume: opt_str(&opts, "resume"),
+        thinking,
+        has_thinking: thinking_present,
+        max_thinking_tokens: opts.get("maxThinkingTokens").and_then(Value::as_u64),
+        executable_args: opt_str_ary(&opts, "executableArgs"),
+        plugins: parse_plugins(&opts),
+        plugin_delivery,
+        invalid_plugin_delivery,
+        project_config_root: opt_str(&opts, "projectConfigRoot"),
+        disable_built_in_tools,
+        settings: opts.get("settings").cloned(),
+        sandbox: opts.get("sandbox").cloned(),
+        mcp_config: mcp_config_json(&user_mcp_servers, &acp_mcp_servers),
+        settings_arg: None,
     }
 }
 
@@ -359,7 +965,7 @@ mod tests {
         assert_eq!(o.agent.as_deref(), Some("builder"));
         assert!(o.include_hook_events);
         assert_eq!(o.additional_directories, vec![PathBuf::from("/x")]);
-        assert!(o.persist_session);
+        assert_eq!(o.persist_session, Some(true));
         assert!(o.strict_mcp_config);
         assert_eq!(o.prompt_suggestions, Some(false));
         assert_eq!(o.allow_dangerously_skip_permissions, Some(false));
@@ -409,5 +1015,433 @@ mod tests {
             o.additional_directories,
             vec![PathBuf::from("/opt1"), PathBuf::from("/root1")]
         );
+    }
+
+    /// WB-13 / O-131: ACP stdio servers reach the SDK `--mcp-config` payload in
+    /// the SDK's exact key order, and the flag sits after `--tools`, before
+    /// `--setting-sources`.
+    #[test]
+    fn inv_57_mcp_config_stdio() {
+        let params = json!({
+            "mcpServers": [{
+                "name": "echo",
+                "command": "/bin/echo",
+                "args": ["hi"],
+                "env": [{"name": "TOKEN", "value": "secret"}]
+            }]
+        });
+        let o = claude_options(&params);
+        assert_eq!(
+            o.mcp_config.as_deref(),
+            Some(
+                r#"{"mcpServers":{"echo":{"type":"stdio","command":"/bin/echo","args":["hi"],"env":{"TOKEN":"secret"}}}}"#
+            )
+        );
+
+        let mut spawn = base_spawn();
+        spawn.mcp_config = o.mcp_config.clone();
+        let argv = build_argv(&spawn);
+        let config = argv
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config token");
+        assert_eq!(argv[config + 1], o.mcp_config.unwrap());
+        let tools = argv.iter().position(|a| a == "--tools=default").unwrap();
+        let sources = argv
+            .iter()
+            .position(|a| a == "--setting-sources=user,project,local")
+            .unwrap();
+        assert!(tools < config && config < sources);
+    }
+
+    /// O-131: http and sse servers keep their headers in array order; optional
+    /// `args`/`env`/`headers` are omitted exactly like `JSON.stringify`.
+    #[test]
+    fn inv_57_mcp_config_http_sse() {
+        let params = json!({
+            "mcpServers": [
+                {"type": "http", "name": "remote", "url": "https://x.test/mcp",
+                 "headers": [{"name": "Authorization", "value": "Bearer t"}]},
+                {"type": "sse", "name": "events", "url": "https://y.test/sse"}
+            ]
+        });
+        let o = claude_options(&params);
+        assert_eq!(
+            o.mcp_config.as_deref(),
+            Some(
+                r#"{"mcpServers":{"remote":{"type":"http","url":"https://x.test/mcp","headers":{"Authorization":"Bearer t"}},"events":{"type":"sse","url":"https://y.test/sse"}}}"#
+            )
+        );
+    }
+
+    /// O-131: `_meta.claudeCode.options.mcpServers` (SDK-format object) merges
+    /// with the ACP list; a same-named ACP server overrides the user entry.
+    #[test]
+    fn inv_57_mcp_config_user_merge() {
+        let params = json!({
+            "mcpServers": [{"name": "echo", "command": "/bin/echo"}],
+            "_meta": {"claudeCode": {"options": {"mcpServers": {
+                "echo": {"type": "stdio", "command": "/bin/false"},
+                "user": {"type": "http", "url": "https://u.test"}
+            }}}}
+        });
+        let o = claude_options(&params);
+        assert_eq!(
+            o.mcp_config.as_deref(),
+            Some(
+                r#"{"mcpServers":{"echo":{"type":"stdio","command":"/bin/echo"},"user":{"type":"http","url":"https://u.test"}}}"#
+            )
+        );
+
+        // No servers at all -> no flag (Node `Object.keys(O).length > 0`).
+        assert_eq!(claude_options(&json!({"mcpServers": []})).mcp_config, None);
+    }
+
+    /// O-131: an explicit `type:"stdio"` (not http/sse) is ignored by the
+    /// Node adapter's `else if (!("type" in server))` branch.
+    #[test]
+    fn inv_57_mcp_config_ignores_explicit_stdio_type() {
+        let params = json!({
+            "mcpServers": [{"type": "stdio", "name": "x", "command": "/bin/echo"}]
+        });
+        assert_eq!(claude_options(&params).mcp_config, None);
+    }
+
+    /// O-62 / O-117: `MAX_THINKING_TOKENS` -> thinking; JS `parseInt(raw, 10)`
+    /// semantics; 0 disables, a positive value is a budget, junk is ignored.
+    #[test]
+    fn inv_57_thinking_from_env() {
+        assert_eq!(resolve_thinking(None), None);
+        assert_eq!(resolve_thinking(Some("0")), Some(ThinkingConfig::Disabled));
+        assert_eq!(
+            resolve_thinking(Some("2048")),
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: Some(2048),
+                display: None
+            })
+        );
+        assert_eq!(
+            resolve_thinking(Some(" 4096abc")),
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: Some(4096),
+                display: None
+            })
+        );
+        assert_eq!(
+            resolve_thinking(Some("+7")),
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: Some(7),
+                display: None
+            })
+        );
+        assert_eq!(resolve_thinking(Some("-1")), None);
+        assert_eq!(resolve_thinking(Some("abc")), None);
+        assert_eq!(resolve_thinking(Some("")), None);
+    }
+
+    /// O-62 / O-117 / O-118: the SDK argv encoding of every thinking shape.
+    #[test]
+    fn inv_57_thinking_argv() {
+        let mut spawn = base_spawn();
+        spawn.thinking = Some(ThinkingConfig::Adaptive { display: None });
+        let argv = build_argv(&spawn);
+        assert_eq!(argv[5], "--thinking=adaptive");
+
+        spawn.thinking = Some(ThinkingConfig::Disabled);
+        let argv = build_argv(&spawn);
+        assert_eq!(argv[5], "--thinking=disabled");
+        assert!(!argv.iter().any(|a| a.starts_with("--thinking-display")));
+
+        spawn.thinking = Some(ThinkingConfig::Enabled {
+            budget_tokens: Some(1024),
+            display: Some("summary".into()),
+        });
+        let argv = build_argv(&spawn);
+        assert_eq!(argv[5], "--max-thinking-tokens=1024");
+        assert_eq!(argv[6], "--thinking-display=summary");
+
+        spawn.thinking = Some(ThinkingConfig::Enabled {
+            budget_tokens: None,
+            display: None,
+        });
+        let argv = build_argv(&spawn);
+        assert_eq!(argv[5], "--thinking=adaptive");
+    }
+
+    /// O-49/O-129: `--settings` follows `--replay-user-messages` (Node appends
+    /// the tier to the SDK `extraArgs`), unless the user already supplied a
+    /// `settings` extra arg (then it is overridden in place).
+    #[test]
+    fn inv_57_settings_extra_arg_order() {
+        let mut spawn = base_spawn();
+        spawn.settings_arg = Some(r#"{"model":"haiku"}"#.into());
+        let argv = build_argv(&spawn);
+        let replay = argv
+            .iter()
+            .position(|a| a == "--replay-user-messages")
+            .unwrap();
+        let settings = argv.iter().position(|a| a == "--settings").unwrap();
+        assert!(replay < settings);
+        assert_eq!(argv[settings + 1], r#"{"model":"haiku"}"#);
+
+        let mut spawn = base_spawn();
+        spawn.extra_args = vec![("settings".into(), Some("user.json".into()))];
+        spawn.settings_arg = Some(r#"{"model":"haiku"}"#.into());
+        let argv = build_argv(&spawn);
+        let session = argv.iter().position(|a| a == "--session-id=sess").unwrap();
+        let settings = argv.iter().position(|a| a == "--settings").unwrap();
+        assert_eq!(argv[settings + 1], r#"{"model":"haiku"}"#);
+        // The overridden key keeps the user position (before replay).
+        assert!(
+            session < settings
+                && settings
+                    < argv
+                        .iter()
+                        .position(|a| a == "--replay-user-messages")
+                        .unwrap()
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--settings").count(),
+            1,
+            "settings must be emitted once: {argv:?}"
+        );
+    }
+
+    /// `_meta.claudeCode.options.thinking` overrides `MAX_THINKING_TOKENS`,
+    /// including an explicit invalid value (which yields no flag).
+    #[test]
+    fn inv_57_thinking_option_override() {
+        let o = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"thinking": {
+                "type": "enabled", "budgetTokens": 512, "display": "detailed"
+            }}}}
+        }));
+        assert!(o.has_thinking);
+        assert_eq!(
+            o.thinking,
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: Some(512),
+                display: Some("detailed".into())
+            })
+        );
+
+        let invalid = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"thinking": {"type": "bogus"}}}}
+        }));
+        assert!(invalid.has_thinking);
+        assert_eq!(invalid.thinking, None);
+    }
+
+    /// O-49 / O-48: a settings object is serialised as the `--settings` value;
+    /// `CLAUDE_MODEL_CONFIG` is merged underneath it.
+    #[test]
+    fn inv_57_settings_object_and_model_config() {
+        let cwd = std::env::temp_dir();
+        let env = crate::env_snapshot::EnvSnapshot::empty();
+        let settings = json!({"model": "haiku"});
+        let arg = resolve_settings_arg(&cwd, &env, Some(&settings), None).unwrap();
+        assert_eq!(arg.as_deref(), Some(r#"{"model":"haiku"}"#));
+
+        let env = crate::env_snapshot::EnvSnapshot::from_pairs([(
+            "CLAUDE_MODEL_CONFIG",
+            r#"{"modelOverrides":{"claude-opus-4-6":"claude-opus-4-6"}}"#,
+        )]);
+        let arg = resolve_settings_arg(&cwd, &env, Some(&settings), None).unwrap();
+        assert_eq!(
+            arg.as_deref(),
+            Some(r#"{"modelOverrides":{"claude-opus-4-6":"claude-opus-4-6"},"model":"haiku"}"#)
+        );
+
+        // No settings and no model config -> no flag.
+        assert_eq!(
+            resolve_settings_arg(&cwd, &crate::env_snapshot::EnvSnapshot::empty(), None, None)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// O-48: an invalid `CLAUDE_MODEL_CONFIG` throws before spawning; a
+    /// non-object is rejected with the adapter's message.
+    #[test]
+    fn inv_57_model_config_errors() {
+        let cwd = std::env::temp_dir();
+        let env = crate::env_snapshot::EnvSnapshot::from_pairs([("CLAUDE_MODEL_CONFIG", "{oops")]);
+        assert!(resolve_settings_arg(&cwd, &env, None, None).is_err());
+
+        let env = crate::env_snapshot::EnvSnapshot::from_pairs([("CLAUDE_MODEL_CONFIG", "[1]")]);
+        assert_eq!(
+            resolve_settings_arg(&cwd, &env, None, None).unwrap_err(),
+            "CLAUDE_MODEL_CONFIG must be a JSON object"
+        );
+
+        // An empty object contributes no tier.
+        let env = crate::env_snapshot::EnvSnapshot::from_pairs([("CLAUDE_MODEL_CONFIG", "{}")]);
+        assert_eq!(resolve_settings_arg(&cwd, &env, None, None).unwrap(), None);
+    }
+
+    /// O-49: a settings path is resolved against the session cwd and parsed.
+    #[test]
+    fn inv_57_settings_file_path() {
+        let root = std::env::temp_dir().join(format!(
+            "acp-sdk-settings-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("my.json"), r#"{"effortLevel":"high"}"#).unwrap();
+        let env = crate::env_snapshot::EnvSnapshot::empty();
+        let arg = resolve_settings_arg(&root, &env, Some(&json!("my.json")), None).unwrap();
+        assert_eq!(arg.as_deref(), Some(r#"{"effortLevel":"high"}"#));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// O-159: the sandbox option is folded into the settings tier by the SDK's
+    /// `F4`/`U4` merge (arrays concatenate, `failIfUnavailable` defaults on).
+    /// `serde_json`'s `preserve_order` keeps the JS insertion order.
+    #[test]
+    fn inv_57_sandbox_merge() {
+        let cwd = std::env::temp_dir();
+        let env = crate::env_snapshot::EnvSnapshot::empty();
+        let arg = resolve_settings_arg(
+            &cwd,
+            &env,
+            None,
+            Some(&json!({"enabled": true, "network": {"deniedDomains": ["a.test"]}})),
+        )
+        .unwrap();
+        assert_eq!(
+            arg.as_deref(),
+            Some(
+                r#"{"sandbox":{"enabled":true,"network":{"deniedDomains":["a.test"]},"failIfUnavailable":true}}"#
+            )
+        );
+
+        // Arrays under the merge keys concatenate with duplicates removed; the
+        // settings file's `sandbox` object is the merge base.
+        let settings = json!({"sandbox": {"filesystem": {"denyRead": ["/a"]}}});
+        let arg = resolve_settings_arg(
+            &cwd,
+            &env,
+            Some(&settings),
+            Some(&json!({"filesystem": {"denyRead": ["/a", "/b"]}})),
+        )
+        .unwrap();
+        assert_eq!(
+            arg.as_deref(),
+            Some(r#"{"sandbox":{"filesystem":{"denyRead":["/a","/b"]}}}"#)
+        );
+    }
+
+    /// O-134: `_meta.disableBuiltInTools` is a legacy shorthand for `tools: []`;
+    /// an explicit `options.tools` wins.
+    #[test]
+    fn inv_57_disable_built_in_tools() {
+        let o = claude_options(&json!({"_meta": {"disableBuiltInTools": true}}));
+        assert_eq!(o.tools, Some(Vec::new()));
+        assert!(o.disable_built_in_tools);
+        let mut spawn = base_spawn();
+        spawn.tools = o.tools;
+        assert!(build_argv(&spawn).iter().any(|a| a == "--tools="));
+
+        let explicit = claude_options(&json!({
+            "_meta": {"disableBuiltInTools": true,
+                      "claudeCode": {"options": {"tools": ["Read"]}}}
+        }));
+        assert_eq!(explicit.tools, Some(vec!["Read".to_string()]));
+
+        // Absent -> the SDK default preset.
+        assert_eq!(claude_options(&json!({})).tools, None);
+    }
+
+    /// O-123: `plugins` -> `--plugin-dir` / `--plugin-dir-no-mcp` after
+    /// `--add-dir`; `pluginDelivery:"initialize"` with plugins -> `--await-initialize`.
+    #[test]
+    fn inv_57_plugin_args() {
+        let params = json!({
+            "_meta": {"claudeCode": {"options": {
+                "plugins": [
+                    {"type": "local", "path": "/p1"},
+                    {"type": "local", "path": "/p2", "skipMcpDiscovery": true}
+                ]
+            }}}
+        });
+        let o = claude_options(&params);
+        assert_eq!(o.plugins.len(), 2);
+        assert_eq!(o.plugin_delivery, PluginDelivery::Argv);
+        let mut spawn = base_spawn();
+        spawn.plugins = o.plugins;
+        let argv = build_argv(&spawn);
+        let add_dir = argv.iter().position(|a| a == "--add-dir=/d1");
+        let p1 = argv.iter().position(|a| a == "--plugin-dir=/p1").unwrap();
+        let p2 = argv
+            .iter()
+            .position(|a| a == "--plugin-dir-no-mcp=/p2")
+            .unwrap();
+        assert!(p1 < p2 && p2 < argv.iter().position(|a| a == "--session-id=sess").unwrap());
+        if let Some(add_dir) = add_dir {
+            assert!(add_dir < p1);
+        }
+
+        let init = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {
+                "pluginDelivery": "initialize",
+                "plugins": [{"type": "local", "path": "/p1"}]
+            }}}
+        }));
+        assert_eq!(init.plugin_delivery, PluginDelivery::Initialize);
+        let mut spawn = base_spawn();
+        spawn.plugins = init.plugins;
+        spawn.plugin_delivery = init.plugin_delivery;
+        let argv = build_argv(&spawn);
+        assert!(argv.iter().any(|a| a == "--await-initialize"));
+        assert!(!argv.iter().any(|a| a.starts_with("--plugin-dir")));
+
+        let bad = claude_options(&json!({
+            "_meta": {"claudeCode": {"options": {"pluginDelivery": "wat"}}}
+        }));
+        assert!(bad.invalid_plugin_delivery);
+    }
+
+    /// O-124 / O-156 / O-166: argv flags `--no-session-persistence`,
+    /// `--project-config-root` and the `executableArgs` prefix.
+    #[test]
+    fn inv_57_persist_project_root_executable_args() {
+        let params = json!({
+            "_meta": {"claudeCode": {"options": {
+                "persistSession": false,
+                "projectConfigRoot": "/proj",
+                "executableArgs": ["--inspect"]
+            }}}
+        });
+        let o = claude_options(&params);
+        assert_eq!(o.persist_session, Some(false));
+        assert_eq!(o.project_config_root.as_deref(), Some("/proj"));
+        assert_eq!(o.executable_args, vec!["--inspect".to_string()]);
+
+        let mut spawn = base_spawn();
+        spawn.persist_session = o.persist_session;
+        spawn.project_config_root = o.project_config_root;
+        spawn.executable_args = o.executable_args;
+        let argv = build_argv(&spawn);
+        assert_eq!(argv[0], "--inspect");
+        assert_eq!(argv[1], "--output-format");
+        let root = argv
+            .iter()
+            .position(|a| a == "--project-config-root=/proj")
+            .unwrap();
+        let session = argv.iter().position(|a| a == "--session-id=sess").unwrap();
+        let persist = argv
+            .iter()
+            .position(|a| a == "--no-session-persistence")
+            .unwrap();
+        assert!(root < session && session < persist);
+
+        // `persistSession: true`/absent emits nothing.
+        let mut spawn = base_spawn();
+        spawn.persist_session = None;
+        assert!(!build_argv(&spawn)
+            .iter()
+            .any(|a| a == "--no-session-persistence"));
     }
 }

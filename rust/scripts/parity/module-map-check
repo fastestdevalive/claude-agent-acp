@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+#
+# module-map-check — parity MODULE-MAP checker for the claude-agent-acp Rust port.
+#
+# Adapted from ~/code/fastestdevalive/codex-acp-rust/scripts/parity/module-map-check
+# (same CLI style) for the plan-parity-infra contract (System Boundaries,
+# MODULE-MAP format table, Decision 5).
+#
+# Modes (mutually exclusive; --map is the default):
+#   --map        compare porting/parity/MODULE-MAP.md against the committed
+#                upstream-module snapshot (offline / always-on). Fails when an
+#                upstream module has no row, when a row names a non-existent
+#                upstream module (stale), when a rust module path does not
+#                exist, when a relationship is not an allowed form, when a
+#                missing:/not ported: row lacks its MISSING.md ticket /
+#                DECISIONS-FOR-USER entry, or when an acp-agent.ts section
+#                anchor is unresolvable or out of order (export only).
+#   --list       print the upstream-module snapshot TSV (needs --upstream):
+#                  path <TAB> lines <TAB> sha256
+#   --summary    per-relationship counts from MODULE-MAP.md
+#   --sections   print the computed acp-agent.ts@<symbol> ranges (needs --upstream)
+#   --refresh-snapshot  write the snapshot from --upstream
+#   --selftest   run the bundled mini-tree fixture (also exercised by
+#                rust/claude-agent-acp-rs/tests/parity_maps.rs)
+#
+# Options:
+#   --upstream <dir>  export dir made by fetch-upstream.sh (.tag-name/.tag-sha)
+#   --tag <tag>       tag the export must be (default: v$(cat porting/UPSTREAM_VERSION))
+#
+# Env overrides (tests only): MODULE_MAP_FILE, MODULE_SNAPSHOT_FILE, MISSING_FILE,
+# DECISIONS_FILE, RUST_ROOT.
+#
+# Pure bash 3.2 + awk + git + shasum -a 256; macOS-safe; no node; no network.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+RUST_ROOT="${RUST_ROOT:-$ROOT/rust}"
+PARITY="$ROOT/porting/parity"
+PIN="$(cat "$ROOT/porting/UPSTREAM_VERSION")"
+SNAP="${MODULE_SNAPSHOT_FILE:-$PARITY/upstream-modules.v$PIN.tsv}"
+MAP="${MODULE_MAP_FILE:-$PARITY/MODULE-MAP.md}"
+MISSING="${MISSING_FILE:-$PARITY/MISSING.md}"
+DECISIONS="${DECISIONS_FILE:-$PARITY/DECISIONS-FOR-USER.md}"
+SRC_REL="claude-agent-acp-rs/src"
+
+# The 17 acp-agent.ts section anchors (Decision 5), in file order.
+SYMBOLS="top ClaudeAcpAgent authenticate prompt runConsumer trackOrphanCommand setSessionMode replaySessionHistory readTextFile requestPermissionFromClient updateConfigOption getOrCreateSession shouldEmitRawMessage discoverCustomAgents promptToClaude toAcpNotifications runPromptWithCancellation"
+
+usage() {
+  cat <<'EOF'
+usage: module-map-check [--map|--list|--summary|--sections|--refresh-snapshot|--selftest] [--upstream <dir>] [--tag <tag>]
+
+  --map         default: check MODULE-MAP.md against the committed snapshot (offline)
+  --list        print the upstream-module snapshot TSV (requires --upstream)
+  --summary     print counts per relationship from MODULE-MAP.md
+  --sections    print the computed acp-agent.ts@<symbol> ranges (requires --upstream)
+  --refresh-snapshot  write the snapshot from --upstream
+  --selftest    run the bundled fixture test
+  --upstream D  export dir (fetch-upstream.sh) to verify/regenerate from
+  --tag T       tag the export must be at (default: v$PIN)
+EOF
+}
+
+MODE="map"
+UPSTREAM=""
+TAG="v$PIN"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --map) MODE="map"; shift ;;
+    --list) MODE="list"; shift ;;
+    --summary) MODE="summary"; shift ;;
+    --sections) MODE="sections"; shift ;;
+    --refresh-snapshot) MODE="refresh"; shift ;;
+    --selftest) MODE="selftest"; shift ;;
+    --upstream) [ $# -ge 2 ] || usage; UPSTREAM="$2"; shift 2 ;;
+    --tag) [ $# -ge 2 ] || usage; TAG="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+verify_upstream() {
+  if [ -z "$UPSTREAM" ]; then
+    echo "error: this mode requires --upstream <export dir>" >&2
+    exit 1
+  fi
+  [ -d "$UPSTREAM" ] || { echo "error: --upstream $UPSTREAM is not a directory" >&2; exit 1; }
+  local gotname sha exp
+  gotname="$(cat "$UPSTREAM/.tag-name" 2>/dev/null || true)"
+  if [ "$gotname" != "$TAG" ]; then
+    echo "error: --upstream $UPSTREAM is at '$gotname' but --tag $TAG was expected" >&2
+    exit 1
+  fi
+  sha="$(cat "$UPSTREAM/.tag-sha" 2>/dev/null || true)"
+  exp="$(git -C "$ROOT" rev-parse -q --verify "$TAG^{commit}" 2>/dev/null || true)"
+  if [ -n "$exp" ] && [ "$sha" != "$exp" ]; then
+    echo "error: --upstream $UPSTREAM has .tag-sha '$sha' but $TAG is $exp" >&2
+    exit 1
+  fi
+}
+
+list_modules() {
+  local up="$1" f rel
+  while IFS= read -r f; do
+    rel="${f#$up/src/}"
+    printf '%s\t%s\t%s\n' "$rel" "$(wc -l < "$f" | tr -d ' ')" "$(shasum -a 256 "$f" | awk '{print $1}')"
+  done < <(find "$up/src" -name '*.ts' -not -path "$up/src/tests/*" | sort)
+}
+
+# compute_sections <export>: fill SEC_START[] / SEC_END[] in SYMBOLS order.
+compute_sections() {
+  local up="$1"
+  local file="$up/src/acp-agent.ts"
+  local total sym start prev i
+  [ -f "$file" ] || { echo "error: $file not found" >&2; return 1; }
+  total="$(wc -l < "$file" | tr -d ' ')"
+  prev=0
+  i=0
+  for sym in $SYMBOLS; do
+    if [ "$sym" = "top" ]; then
+      start=1
+    else
+      start="$(awk -v sym="$sym" -v from="$prev" '
+        NR > from {
+          if ($0 ~ ("^(export )?(async )?(function|class) " sym "[ (]")) { print NR; exit }
+          if ($0 ~ ("^  (public |private |protected )?(static )?(async )?" sym "\\(")) { print NR; exit }
+        }' "$file")"
+    fi
+    if [ -z "$start" ]; then
+      echo "SECTION-UNRESOLVED acp-agent.ts@$sym (anchor not found)" >&2
+      return 1
+    fi
+    SEC_START[$i]="$start"
+    prev="$start"
+    i=$((i + 1))
+  done
+  i=0
+  for sym in $SYMBOLS; do
+    if [ "$i" -lt 16 ]; then
+      SEC_END[$i]=$(( SEC_START[i + 1] - 1 ))
+    else
+      SEC_END[$i]="$total"
+    fi
+    i=$((i + 1))
+  done
+  SEC_TOTAL="$total"
+  return 0
+}
+
+print_sections() {
+  local i=0 sym
+  for sym in $SYMBOLS; do
+    printf 'acp-agent.ts@%s %s-%s\n' "$sym" "${SEC_START[$i]}" "${SEC_END[$i]}"
+    i=$((i + 1))
+  done
+}
+
+missing_id_ok() {
+  local id="$1"
+  awk -F'|' -v id="$id" '
+    { for (i=1;i<=NF;i++) { v=$i; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); if (v==id) found=1 } }
+    END { exit(found ? 0 : 1) }
+  ' "$MISSING" 2>/dev/null
+}
+
+do_list() {
+  verify_upstream
+  LC_ALL=C list_modules "$UPSTREAM"
+}
+
+do_refresh() {
+  verify_upstream
+  local tmp; tmp="$(mktemp)"
+  LC_ALL=C list_modules "$UPSTREAM" > "$tmp"
+  mv "$tmp" "$SNAP"
+  echo "wrote $SNAP ($(awk 'END{print NR}' "$SNAP") rows)"
+}
+
+do_sections() {
+  verify_upstream
+  compute_sections "$UPSTREAM" || { echo "MODULE-MAP CHECK: FAIL (unresolved section anchor)"; return 1; }
+  print_sections
+}
+
+do_summary() {
+  [ -f "$MAP" ] || { echo "error: $MAP not found" >&2; exit 1; }
+  awk -F'|' '
+    /^#/ { next }
+    /\|/ {
+      up=$2; rs=$3; rel=$4
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", up)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", rs)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", rel)
+      if (up=="" || rel=="") next
+      if (up=="upstream module") next
+      if (up ~ /^-+$/ || rel ~ /^-+$/) next
+      if (rel ~ /^merged:/) s["merged"]++
+      else if (rel ~ /^split:/) s["split"]++
+      else if (rel ~ /^different:/) s["different"]++
+      else if (rel ~ /^missing:/) s["missing"]++
+      else if (rel ~ /^not ported:/) s["not ported"]++
+      else if (rel=="1:1") s["1:1"]++
+      else s["invalid/" rel]++
+      total++
+    }
+    END {
+      n=split("1:1,merged,split,different,missing,not ported", order, ",")
+      for (i=1;i<=n;i++) printf "%-14s %6d\n", order[i] ":", s[order[i]]+0
+      for (k in s) if (k!="1:1" && k!="merged" && k!="split" && k!="different" && k!="missing" && k!="not ported") printf "%-14s %6d\n", k, s[k]
+      printf "%-14s %6d\n", "TOTAL:", total+0
+    }
+  ' "$MAP"
+}
+
+do_map() {
+  local rc=0
+  if [ -n "$UPSTREAM" ]; then
+    verify_upstream
+    local regen; regen="$(mktemp)"
+    LC_ALL=C list_modules "$UPSTREAM" > "$regen"
+    if [ -f "$SNAP" ] && ! cmp -s "$regen" "$SNAP"; then
+      echo "error: regenerated upstream-module snapshot differs from committed $SNAP"
+      echo "  (run: rust/scripts/parity/module-map-check --upstream $UPSTREAM --tag $TAG --refresh-snapshot)"
+      diff "$SNAP" "$regen" | head -20 || true
+      rc=1
+    fi
+    SNAP_USE="$regen"
+  else
+    SNAP_USE="$SNAP"
+  fi
+
+  if [ ! -f "$SNAP_USE" ]; then
+    echo "error: snapshot $SNAP_USE not found (run --refresh-snapshot after fetch-upstream.sh)" >&2
+    echo "MODULE-MAP CHECK: FAIL (missing snapshot)"
+    return 1
+  fi
+  if [ ! -f "$MAP" ]; then
+    echo "error: MODULE-MAP $MAP not found" >&2
+    echo "MODULE-MAP CHECK: FAIL (missing MODULE-MAP)"
+    return 1
+  fi
+  if [ ! -f "$MISSING" ]; then
+    echo "error: MISSING $MISSING not found" >&2
+    echo "MODULE-MAP CHECK: FAIL (missing MISSING.md)"
+    return 1
+  fi
+
+  local result
+  result="$(awk -F'|' -v snapfile="$SNAP_USE" -v mapfile="$MAP" '
+    BEGIN {
+      while ((getline line < snapfile) > 0) {
+        split(line, f, "\t"); if (f[1]=="") continue
+        snap[f[1]]=1
+      }
+      close(snapfile)
+      nmap=0
+      while ((getline line < mapfile) > 0) {
+        if (line ~ /^#/ || line !~ /\|/) continue
+        split(line, f, "|")
+        up=f[2]; rs=f[3]; rel=f[4]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", up)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", rs)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", rel)
+        if (up=="" || rel=="") continue
+        if (up=="upstream module") continue
+        if (up ~ /^-+$/) continue
+        nmap++
+        base=up; sub(/@.*/, "", base)
+        rows[base]++
+        relof[nmap]=rel
+        upraw[nmap]=up
+        upbase[nmap]=base
+      }
+      close(mapfile)
+    }
+    END {
+      nuncov=0; nstale=0; nbadrel=0
+      for (m in snap) {
+        if (m=="acp-agent.ts") {
+          # covered by any acp-agent.ts@<symbol> row
+          if (!(m in rows)) { printf "UNMAPPED\t%s\n", m; nuncov++ }
+        } else if (!(m in rows)) { printf "UNMAPPED\t%s\n", m; nuncov++ }
+      }
+      for (m in rows) if (!(m in snap)) { printf "STALE\t%s\n", m; nstale++ }
+      for (i=1;i<=nmap;i++) {
+        rel=relof[i]
+        if (rel=="1:1" || rel ~ /^merged:./ || rel ~ /^split:./ || rel ~ /^different:./ || rel ~ /^missing:./ || rel ~ /^not ported:./) { }
+        else { printf "BADREL\t%s\t%s\n", upraw[i], rel; nbadrel++ }
+      }
+      printf "META %d %d %d %d\n", nuncov, nstale, nbadrel, nmap
+    }
+  ' "$SNAP_USE" "$MAP")"
+
+  local nuncov nstale nbadrel nmap
+  read -r nuncov nstale nbadrel nmap < <(printf '%s\n' "$result" | grep '^META' | awk '{print $2, $3, $4, $5}') || true
+  nuncov="${nuncov:-0}"; nstale="${nstale:-0}"; nbadrel="${nbadrel:-0}"; nmap="${nmap:-0}"
+
+  printf '%s\n' "$result" | grep -E '^(UNMAPPED|STALE|BADREL)' | while IFS=$'\t' read -r tag a b; do
+    case "$tag" in
+      UNMAPPED) echo "UNMAPPED $a" ;;
+      STALE) echo "STALE $a" ;;
+      BADREL) echo "BAD-RELATIONSHIP $a -> $b" ;;
+    esac
+  done || true
+
+  # rust paths + missing:/not ported: rules
+  local vbad=0 dec
+  dec="$(cat "$DECISIONS" 2>/dev/null || true)"
+  while IFS='|' read -r _ up rs rel _note; do
+    up="$(printf '%s' "$up" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print}')"
+    rs="$(printf '%s' "$rs" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print}')"
+    rel="$(printf '%s' "$rel" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print}')"
+    [ -n "$up" ] || continue
+    [ "$up" = "upstream module" ] && continue
+    case "$up" in ---*) continue ;; esac
+    [ -n "$rel" ] || continue
+    case "$rel" in ---*) continue ;; esac
+    case "$rel" in
+      missing:*)
+        id="${rel#missing:}"
+        if ! missing_id_ok "$id"; then
+          echo "MISSING-ID $up -> $id (no MISSING.md line)"
+          vbad=$((vbad+1))
+        fi
+        ;;
+      "not ported:"*)
+        base="${up%@*}"
+        if ! printf '%s' "$dec" | grep -qF "$base"; then
+          echo "BAD-NOTPORTED $up (not ported: needs a DECISIONS-FOR-USER entry naming the module)"
+          vbad=$((vbad+1))
+        fi
+        ;;
+    esac
+    if [ "$rs" = "-" ]; then
+      case "$rel" in
+        missing:*|"not ported:"*) : ;;
+        *) echo "BAD-RUST $up -> - (only missing:/not ported: may omit a rust module)"; vbad=$((vbad+1)) ;;
+      esac
+    else
+      local spec part p fn
+      spec="$rs"
+      IFS=',' read -r -a parts <<< "$spec"
+      for part in "${parts[@]}"; do
+        part="$(printf '%s' "$part" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print}')"
+        [ -n "$part" ] || continue
+        case "$part" in
+          *::*)
+            p="${part%%::*}"; fn="${part##*::}"
+            if [ ! -f "$RUST_ROOT/$SRC_REL/$p" ]; then
+              echo "BAD-RUST $up -> $part (file not found)"
+              vbad=$((vbad+1))
+            elif ! grep -q "fn[[:space:]]\+$fn" "$RUST_ROOT/$SRC_REL/$p"; then
+              echo "BAD-RUST $up -> $part (fn $fn not found)"
+              vbad=$((vbad+1))
+            fi
+            ;;
+          *)
+            if [ ! -f "$RUST_ROOT/$SRC_REL/$part" ]; then
+              echo "BAD-RUST $up -> $part (file not found)"
+              vbad=$((vbad+1))
+            fi
+            ;;
+        esac
+      done
+    fi
+  done < <(grep -v '^#' "$MAP") || true
+  vbad="${vbad:-0}"
+
+  # section anchors (only when the export is available)
+  if [ -n "$UPSTREAM" ]; then
+    if ! compute_sections "$UPSTREAM" >/dev/null 2>&1; then
+      echo "SECTION-UNRESOLVED (an acp-agent.ts@ anchor does not resolve in the export)"
+      rc=1
+    else
+      local seclist expected badsym
+      seclist="$(grep -oE 'acp-agent\.ts@[A-Za-z_$][A-Za-z0-9_$]*' "$MAP" || true)"
+      badsym=0
+      while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        sym="${row#acp-agent.ts@}"
+        case " $SYMBOLS " in
+          *" $sym "*) : ;;
+          *) echo "SECTION-UNRESOLVED $row (not one of the 17 anchors)"; badsym=1 ;;
+        esac
+      done <<EOF
+$seclist
+EOF
+      if [ "$badsym" -ne 0 ]; then
+        rc=1
+      else
+        # rows must appear in the 17-anchor order, all present
+        expected=""
+        for sym in $SYMBOLS; do expected="$expected
+acp-agent.ts@$sym"; done
+        expected="$(printf '%s\n' "$expected" | sed '/^$/d')"
+        if [ "$seclist" != "$expected" ]; then
+          echo "SECTION-ORDER (acp-agent.ts@ rows must be exactly the 17 anchors in file order)"
+          rc=1
+        fi
+      fi
+    fi
+  fi
+
+  printf 'upstream modules: %d | map rows: %d | unmapped: %d | stale: %d | bad relationship: %d | bad rust path: %d\n' \
+    "$(awk 'END{print NR}' "$SNAP_USE")" "$nmap" "$nuncov" "$nstale" "$nbadrel" "$vbad"
+
+  if [ -n "${regen:-}" ]; then rm -f "$regen"; fi
+
+  totalbad=$((rc + nuncov + nstale + nbadrel + vbad))
+  if [ "$totalbad" -gt 0 ]; then
+    echo "MODULE-MAP CHECK: FAIL ($totalbad problem(s))"
+    return 1
+  fi
+  echo "MODULE-MAP CHECK: PASS"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# --selftest
+# ---------------------------------------------------------------------------
+do_selftest() {
+  local tmp; tmp="$(mktemp -d)"
+  local exp="$tmp/export" rust="$tmp/rust" rc=0
+  mkdir -p "$exp/src" "$rust/claude-agent-acp-rs/src"
+
+  local sha; sha="$(git -C "$ROOT" rev-parse -q --verify "$TAG^{commit}")"
+  printf 'v%s\n' "${TAG#v}" > "$exp/.tag-name"
+  printf '%s\n' "$sha" > "$exp/.tag-sha"
+
+  printf 'export const a = 1;\n' > "$exp/src/a.ts"
+  printf 'export const b = 2;\n' > "$exp/src/b.ts"
+  cat > "$exp/src/acp-agent.ts" <<'EOF'
+// fixture acp-agent.ts
+export class ClaudeAcpAgent {
+  async authenticate() {}
+  async prompt() {}
+  private async runConsumer() {}
+  private trackOrphanCommand() {}
+  async setSessionMode() {}
+  private async replaySessionHistory() {}
+  async readTextFile() {}
+  private async requestPermissionFromClient() {}
+  private async updateConfigOption() {}
+  private async getOrCreateSession() {}
+}
+function shouldEmitRawMessage() {}
+export async function discoverCustomAgents() {}
+export function promptToClaude() {}
+export function toAcpNotifications() {}
+export async function runPromptWithCancellation() {}
+EOF
+
+  printf 'pub fn a() {}\n' > "$rust/claude-agent-acp-rs/src/a.rs"
+  printf 'pub fn b() {}\n' > "$rust/claude-agent-acp-rs/src/b.rs"
+
+  printf '| id | description | work package |\n|---|---|---|\n| M-1 | fixture ticket | TBD |\n| M-2 | another | TBD |\n' > "$tmp/missing.md"
+  : > "$tmp/decisions.md"
+
+  local snap="$tmp/snap.tsv" map="$tmp/map.md"
+  MODULE_SNAPSHOT_FILE="$snap" bash "$0" --upstream "$exp" --tag "$TAG" --refresh-snapshot >/dev/null 2>&1 || {
+    echo "SELFTEST: FAIL (refresh-snapshot on mini tree)"; rm -rf "$tmp"; return 1; }
+
+  # good map: every module covered; the 17 anchors in order
+  {
+    printf '| upstream module | rust module(s) | relationship | note |\n'
+    printf '|---|---|---|---|\n'
+    printf '| a.ts | a.rs | 1:1 | |\n'
+    printf '| b.ts | b.rs | merged:a.rs | |\n'
+    for sym in $SYMBOLS; do
+      printf '| acp-agent.ts@%s | a.rs | split:a.rs | |\n' "$sym"
+    done
+  } > "$map"
+
+  run_map() { # <mapfile> -> prints output, returns rc
+    MODULE_MAP_FILE="$1" MODULE_SNAPSHOT_FILE="$snap" MISSING_FILE="$tmp/missing.md" \
+      DECISIONS_FILE="$tmp/decisions.md" RUST_ROOT="$rust" \
+      bash "$0" --map --upstream "$exp" --tag "$TAG" 2>&1
+  }
+
+  local out r
+  out="$(run_map "$map")" && r=0 || r=$?
+  if [ "$r" -ne 0 ]; then
+    echo "SELFTEST: FAIL (good mini map should pass)"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    rc=1
+  else
+    echo "  ok: good mini map passes"
+  fi
+
+  check_fail() { # <label> <marker> <mapfile>
+    local label="$1" marker="$2" mf="$3" o rr
+    o="$(run_map "$mf")" && rr=0 || rr=$?
+    if [ "$rr" -ne 0 ] && printf '%s\n' "$o" | grep -q "$marker"; then
+      echo "  ok: $label"
+    else
+      echo "SELFTEST: FAIL ($label: rc=$rr, marker '$marker' not found)"
+      printf '%s\n' "$o" | sed 's/^/    /'
+      rc=1
+    fi
+  }
+
+  sed '/^| b\.ts |/d' "$map" > "$tmp/m1.md"
+  check_fail "unmapped module" "UNMAPPED b.ts" "$tmp/m1.md"
+
+  { cat "$map"; printf '| c.ts | a.rs | 1:1 | |\n'; } > "$tmp/m2.md"
+  check_fail "stale row" "STALE c.ts" "$tmp/m2.md"
+
+  sed 's/| a\.ts | a\.rs | 1:1 |/| a.ts | a.rs | 1:1 extra |/' "$map" > "$tmp/m3.md"
+  check_fail "bad relationship" "BAD-RELATIONSHIP" "$tmp/m3.md"
+
+  sed 's/| a\.ts | a\.rs | 1:1 |/| a.ts | nope.rs | 1:1 |/' "$map" > "$tmp/m4.md"
+  check_fail "bad rust path" "BAD-RUST" "$tmp/m4.md"
+
+  sed 's/| b\.ts | b\.rs | merged:a\.rs |/| b.ts | - | not ported:impossible |/' "$map" > "$tmp/m5.md"
+  check_fail "not ported without DECISIONS entry" "BAD-NOTPORTED" "$tmp/m5.md"
+
+  sed 's/| b\.ts | b\.rs | merged:a\.rs |/| b.ts | - | missing:M-999 |/' "$map" > "$tmp/m6.md"
+  check_fail "missing id without ticket" "MISSING-ID" "$tmp/m6.md"
+
+  sed 's/acp-agent\.ts@prompt /acp-agent.ts@promt /' "$map" > "$tmp/m7.md"
+  check_fail "unresolvable section anchor" "SECTION-UNRESOLVED" "$tmp/m7.md"
+
+  # out of order: swap authenticate and prompt rows
+  awk '
+    /acp-agent\.ts@authenticate \|/ { auth=$0; next }
+    /acp-agent\.ts@prompt \|/ { print; print auth; next }
+    { print }' "$map" > "$tmp/m8.md"
+  check_fail "out-of-order sections" "SECTION-ORDER" "$tmp/m8.md"
+
+  # missing snapshot (no --upstream so the snapshot half runs)
+  mv "$snap" "$tmp/snap.bak"
+  local o2 r2
+  o2="$(MODULE_MAP_FILE="$map" MODULE_SNAPSHOT_FILE="$snap" MISSING_FILE="$tmp/missing.md" \
+        DECISIONS_FILE="$tmp/decisions.md" RUST_ROOT="$rust" bash "$0" --map 2>&1)" && r2=0 || r2=$?
+  if [ "$r2" -ne 0 ] && printf '%s\n' "$o2" | grep -q "missing snapshot"; then
+    echo "  ok: missing snapshot fails"
+  else
+    echo "SELFTEST: FAIL (missing snapshot: rc=$r2)"
+    rc=1
+  fi
+  mv "$tmp/snap.bak" "$snap"
+
+  # wrong .tag-sha
+  printf 'deadbeef\n' > "$exp/.tag-sha"
+  local o3 r3
+  o3="$(run_map "$map")" && r3=0 || r3=$?
+  if [ "$r3" -ne 0 ] && printf '%s\n' "$o3" | grep -q ".tag-sha"; then
+    echo "  ok: wrong .tag-sha fails"
+  else
+    echo "SELFTEST: FAIL (wrong .tag-sha: rc=$r3)"
+    rc=1
+  fi
+
+  rm -rf "$tmp"
+  if [ "$rc" -ne 0 ]; then
+    echo "SELFTEST: FAIL"
+    return 1
+  fi
+  echo "SELFTEST: PASS"
+  return 0
+}
+
+case "$MODE" in
+  list) do_list ;;
+  refresh) do_refresh ;;
+  sections) do_sections ;;
+  summary) do_summary ;;
+  selftest) do_selftest ;;
+  map) do_map ;;
+esac

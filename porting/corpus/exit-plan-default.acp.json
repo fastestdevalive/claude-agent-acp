@@ -1,0 +1,8 @@
+{
+  "permission": {"option_id": "exit-plan-default"},
+  "steps": [
+    {"call": "initialize"},
+    {"call": "session/new"},
+    {"call": "session/prompt", "text": "done planning: approve the plan"}
+  ]
+}

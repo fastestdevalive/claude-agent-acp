@@ -1,0 +1,1026 @@
+#!/usr/bin/env bash
+#
+# test-map-check — parity TEST-MAP checker for the claude-agent-acp Rust port.
+#
+# Adapted from ~/code/fastestdevalive/codex-acp-rust/scripts/parity/test-map-check
+# (same mode names and row format) for the plan-parity-infra contract.
+#
+# Modes (mutually exclusive; --map is the default):
+#   --map           compare porting/parity/TEST-MAP.md against the committed
+#                   upstream-test snapshot (offline / always-on). Fails when an
+#                   upstream test is unmapped, a map row/default is stale, a
+#                   ported:/covered: target does not exist, a default row is not
+#                   `missing:`, a `different:` reason is empty/short, or a
+#                   missing: id has no MISSING.md line. `missing:` only WARNS.
+#   --list          print the upstream-test snapshot TSV (needs --upstream):
+#                       file <TAB> case-title <TAB> content-hash
+#                   plus the synthetic scenario rows (Decision 3).
+#   --seed          write a skeleton TEST-MAP.md (every row missing:T-UNCLASSIFIED)
+#   --summary       per-status counts with explicit / default-covered columns
+#   --groups        file | top-level describe | n cases | n unresolved
+#   --unresolved    file + count of cases still missing:T-UNCLASSIFIED
+#   --reconcile     scanner line-set vs independent grep line-set per file
+#   --diff A B      new/removed/changed cases and changed test files
+#   --refresh-snapshot  write the snapshot from --upstream
+#   --selftest      extractor fixture + mini-tree mutation suite
+#
+# Options:
+#   --upstream <dir>  export dir made by fetch-upstream.sh (has .tag-name/.tag-sha)
+#   --tag <tag>       tag the export must be (default: v$(cat porting/UPSTREAM_VERSION))
+#   --forbid-unclassified  fail on missing:T-UNCLASSIFIED (final flip, Decision 7)
+#
+# Env overrides (tests only): TEST_MAP_FILE, TEST_SNAPSHOT_FILE, MISSING_FILE,
+# DECISIONS_FILE, ALLOWLIST_FILE, CORPUS_DIR, RUST_ROOT.
+#
+# Pure bash 3.2 + awk + git + shasum -a 256; macOS-safe; no node; no network.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPTS="$ROOT/rust/scripts/parity"
+RUST_ROOT="${RUST_ROOT:-$ROOT/rust}"
+PARITY="$ROOT/porting/parity"
+PIN="$(cat "$ROOT/porting/UPSTREAM_VERSION")"
+SNAP="${TEST_SNAPSHOT_FILE:-$PARITY/upstream-tests.v$PIN.tsv}"
+MAP="${TEST_MAP_FILE:-$PARITY/TEST-MAP.md}"
+MISSING="${MISSING_FILE:-$PARITY/MISSING.md}"
+DECISIONS="${DECISIONS_FILE:-$PARITY/DECISIONS-FOR-USER.md}"
+ALLOWLIST="${ALLOWLIST_FILE:-$PARITY/scan-allowlist.tsv}"
+CORPUS="${CORPUS_DIR:-$ROOT/porting/corpus}"
+CACHE_DIR="$ROOT/rust/target/parity/cache"
+CRATE="$RUST_ROOT/claude-agent-acp-rs"
+
+usage() {
+  cat <<'EOF'
+usage: test-map-check [--map|--list|--seed|--summary|--groups|--unresolved|--reconcile|--diff A B|--refresh-snapshot|--selftest] [--upstream <dir>] [--tag <tag>] [--forbid-unclassified]
+
+  --map         default: check TEST-MAP.md against the committed snapshot (offline)
+  --list        print the upstream-test snapshot TSV (requires --upstream)
+  --seed        write a skeleton TEST-MAP.md (every row missing:T-UNCLASSIFIED)
+  --summary     print per-status counts from TEST-MAP.md
+  --groups      print file | top-level describe | n cases | n unresolved
+  --unresolved  print file + count of rows still T-UNCLASSIFIED
+  --reconcile   compare the scanner's case lines with an independent grep
+  --diff A B    print new/removed/changed cases between two snapshots
+  --refresh-snapshot  write the snapshot from --upstream
+  --selftest    run the bundled extractor fixture + mutation suite
+  --upstream D  export dir (fetch-upstream.sh) to verify/regenerate from
+  --tag T       tag the export must be at (default: v$PIN)
+  --forbid-unclassified  fail on missing:T-UNCLASSIFIED (final flip)
+EOF
+}
+
+MODE="map"
+UPSTREAM=""
+TAG="v$PIN"
+FORBID=0
+DIFF_OLD=""
+DIFF_NEW=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --map) MODE="map"; shift ;;
+    --list) MODE="list"; shift ;;
+    --seed) MODE="seed"; shift ;;
+    --summary) MODE="summary"; shift ;;
+    --groups) MODE="groups"; shift ;;
+    --unresolved) MODE="unresolved"; shift ;;
+    --reconcile) MODE="reconcile"; shift ;;
+    --refresh-snapshot) MODE="refresh"; shift ;;
+    --selftest) MODE="selftest"; shift ;;
+    --diff) [ $# -ge 3 ] || { echo "error: --diff needs <old> <new>" >&2; exit 1; }; MODE="diff"; DIFF_OLD="$2"; DIFF_NEW="$3"; shift 3 ;;
+    --upstream) [ $# -ge 2 ] || usage; UPSTREAM="$2"; shift 2 ;;
+    --tag) [ $# -ge 2 ] || usage; TAG="$2"; shift 2 ;;
+    --forbid-unclassified) FORBID=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+trim() { awk '{ gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print }'; }
+
+# ---------------------------------------------------------------------------
+# path / hash helpers
+# ---------------------------------------------------------------------------
+path_norm() {
+  local p="$1" out="" seg IFS='/'
+  for seg in $p; do
+    case "$seg" in
+      "" | ".") ;;
+      "..") out="${out%/*}" ;;
+      *) out="$out/$seg" ;;
+    esac
+  done
+  printf '%s' "${out#/}"
+}
+
+# file_hash <rel-file> <export-root>
+# sha256 over (the test file + its resolved relative imports (.js->.ts) +, for
+# the three acp-scenarios*.test.ts files, the whole src/tests/acp-scenarios/
+# tree), concatenated in first-seen order (Decision 2).
+file_hash() {
+  local rel="$1" up="$2"
+  local dir files imp cand e found drel
+  dir="$(dirname "$rel")"
+  [ -n "$dir" ] || dir="."
+  files="$rel"
+
+  while IFS= read -r imp; do
+    [ -n "$imp" ] || continue
+    cand="$(path_norm "$dir/$imp")"
+    found=""
+    for e in "" ".ts" ".tsx" ".js"; do
+      if [ -f "$up/$cand$e" ]; then found="$cand$e"; break; fi
+    done
+    # `.js` import suffix resolves to the `.ts` source in this repo
+    case "$cand" in
+      *.js) if [ -f "$up/${cand%.js}.ts" ]; then found="${cand%.js}.ts"; fi ;;
+    esac
+    if [ -n "$found" ] && [ "$found" != "$rel" ]; then
+      files="$files
+$found"
+    fi
+  done < <(grep -oE "(from|import)[[:space:]]+['\"][.]{1,2}[^'\"]*['\"]" "$up/$rel" 2>/dev/null \
+        | sed -E "s/^(from|import)[[:space:]]+['\"]//; s/['\"]$//" || true)
+
+  case "$rel" in
+    *acp-scenarios*.test.ts)
+      if [ -d "$up/src/tests/acp-scenarios" ]; then
+        while IFS= read -r drel; do
+          files="$files
+${drel#$up/}"
+        done < <(find "$up/src/tests/acp-scenarios" -type f | sort)
+      fi
+      ;;
+  esac
+
+  {
+    printf '%s\n' "$files" | awk 'NF && !seen[$0]++' | while IFS= read -r f; do
+      cat "$up/$f" 2>/dev/null || true
+    done
+  } | shasum -a 256 | awk '{print $1}'
+}
+
+# scenario_hash <name> <export-root>: sha256 of the three snapshot streams.
+scenario_hash() {
+  local name="$1" up="$2" f
+  for f in \
+    "$up/src/tests/acp-scenarios/__snapshots__/air/$name.jsonl" \
+    "$up/src/tests/acp-scenarios/__snapshots__/v2/$name.jsonl" \
+    "$up/src/tests/acp-scenarios/__snapshots__/origin-main/plain/$name.jsonl"; do
+    [ -f "$f" ] && cat "$f" || true
+  done | shasum -a 256 | awk '{print $1}'
+}
+
+# ---------------------------------------------------------------------------
+# verify the export is at the pinned tag (.tag-name/.tag-sha; no git history)
+# ---------------------------------------------------------------------------
+verify_upstream() {
+  if [ -z "$UPSTREAM" ]; then
+    echo "error: this mode requires --upstream <export dir>" >&2
+    exit 1
+  fi
+  if [ ! -d "$UPSTREAM" ]; then
+    echo "error: --upstream $UPSTREAM is not a directory" >&2
+    exit 1
+  fi
+  local gotname sha exp
+  gotname="$(cat "$UPSTREAM/.tag-name" 2>/dev/null || true)"
+  if [ "$gotname" != "$TAG" ]; then
+    echo "error: --upstream $UPSTREAM is at '$gotname' but --tag $TAG was expected" >&2
+    exit 1
+  fi
+  sha="$(cat "$UPSTREAM/.tag-sha" 2>/dev/null || true)"
+  exp="$(git -C "$ROOT" rev-parse -q --verify "$TAG^{commit}" 2>/dev/null || true)"
+  if [ -n "$exp" ] && [ "$sha" != "$exp" ]; then
+    echo "error: --upstream $UPSTREAM has .tag-sha '$sha' but $TAG is $exp" >&2
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# list_cases <export-root> -> TSV (file TAB title TAB hash) incl. scenarios
+# ---------------------------------------------------------------------------
+list_cases() {
+  local up="$1" f rel hash
+  while IFS= read -r f; do
+    rel="${f#$up/}"
+    hash="$(file_hash "$rel" "$up")"
+    awk -v file="$rel" -f "$SCRIPTS/scan_tests.awk" "$f" \
+      | awk -F"\t" -v h="$hash" 'NF { printf "%s\t%s\t%s\n", $1, $3, h }'
+  done < <( { find "$up/src/tests" -maxdepth 1 -name '*.test.ts' | sort
+              if [ -f "$up/scripts/next-preview-version.test.mjs" ]; then echo "$up/scripts/next-preview-version.test.mjs"; fi
+            } )
+
+  # Decision 3: one synthetic row per scenario snapshot (air/ is the index).
+  local snapdir="$up/src/tests/acp-scenarios/__snapshots__/air"
+  if [ -d "$snapdir" ]; then
+    while IFS= read -r f; do
+      local name hash2
+      name="$(basename "$f" .jsonl)"
+      hash2="$(scenario_hash "$name" "$up")"
+      printf '%s\tscenario > %s\t%s\n' "src/tests/acp-scenarios/scenarios.ts" "$name" "$hash2"
+    done < <(find "$snapdir" -maxdepth 1 -name '*.jsonl' | sort)
+  fi
+}
+
+# cached list (Decision 11 listing cache; work order keeps caches under rust/target/parity)
+cached_list() {
+  local up="$1" tagsha scannersha cache tmp
+  tagsha="$(cat "$up/.tag-sha" 2>/dev/null || true)"
+  scannersha="$(shasum -a 256 "$SCRIPTS/scan_tests.awk" | awk '{print $1}')"
+  cache="$CACHE_DIR/tests-$tagsha-$scannersha.tsv"
+  if [ -f "$cache" ]; then
+    cat "$cache"
+    return 0
+  fi
+  mkdir -p "$CACHE_DIR"
+  tmp="$cache.$$"
+  LC_ALL=C list_cases "$up" > "$tmp"
+  mv "$tmp" "$cache"
+  cat "$cache"
+}
+
+# ---------------------------------------------------------------------------
+# modes
+# ---------------------------------------------------------------------------
+do_list() {
+  verify_upstream
+  LC_ALL=C cached_list "$UPSTREAM"
+}
+
+do_refresh() {
+  verify_upstream
+  local tmp
+  tmp="$(mktemp)"
+  LC_ALL=C list_cases "$UPSTREAM" > "$tmp"
+  mv "$tmp" "$SNAP"
+  echo "wrote $SNAP ($(awk 'END{print NR}' "$SNAP") rows)"
+}
+
+do_seed() {
+  verify_upstream
+  local tmp
+  tmp="$(mktemp)"
+  {
+    printf '# TEST-MAP — claude-agent-acp upstream test mapping (snapshot %s)\n' "v$PIN"
+    printf '# (comment lines start with `#`)\n'
+    printf '\n# Generated by `rust/scripts/parity/test-map-check --seed`; classify rows below.\n'
+    printf '# Status vocabulary: ported:<target> | covered:<scenario>[+<scenario>] | different:<reason> | missing:<id>.\n'
+    printf '# Wildcard rows (`*`, `<prefix> > *`) may only be missing:<id>.\n\n'
+    printf 'file | case title | status | note\n'
+    LC_ALL=C cached_list "$UPSTREAM" \
+      | awk -F"\t" '{ printf "%s | %s | missing:T-UNCLASSIFIED | \n", $1, $2 }'
+  } > "$tmp"
+  mv "$tmp" "$MAP"
+  echo "wrote $MAP ($(awk 'END{print NR}' "$MAP") lines)"
+}
+
+# effective-status awk shared by --summary/--groups/--unresolved
+# args: snapshot mapfile
+effective_awk() {
+  awk -F'\t' -v snap="$1" -v mapfile="$2" '
+    BEGIN {
+      while ((getline line < snap) > 0) {
+        split(line, f, "\t"); if (f[1]=="") continue
+        ncase++; cfile[ncase]=f[1]; ctitle[ncase]=f[2]
+      }
+      close(snap)
+      while ((getline line < mapfile) > 0) {
+        if (line ~ /^#/ || line !~ /\|/) continue
+        nf=split(line, f, "|")
+        file=f[1]; title=f[2]; status=f[3]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", file)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", title)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
+        if (file=="file" && title=="case title") continue
+        if (file=="" || title=="") continue
+        if (title=="*") def[file]=status
+        else if (title ~ / > \*$/) { p=title; sub(/ > \*$/, "", p); pref[file SUBSEP p]=status; np[file]++ }
+        else exact[file SUBSEP title]=status
+      }
+      close(mapfile)
+    }
+    END {
+      for (i=1;i<=ncase;i++) {
+        file=cfile[i]; title=ctitle[i]; k=file SUBSEP title
+        st=""; how=""
+        if (k in exact) { st=exact[k]; how="explicit" }
+        else {
+          best=""; bl=-1
+          for (p in pref) {
+            split(p, pf, SUBSEP)
+            if (pf[1]==file && index(title, pf[2] " > ")==1 && length(pf[2])>bl) { best=pf[2]; bl=length(pf[2]) }
+          }
+          if (best!="") { st=pref[file SUBSEP best]; how="default" }
+          else if (file in def) { st=def[file]; how="default" }
+        }
+        if (st=="") st="(unmapped)"
+        print file "\t" title "\t" st "\t" how
+      }
+    }
+  ' "$1" "$2"
+}
+
+do_summary() {
+  [ -f "$SNAP" ] || { echo "error: snapshot $SNAP not found" >&2; exit 1; }
+  [ -f "$MAP" ] || { echo "error: TEST-MAP $MAP not found (run --seed)" >&2; exit 1; }
+  effective_awk "$SNAP" "$MAP" | awk -F'\t' '
+    {
+      st=$3; how=$4
+      if (st ~ /^ported:/) base="ported"
+      else if (st ~ /^covered:/) base="covered"
+      else if (st ~ /^different:/) base="different"
+      else if (st ~ /^missing:/) base="missing"
+      else base="invalid/" st
+      if (how=="default") dc[base]++
+      else ec[base]++
+      seen[base]=1; total++
+    }
+    END {
+      printf "%-16s %9s %16s\n", "status", "explicit", "default-covered"
+      n=split("ported covered different missing", order, " ")
+      for (i=1;i<=n;i++) { k=order[i]; printf "%-16s %9d %16d\n", k ":", ec[k]+0, dc[k]+0 }
+      for (k in seen) if (k!="ported" && k!="covered" && k!="different" && k!="missing") printf "%-16s %9d %16d\n", k, ec[k]+0, dc[k]+0
+      printf "%-16s %9d %16d\n", "TOTAL:", total+0, 0
+    }
+  '
+}
+
+do_groups() {
+  [ -f "$SNAP" ] || { echo "error: snapshot $SNAP not found" >&2; exit 1; }
+  [ -f "$MAP" ] || { echo "error: TEST-MAP $MAP not found" >&2; exit 1; }
+  effective_awk "$SNAP" "$MAP" | awk -F'\t' '
+    {
+      file=$1; title=$2; st=$3
+      if (index(title, " > ")>0) { g=substr(title, 1, index(title, " > ")-1) }
+      else if (title ~ /^scenario > /) g="scenario"
+      else g="(top)"
+      n[file SUBSEP g]++
+      if (st=="missing:T-UNCLASSIFIED") u[file SUBSEP g]++
+    }
+    END {
+      for (k in n) { split(k, a, SUBSEP); printf "%s | %s | %d | %d\n", a[1], a[2], n[k], u[k]+0 }
+    }
+  ' | LC_ALL=C sort
+}
+
+do_unresolved() {
+  [ -f "$SNAP" ] || { echo "error: snapshot $SNAP not found" >&2; exit 1; }
+  [ -f "$MAP" ] || { echo "error: TEST-MAP $MAP not found" >&2; exit 1; }
+  effective_awk "$SNAP" "$MAP" | awk -F'\t' '
+    $3=="missing:T-UNCLASSIFIED" { n[$1]++ }
+    END { for (f in n) printf "%s\t%d\n", f, n[f] }
+  ' | LC_ALL=C sort
+}
+
+# ---------------------------------------------------------------------------
+# --map
+# ---------------------------------------------------------------------------
+ported_target_ok() {
+  local t="$1" path fn
+  case "$t" in
+    tests/*.rs::*)
+      path="$CRATE/tests/${t#tests/}"; path="${path%%::*}"
+      fn="${t##*::}"
+      ;;
+    src/*.rs::*)
+      path="$CRATE/${t%%::*}"; fn="${t##*::}"
+      ;;
+    */*.rs::*)
+      # <crate-dir>/<path>.rs::<fn> for acp-recorder / fake-claude
+      path="$RUST_ROOT/${t%%::*}"; fn="${t##*::}"
+      ;;
+    *) return 1 ;;
+  esac
+  [ -f "$path" ] || return 1
+  awk -v fn="$fn" '
+    { lines[NR]=$0 }
+    END {
+      found=0
+      for (i=1;i<=NR;i++) {
+        if (lines[i] ~ ("fn[[:space:]]+" fn "[[:space:]]*\\(")) {
+          has=0; ign=0
+          if (lines[i] ~ /#\[test\]/ || lines[i] ~ /#\[tokio::test/) has=1
+          j=i-1
+          while (j>=1) {
+            if (lines[j] ~ /^[[:space:]]*$/) break
+            if (lines[j] ~ /^[[:space:]]*#\[/) {
+              if (lines[j] ~ /#\[test\]/ || lines[j] ~ /#\[tokio::test/) has=1
+              if (lines[j] ~ /#\[ignore/) ign=1
+            } else if (lines[j] ~ /^[[:space:]]*\/\//) {
+              # comment above the attributes: keep scanning
+            } else {
+              break
+            }
+            j--
+          }
+          if (has && !ign) found=1
+          break
+        }
+      }
+      print (found ? "yes" : "no")
+    }
+  ' "$path" | grep -qx yes
+}
+
+covered_target_ok() {
+  local spec="$1" s
+  IFS='+' read -r -a parts <<< "$spec"
+  for s in "${parts[@]}"; do
+    s="$(printf '%s' "$s" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print}')"
+    [ -n "$s" ] || continue
+    [ -f "$CORPUS/$s.acp.json" ] || return 1
+    [ -f "$CORPUS/$s.transcript.jsonl" ] || return 1
+  done
+  return 0
+}
+
+missing_id_ok() {
+  local id="$1"
+  awk -F'|' -v id="$id" '
+    {
+      for (i=1;i<=NF;i++) {
+        v=$i; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        if (v==id) found=1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$MISSING" 2>/dev/null
+}
+
+do_map() {
+  local rc=0
+  if [ -n "$UPSTREAM" ]; then
+    verify_upstream
+    local regen
+    regen="$(mktemp)"
+    LC_ALL=C list_cases "$UPSTREAM" > "$regen" || true
+    if [ -f "$SNAP" ] && ! cmp -s "$regen" "$SNAP"; then
+      echo "error: regenerated upstream snapshot differs from committed $SNAP"
+      echo "  (run: rust/scripts/parity/test-map-check --upstream $UPSTREAM --tag $TAG --refresh-snapshot)"
+      diff "$SNAP" "$regen" | head -20 || true
+      rc=1
+    fi
+    SNAP_USE="$regen"
+  else
+    SNAP_USE="$SNAP"
+  fi
+
+  if [ ! -f "$SNAP_USE" ]; then
+    echo "error: snapshot $SNAP_USE not found (run --refresh-snapshot after fetch-upstream.sh)" >&2
+    echo "TEST-MAP CHECK: FAIL (missing snapshot)"
+    return 1
+  fi
+  if [ ! -f "$MAP" ]; then
+    echo "error: TEST-MAP $MAP not found (run --seed)" >&2
+    echo "TEST-MAP CHECK: FAIL (missing TEST-MAP)"
+    return 1
+  fi
+  if [ ! -f "$MISSING" ]; then
+    echo "error: MISSING $MISSING not found" >&2
+    echo "TEST-MAP CHECK: FAIL (missing MISSING.md)"
+    return 1
+  fi
+
+  local result
+  result="$(awk -F'\t' -v snap="$SNAP_USE" -v mapfile="$MAP" -v forbid="$FORBID" -v decisions="$DECISIONS" '
+    BEGIN {
+      dec=""
+      while ((getline line < decisions) > 0) dec = dec line "\n"
+      close(decisions)
+      while ((getline line < snap) > 0) {
+        split(line, f, "\t"); if (f[1]=="") continue
+        ncase++; cfile[ncase]=f[1]; ctitle[ncase]=f[2]
+        snapkey[f[1] SUBSEP f[2]]=1
+      }
+      close(snap)
+      nmap=0
+      while ((getline line < mapfile) > 0) {
+        if (line ~ /^#/ || line !~ /\|/) continue
+        nf=split(line, f, "|")
+        file=f[1]; title=f[2]; status=f[3]; note=""
+        if (nf>=4) note=f[4]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", file)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", title)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", status)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", note)
+        if (file=="file" && title=="case title") continue
+        if (file=="" || title=="") continue
+        nmap++
+        if (title=="*") {
+          def[file]=status; defnote[file]=note; defrow[file]=1
+        } else if (title ~ / > \*$/) {
+          p=title; sub(/ > \*$/, "", p)
+          pref[file SUBSEP p]=status; prefnote[file SUBSEP p]=note
+          prefrow[file SUBSEP p]=1; np[file]++
+        } else {
+          exact[file SUBSEP title]=status; exactnote[file SUBSEP title]=note
+          exprow[file SUBSEP title]=1
+        }
+      }
+      close(mapfile)
+    }
+    END {
+      nuncov=0; nstale=0; nbadsyn=0; nmiss=0; nunclass=0
+      # --- resolve each upstream case ---
+      for (i=1;i<=ncase;i++) {
+        file=cfile[i]; title=ctitle[i]; k=file SUBSEP title
+        st=""; how=""
+        if (k in exact) { st=exact[k]; how="explicit" }
+        else {
+          best=""; bl=-1
+          for (p in pref) {
+            split(p, pf, SUBSEP)
+            if (pf[1]==file && index(title, pf[2] " > ")==1 && length(pf[2])>bl) { best=pf[2]; bl=length(pf[2]) }
+          }
+          if (best!="") { st=pref[file SUBSEP best]; how="default" }
+          else if (file in def) { st=def[file]; how="default" }
+        }
+        if (st=="") { printf "UNMAPPED\t%s\t%s\n", file, title; nuncov++; continue }
+        # status validation
+        if (st ~ /^ported:/) { printf "PORTED\t%s\t%s\t%s\t%s\n", file, title, st, how }
+        else if (st ~ /^covered:/) { printf "COVERED\t%s\t%s\t%s\t%s\n", file, title, st, how }
+        else if (st ~ /^different:/) {
+          reason=st; sub(/^different:/, "", reason)
+          if (length(reason) < 15 || reason=="n/a" || reason=="todo") { printf "BADDIFF\t%s\t%s\n", file, title; nbadsyn++ }
+          else printf "DIFFERENT\t%s\t%s\n", file, title
+        }
+        else if (st ~ /^missing:/) {
+          id=st; sub(/^missing:/, "", id)
+          if (id=="") { printf "BADSTATUS\t%s\t%s\n", file, title; nbadsyn++ }
+          else {
+            if (id=="T-UNCLASSIFIED") { nunclass++; if (forbid==1) { printf "UNCLASSIFIED\t%s\t%s\n", file, title; nbadsyn++ } }
+            printf "MISSING\t%s\t%s\t%s\n", file, title, id
+            nmiss++
+          }
+        }
+        else { printf "BADSTATUS\t%s\t%s\n", file, title; nbadsyn++ }
+        # note required on .each/loop-generated claims
+        note = (how=="explicit") ? exactnote[k] : (how=="default" ? "" : "")
+        if (how=="explicit" && (st ~ /^ported:/ || st ~ /^covered:/)) {
+          if ((title ~ /\[dynamic#/ || title ~ /\[dynamic-describe#/ || title ~ /%[sdifjo]/) && note=="") {
+            printf "BADNOTE\t%s\t%s\n", file, title; nbadsyn++
+          }
+        }
+      }
+      # --- explicit rows that match no case are stale ---
+      for (k in exprow) {
+        if (!(k in snapkey)) {
+          split(k, f, SUBSEP)
+          printf "STALE\t%s\t%s\n", f[1], f[2]; nstale++
+        }
+      }
+      # --- defaults must match at least one case and be missing:/different: ---
+      for (file in def) {
+        matched=0
+        for (i=1;i<=ncase;i++) if (cfile[i]==file) matched=1
+        if (!matched) { printf "STALE-DEFAULT\t%s\t*\n", file; nstale++ }
+        st=def[file]
+        if (st !~ /^missing:/ && st !~ /^different:/) { printf "BAD-DEFAULT\t%s\t*\t%s\n", file, st; nbadsyn++ }
+        if (st ~ /^different:/ && index(dec, file)==0) { printf "BAD-DEFAULT\t%s\t*\t%s (different default needs DECISIONS-FOR-USER entry)\n", file, st; nbadsyn++ }
+      }
+      for (p in prefrow) {
+        split(p, pf, SUBSEP); file=pf[1]; prefix=pf[2]
+        matched=0
+        for (i=1;i<=ncase;i++) if (cfile[i]==file && index(ctitle[i], prefix " > ")==1) matched=1
+        if (!matched) { printf "STALE-DEFAULT\t%s\t%s > *\n", file, prefix; nstale++ }
+        st=pref[p]
+        if (st !~ /^missing:/ && st !~ /^different:/) { printf "BAD-DEFAULT\t%s\t%s > *\t%s\n", file, prefix, st; nbadsyn++ }
+        if (st ~ /^different:/ && index(dec, file)==0) { printf "BAD-DEFAULT\t%s\t%s > *\t%s (different default needs DECISIONS-FOR-USER entry)\n", file, prefix, st; nbadsyn++ }
+      }
+      printf "META %d %d %d %d %d %d\n", nuncov, nstale, nmiss, nunclass, nbadsyn, nmap
+    }
+  ' "$SNAP_USE" "$MAP")"
+
+  local nuncov nstale nmiss nunclass nbadsyn nmap
+  read -r nuncov nstale nmiss nunclass nbadsyn nmap < <(printf '%s\n' "$result" | grep '^META' | awk '{print $2, $3, $4, $5, $6, $7}') || true
+  nuncov="${nuncov:-0}"; nstale="${nstale:-0}"; nmiss="${nmiss:-0}"; nunclass="${nunclass:-0}"; nbadsyn="${nbadsyn:-0}"; nmap="${nmap:-0}"
+
+  printf '%s\n' "$result" | grep -E '^(UNMAPPED|STALE|STALE-DEFAULT|BADDIFF|BADSTATUS|BADNOTE|BAD-DEFAULT|UNCLASSIFIED)' | while IFS=$'\t' read -r tag a b c; do
+    case "$tag" in
+      UNMAPPED) echo "UNMAPPED $a | $b" ;;
+      STALE) echo "STALE $a | $b" ;;
+      STALE-DEFAULT) echo "STALE-DEFAULT $a | $b" ;;
+      BADDIFF) echo "BAD-DIFFERENT $a | $b (reason empty or <15 chars)" ;;
+      BADSTATUS) echo "BAD-STATUS $a | $b" ;;
+      BADNOTE) echo "BAD-NOTE $a | $b (.each/loop row needs a note)" ;;
+      BAD-DEFAULT) echo "BAD-DEFAULT $a | $b -> $c (only missing:/different: allowed)" ;;
+      UNCLASSIFIED) echo "UNCLASSIFIED $a | $b (forbidden at this stage)" ;;
+    esac
+  done || true
+
+  # missing: ids need a MISSING.md ticket line (except T-UNCLASSIFIED until the flip)
+  local vbad=0
+  while IFS=$'\t' read -r tag file title id; do
+    [ "$tag" = "MISSING" ] || continue
+    if [ "$id" = "T-UNCLASSIFIED" ]; then
+      [ "$FORBID" = "1" ] || continue
+    fi
+    if ! missing_id_ok "$id"; then
+      echo "MISSING-ID $file | $title -> $id (no MISSING.md line)"
+      vbad=$((vbad+1))
+    fi
+  done < <(printf '%s\n' "$result" | grep '^MISSING') || true
+
+  # ported:/covered: targets must exist
+  while IFS=$'\t' read -r tag file title status how; do
+    case "$tag" in
+      PORTED)
+        target="${status#ported:}"
+        if ! ported_target_ok "$target"; then
+          echo "BAD-PORTED $file | $title -> $target (test fn not found, #[ignore]d, or a helper)"
+          vbad=$((vbad+1))
+        fi
+        ;;
+      COVERED)
+        scen="${status#covered:}"
+        if ! covered_target_ok "$scen"; then
+          echo "BAD-COVERED $file | $title -> $scen (corpus .acp.json/.transcript.jsonl missing)"
+          vbad=$((vbad+1))
+        fi
+        ;;
+    esac
+  done < <(printf '%s\n' "$result" | grep -E '^(PORTED|COVERED)') || true
+  vbad="${vbad:-0}"
+
+  printf 'upstream tests: %d | mapped rows: %d | unmapped: %d | stale: %d | missing(warn): %d | unclassified: %d | broken targets: %d | bad syntax: %d\n' \
+    "$(awk 'END{print NR}' "$SNAP_USE")" "$nmap" "$nuncov" "$nstale" "$nmiss" "$nunclass" "$vbad" "$nbadsyn"
+
+  if [ "$nmiss" -gt 0 ]; then
+    echo "note: $nmiss missing: row(s) warn only (each needs a MISSING.md ticket)"
+  fi
+
+  if [ -n "${regen:-}" ]; then rm -f "$regen"; fi
+
+  totalbad=$((rc + nuncov + nstale + vbad + nbadsyn))
+  if [ "$totalbad" -gt 0 ]; then
+    echo "TEST-MAP CHECK: FAIL ($totalbad problem(s))"
+    return 1
+  fi
+  echo "TEST-MAP CHECK: PASS"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# --reconcile (Decision 11)
+# ---------------------------------------------------------------------------
+do_reconcile() {
+  verify_upstream
+  local tmpdir rc=0 f rel
+  tmpdir="$(mktemp -d)"
+  local files
+  files="$( { find "$UPSTREAM/src/tests" -maxdepth 1 -name '*.test.ts' | sort
+             if [ -f "$UPSTREAM/scripts/next-preview-version.test.mjs" ]; then echo "$UPSTREAM/scripts/next-preview-version.test.mjs"; fi
+           } )"
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rel="${f#$UPSTREAM/}"
+    local scan grep dyn
+    scan="$tmpdir/scan"
+    grep="$tmpdir/grep"
+    dyn="$tmpdir/dyn"
+    LC_ALL=C awk -v file="$rel" -f "$SCRIPTS/scan_tests.awk" "$f" > "$tmpdir/raw"
+    awk -F'\t' 'NF { print $2 }' "$tmpdir/raw" | LC_ALL=C sort -n > "$scan"
+    awk -F'\t' '$3 ~ /\[dynamic/ { print $2 }' "$tmpdir/raw" | LC_ALL=C sort -n > "$dyn"
+    if [ ! -s "$scan" ]; then
+      echo "RECONCILE-ZERO $rel (scanner produced zero rows)"
+      rc=1
+    fi
+    grep -nE '^[[:space:]]*(it|test)(\.[A-Za-z]+(\([^)]*\))?)*\(' "$f" \
+      | sed -E 's/^([0-9]+):.*/\1/' | LC_ALL=C sort -n > "$grep" || true
+
+    # allowlist: file TAB line TAB reason
+    awk -F'\t' -v rel="$rel" -v scanf="$scan" -v grepf="$grep" -v dynf="$dyn" -v allow="$ALLOWLIST" '
+      BEGIN {
+        while ((getline l < allow) > 0) {
+          if (l ~ /^#/ || l !~ /\t/) continue
+          split(l, a, "\t")
+          if (a[1]==rel) allowline[a[2]]=1
+        }
+        close(allow)
+        while ((getline l < scanf) > 0) ins["S" l]=1
+        close(scanf)
+        while ((getline l < grepf) > 0) ins["G" l]=1
+        close(grepf)
+        while ((getline l < dynf) > 0) isdyn[l]=1
+        close(dynf)
+      }
+      END {
+        bad=0
+        for (k in ins) {
+          line = substr(k, 2)
+          inS = (("S" line) in ins)
+          inG = (("G" line) in ins)
+          if (inS && inG) {
+            # both sides agree; an allowlist entry is only justified for a
+            # dynamic-title row (Decision 11(c)), otherwise it is stale.
+            if ((line in allowline) && !(line in isdyn)) {
+              printf "STALE-ALLOWLIST %s:%s\n", rel, line; bad++
+            }
+            continue
+          }
+          if (!(line in allowline)) { printf "MISMATCH %s:%s\n", rel, line; bad++ }
+        }
+        for (l in isdyn) {
+          if (!(l in allowline)) { printf "DYNAMIC-NOT-ALLOWLISTED %s:%s\n", rel, l; bad++ }
+        }
+        print "BAD " (bad+0)
+      }
+    ' < /dev/null > "$tmpdir/recon"
+    local bad
+    bad="$(grep '^BAD ' "$tmpdir/recon" | awk '{print $2}')"
+    if [ "${bad:-0}" -gt 0 ]; then
+      grep -v '^BAD ' "$tmpdir/recon"
+      rc=1
+    fi
+  done <<EOF
+$files
+EOF
+
+  rm -rf "$tmpdir"
+  if [ "$rc" -ne 0 ]; then
+    echo "RECONCILE: FAIL"
+    return 1
+  fi
+  echo "RECONCILE: PASS"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# --diff <old> <new>
+# ---------------------------------------------------------------------------
+do_diff() {
+  [ -f "$DIFF_OLD" ] || { echo "error: $DIFF_OLD not found" >&2; exit 1; }
+  [ -f "$DIFF_NEW" ] || { echo "error: $DIFF_NEW not found" >&2; exit 1; }
+  awk -F'\t' '
+    FNR==NR { old[$1 SUBSEP $2]=$3; ofile[$1]=$3; next }
+    {
+      new[$1 SUBSEP $2]=$3; nfile[$1]=$3
+      if (!(($1 SUBSEP $2) in old)) print "+ " $1 " | " $2
+      else if (old[$1 SUBSEP $2] != $3) print "~ " $1 " | " $2
+    }
+    END {
+      for (k in old) if (!(k in new)) { split(k, a, SUBSEP); print "- " a[1] " | " a[2] }
+      for (f in ofile) if (!(f in nfile)) print "~ file removed " f
+      for (f in nfile) {
+        if (!(f in ofile)) print "~ file added " f
+        else if (ofile[f] != nfile[f]) print "~ file content changed " f
+      }
+    }
+  ' "$DIFF_OLD" "$DIFF_NEW"
+}
+
+# ---------------------------------------------------------------------------
+# --selftest
+# ---------------------------------------------------------------------------
+do_selftest() {
+  local fixture="$SCRIPTS/selftest/fixture.test.ts"
+  if [ ! -f "$fixture" ]; then
+    echo "error: selftest fixture missing: $fixture" >&2
+    echo "SELFTEST: FAIL"
+    return 1
+  fi
+  local out expect rc=0
+  out="$(LC_ALL=C awk -v file="fixture.test.ts" -f "$SCRIPTS/scan_tests.awk" "$fixture" | awk -F'\t' '{print $1 "\t" $3}')"
+  expect="$(cat <<'EOF'
+fixture.test.ts	[dynamic#1]
+fixture.test.ts	multi.line call spanning several lines
+fixture.test.ts	parametrized case for %s
+fixture.test.ts	conditional case
+fixture.test.ts	plain test call
+fixture.test.ts	outer > inner > nested case
+fixture.test.ts	%s group > each-describe case
+fixture.test.ts	skipped describe > skipif case
+fixture.test.ts	runif describe > runif case
+fixture.test.ts	[dynamic-describe#1] > inside dynamic describe
+fixture.test.ts	registered in helper
+fixture.test.ts	[dynamic#2]
+fixture.test.ts	duplicate title
+fixture.test.ts	duplicate title#2
+fixture.test.ts	pipes ¦ in title
+fixture.test.ts	[dynamic#3]
+EOF
+)"
+  if [ "$out" != "$expect" ]; then
+    echo "SELFTEST: FAIL"
+    echo "--- got ---"
+    printf '%s\n' "$out"
+    echo "--- want ---"
+    printf '%s\n' "$expect"
+    return 1
+  fi
+  if ! printf '%s\n' "$out" | awk -F'\t' '
+      { n=split($2, seg, " > "); for (i=1;i<=n;i++) if (seg[i]=="") bad=1 }
+      END { exit(bad ? 1 : 0) }'; then
+    echo "SELFTEST: FAIL (empty path segment)"
+    return 1
+  fi
+
+  # --- mutation suite on a tiny export tree -------------------------------
+  local tmp; tmp="$(mktemp -d)"
+  local exp="$tmp/export" crate="$tmp/rust/claude-agent-acp-rs" corpus="$tmp/corpus"
+  mkdir -p "$exp/src/tests/acp-scenarios/__snapshots__/air" \
+           "$exp/src/tests/acp-scenarios/__snapshots__/v2" \
+           "$exp/src/tests/acp-scenarios/__snapshots__/origin-main/plain" \
+           "$exp/scripts" "$crate/tests" "$corpus"
+
+  local sha; sha="$(git -C "$ROOT" rev-parse -q --verify "$TAG^{commit}")"
+  printf 'v%s\n' "${TAG#v}" > "$exp/.tag-name"
+  printf '%s\n' "$sha" > "$exp/.tag-sha"
+
+  cat > "$exp/src/tests/a.test.ts" <<'EOF'
+describe("group", () => {
+  it("first case", () => {});
+  it.each([["x"]])("each case %s", () => {});
+});
+EOF
+  printf '' > "$exp/src/tests/empty.test.ts"
+  printf '{"x":1}\n' > "$exp/src/tests/acp-scenarios/__snapshots__/air/scen.jsonl"
+  printf '{"x":1}\n' > "$exp/src/tests/acp-scenarios/__snapshots__/v2/scen.jsonl"
+  printf '{"x":1}\n' > "$exp/src/tests/acp-scenarios/__snapshots__/origin-main/plain/scen.jsonl"
+
+  cat > "$crate/tests/agent.rs" <<'EOF'
+#[test]
+fn good_test() {
+    assert!(true);
+}
+
+#[ignore]
+#[test]
+fn ignored_test() {
+    assert!(true);
+}
+
+fn helper_no_attr() {
+    assert!(true);
+}
+EOF
+
+  printf '{}\n' > "$corpus/scen.acp.json"
+  printf '{}\n' > "$corpus/scen.transcript.jsonl"
+
+  printf '| id | description | work package |\n|---|---|---|\n| T-1 | fixture ticket | TBD |\n| T-UNCLASSIFIED | seed rows | TBD |\n' > "$tmp/missing.md"
+
+  local snap="$tmp/snap.tsv" map="$tmp/map.md"
+  TEST_SNAPSHOT_FILE="$snap" bash "$0" --upstream "$exp" --tag "$TAG" --refresh-snapshot >/dev/null 2>&1 || {
+    echo "SELFTEST: FAIL (refresh-snapshot on mini tree)"; rm -rf "$tmp"; return 1; }
+
+  local envs
+  envs="TEST_SNAPSHOT_FILE=$snap MISSING_FILE=$tmp/missing.md DECISIONS_FILE=$tmp/decisions.md ALLOWLIST_FILE=$tmp/allow.tsv CORPUS_DIR=$corpus RUST_ROOT=$tmp/rust"
+  : > "$tmp/decisions.md"
+  : > "$tmp/allow.tsv"
+
+  # helper: run a mutated map and assert FAIL + expected marker
+  check_fail() { # <label> <marker> <mapfile>
+    local label="$1" marker="$2" mf="$3" outf rc2
+    outf="$(TEST_MAP_FILE="$mf" TEST_SNAPSHOT_FILE="$snap" MISSING_FILE="$tmp/missing.md" \
+            DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
+            CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" \
+            bash "$0" --map 2>&1)" && rc2=0 || rc2=$?
+    if [ "$rc2" -ne 0 ] && printf '%s\n' "$outf" | grep -q "$marker"; then
+      echo "  ok: $label"
+    else
+      echo "SELFTEST: FAIL ($label: rc=$rc2, marker '$marker' not found)"
+      printf '%s\n' "$outf" | sed 's/^/    /'
+      rc=1
+    fi
+  }
+
+  # good map (explicit rows): passes
+  {
+    printf 'file | case title | status | note\n'
+    printf 'src/tests/a.test.ts | group > first case | ported:tests/agent.rs::good_test | \n'
+    printf 'src/tests/a.test.ts | group > each case %%s | ported:tests/agent.rs::good_test | covers all variants\n'
+    printf 'src/tests/acp-scenarios/scenarios.ts | scenario > scen | covered:scen | \n'
+  } > "$map"
+  local goodout rc0
+  goodout="$(TEST_MAP_FILE="$map" TEST_SNAPSHOT_FILE="$snap" MISSING_FILE="$tmp/missing.md" \
+             DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
+             CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" bash "$0" --map 2>&1)" && rc0=0 || rc0=$?
+  if [ "$rc0" -ne 0 ]; then
+    echo "SELFTEST: FAIL (good mini map should pass)"
+    printf '%s\n' "$goodout" | sed 's/^/    /'
+    rc=1
+  else
+    echo "  ok: good mini map passes"
+  fi
+
+  # default precedence: a prefix default covers both a.test.ts cases
+  {
+    printf 'file | case title | status | note\n'
+    printf 'src/tests/a.test.ts | group > * | missing:T-1 | \n'
+    printf 'src/tests/acp-scenarios/scenarios.ts | scenario > scen | covered:scen | \n'
+  } > "$tmp/md.md"
+  local dout drc
+  dout="$(TEST_MAP_FILE="$tmp/md.md" TEST_SNAPSHOT_FILE="$snap" MISSING_FILE="$tmp/missing.md" \
+          DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
+          CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" bash "$0" --map 2>&1)" && drc=0 || drc=$?
+  if [ "$drc" -ne 0 ]; then
+    echo "SELFTEST: FAIL (prefix default should cover both cases)"
+    printf '%s\n' "$dout" | sed 's/^/    /'
+    rc=1
+  else
+    echo "  ok: prefix default precedence"
+  fi
+
+  # unmapped: delete the first-case row (the good map has no default)
+  sed '/group > first case/d' "$map" > "$tmp/m1.md"
+  check_fail "unmapped case" "UNMAPPED" "$tmp/m1.md"
+
+  # stale explicit row
+  { cat "$map"; printf 'src/tests/a.test.ts | no such case | missing:T-1 | \n'; } > "$tmp/m2.md"
+  check_fail "stale row" "STALE " "$tmp/m2.md"
+
+  # zero-match default row
+  { cat "$map"; printf 'src/tests/empty.test.ts | * | missing:T-1 | \n'; } > "$tmp/m3.md"
+  check_fail "zero-match default" "STALE-DEFAULT" "$tmp/m3.md"
+
+  # broken ported target
+  sed 's/ported:tests\/agent.rs::good_test/ported:tests\/agent.rs::no_such_fn/' "$map" > "$tmp/m4.md"
+  check_fail "broken ported target" "BAD-PORTED" "$tmp/m4.md"
+
+  # ported target that is #[ignore]d
+  sed 's/ported:tests\/agent.rs::good_test/ported:tests\/agent.rs::ignored_test/' "$map" > "$tmp/m5.md"
+  check_fail "ported target #[ignore]d" "BAD-PORTED" "$tmp/m5.md"
+
+  # ported target that is a helper without a test attribute
+  sed 's/ported:tests\/agent.rs::good_test/ported:tests\/agent.rs::helper_no_attr/' "$map" > "$tmp/m6.md"
+  check_fail "ported target helper" "BAD-PORTED" "$tmp/m6.md"
+
+  # covered without transcript
+  rm -f "$corpus/scen.transcript.jsonl"
+  check_fail "covered without transcript" "BAD-COVERED" "$map"
+  printf '{}\n' > "$corpus/scen.transcript.jsonl"
+
+  # empty different reason
+  sed 's/| ported:tests\/agent.rs::good_test |/| different: |/g' "$map" > "$tmp/m7.md"
+  check_fail "empty different reason" "BAD-DIFFERENT" "$tmp/m7.md"
+
+  # ported/covered default rejected
+  { cat "$map"; printf 'src/tests/a.test.ts | * | ported:tests/agent.rs::good_test | \n'; } > "$tmp/m8.md"
+  check_fail "ported default rejected" "BAD-DEFAULT" "$tmp/m8.md"
+
+  # .each row without note
+  sed 's/| covers all variants//' "$map" > "$tmp/m9.md"
+  check_fail "each row without note" "BAD-NOTE" "$tmp/m9.md"
+
+  # missing id without a ticket line
+  sed 's/ported:tests\/agent.rs::good_test/missing:T-999/g' "$map" > "$tmp/m10.md"
+  check_fail "missing id without ticket" "MISSING-ID" "$tmp/m10.md"
+
+  # missing snapshot
+  mv "$snap" "$tmp/snap.bak"
+  check_fail "missing snapshot" "missing snapshot" "$map"
+  mv "$tmp/snap.bak" "$snap"
+
+  # zero-row file
+  printf 'describe("x", () => {});\n' > "$exp/src/tests/empty.test.ts"
+  TEST_SNAPSHOT_FILE="$tmp/snap2.tsv" bash "$0" --upstream "$exp" --tag "$TAG" --refresh-snapshot >/dev/null 2>&1 || true
+  local zout zrc
+  zout="$(TEST_MAP_FILE="$map" TEST_SNAPSHOT_FILE="$tmp/snap2.tsv" MISSING_FILE="$tmp/missing.md" \
+          DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
+          CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" bash "$0" --reconcile --upstream "$exp" --tag "$TAG" 2>&1)" && zrc=0 || zrc=$?
+  if [ "$zrc" -ne 0 ] && printf '%s\n' "$zout" | grep -q "RECONCILE-ZERO"; then
+    echo "  ok: zero-row file fails reconcile"
+  else
+    echo "SELFTEST: FAIL (zero-row file: rc=$zrc)"
+    rc=1
+  fi
+  printf 'describe("group", () => { it("first case", () => {}); });\n' > "$exp/src/tests/empty.test.ts"
+
+  # wrong .tag-sha
+  printf 'deadbeef\n' > "$exp/.tag-sha"
+  local tout trc
+  tout="$(TEST_MAP_FILE="$map" TEST_SNAPSHOT_FILE="$snap" MISSING_FILE="$tmp/missing.md" \
+          DECISIONS_FILE="$tmp/decisions.md" ALLOWLIST_FILE="$tmp/allow.tsv" \
+          CORPUS_DIR="$corpus" RUST_ROOT="$tmp/rust" \
+          bash "$0" --map --upstream "$exp" --tag "$TAG" 2>&1)" && trc=0 || trc=$?
+  if [ "$trc" -ne 0 ] && printf '%s\n' "$tout" | grep -q ".tag-sha"; then
+    echo "  ok: wrong .tag-sha fails"
+  else
+    echo "SELFTEST: FAIL (wrong .tag-sha: rc=$trc)"
+    rc=1
+  fi
+
+  rm -rf "$tmp"
+  if [ "$rc" -ne 0 ]; then
+    echo "SELFTEST: FAIL"
+    return 1
+  fi
+  echo "SELFTEST: PASS"
+  return 0
+}
+
+case "$MODE" in
+  list) do_list ;;
+  seed) do_seed ;;
+  refresh) do_refresh ;;
+  summary) do_summary ;;
+  groups) do_groups ;;
+  unresolved) do_unresolved ;;
+  reconcile) do_reconcile ;;
+  diff) do_diff ;;
+  selftest) do_selftest ;;
+  map) do_map ;;
+esac

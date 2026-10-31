@@ -4,42 +4,17 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+pub use crate::session_model::{
+    canonicalize_model_id, context_hint_of, extract_model_family_version, get_available_models,
+    match_resumed_model, model_versions_compatible, resolve_model_preference, strip_context_hints,
+    versioned_model_display_name, AvailableModel, ModelInfo, ModelSelection, MODEL_CONFIG_ID,
+};
 
 pub const MODE_CONFIG_ID: &str = "mode";
-pub const MODEL_CONFIG_ID: &str = "model";
 pub const EFFORT_CONFIG_ID: &str = "effort";
 pub const AUTO_MODE_FALLBACK: &str = "acceptEdits";
-
-/// Model metadata surfaced by the SDK during initialize.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelInfo {
-    pub value: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_auto_mode: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_effort: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supported_effort_levels: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_fast_mode: Option<bool>,
-}
-
-/// An available model option in the picker.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AvailableModel {
-    pub model_id: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
 
 /// An available permission mode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,6 +78,8 @@ pub struct SessionConfigState {
     pub is_air: bool,
     pub ultracode: bool,
     pub pre_plan_mode: Option<String>,
+    /// Backend key for the cross-session context-window cache (F5b/B-70).
+    pub provider_cache_key: String,
 }
 
 impl Default for ModesState {
@@ -194,328 +171,8 @@ pub fn build_mode_config_option(modes: &ModesState) -> ConfigOption {
 }
 
 // ---------------------------------------------------------------------------
-// Model matching and resolution (session-model.js)
+// Model config option composition
 // ---------------------------------------------------------------------------
-
-pub fn strip_context_hints(value: &str) -> String {
-    let mut s = value.to_string();
-    // Strip `[<digits>m]`
-    while let Some(start) = s.rfind('[') {
-        if let Some(rel_end) = s[start..].find(']') {
-            let end = start + rel_end;
-            let inner = &s[start + 1..end];
-            if inner.ends_with('m') || inner.ends_with('M') {
-                let digits = &inner[..inner.len() - 1];
-                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                    s.replace_range(start..=end, "");
-                    continue;
-                }
-            }
-        }
-        break;
-    }
-    // Strip `-<digits>m` at the end
-    if let Some(dash) = s.rfind('-') {
-        let suffix = &s[dash + 1..];
-        if suffix.ends_with('m') || suffix.ends_with('M') {
-            let digits = &suffix[..suffix.len() - 1];
-            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                s.truncate(dash);
-            }
-        }
-    }
-    s
-}
-
-pub fn canonicalize_model_id(value: &str) -> String {
-    let trimmed = value.trim().to_lowercase();
-    if let Some(dash) = trimmed.rfind('-') {
-        let suffix = &trimmed[dash + 1..];
-        if suffix.ends_with('m') {
-            if let Some(digits) = suffix.strip_suffix('m') {
-                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                    return format!("{}[{suffix}]", &trimmed[..dash]);
-                }
-            }
-        }
-    }
-    trimmed
-}
-
-pub fn context_hint_of(value: &str) -> Option<String> {
-    let canon = canonicalize_model_id(value);
-    let start = canon.rfind('[')?;
-    let end = canon.rfind(']')?;
-    if end > start + 1 {
-        let inner = &canon[start + 1..end];
-        if inner.ends_with('m') && inner[..inner.len() - 1].chars().all(|c| c.is_ascii_digit()) {
-            return Some(inner.to_string());
-        }
-    }
-    None
-}
-
-pub fn extract_model_family_version(value: &str) -> Option<String> {
-    let stripped = strip_context_hints(value);
-    let words = stripped.split(|c: char| !c.is_alphanumeric() && c != '.' && c != '-');
-    for word in words {
-        let parts: Vec<&str> = word.split(['.', '-']).collect();
-        if !parts.is_empty() && parts[0].chars().all(|c| c.is_ascii_digit()) && !parts[0].is_empty()
-        {
-            if parts.len() > 1
-                && parts[1].chars().all(|c| c.is_ascii_digit())
-                && !parts[1].is_empty()
-            {
-                return Some(format!("{}.{}", parts[0], parts[1]));
-            } else {
-                return Some(parts[0].to_string());
-            }
-        }
-    }
-    None
-}
-
-pub fn model_versions_compatible(preference: &str, candidate: &ModelInfo) -> bool {
-    let Some(preferred) = extract_model_family_version(preference) else {
-        return true;
-    };
-    let candidate_version = extract_model_family_version(&candidate.value)
-        .or_else(|| extract_model_family_version(&candidate.display_name))
-        .or_else(|| extract_model_family_version(&candidate.description));
-    match candidate_version {
-        Some(cand) => preferred == cand,
-        None => true,
-    }
-}
-
-fn display_model_version(model: &ModelInfo, family: &str) -> Option<String> {
-    let family_lower = family.to_lowercase();
-    for source in [
-        model.resolved_model.as_deref(),
-        Some(model.description.as_str()),
-        Some(model.value.as_str()),
-    ] {
-        let Some(text) = source else { continue };
-        let lower = text.to_lowercase();
-        if let Some(pos) = lower.find(&family_lower) {
-            let after = &lower[pos + family_lower.len()..];
-            let after_trimmed = after.trim_start_matches(['-', ' ']);
-            let mut parts =
-                after_trimmed.split(|c: char| !c.is_alphanumeric() && c != '.' && c != '-');
-            if let Some(candidate) = parts.next() {
-                let subparts: Vec<&str> = candidate.split(['.', '-']).collect();
-                if !subparts.is_empty()
-                    && subparts[0].chars().all(|c| c.is_ascii_digit())
-                    && !subparts[0].is_empty()
-                {
-                    if subparts.len() > 1
-                        && subparts[1].chars().all(|c| c.is_ascii_digit())
-                        && !subparts[1].is_empty()
-                    {
-                        return Some(format!("{}.{}", subparts[0], subparts[1]));
-                    } else {
-                        return Some(subparts[0].to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-pub fn versioned_model_display_name(model: &ModelInfo) -> String {
-    let name = model.display_name.trim();
-    // Match `^(?:Claude\s+)?([a-z][a-z0-9-]*)(?:\s+\d+(?:\.\d+)?)?(?:\s+\(\d+[mk]\s+context\))?$`
-    let stripped_claude = if let Some(rest) = name.strip_prefix("Claude ") {
-        rest
-    } else {
-        name
-    };
-    let mut tokens = stripped_claude.split_whitespace();
-    let Some(first_word) = tokens.next() else {
-        return name.to_string();
-    };
-    if !first_word
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return name.to_string();
-    }
-    let family = first_word;
-    let Some(version) = display_model_version(model, family) else {
-        return name.to_string();
-    };
-
-    // If displayName already has version digits, keep original
-    let without_context = if let Some(idx) = name.find(" (") {
-        &name[..idx]
-    } else {
-        name
-    };
-    if without_context.split_whitespace().any(|word| {
-        word.chars().any(|c| c.is_ascii_digit()) && !word.ends_with('k') && !word.ends_with('m')
-    }) {
-        return name.to_string();
-    }
-
-    if let Some(idx) = name.find(" (") {
-        let suffix = &name[idx..];
-        format!("{without_context} {version}{suffix}")
-    } else {
-        format!("{without_context} {version}")
-    }
-}
-
-fn tokenize_model_preference(model: &str) -> (Vec<String>, Option<String>) {
-    let lower = model.trim().to_lowercase();
-    let context_hint = context_hint_of(&lower);
-    let mut tokens = Vec::new();
-    for part in lower.split(|c: char| !c.is_alphanumeric()) {
-        if part.is_empty() {
-            continue;
-        }
-        let token = if part == "opusplan" {
-            "opus"
-        } else if part == "best" || part == "default" || part == "claude" {
-            continue;
-        } else {
-            part
-        };
-        if token.chars().any(|c| c.is_alphabetic()) || token.ends_with('m') {
-            tokens.push(token.to_string());
-        }
-    }
-    (tokens, context_hint)
-}
-
-fn score_model_match(model: &ModelInfo, tokens: &[String], context_hint: Option<&str>) -> usize {
-    let haystack = format!("{} {}", model.value, model.display_name).to_lowercase();
-    let mut score = 0;
-    let mut non_hint_matched = false;
-    for token in tokens {
-        if !haystack.contains(token) {
-            continue;
-        }
-        if Some(token.as_str()) != context_hint {
-            non_hint_matched = true;
-        }
-        score += if Some(token.as_str()) == context_hint {
-            3
-        } else {
-            1
-        };
-    }
-    if context_hint.is_some() && !non_hint_matched {
-        0
-    } else {
-        score
-    }
-}
-
-pub fn resolve_model_preference(models: &[ModelInfo], preference: &str) -> Option<ModelInfo> {
-    let trimmed = preference.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_lowercase();
-    let canon_pref = canonicalize_model_id(trimmed);
-
-    // 1. Direct match on value, canonicalized value, or display_name
-    if let Some(m) = models.iter().find(|m| {
-        m.value == trimmed
-            || canonicalize_model_id(&m.value) == canon_pref
-            || m.display_name.to_lowercase() == lower
-    }) {
-        return Some(m.clone());
-    }
-
-    // 2. Matches resolvedModel
-    let matches_resolved = |m: &ModelInfo| {
-        m.resolved_model
-            .as_deref()
-            .is_some_and(|r| canonicalize_model_id(r) == canon_pref)
-    };
-    if let Some(m) = models
-        .iter()
-        .find(|m| m.value != "default" && matches_resolved(m))
-        .or_else(|| models.iter().find(|m| matches_resolved(m)))
-    {
-        return Some(m.clone());
-    }
-
-    // 3. Includes match
-    let pref_hint = context_hint_of(trimmed);
-    if let Some(m) = models.iter().find(|m| {
-        if !model_versions_compatible(trimmed, m) {
-            return false;
-        }
-        if context_hint_of(&m.value) != pref_hint {
-            return false;
-        }
-        let v = m.value.to_lowercase();
-        let d = m.display_name.to_lowercase();
-        v.contains(&lower) || d.contains(&lower) || lower.contains(&v)
-    }) {
-        return Some(m.clone());
-    }
-
-    // 4. Token-based scoring
-    let (tokens, context_hint) = tokenize_model_preference(trimmed);
-    if tokens.is_empty() {
-        return None;
-    }
-    let mut best_match: Option<&ModelInfo> = None;
-    let mut best_score = 0;
-    for model in models {
-        if !model_versions_compatible(trimmed, model) {
-            continue;
-        }
-        let score = score_model_match(model, &tokens, context_hint.as_deref());
-        if score > 0 && score > best_score {
-            best_match = Some(model);
-            best_score = score;
-        }
-    }
-
-    best_match.cloned()
-}
-
-pub fn match_resumed_model(models: &[ModelInfo], live_model: &str) -> ModelInfo {
-    let live = canonicalize_model_id(live_model);
-    let default_entry = models.iter().find(|m| m.value == "default");
-    let default_resolved = default_entry
-        .and_then(|m| m.resolved_model.as_deref())
-        .map(canonicalize_model_id);
-
-    if let Some(default_entry) = default_entry {
-        if default_resolved.as_deref() == Some(&live) {
-            return default_entry.clone();
-        }
-    }
-
-    if let Some(exact) = models.iter().find(|m| {
-        m.resolved_model
-            .as_deref()
-            .is_some_and(|r| canonicalize_model_id(r) == live)
-    }) {
-        return exact.clone();
-    }
-
-    if let Some(default_entry) = default_entry {
-        if let Some(ref d_res) = default_resolved {
-            if strip_context_hints(d_res) == strip_context_hints(&live) {
-                return default_entry.clone();
-            }
-        }
-    }
-
-    resolve_model_preference(models, live_model).unwrap_or_else(|| ModelInfo {
-        value: live_model.to_string(),
-        display_name: live_model.to_string(),
-        description: String::new(),
-        ..Default::default()
-    })
-}
 
 pub fn build_model_config_option(
     available_models: &[AvailableModel],
@@ -744,107 +401,8 @@ pub fn build_effort_config_option(
 }
 
 // ---------------------------------------------------------------------------
-// Model catalog computation (getAvailableModels)
+// Config option composition
 // ---------------------------------------------------------------------------
-
-pub fn get_available_models(
-    models: &[ModelInfo],
-    sdk_models: &[ModelInfo],
-    settings_model: Option<&str>,
-    env_model: Option<&str>,
-    is_resumed_session: bool,
-    resumed_model_hint: Option<&str>,
-) -> (Vec<AvailableModel>, String, bool) {
-    if models.is_empty() {
-        let cur = if is_resumed_session {
-            resumed_model_hint.unwrap_or(
-                sdk_models
-                    .first()
-                    .map(|m| m.value.as_str())
-                    .unwrap_or("default"),
-            )
-        } else {
-            sdk_models
-                .first()
-                .map(|m| m.value.as_str())
-                .unwrap_or("default")
-        };
-        return (Vec::new(), cur.to_string(), false);
-    }
-
-    let mut current_model = &models[0];
-    let mut resolved_from_input: Option<String> = None;
-
-    if let Some(env_m) = env_model {
-        if !env_m.trim().is_empty() {
-            if let Some(matched) = resolve_model_preference(models, env_m) {
-                if let Some(pos) = models.iter().position(|m| m.value == matched.value) {
-                    current_model = &models[pos];
-                    resolved_from_input = Some(env_m.to_string());
-                }
-            }
-        }
-    } else if let Some(sett_m) = settings_model {
-        if !sett_m.trim().is_empty() {
-            if let Some(matched) = resolve_model_preference(models, sett_m) {
-                if let Some(pos) = models.iter().position(|m| m.value == matched.value) {
-                    current_model = &models[pos];
-                    resolved_from_input = Some(sett_m.to_string());
-                }
-            }
-        }
-    }
-
-    if resolved_from_input.is_none() && is_resumed_session {
-        if let Some(hint) = resumed_model_hint {
-            let matched = match_resumed_model(models, hint);
-            if let Some(pos) = models.iter().position(|m| m.value == matched.value) {
-                current_model = &models[pos];
-            }
-        }
-    }
-
-    let sdk_saw_same_value = sdk_models.iter().any(|m| m.value == current_model.value);
-    let sdk_default = sdk_models.iter().find(|m| m.value == "default");
-    let sdk_default_dropped = sdk_default.is_some() && !models.iter().any(|m| m.value == "default");
-    let switch_to_listed = resolved_from_input.is_none()
-        && (!is_resumed_session || resumed_model_hint.is_none())
-        && sdk_default_dropped;
-
-    let skip_set_model = (resolved_from_input.is_none() && !switch_to_listed)
-        || (!is_resumed_session
-            && resolved_from_input.as_deref() == Some(&current_model.value)
-            && sdk_saw_same_value);
-
-    let display_names: Vec<String> = models.iter().map(versioned_model_display_name).collect();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for name in &display_names {
-        *counts.entry(name.clone()).or_insert(0) += 1;
-    }
-
-    let available: Vec<AvailableModel> = models
-        .iter()
-        .enumerate()
-        .map(|(i, model)| {
-            let name = if counts.get(&display_names[i]) == Some(&1) {
-                display_names[i].clone()
-            } else {
-                model.display_name.clone()
-            };
-            AvailableModel {
-                model_id: model.value.clone(),
-                name,
-                description: if model.description.is_empty() {
-                    None
-                } else {
-                    Some(model.description.clone())
-                },
-            }
-        })
-        .collect();
-
-    (available, current_model.value.clone(), !skip_set_model)
-}
 
 /// Compose all session config options for a session.
 pub fn build_config_options(
@@ -940,117 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn inv_62_resolve_model_preference_table() {
-        let models = vec![
-            ModelInfo {
-                value: "claude-sonnet-4-5".into(),
-                display_name: "Claude Sonnet 4.5".into(),
-                description: "Fast, efficient model".into(),
-                ..Default::default()
-            },
-            ModelInfo {
-                value: "claude-haiku-4-5".into(),
-                display_name: "Claude Haiku 4.5".into(),
-                description: "Lightweight model".into(),
-                ..Default::default()
-            },
-            ModelInfo {
-                value: "claude-opus-4".into(),
-                display_name: "Claude Opus 4".into(),
-                description: "Powerful reasoning model".into(),
-                ..Default::default()
-            },
-        ];
-
-        // Exact match
-        assert_eq!(
-            resolve_model_preference(&models, "claude-sonnet-4-5")
-                .unwrap()
-                .value,
-            "claude-sonnet-4-5"
-        );
-        // Alias match
-        assert_eq!(
-            resolve_model_preference(&models, "sonnet").unwrap().value,
-            "claude-sonnet-4-5"
-        );
-        assert_eq!(
-            resolve_model_preference(&models, "haiku").unwrap().value,
-            "claude-haiku-4-5"
-        );
-        assert_eq!(
-            resolve_model_preference(&models, "opus").unwrap().value,
-            "claude-opus-4"
-        );
-        // Unknown
-        assert!(resolve_model_preference(&models, "gpt-4o").is_none());
-        assert!(resolve_model_preference(&models, "").is_none());
-    }
-
-    #[test]
-    fn inv_62_match_resumed_model() {
-        let models = vec![
-            ModelInfo {
-                value: "claude-sonnet-4-5".into(),
-                display_name: "Claude Sonnet 4.5".into(),
-                description: "".into(),
-                resolved_model: Some("claude-sonnet-4-5-20251001".into()),
-                ..Default::default()
-            },
-            ModelInfo {
-                value: "default".into(),
-                display_name: "Default".into(),
-                description: "".into(),
-                resolved_model: Some("claude-sonnet-4-5-20251001".into()),
-                ..Default::default()
-            },
-        ];
-
-        let matched = match_resumed_model(&models, "claude-sonnet-4-5-20251001");
-        assert_eq!(matched.value, "default");
-
-        let matched_other = match_resumed_model(&models, "claude-haiku-4-5");
-        assert_eq!(matched_other.value, "claude-haiku-4-5");
-    }
-
-    #[test]
-    fn inv_62_get_available_models_env_and_settings() {
-        let models = vec![
-            ModelInfo {
-                value: "claude-sonnet-4-5".into(),
-                display_name: "Claude Sonnet 4.5".into(),
-                description: "Desc".into(),
-                ..Default::default()
-            },
-            ModelInfo {
-                value: "claude-haiku-4-5".into(),
-                display_name: "Claude Haiku 4.5".into(),
-                description: "Desc".into(),
-                ..Default::default()
-            },
-        ];
-
-        // Default picks first model
-        let (avail, cur, need_sync) =
-            get_available_models(&models, &models, None, None, false, None);
-        assert_eq!(avail.len(), 2);
-        assert_eq!(cur, "claude-sonnet-4-5");
-        assert!(!need_sync);
-
-        // Env model overrides
-        let (_, cur_env, need_sync_env) =
-            get_available_models(&models, &models, None, Some("haiku"), false, None);
-        assert_eq!(cur_env, "claude-haiku-4-5");
-        assert!(need_sync_env);
-
-        // Settings model overrides when env unset
-        let (_, cur_sett, need_sync_sett) =
-            get_available_models(&models, &models, Some("haiku"), None, false, None);
-        assert_eq!(cur_sett, "claude-haiku-4-5");
-        assert!(need_sync_sett);
-    }
-
-    #[test]
     fn inv_62_model_option_shape() {
         let models = vec![ModelInfo {
             value: "claude-sonnet-4-5".into(),
@@ -1060,14 +507,22 @@ mod tests {
             supported_effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
             ..Default::default()
         }];
-        let (avail, cur, _) = get_available_models(&models, &models, None, None, false, None);
-        let opt = build_model_config_option(&avail, &cur, &models, false);
+        let selection = crate::session_model::get_available_models(
+            &models, &models, None, None, false, None, false,
+        );
+        let opt = build_model_config_option(
+            &selection.available_models,
+            &selection.current_model_id,
+            &models,
+            false,
+        );
         assert_eq!(opt.id, "model");
         assert_eq!(opt.current_value, "claude-sonnet-4-5");
         assert_eq!(opt.options.len(), 1);
         assert_eq!(opt.options[0].value, "claude-sonnet-4-5");
 
-        let effort_opt = build_effort_config_option(&models, &cur, None, false).unwrap();
+        let effort_opt =
+            build_effort_config_option(&models, &selection.current_model_id, None, false).unwrap();
         assert_eq!(effort_opt.id, "effort");
         assert_eq!(effort_opt.current_value, "default");
         assert_eq!(effort_opt.options.len(), 4); // default, low, medium, high
@@ -1087,8 +542,17 @@ mod tests {
             display_name: "Sonnet".into(),
             ..Default::default()
         }];
-        let (avail, cur, _) = get_available_models(&models, &models, None, None, false, None);
-        let config_opts = build_config_options(&modes, &avail, &cur, &models, None, false);
+        let selection = crate::session_model::get_available_models(
+            &models, &models, None, None, false, None, false,
+        );
+        let config_opts = build_config_options(
+            &modes,
+            &selection.available_models,
+            &selection.current_model_id,
+            &models,
+            None,
+            false,
+        );
 
         // Unknown config option check
         let opt = config_opts.iter().find(|o| o.id == "bogus");

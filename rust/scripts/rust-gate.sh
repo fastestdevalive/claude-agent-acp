@@ -62,6 +62,9 @@ if [ "$(cargo tree --manifest-path "$MANIFEST" -d | grep -c '^agent-client-proto
     exit 1
 fi
 
+echo "==> parity maps (TEST-MAP + MODULE-MAP)"
+run_timeout 180 bash "$RUST/scripts/parity/gate-parity.sh"
+
 echo "==> upstream ahead (non-failing)"
 run_timeout 20 bash "$RUST/scripts/upstream-ahead.sh" || true
 

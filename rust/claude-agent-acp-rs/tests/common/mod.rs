@@ -918,6 +918,20 @@ fn run_recorder_inner(
             command.env(key, val);
         }
     }
+    // Per-script environment (e.g. `NO_BROWSER=1` for the remote-login auth
+    // corpus). The recorder passes its environment on to the agent, so the
+    // adapter reads the same hermetic values the Node oracle saw at capture.
+    if let Ok(text) = std::fs::read_to_string(script_path) {
+        if let Ok(script) = serde_json::from_str::<Value>(&text) {
+            if let Some(env) = script.get("env").and_then(Value::as_object) {
+                for (key, value) in env {
+                    if let Some(value) = value.as_str() {
+                        command.env(key, value);
+                    }
+                }
+            }
+        }
+    }
     command
         .arg(agent_cmd)
         .arg(script_path)
@@ -964,6 +978,50 @@ pub fn normalize_root_paths(frames: Vec<Frame>, root: &Path) -> Vec<Frame> {
         .map(|frame| Frame {
             direction: frame.direction,
             json: replace_strings(frame.json, &root_str, "$ROOT"),
+        })
+        .collect()
+}
+
+/// Normalise the volatile agent entrypoint in `_meta["terminal-auth"]`.
+///
+/// Node's `process.execPath` + `process.argv.slice(1)` and the Rust binary's
+/// `current_exe()` + args are different by design, so the differential maps
+/// `command` to `$EXEC` and drops the leading entrypoint argument. Every
+/// remaining flag is still compared exactly. `capture.sh` applies the same
+/// rewrite to the committed fixture.
+pub fn normalize_terminal_auth(frames: Vec<Frame>) -> Vec<Frame> {
+    frames
+        .into_iter()
+        .map(|mut frame| {
+            if let Some(methods) = frame
+                .json
+                .get_mut("result")
+                .and_then(|result| result.get_mut("authMethods"))
+                .and_then(Value::as_array_mut)
+            {
+                for method in methods {
+                    let Some(terminal_auth) = method
+                        .get_mut("_meta")
+                        .and_then(|meta| meta.get_mut("terminal-auth"))
+                    else {
+                        continue;
+                    };
+                    if terminal_auth.get("command").is_some() {
+                        terminal_auth["command"] = Value::String("$EXEC".to_string());
+                    }
+                    if let Some(args) = terminal_auth.get_mut("args").and_then(Value::as_array_mut)
+                    {
+                        let drop_entrypoint = args
+                            .first()
+                            .and_then(Value::as_str)
+                            .is_some_and(|arg| !arg.starts_with("--"));
+                        if drop_entrypoint {
+                            args.remove(0);
+                        }
+                    }
+                }
+            }
+            frame
         })
         .collect()
 }

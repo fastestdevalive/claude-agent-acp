@@ -480,6 +480,36 @@ pub enum AuthCmd {
     },
 }
 
+/// The auth-probe context Node compares in `useAuthStatusSettings`
+/// (`acp-agent.ts:3324-3346`): the settings cwd, the api-key helper, and the
+/// launch env serialized with `JSON.stringify` (`None` for `undefined`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthContext {
+    pub cwd: PathBuf,
+    pub api_key_helper: Option<String>,
+    pub env: Option<String>,
+}
+
+impl Default for AuthContext {
+    /// Node's initial context: the process cwd, no helper, no env
+    /// (`this.authStatusSettings?.manager.getCwd() ?? process.cwd()`, `helper
+    /// !== undefined`, `JSON.stringify(undefined) !== undefined`).
+    fn default() -> Self {
+        Self {
+            cwd: std::env::current_dir().unwrap_or_default(),
+            api_key_helper: None,
+            env: None,
+        }
+    }
+}
+
+/// Whether a new auth-probe context differs from the previous one — cwd OR
+/// api-key helper OR serialized `options.env` (D10 / Decision 12). An equal
+/// context does not re-probe.
+pub fn auth_context_changed(prev: &AuthContext, next: &AuthContext) -> bool {
+    prev.cwd != next.cwd || prev.api_key_helper != next.api_key_helper || prev.env != next.env
+}
+
 /// Cheap handle to the actor.
 #[derive(Debug, Clone)]
 pub struct AuthHandle {
@@ -992,5 +1022,42 @@ mod tests {
             next_push(&mut push_rx).await,
             Some(acct("pro", Some("a@b.c"), Some("Org")).to_json())
         );
+    }
+
+    /// D10 (Decision 12) — the `useAuthStatusSettings` change rule: cwd, the
+    /// api-key helper and the serialized launch env each trigger a re-probe;
+    /// an equal context does not.
+    #[test]
+    fn inv_78_context_change_rules() {
+        let base = AuthContext {
+            cwd: PathBuf::from("/repo"),
+            api_key_helper: None,
+            env: None,
+        };
+        assert!(!auth_context_changed(&base, &base.clone()));
+
+        let other_cwd = AuthContext {
+            cwd: PathBuf::from("/elsewhere"),
+            ..base.clone()
+        };
+        assert!(auth_context_changed(&base, &other_cwd));
+
+        let helper = AuthContext {
+            api_key_helper: Some("/bin/helper".into()),
+            ..base.clone()
+        };
+        assert!(auth_context_changed(&base, &helper));
+
+        let env = AuthContext {
+            env: Some("{\"CLAUDE_CODE_ARTIFACT\":\"1\"}".into()),
+            ..base.clone()
+        };
+        assert!(auth_context_changed(&base, &env));
+        // Equal serialized env does not re-probe.
+        let same_env = AuthContext {
+            env: Some("{\"CLAUDE_CODE_ARTIFACT\":\"1\"}".into()),
+            ..base.clone()
+        };
+        assert!(!auth_context_changed(&env, &same_env));
     }
 }

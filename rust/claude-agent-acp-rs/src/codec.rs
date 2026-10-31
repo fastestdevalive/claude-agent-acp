@@ -14,11 +14,16 @@
 //! is cancel-safe: a cancel that races the reader task never drops a line that
 //! was already enqueued (INV-32).
 
+use std::collections::HashMap;
 use std::io;
 
-use serde_json::Value;
+use agent_client_protocol::{Agent, ConnectTo, Lines};
+use futures::StreamExt as _;
+use serde_json::{json, Value};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 /// A pure newline splitter that also handles CRLF and UTF-8 multi-byte
@@ -125,6 +130,400 @@ pub fn spawn_codec(
         Ok(())
     });
     (rx, handle)
+}
+
+// ---------------------------------------------------------------------------
+// Client transport wire codec (ROADMAP F2c / M-126)
+// ---------------------------------------------------------------------------
+//
+// The ACP client speaks newline-delimited JSON to us on stdin. The pinned
+// `agent-client-protocol` crate already splits lines and routes JSON-RPC, but
+// two wire details differ from Node's `ndJsonStream`
+// (`@agentclientprotocol/sdk/dist/core/stream.js`):
+//
+// - a line that is not JSON gets `{"jsonrpc":"2.0","id":null,"error":
+//   {"code":-32700,"message":"Parse error"}}` (the crate adds `data:{line}`),
+// - outgoing request ids are uuid strings (the crate), while Node allocates
+//   numbers (`nextRequestId++`, `core/jsonrpc.js:546`), so
+//   `session/request_permission` must carry a NUMBER id.
+//
+// [`WireTransport`] wraps the crate's line transport: it parses/validates each
+// inbound line exactly like `ndJsonStream`, answers malformed lines itself,
+// and translates outgoing ids (and the client's replies) through [`RequestIds`].
+// The crate stays at 2.1.0 (guard G10) — no patching.
+
+/// The outcome of parsing one line of the ACP client wire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WireLine {
+    /// A JSON object or array; Node's `ndJsonStream` enqueues it as-is.
+    Message(Value),
+    /// The line is not JSON: Node answers `-32700 Parse error`.
+    ParseError,
+    /// Valid JSON that is neither an object nor an array: Node answers
+    /// `-32600 Invalid request` with the value as `data`.
+    InvalidRequest(Value),
+    /// A blank line: Node's stream skips it.
+    Empty,
+}
+
+/// Port of Node's `ndJsonStream` line handling: trim the line, skip blanks,
+/// `JSON.parse` it, and classify objects/arrays as protocol messages while
+/// everything else is answered at the transport.
+pub fn parse_wire_line(line: &str) -> WireLine {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return WireLine::Empty;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => WireLine::Message(value),
+        Ok(value) => WireLine::InvalidRequest(value),
+        Err(_) => WireLine::ParseError,
+    }
+}
+
+/// The reply Node's `ndJsonStream` writes for an unparsable line
+/// (`protocolErrorResponse(RequestError.parseError())`).
+pub fn parse_error_reply() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": Value::Null,
+        "error": { "code": -32700, "message": "Parse error" },
+    })
+}
+
+/// The reply Node's `ndJsonStream` writes for JSON that is not an object or
+/// array (`RequestError.invalidRequest(value)`, `data` = the value).
+pub fn invalid_request_reply(value: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": Value::Null,
+        "error": { "code": -32600, "message": "Invalid request", "data": value.clone() },
+    })
+}
+
+/// Outgoing request-id translation for the stdio transport.
+///
+/// Node's ACP SDK allocates outgoing request ids as numbers (`nextRequestId++`,
+/// `core/jsonrpc.js:546`); the pinned crate allocates uuid strings. This map
+/// rewrites each outgoing request id to the next number and maps the client's
+/// numeric reply (and an outgoing `$/cancel_request`'s `requestId`) back to the
+/// crate's string id.
+#[derive(Debug, Default)]
+pub struct RequestIds {
+    next: u64,
+    by_string: HashMap<String, u64>,
+    by_number: HashMap<u64, String>,
+}
+
+impl RequestIds {
+    /// Assign (or reuse) the numeric id for a crate-generated string id.
+    fn number_for(&mut self, id: &str) -> u64 {
+        if let Some(number) = self.by_string.get(id) {
+            return *number;
+        }
+        let number = self.next;
+        self.next += 1;
+        self.by_string.insert(id.to_string(), number);
+        self.by_number.insert(number, id.to_string());
+        number
+    }
+
+    /// Remember a `(number, string id)` pair assigned by the writer side, so
+    /// the reader can map the client's numeric reply back.
+    pub fn remember(&mut self, number: u64, id: &str) {
+        self.by_number.insert(number, id.to_string());
+    }
+
+    /// Rewrite one outgoing value in place: a request's `id` becomes a number,
+    /// and an outgoing `$/cancel_request`'s `params.requestId` follows the same
+    /// mapping. Returns the newly assigned `(number, original id)` pair (if
+    /// any) so the reader can remember it.
+    pub fn rewrite_outgoing(&mut self, value: &mut Value) -> Option<(u64, String)> {
+        let object = value.as_object_mut()?;
+        let method = object.get("method").and_then(Value::as_str)?;
+        if method == "$/cancel_request" {
+            let params = object.get_mut("params").and_then(Value::as_object_mut)?;
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            let number = self.by_string.get(&request_id).copied()?;
+            params.insert("requestId".to_string(), json!(number));
+            return None;
+        }
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)?;
+        let number = self.number_for(&id);
+        object.insert("id".to_string(), json!(number));
+        Some((number, id))
+    }
+
+    /// Rewrite one incoming value in place: a response to one of our requests
+    /// gets the crate's original string id back (batches are handled member by
+    /// member). Client requests keep their own ids untouched.
+    pub fn rewrite_incoming(&mut self, value: &mut Value) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    self.rewrite_incoming(item);
+                }
+            }
+            Value::Object(object) => {
+                if object.contains_key("method") {
+                    return;
+                }
+                let Some(id) = object.get("id").and_then(Value::as_u64) else {
+                    return;
+                };
+                let Some(original) = self.by_number.get(&id).cloned() else {
+                    return;
+                };
+                object.insert("id".to_string(), Value::String(original));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Serialize a JSON value as one wire line (no trailing newline).
+fn wire_line(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Rewrite an outgoing wire line (crate -> client) through [`RequestIds`],
+/// also returning any newly assigned `(number, original id)` mapping.
+pub fn rewrite_outgoing_line(line: &str, ids: &mut RequestIds) -> (String, Option<(u64, String)>) {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return (line.to_string(), None);
+    };
+    let assigned = ids.rewrite_outgoing(&mut value);
+    (wire_line(&value), assigned)
+}
+
+/// Rewrite an incoming wire line (client -> crate) through [`RequestIds`].
+pub fn rewrite_incoming_line(line: &str, ids: &mut RequestIds) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return line.to_string();
+    };
+    ids.rewrite_incoming(&mut value);
+    wire_line(&value)
+}
+
+/// Feed one raw line to the crate, or answer it at the transport like Node's
+/// `ndJsonStream` does.
+fn handle_wire_line(
+    line: &[u8],
+    in_tx: &futures::channel::mpsc::UnboundedSender<io::Result<String>>,
+    out_tx: &futures::channel::mpsc::UnboundedSender<String>,
+    ids: &mut RequestIds,
+) {
+    let Ok(text) = std::str::from_utf8(line) else {
+        // Node decodes with TextDecoder (U+FFFD for invalid UTF-8) and then
+        // fails JSON.parse: the line is a parse error.
+        let _ = out_tx.unbounded_send(wire_line(&parse_error_reply()));
+        return;
+    };
+    match parse_wire_line(text) {
+        WireLine::Empty => {}
+        WireLine::ParseError => {
+            let _ = out_tx.unbounded_send(wire_line(&parse_error_reply()));
+        }
+        WireLine::InvalidRequest(value) => {
+            let _ = out_tx.unbounded_send(wire_line(&invalid_request_reply(&value)));
+        }
+        WireLine::Message(mut value) => {
+            ids.rewrite_incoming(&mut value);
+            let _ = in_tx.unbounded_send(Ok(wire_line(&value)));
+        }
+    }
+}
+
+/// Read the byte stream to EOF, splitting lines and feeding the crate.
+async fn read_wire<R: AsyncRead + Unpin>(
+    mut reader: R,
+    in_tx: futures::channel::mpsc::UnboundedSender<io::Result<String>>,
+    out_tx: futures::channel::mpsc::UnboundedSender<String>,
+    mut assigned_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, String)>,
+) {
+    // The reader is the single owner of the reverse map: the writer sends each
+    // `(number, string id)` pair it assigns before it writes the request, so
+    // the pair is always queued before the client can answer. Draining the
+    // channel before each line (and each chunk) keeps the mapping exact without
+    // a lock (guard G5: no mutexes).
+    let mut ids = RequestIds::default();
+    let mut codec = LineCodec::new();
+    let mut buf = [0u8; 16 * 1024];
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) => {
+                let _ = in_tx.unbounded_send(Err(error));
+                return;
+            }
+        };
+        while let Ok((number, id)) = assigned_rx.try_recv() {
+            ids.remember(number, &id);
+        }
+        lines.clear();
+        codec.push(&buf[..n], &mut lines);
+        for line in lines.drain(..) {
+            handle_wire_line(&line, &in_tx, &out_tx, &mut ids);
+        }
+    }
+    lines.clear();
+    codec.finish(&mut lines);
+    for line in lines.drain(..) {
+        handle_wire_line(&line, &in_tx, &out_tx, &mut ids);
+    }
+    // Dropping `in_tx` ends the crate's incoming stream (transport EOF).
+}
+
+/// Write rewritten lines to the peer, one newline-terminated line at a time.
+async fn write_wire<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    mut rx: futures::channel::mpsc::UnboundedReceiver<String>,
+) {
+    while let Some(line) = rx.next().await {
+        if writer.write_all(line.as_bytes()).await.is_err()
+            || writer.write_all(b"\n").await.is_err()
+        {
+            break;
+        }
+        let _ = writer.flush().await;
+    }
+}
+
+/// Blocking counterpart of [`read_wire`] for stdio.
+///
+/// The binary reads stdin on a plain OS thread: a `tokio::io::stdin()` read
+/// parks a runtime blocking-pool task, and the runtime waits for those on drop,
+/// so a SIGTERM/SIGINT shutdown would never finish while stdin stays open. A
+/// detached OS thread is abandoned at process exit instead.
+fn read_wire_blocking(
+    mut reader: impl std::io::BufRead,
+    in_tx: futures::channel::mpsc::UnboundedSender<io::Result<String>>,
+    out_tx: futures::channel::mpsc::UnboundedSender<String>,
+    mut assigned_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, String)>,
+) {
+    let mut ids = RequestIds::default();
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                // Drain AFTER the read: a mapping is queued before its request
+                // is written, so any reply we just read has its pair waiting.
+                // (Draining before the blocking read would miss every request
+                // the writer assigns while we are parked in it.)
+                while let Ok((number, id)) = assigned_rx.try_recv() {
+                    ids.remember(number, &id);
+                }
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                handle_wire_line(&line, &in_tx, &out_tx, &mut ids);
+            }
+            Err(error) => {
+                let _ = in_tx.unbounded_send(Err(error));
+                return;
+            }
+        }
+    }
+    // Dropping `in_tx` ends the crate's incoming stream (transport EOF).
+}
+
+/// A line-oriented ACP client transport that applies Node's `ndJsonStream`
+/// wire rules in front of the pinned crate (ROADMAP F2c).
+///
+/// The binary uses [`WireTransport::stdio`]; tests can wrap any
+/// reader/writer pair (e.g. a duplex pipe) to drive raw JSON-RPC lines.
+pub struct WireTransport {
+    /// Lines already validated/rewritten, ready for the crate.
+    incoming: futures::channel::mpsc::UnboundedReceiver<io::Result<String>>,
+    /// Lines from the crate, before id rewriting.
+    outgoing: futures::channel::mpsc::UnboundedSender<String>,
+    /// `(number, original id)` pairs assigned by the outgoing sink; the reader
+    /// owns the reverse map (no mutex — guard G5).
+    assigned_tx: tokio::sync::mpsc::UnboundedSender<(u64, String)>,
+}
+
+impl WireTransport {
+    /// The stdio transport used by `bin/claude-agent-acp-rs.rs`.
+    pub fn stdio() -> Self {
+        let (in_tx, in_rx) = futures::channel::mpsc::unbounded::<io::Result<String>>();
+        let (out_tx, out_rx) = futures::channel::mpsc::unbounded::<String>();
+        let (assigned_tx, assigned_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, String)>();
+        tokio::spawn(write_wire(tokio::io::stdout(), out_rx));
+        let read_out = out_tx.clone();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let reader = std::io::BufReader::new(stdin.lock());
+            read_wire_blocking(reader, in_tx, read_out, assigned_rx);
+        });
+        Self {
+            incoming: in_rx,
+            outgoing: out_tx,
+            assigned_tx,
+        }
+    }
+
+    /// Wrap a byte reader (client input) and writer (client output).
+    pub fn new<R, W>(reader: R, writer: W) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (in_tx, in_rx) = futures::channel::mpsc::unbounded::<io::Result<String>>();
+        let (out_tx, out_rx) = futures::channel::mpsc::unbounded::<String>();
+        let (assigned_tx, assigned_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, String)>();
+        tokio::spawn(write_wire(writer, out_rx));
+        let read_out = out_tx.clone();
+        tokio::spawn(async move {
+            read_wire(reader, in_tx, read_out, assigned_rx).await;
+        });
+        Self {
+            incoming: in_rx,
+            outgoing: out_tx,
+            assigned_tx,
+        }
+    }
+}
+
+impl ConnectTo<Agent> for WireTransport {
+    async fn connect_to(
+        self,
+        client: impl ConnectTo<agent_client_protocol::Client>,
+    ) -> agent_client_protocol::Result<()> {
+        let Self {
+            incoming,
+            outgoing,
+            assigned_tx,
+        } = self;
+        // The sink is the single owner of the forward (string -> number) map;
+        // the reader owns the reverse map, fed by `assigned_tx`.
+        let outgoing = futures::sink::unfold(
+            (outgoing, assigned_tx, RequestIds::default()),
+            |(tx, assigned_tx, mut ids), line: String| async move {
+                let (rewritten, assigned) = rewrite_outgoing_line(&line, &mut ids);
+                if let Some((number, id)) = assigned {
+                    let _ = assigned_tx.send((number, id));
+                }
+                tx.unbounded_send(rewritten)
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ACP stdout closed"))?;
+                Ok::<_, io::Error>((tx, assigned_tx, ids))
+            },
+        );
+        let lines = Lines::new(outgoing, incoming);
+        ConnectTo::<Agent>::connect_to(lines, client).await
+    }
 }
 
 #[cfg(test)]
@@ -265,4 +664,224 @@ mod tests {
     }
 
     use std::time::Duration;
+
+    /// F2c / M-126 — the malformed-line reply is exactly Node's
+    /// `ndJsonStream` parse error: id null, -32700, no `data`.
+    #[test]
+    fn inv_52_parse_error_reply_matches_node() {
+        assert_eq!(parse_wire_line("not json"), WireLine::ParseError);
+        assert_eq!(
+            parse_error_reply(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32700, "message": "Parse error"}
+            })
+        );
+        // Node trims each line before JSON.parse and skips blank ones.
+        assert_eq!(parse_wire_line("   \t "), WireLine::Empty);
+        assert_eq!(
+            parse_wire_line("  {\"jsonrpc\":\"2.0\",\"method\":\"x\"}  "),
+            WireLine::Message(json!({"jsonrpc": "2.0", "method": "x"}))
+        );
+    }
+
+    /// F2c / M-126 — valid JSON that is not an object/array gets Node's
+    /// `invalidRequest` reply with the value in `data` (a JSON `null` keeps a
+    /// literal `data:null`).
+    #[test]
+    fn inv_52_invalid_request_reply_matches_node() {
+        assert_eq!(parse_wire_line("42"), WireLine::InvalidRequest(json!(42)));
+        assert_eq!(
+            invalid_request_reply(&json!(42)),
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32600, "message": "Invalid request", "data": 42}
+            })
+        );
+        assert_eq!(
+            parse_wire_line("null"),
+            WireLine::InvalidRequest(Value::Null)
+        );
+        assert_eq!(
+            invalid_request_reply(&Value::Null)["error"]["data"],
+            Value::Null
+        );
+        assert_eq!(
+            parse_wire_line("[\"not a record\"]"),
+            WireLine::Message(json!(["not a record"]))
+        );
+    }
+
+    /// F2c / M-126 — outgoing request ids become Node's sequential numbers
+    /// (first outgoing request = 0) and the client's numeric reply maps back to
+    /// the crate's string id. Client request ids are never rewritten.
+    #[test]
+    fn inv_52_outgoing_ids_are_numbers() {
+        let mut ids = RequestIds::default();
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "id": "11111111-1111-1111-1111-111111111111",
+            "method": "session/request_permission",
+            "params": {}
+        });
+        assert_eq!(
+            ids.rewrite_outgoing(&mut request),
+            Some((0, "11111111-1111-1111-1111-111111111111".to_string()))
+        );
+        assert_eq!(request["id"], json!(0));
+
+        let mut second = json!({
+            "jsonrpc": "2.0",
+            "id": "22222222-2222-2222-2222-222222222222",
+            "method": "elicitation/create",
+            "params": {}
+        });
+        assert_eq!(
+            ids.rewrite_outgoing(&mut second),
+            Some((1, "22222222-2222-2222-2222-222222222222".to_string()))
+        );
+        assert_eq!(second["id"], json!(1));
+
+        let mut reply = json!({"jsonrpc": "2.0", "id": 0, "result": {}});
+        ids.rewrite_incoming(&mut reply);
+        assert_eq!(reply["id"], "11111111-1111-1111-1111-111111111111");
+
+        // A client request that happens to reuse the number 0 keeps its id.
+        let mut client_request =
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}});
+        ids.rewrite_incoming(&mut client_request);
+        assert_eq!(client_request["id"], json!(0));
+
+        // An unknown numeric response id is left alone (the crate reports it).
+        let mut unknown = json!({"jsonrpc": "2.0", "id": 7, "result": {}});
+        ids.rewrite_incoming(&mut unknown);
+        assert_eq!(unknown["id"], json!(7));
+    }
+
+    /// F2c — an outgoing `$/cancel_request` carries the numeric id the client
+    /// knows, not the crate's uuid.
+    #[test]
+    fn inv_52_cancel_request_id_translated() {
+        let mut ids = RequestIds::default();
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "id": "abc-uuid",
+            "method": "session/request_permission",
+            "params": {}
+        });
+        let _ = ids.rewrite_outgoing(&mut request);
+        let mut cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancel_request",
+            "params": {"requestId": "abc-uuid"}
+        });
+        assert_eq!(ids.rewrite_outgoing(&mut cancel), None);
+        assert_eq!(cancel["params"]["requestId"], json!(0));
+
+        // A batch of responses is rewritten member by member.
+        let mut batch = json!([
+            {"jsonrpc": "2.0", "id": 0, "result": {}},
+            {"jsonrpc": "2.0", "id": 9, "result": {}}
+        ]);
+        ids.rewrite_incoming(&mut batch);
+        assert_eq!(batch[0]["id"], "abc-uuid");
+        assert_eq!(batch[1]["id"], json!(9));
+    }
+
+    /// F2c — the line-level helpers are the exact pair used by the transport.
+    #[test]
+    fn inv_52_line_rewrites() {
+        let mut ids = RequestIds::default();
+        let (outgoing, assigned) = rewrite_outgoing_line(
+            r#"{"jsonrpc":"2.0","id":"u-1","method":"session/request_permission","params":{}}"#,
+            &mut ids,
+        );
+        assert_eq!(assigned, Some((0, "u-1".to_string())));
+        let value: Value = serde_json::from_str(&outgoing).expect("valid JSON");
+        assert_eq!(value["id"], json!(0));
+
+        let incoming = rewrite_incoming_line(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#, &mut ids);
+        let value: Value = serde_json::from_str(&incoming).expect("valid JSON");
+        assert_eq!(value["id"], "u-1");
+
+        // Unparsable text passes through unchanged (the transport never hands
+        // it to the crate; it is answered as a parse error).
+        assert_eq!(
+            rewrite_outgoing_line("nope", &mut ids),
+            ("nope".to_string(), None)
+        );
+    }
+
+    /// F2c — the blocking stdio reader must drain the `(number, id)` pairs the
+    /// writer queued while it was parked in `read`. Otherwise the client's
+    /// numeric reply to `session/request_permission` reaches the crate
+    /// untranslated and the request never resolves (the binary path; the async
+    /// duplex path drains after its read as well).
+    #[test]
+    fn inv_52_blocking_reader_drains_ids_after_read() {
+        use futures::StreamExt as _;
+        use std::io::Read;
+
+        /// A reader that signals when it enters `read`, then waits for the test
+        /// to hand it one line; a later read is EOF. This makes the "writer
+        /// assigns an id while the reader is blocked" interleaving
+        /// deterministic.
+        struct GateReader {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<Vec<u8>>,
+            done: bool,
+        }
+        impl Read for GateReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.done {
+                    return Ok(0);
+                }
+                let _ = self.entered.send(());
+                let data = self.release.recv().unwrap_or_default();
+                self.done = true;
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                Ok(n)
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (in_tx, mut in_rx) = futures::channel::mpsc::unbounded::<io::Result<String>>();
+        let (out_tx, _out_rx) = futures::channel::mpsc::unbounded::<String>();
+        let (assigned_tx, assigned_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, String)>();
+
+        let handle = std::thread::spawn(move || {
+            read_wire_blocking(
+                std::io::BufReader::new(GateReader {
+                    entered: entered_tx,
+                    release: release_rx,
+                    done: false,
+                }),
+                in_tx,
+                out_tx,
+                assigned_rx,
+            );
+        });
+
+        // The reader is parked inside `read`; the writer assigns id 0 to the
+        // crate's uuid string and then writes the client's numeric reply.
+        entered_rx.recv().expect("reader entered read");
+        assigned_tx
+            .send((0, "u-1".to_string()))
+            .expect("queue mapping");
+        release_tx
+            .send(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}\n".to_vec())
+            .expect("release line");
+
+        let line = futures::executor::block_on(in_rx.next()).expect("one rewritten line");
+        let value: Value = serde_json::from_str(&line.expect("line ok")).expect("valid JSON");
+        assert_eq!(
+            value["id"], "u-1",
+            "the numeric reply must map back to the uuid"
+        );
+        handle.join().expect("reader thread ends");
+    }
 }

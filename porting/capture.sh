@@ -200,12 +200,27 @@ normalize_frames() {
       if (s.indexOf(root) !== -1) return s.split(root).join("$ROOT");
       return s;
     };
-    const walk = (v) => {
+    const walk = (v, topKey) => {
       if (typeof v === "string") return isTimestamp(v) ? ph(v) : normPath(replaceUuids(v));
-      if (Array.isArray(v)) return v.map(walk);
+      if (Array.isArray(v)) return v.map((x) => walk(x, topKey));
       if (v && typeof v === "object") {
         const out = {};
-        for (const [k, x] of Object.entries(v)) out[k] = walk(x);
+        for (const [k, x] of Object.entries(v)) out[k] = walk(x, k);
+        // `_meta["terminal-auth"]` carries the agent own entrypoint
+        // (`process.execPath` + `process.argv.slice(1)`), which differs
+        // between the Node oracle and the Rust binary by design. The
+        // differential normalises it to `$EXEC` and drops the leading
+        // entrypoint argument; every flag stays compared exactly.
+        if (topKey === "terminal-auth") {
+          if (typeof out.command === "string") out.command = "$EXEC";
+          if (
+            Array.isArray(out.args) &&
+            typeof out.args[0] === "string" &&
+            !out.args[0].startsWith("--")
+          ) {
+            out.args = out.args.slice(1);
+          }
+        }
         return out;
       }
       return v;
@@ -299,6 +314,20 @@ for name in "${names[@]}"; do
   fi
   init_raw="$init.raw"
 
+  # Per-script environment (e.g. `NO_BROWSER=1` for the remote-login auth
+  # variant). Names and values are read from the corpus script; the adapter
+  # inherits them under the hermetic `env -i` allow-list.
+  SCRIPT_ENV=()
+  while IFS= read -r env_line; do
+    if [ -n "$env_line" ]; then
+      SCRIPT_ENV+=("$env_line")
+    fi
+  done < <(node -e '
+    const script = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    const env = script.env || {};
+    process.stdout.write(Object.entries(env).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
+  ' "$script")
+
   rm -rf "$FAKE_HOME"
   FAKE_HOME="$(mktemp -d)"
   mkdir -p "$FAKE_HOME/.claude"
@@ -321,6 +350,7 @@ for name in "${names[@]}"; do
     TMPDIR="${TMPDIR:-/tmp}" \
     LANG="${LANG:-C}" \
     "${LC_ARGV[@]+"${LC_ARGV[@]}"}" \
+    "${SCRIPT_ENV[@]+"${SCRIPT_ENV[@]}"}" \
     HOME="$FAKE_HOME" \
     CLAUDE_CONFIG_DIR="$FAKE_HOME/.claude" \
     CLAUDE_CODE_EXECUTABLE="$FAKE" \

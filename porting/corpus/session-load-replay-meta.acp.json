@@ -1,0 +1,10 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "projects/$CWD_SLUG/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl", "from": "seeds/session-load-replay-meta.jsonl"}
+  ],
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/load", "capture_session_id": true, "params": {"sessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "cwd": "$CWD", "mcpServers": []}}
+  ]
+}

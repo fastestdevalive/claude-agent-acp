@@ -1,0 +1,11 @@
+{
+  "permission": "allow",
+  "seed_files": [
+    {"path": "projects/$CWD_SLUG/ffffffff-ffff-4fff-8fff-ffffffffffff.jsonl", "from": "seeds/session-load-replay-task-plan.jsonl"}
+  ],
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/load", "capture_session_id": true, "params": {"sessionId": "ffffffff-ffff-4fff-8fff-ffffffffffff", "cwd": "$CWD", "mcpServers": []}},
+    {"call": "session/prompt", "text": "resume the task"}
+  ]
+}

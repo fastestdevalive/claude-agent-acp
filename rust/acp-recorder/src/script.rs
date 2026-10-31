@@ -40,6 +40,12 @@ pub enum Step {
         /// under test treats this recorder run as an AIR client.
         #[serde(default)]
         client_capabilities_meta: Option<Value>,
+        /// The WHOLE `clientCapabilities` object (F1, additive): `fs`,
+        /// `terminal`, `session`, `auth`, `elicitation`, `_meta`, ... Existing
+        /// scripts that only set `client_capabilities_meta` keep working; when
+        /// both are present the explicit `_meta` is merged over the object's.
+        #[serde(default)]
+        client_capabilities: Option<Value>,
     },
     /// `session/new`
     #[serde(rename = "session/new")]
@@ -82,6 +88,13 @@ pub enum Step {
     /// Await the responses of every `no_wait` prompt issued so far.
     #[serde(rename = "session/wait")]
     WaitPrompts,
+    /// Reply to the next agent->client `elicitation/create` request (F1, the
+    /// F23a corpus lane). Use after a `no_wait` prompt; the agent's request is
+    /// queued by the client handler and answered here. `response` is the JSON
+    /// `CreateElicitationResponse` object: `{"action":"accept","content":{...}}`,
+    /// `{"action":"decline"}` or `{"action":"cancel"}`.
+    #[serde(rename = "elicit_reply")]
+    ElicitReply { response: Value },
     /// Any ACP request with arbitrary params (rust-air-gaps Decision 1). String
     /// values in `params` expand `$SESSION`, `$CWD`, `$CWD_SLUG`.
     #[serde(rename = "request")]
@@ -168,7 +181,8 @@ mod tests {
         assert_eq!(
             script.steps[0],
             Step::Initialize {
-                client_capabilities_meta: None
+                client_capabilities_meta: None,
+                client_capabilities: None
             }
         );
         assert_eq!(
@@ -296,7 +310,93 @@ mod tests {
             Step::Initialize {
                 client_capabilities_meta: Some(serde_json::json!({
                     "jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}
-                }))
+                })),
+                client_capabilities: None
+            }
+        );
+    }
+
+    /// F1: the whole `clientCapabilities` object is carried, additively (the
+    /// meta-only form above keeps working unchanged).
+    #[test]
+    fn parses_initialize_with_whole_client_capabilities() {
+        let script = Script::parse(
+            r#"{"steps": [{"call": "initialize", "client_capabilities": {
+                "fs": {"readTextFile": true, "writeTextFile": true},
+                "terminal": true,
+                "elicitation": {"form": {}, "url": {}},
+                "_meta": {"jetbrains": {"air": {"version": 1}}}
+            }}]}"#,
+        )
+        .unwrap();
+        let Step::Initialize {
+            client_capabilities,
+            ..
+        } = &script.steps[0]
+        else {
+            panic!("expected an initialize step");
+        };
+        let caps = client_capabilities.as_ref().expect("whole object present");
+        assert_eq!(caps["terminal"], serde_json::json!(true));
+        assert_eq!(
+            caps["fs"]["readTextFile"],
+            serde_json::json!(true),
+            "fs capability carried verbatim"
+        );
+        assert_eq!(caps["elicitation"]["form"], serde_json::json!({}));
+        assert_eq!(caps["_meta"]["jetbrains"]["air"]["version"], 1);
+    }
+
+    /// F1: both capability forms may be set; the explicit `_meta` is merged over
+    /// the whole object's `_meta` (existing AIR scripts stay valid).
+    #[test]
+    fn parses_initialize_with_both_capability_forms() {
+        let script = Script::parse(
+            r#"{"steps": [{"call": "initialize",
+                "client_capabilities": {"terminal": true, "_meta": {"jetbrains": {"air": {"version": 1}}}},
+                "client_capabilities_meta": {"jetbrains": {"air": {"capabilities": ["asyncTasks"]}}}
+            }]}"#,
+        )
+        .unwrap();
+        let Step::Initialize {
+            client_capabilities_meta,
+            client_capabilities,
+        } = &script.steps[0]
+        else {
+            panic!("expected an initialize step");
+        };
+        assert!(client_capabilities.is_some());
+        assert!(client_capabilities_meta.is_some());
+    }
+
+    /// F1: `elicit_reply` carries the JSON `CreateElicitationResponse` for the
+    /// F23a corpus lane (accept with content, decline, cancel).
+    #[test]
+    fn parses_elicit_reply_actions() {
+        let script = Script::parse(
+            r#"{"steps": [
+                {"call": "elicit_reply", "response": {"action": "accept", "content": {"choice": "a"}}},
+                {"call": "elicit_reply", "response": {"action": "decline"}},
+                {"call": "elicit_reply", "response": {"action": "cancel"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            script.steps[0],
+            Step::ElicitReply {
+                response: serde_json::json!({"action": "accept", "content": {"choice": "a"}})
+            }
+        );
+        assert_eq!(
+            script.steps[1],
+            Step::ElicitReply {
+                response: serde_json::json!({"action": "decline"})
+            }
+        );
+        assert_eq!(
+            script.steps[2],
+            Step::ElicitReply {
+                response: serde_json::json!({"action": "cancel"})
             }
         );
     }

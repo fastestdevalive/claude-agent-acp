@@ -23,6 +23,28 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
+/// The only `FAKE_CLAUDE_*` environment variables this binary may read (F1).
+/// Anything else named `FAKE_CLAUDE_*` is ignored, so a stray variable cannot
+/// change replay behaviour; the binary never prints any variable VALUE.
+pub const FAKE_CLAUDE_ENV_ALLOWLIST: [&str; 6] = [
+    "FAKE_CLAUDE_SCRIPT",
+    "FAKE_CLAUDE_ARGV_OUT",
+    "FAKE_CLAUDE_INIT_OUT",
+    "FAKE_CLAUDE_PID_OUT",
+    "FAKE_CLAUDE_LOG_FRAMES",
+    "FAKE_CLAUDE_CURSOR",
+];
+
+/// Read a `FAKE_CLAUDE_*` variable through [`FAKE_CLAUDE_ENV_ALLOWLIST`].
+/// Returns `None` for any name outside the allow-list, even when it is set.
+pub fn fake_claude_env(name: &str) -> Option<std::ffi::OsString> {
+    if FAKE_CLAUDE_ENV_ALLOWLIST.contains(&name) {
+        env::var_os(name)
+    } else {
+        None
+    }
+}
+
 /// Errors produced during replay.
 #[derive(Debug, Error)]
 pub enum ReplayError {
@@ -68,14 +90,23 @@ pub struct Transcript {
     /// The `claude auth status --json` stdout (special transcript line
     /// `{"auth_status_stdout": {...}}`); never replayed as a step.
     pub auth_status_stdout: Option<Value>,
-    /// The ordered steps.
+    /// The ordered steps (all segments).
     pub steps: Vec<Step>,
+    /// Step indices where segment 1, 2, ... start. Segment 0 starts at 0; a
+    /// transcript with no `{"segment": N}` marker has exactly one segment.
+    #[serde(skip)]
+    pub segment_starts: Vec<usize>,
 }
 
 impl Transcript {
     /// Parse a transcript from its JSONL text.
+    ///
+    /// A line `{"segment": N}` starts the 0-based segment `N` (segments must be
+    /// declared in order, 1, 2, ...). Multi-spawn transcripts use this so a
+    /// restarted process can replay only its own segment (F1).
     pub fn parse(text: &str) -> Result<Self, TranscriptError> {
         let mut steps = Vec::new();
+        let mut segment_starts = Vec::new();
         let mut keep_alive_every_ms = None;
         let mut auth_status_stdout = None;
         for (idx, raw) in text.lines().enumerate() {
@@ -95,6 +126,18 @@ impl Transcript {
                 auth_status_stdout = Some(auth.clone());
                 continue;
             }
+            if let Some(segment) = value.get("segment").and_then(Value::as_u64) {
+                let expected = segment_starts.len() as u64 + 1;
+                if segment != expected {
+                    return Err(TranscriptError::BadSegment {
+                        line: idx,
+                        expected,
+                        got: segment,
+                    });
+                }
+                segment_starts.push(steps.len());
+                continue;
+            }
             let step: Step = serde_json::from_value(value).map_err(|e| TranscriptError::Parse {
                 line: idx,
                 source: e,
@@ -105,6 +148,7 @@ impl Transcript {
             keep_alive_every_ms,
             auth_status_stdout,
             steps,
+            segment_starts,
         })
     }
 
@@ -112,6 +156,27 @@ impl Transcript {
     pub fn keep_alive_interval(&self) -> Option<std::time::Duration> {
         self.keep_alive_every_ms
             .map(std::time::Duration::from_millis)
+    }
+
+    /// Number of segments (1 for a transcript without segment markers).
+    pub fn segment_count(&self) -> usize {
+        self.segment_starts.len() + 1
+    }
+
+    /// The steps of segment `index` (clamped to the last segment).
+    pub fn segment(&self, index: usize) -> &[Step] {
+        let index = index.min(self.segment_count() - 1);
+        let start = if index == 0 {
+            0
+        } else {
+            self.segment_starts[index - 1]
+        };
+        let end = self
+            .segment_starts
+            .get(index)
+            .copied()
+            .unwrap_or(self.steps.len());
+        &self.steps[start..end]
     }
 }
 
@@ -128,12 +193,42 @@ pub enum TranscriptError {
     Io(#[from] std::io::Error),
     #[error("failed to read script path: {0}")]
     ReadScript(#[source] std::io::Error),
+    #[error("transcript line {line}: segment marker expected {expected}, got {got}")]
+    BadSegment {
+        line: usize,
+        expected: u64,
+        got: u64,
+    },
 }
 
 /// Load a transcript from `$FAKE_CLAUDE_SCRIPT` (or an explicit path).
 pub fn load_transcript(path: &Path) -> Result<Transcript, TranscriptError> {
     let text = std::fs::read_to_string(path).map_err(TranscriptError::ReadScript)?;
     Transcript::parse(&text)
+}
+
+/// The 0-based segment a fresh spawn should replay (F1 multi-spawn).
+///
+/// When the transcript has more than one segment and `FAKE_CLAUDE_CURSOR` names
+/// a file, the file holds the ordinal of this spawn (0 for the first) and is
+/// advanced for the next spawn — so a second process after a restart reads the
+/// next segment. Without the env var (or for a single-segment transcript) every
+/// spawn replays segment 0: existing fixtures are unchanged and nothing is ever
+/// written into the repo.
+pub fn next_segment_index(transcript: &Transcript) -> usize {
+    if transcript.segment_count() <= 1 {
+        return 0;
+    }
+    let Some(cursor) = fake_claude_env("FAKE_CLAUDE_CURSOR") else {
+        return 0;
+    };
+    let cursor = std::path::PathBuf::from(cursor);
+    let ordinal = std::fs::read_to_string(&cursor)
+        .ok()
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let _ = std::fs::write(&cursor, (ordinal + 1).to_string());
+    ordinal.min(transcript.segment_count() - 1)
 }
 
 /// The only environment variables `fake-claude` may ever persist to
@@ -274,20 +369,25 @@ pub fn subset_match(expect: &Value, frame: &Value) -> bool {
 /// Substitute `$REQ` (== `$MATCH.request_id`) and `$MATCH.<field>` in `value`
 /// using the matched stdin frame. `$CWD` expands inside any string.
 pub fn substitute(value: &Value, matched: &Value) -> Value {
-    substitute_with(value, matched, None)
+    substitute_with(value, matched, &[])
 }
 
-/// As [`substitute`], additionally resolving `$REQ.1` to the `request_id` of
-/// the frame the PREVIOUS transcript step matched (`prev`), so a step can
-/// answer a request that an earlier step deliberately left unanswered.
-pub fn substitute_with(value: &Value, matched: &Value, prev: Option<&Value>) -> Value {
+/// As [`substitute`], additionally resolving `$REQ.<n>` (`n >= 1`) to the
+/// `request_id` of the frame the n-th PREVIOUS transcript step matched, so a
+/// step can answer a request that an earlier step deliberately left unanswered
+/// (`$REQ.1` is the immediately previous step, `$REQ.2` the one before, ...).
+pub fn substitute_with(value: &Value, matched: &Value, history: &[Value]) -> Value {
     match value {
         Value::String(s) => {
             if s == "$REQ" {
                 field_of(matched, "request_id")
-            } else if s == "$REQ.1" {
-                prev.map(|p| field_of(p, "request_id"))
-                    .unwrap_or(Value::Null)
+            } else if let Some(rest) = s.strip_prefix("$REQ.") {
+                match rest.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= history.len() => {
+                        field_of(&history[history.len() - n], "request_id")
+                    }
+                    _ => Value::Null,
+                }
             } else if let Some(rest) = s.strip_prefix("$MATCH.") {
                 field_of(matched, rest)
             } else if s.contains("$CWD") {
@@ -298,13 +398,13 @@ pub fn substitute_with(value: &Value, matched: &Value, prev: Option<&Value>) -> 
         }
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), substitute_with(v, matched, prev)))
+                .map(|(k, v)| (k.clone(), substitute_with(v, matched, history)))
                 .collect(),
         ),
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|v| substitute_with(v, matched, prev))
+                .map(|v| substitute_with(v, matched, history))
                 .collect(),
         ),
         other => other.clone(),
@@ -398,20 +498,35 @@ pub fn replay(
     arg_out: Option<&Path>,
     init_out: Option<&Path>,
     stdin: impl Read,
+    stdout: impl Write,
+) -> Result<usize, ReplayError> {
+    replay_segment(transcript, 0, argv, arg_out, init_out, stdin, stdout)
+}
+
+/// Replay only `segment_index` of `transcript` (F1 multi-spawn: a restarted
+/// process reads the next segment). [`replay`] is `replay_segment(..., 0, ...)`.
+pub fn replay_segment(
+    transcript: &Transcript,
+    segment_index: usize,
+    argv: &[String],
+    arg_out: Option<&Path>,
+    init_out: Option<&Path>,
+    stdin: impl Read,
     mut stdout: impl Write,
 ) -> Result<usize, ReplayError> {
     if let Some(out) = arg_out {
         record_argv_env(out, argv)?;
     }
 
+    let steps = transcript.segment(segment_index);
     let mut matched_init = false;
     let mut step_index = 0usize;
-    // `request_id` source for `$REQ.1`: the frame the previous step matched.
-    let mut prev_frame: Option<Value> = None;
+    // Frames matched by earlier steps, in order; `$REQ.<n>` indexes backwards.
+    let mut history: Vec<Value> = Vec::new();
     let mut reader = BufReader::new(stdin);
 
     loop {
-        if step_index >= transcript.steps.len() {
+        if step_index >= steps.len() {
             // All steps consumed: keep reading stdin until EOF (claude stays
             // alive until its stdin closes), logging any late frames so we can
             // see what the host still sends after the transcript is spent.
@@ -424,7 +539,7 @@ pub fn replay(
                 return Ok(step_index);
             }
             let line = line.trim();
-            if std::env::var_os("FAKE_CLAUDE_LOG_FRAMES").is_some() && !line.is_empty() {
+            if fake_claude_env("FAKE_CLAUDE_LOG_FRAMES").is_some() && !line.is_empty() {
                 eprintln!("[fake-claude drain] {line}");
             }
             // After the transcript is spent, still auto-ack a late
@@ -446,16 +561,16 @@ pub fn replay(
             Err(error) => return Err(ReplayError::Io(error)),
         };
         if bytes == 0 {
-            // stdin EOF before the transcript finished.
+            // stdin EOF before the transcript segment finished.
             return Err(ReplayError::Eof {
-                remaining: transcript.steps.len() - step_index,
+                remaining: steps.len() - step_index,
             });
         }
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if std::env::var_os("FAKE_CLAUDE_LOG_FRAMES").is_some() {
+        if fake_claude_env("FAKE_CLAUDE_LOG_FRAMES").is_some() {
             eprintln!("[fake-claude stdin] {line}");
         }
         let frame: Value = match serde_json::from_str(line) {
@@ -468,7 +583,7 @@ pub fn replay(
             }
         };
 
-        let step = &transcript.steps[step_index];
+        let step = &steps[step_index];
         if !subset_match(&step.expect, &frame) {
             // Not the expected step: if it is an auto-ackable control_request
             // (e.g. `get_context_usage`), respond without consuming a step
@@ -501,7 +616,7 @@ pub fn replay(
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 continue;
             }
-            let resolved = substitute_with(emit, &frame, prev_frame.as_ref());
+            let resolved = substitute_with(emit, &frame, &history);
             let mut text = serde_json::to_string(&resolved)?;
             text.push('\n');
             stdout.write_all(text.as_bytes())?;
@@ -511,7 +626,7 @@ pub fn replay(
         }
         stdout.flush()?;
         step_index += 1;
-        prev_frame = Some(frame);
+        history.push(frame);
         if step.exit {
             // The transcript asks us to die here (e.g. mid-turn before a
             // `result`): return so main exits and stdout closes, letting the
@@ -602,5 +717,101 @@ mod tests {
         let expect = serde_json::json!({"type": "user", "uuid": "x"});
         let frame = serde_json::json!({"type": "user"});
         assert!(!subset_match(&expect, &frame));
+    }
+
+    /// F1 multi-spawn: `{"segment": N}` markers split the transcript, and each
+    /// segment slices only its own steps (the last segment is clamped).
+    #[test]
+    fn parses_segment_markers_and_slices() {
+        let text = concat!(
+            "{\"expect\":{\"type\":\"a\"}}\n",
+            "{\"segment\":1}\n",
+            "{\"expect\":{\"type\":\"b\"}}\n",
+            "{\"segment\":2}\n",
+            "{\"expect\":{\"type\":\"c\"}}\n"
+        );
+        let transcript = Transcript::parse(text).unwrap();
+        assert_eq!(transcript.segment_count(), 3);
+        assert_eq!(transcript.segment(0).len(), 1);
+        assert_eq!(transcript.segment(1).len(), 1);
+        assert_eq!(transcript.segment(2).len(), 1);
+        assert_eq!(
+            transcript.segment(99).len(),
+            1,
+            "clamped to the last segment"
+        );
+        assert_eq!(
+            transcript.segment(1)[0].expect,
+            serde_json::json!({"type": "b"}),
+            "segment 1 starts after its marker"
+        );
+    }
+
+    /// F1: a single-segment transcript stays one segment and `replay` is segment 0.
+    #[test]
+    fn transcript_without_markers_has_one_segment() {
+        let transcript =
+            Transcript::parse("{\"expect\":{\"type\":\"user\"},\"emit\":[]}\n").unwrap();
+        assert_eq!(transcript.segment_count(), 1);
+        assert_eq!(transcript.segment(0).len(), 1);
+    }
+
+    /// F1: segment markers must be declared in order (a typo fails loudly).
+    #[test]
+    fn rejects_out_of_order_segment_marker() {
+        let err = Transcript::parse("{\"segment\":2}\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TranscriptError::BadSegment {
+                    expected: 1,
+                    got: 2,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// F1 `$REQ.n`: n-th previous matched frame's `request_id` (1 = previous).
+    #[test]
+    fn req_placeholder_indexes_backwards() {
+        let history = vec![
+            serde_json::json!({"request_id": "R1"}),
+            serde_json::json!({"request_id": "R2"}),
+        ];
+        let matched = serde_json::json!({"request_id": "R3"});
+        assert_eq!(
+            substitute_with(&serde_json::json!("$REQ"), &matched, &history),
+            serde_json::json!("R3")
+        );
+        assert_eq!(
+            substitute_with(&serde_json::json!("$REQ.1"), &matched, &history),
+            serde_json::json!("R2")
+        );
+        assert_eq!(
+            substitute_with(&serde_json::json!("$REQ.2"), &matched, &history),
+            serde_json::json!("R1")
+        );
+        assert_eq!(
+            substitute_with(&serde_json::json!("$REQ.3"), &matched, &history),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            substitute_with(&serde_json::json!("$REQ.0"), &matched, &history),
+            serde_json::Value::Null
+        );
+    }
+
+    /// F1: only allow-listed `FAKE_CLAUDE_*` names are readable; a stray name is
+    /// ignored even when set (names only — no value is ever printed).
+    #[test]
+    fn fake_claude_env_is_allowlisted() {
+        std::env::set_var("FAKE_CLAUDE_NOT_ALLOWED", "set-but-ignored");
+        assert_eq!(fake_claude_env("FAKE_CLAUDE_NOT_ALLOWED"), None);
+        assert!(FAKE_CLAUDE_ENV_ALLOWLIST.contains(&"FAKE_CLAUDE_SCRIPT"));
+        assert!(FAKE_CLAUDE_ENV_ALLOWLIST.contains(&"FAKE_CLAUDE_CURSOR"));
+        assert_eq!(FAKE_CLAUDE_ENV_ALLOWLIST.len(), 6);
+        std::env::remove_var("FAKE_CLAUDE_NOT_ALLOWED");
     }
 }

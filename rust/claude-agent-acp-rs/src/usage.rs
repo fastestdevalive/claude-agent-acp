@@ -37,6 +37,14 @@ pub fn total_tokens(usage: &UsageSnapshot) -> u64 {
     usage.total_tokens()
 }
 
+/// `rawMaxTokens` from a `get_context_usage` reply, at the SDK's payload level
+/// (`frame.response.response`, see `control::raw_max_tokens`). Returns `None`
+/// for a missing / non-numeric / zero window, so both refresh sites can apply
+/// the answer unconditionally (D1 / Decision 1).
+pub fn raw_max_tokens(frame: &Value) -> Option<u64> {
+    crate::control::raw_max_tokens(frame).filter(|tokens| *tokens > 0)
+}
+
 /// Project a nullable API usage JSON object into a non-null snapshot.
 /// Coerces missing or null fields to 0.
 pub fn snapshot_from_usage(usage: &Value) -> UsageSnapshot {
@@ -157,6 +165,9 @@ pub struct UsageState {
     pub authoritative: bool,
     /// Latest context used tokens (mirrors Node `session.contextUsedTokens`).
     pub used: u64,
+    /// Stable identifier of the LLM backend the session's query was created
+    /// against (F5b/B-70); scopes the cross-session context-window cache.
+    pub provider_cache_key: String,
 }
 
 impl Default for UsageState {
@@ -168,6 +179,7 @@ impl Default for UsageState {
             context_window: DEFAULT_CONTEXT_WINDOW,
             authoritative: false,
             used: 0,
+            provider_cache_key: String::new(),
         }
     }
 }
@@ -264,6 +276,47 @@ pub fn build_rate_limit_usage_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D1 (Decision 1) — the REAL captured `get_context_usage` reply shape: the
+    /// payload sits at `frame.response.response` (`control.rs` A-21).
+    #[test]
+    fn inv_70_raw_max_tokens_full_frame_shape() {
+        let frame = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "ctx-1",
+                "response": {
+                    "model": "claude-haiku-5-5",
+                    "rawMaxTokens": 1000000,
+                    "maxTokens": 1000000
+                }
+            }
+        });
+        assert_eq!(raw_max_tokens(&frame), Some(1_000_000));
+    }
+
+    /// D1 — the legacy / wrong levels are NOT the payload level and yield
+    /// nothing (the pre-fix bug read the frame's top level).
+    #[test]
+    fn inv_70_raw_max_tokens_legacy_shapes() {
+        let top_level = json!({"type": "control_response", "rawMaxTokens": 200000});
+        assert_eq!(raw_max_tokens(&top_level), None);
+        let response_level =
+            json!({"type": "control_response", "response": {"rawMaxTokens": 200000}});
+        assert_eq!(raw_max_tokens(&response_level), None);
+    }
+
+    /// D1 — zero, missing and non-numeric windows are rejected.
+    #[test]
+    fn inv_70_raw_max_tokens_rejects_zero_missing_string() {
+        let zero = json!({"response": {"response": {"rawMaxTokens": 0}}});
+        assert_eq!(raw_max_tokens(&zero), None);
+        let missing = json!({"response": {"response": {"model": "m"}}});
+        assert_eq!(raw_max_tokens(&missing), None);
+        let string = json!({"response": {"response": {"rawMaxTokens": "1000000"}}});
+        assert_eq!(raw_max_tokens(&string), None);
+    }
 
     #[test]
     fn inv_61_total_tokens() {

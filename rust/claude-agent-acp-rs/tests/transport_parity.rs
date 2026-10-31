@@ -125,6 +125,7 @@ async fn run_over_channel(
         default_cwd: Some(root.clone()),
         timings,
         env: claude_agent_acp_rs::env_snapshot::EnvSnapshot::empty(),
+        logger: None,
     };
     let serve_task = tokio::spawn(async move { serve(a1, opts).await });
 

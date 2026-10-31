@@ -61,6 +61,15 @@ impl EnvSnapshot {
         self.vars.contains_key(key)
     }
 
+    /// Whether `key` is set to a non-empty value.
+    ///
+    /// Node tests the remote-login environment with `process.env.NO_BROWSER`
+    /// etc., where an empty string is falsy; this mirrors that truthiness
+    /// without ever exposing the value.
+    pub fn flag(&self, key: &str) -> bool {
+        self.get(key).is_some_and(|value| !value.is_empty())
+    }
+
     pub fn vars(&self) -> &HashMap<String, String> {
         &self.vars
     }

@@ -1,0 +1,47 @@
+{
+  "request_id": "$0",
+  "type": "control_request",
+  "request": {
+    "subtype": "$1",
+    "hooks": {
+      "PostToolUse": [
+        {
+          "hookCallbackIds": [
+            "hook_0"
+          ]
+        }
+      ],
+      "PostModelSwitch": [
+        {
+          "hookCallbackIds": [
+            "hook_1"
+          ]
+        }
+      ],
+      "PostCompact": [
+        {
+          "hookCallbackIds": [
+            "hook_2"
+          ]
+        }
+      ],
+      "TaskCreated": [
+        {
+          "hookCallbackIds": [
+            "hook_3"
+          ]
+        }
+      ],
+      "TaskCompleted": [
+        {
+          "hookCallbackIds": [
+            "hook_4"
+          ]
+        }
+      ]
+    },
+    "appendSystemPrompt": "Prefer tabs over spaces.",
+    "promptSuggestions": true,
+    "forwardSubagentText": false
+  }
+}

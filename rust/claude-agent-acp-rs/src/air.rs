@@ -50,7 +50,19 @@ impl AirClient {
         if air.is_null() || !air.is_object() {
             return None;
         }
-        let version = air.get("version").and_then(serde_json::Value::as_u64);
+        // Node's `Number.isInteger`: a JSON float such as `1.0` is still an
+        // integer version. `as_u64` alone would reject the float spelling, so
+        // read the number and accept any finite, integral, non-negative value.
+        let version = air.get("version").and_then(|value| {
+            if let Some(integer) = value.as_u64() {
+                Some(integer)
+            } else {
+                value
+                    .as_f64()
+                    .filter(|number| number.is_finite() && number.fract() == 0.0 && *number >= 0.0)
+                    .map(|number| number as u64)
+            }
+        });
         let capabilities = air
             .get("capabilities")
             .and_then(serde_json::Value::as_array)
@@ -180,5 +192,27 @@ mod tests {
         let air = AirClient::from_client_capabilities(&caps).expect("air client");
         assert!(air.is_air());
         assert!(!air.supports("asyncTasks"));
+    }
+
+    #[test]
+    fn float_integer_version_is_accepted_like_number_is_integer() {
+        // Node's `Number.isInteger(1.0)` is true; a JSON float version must
+        // therefore pass the >= 1 gate.
+        let caps = json!({"_meta": {"jetbrains": {"air": {
+            "version": 1.0, "capabilities": ["asyncTasks"]
+        }}}});
+        let air = AirClient::from_client_capabilities(&caps).expect("air client");
+        assert!(air.supports("asyncTasks"));
+    }
+
+    #[test]
+    fn fractional_or_negative_version_is_not_an_integer() {
+        for version in [json!(1.5), json!(-1), json!(-1.0)] {
+            let caps = json!({"_meta": {"jetbrains": {"air": {
+                "version": version, "capabilities": ["asyncTasks"]
+            }}}});
+            let air = AirClient::from_client_capabilities(&caps).expect("air client");
+            assert!(!air.supports("asyncTasks"));
+        }
     }
 }

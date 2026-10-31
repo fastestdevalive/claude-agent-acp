@@ -1,0 +1,13 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD",
+                "mcpServers": [
+                  {"name": "echo", "command": "/bin/echo", "args": ["hello"],
+                   "env": [{"name": "MCP_FIXTURE_VALUE", "value": "fixture"}]}
+                ]}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}

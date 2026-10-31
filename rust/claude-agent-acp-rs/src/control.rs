@@ -34,23 +34,38 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-/// A pinned boxed future returning a `Value` (used by the inbound request
-/// handler). Defined without the `futures` crate to avoid a new dependency.
-type BoxFuture = Pin<Box<dyn Future<Output = Value> + Send + 'static>>;
+/// A pinned boxed future returning an optional `Value` (used by the inbound
+/// request handler). Defined without the `futures` crate to avoid a new
+/// dependency.
+type BoxFuture = Pin<Box<dyn Future<Output = Option<Value>> + Send + 'static>>;
 
 /// Handles an inbound `control_request` (from `claude` to us).
 ///
 /// Receives the full inbound `control_request` frame and returns the full
-/// `control_response` frame to write back. Runs in a spawned task (D14) so the
+/// `control_response` frame to write back — or `None` to write **nothing**
+/// (`sdk.mjs` `suppressControlResponse`: the `Z4` machine-only subtypes and a
+/// `request_user_dialog` with no handler). Runs in a spawned task (D14) so the
 /// control task never awaits it inline.
 pub type RequestHandler = Box<dyn Fn(Value) -> BoxFuture + Send + Sync>;
+
+/// Inbound subtypes the SDK never answers ("for the machine serving this
+/// session's tools — leaving it unanswered", `sdk.mjs` `Z4`). They are
+/// suppressed even when a handler is registered.
+pub const SUPPRESSED_SUBTYPES: [&str; 4] = [
+    "remote_tool_call",
+    "remote_plumbing_call",
+    "remote_tools_probe",
+    "remote_tools_reannounce",
+];
 
 /// Options controlling the control channel.
 #[derive(Default)]
 pub struct ControlOptions {
-    /// Handler for inbound `control_request` frames. When `None` (or when the
-    /// subtype is not recognised) the module responds `{subtype:"error"}`
-    /// (4.6 / 4.T9).
+    /// Handler for inbound `control_request` frames. When `None` the module
+    /// applies the SDK's own defaults (`sdk.mjs` `processControlRequest`):
+    /// silence for `request_user_dialog` and the [`SUPPRESSED_SUBTYPES`],
+    /// `{action:"decline"}` for `elicitation`, and an error response carrying
+    /// an `error` string for every other subtype (4.6 / 4.T9).
     pub on_request: Option<Arc<RequestHandler>>,
 }
 
@@ -63,6 +78,12 @@ pub enum ControlError {
     Stdin(#[from] std::io::Error),
     #[error("failed to serialise a frame: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// The CLI answered an outbound `control_request` with an `error` verdict.
+    /// The string is the response's `error` field (`sdk.mjs` `request()`
+    /// rejects with `Error(response.error)`); it may be empty when the CLI
+    /// omitted the field.
+    #[error("{0}")]
+    Remote(String),
 }
 
 /// What the control task is asked to do by the session actor.
@@ -83,6 +104,15 @@ enum Outbound {
     /// Replay a `pending_permission_requests` entry through the inbound handler
     /// (4.5).
     Replay(Value),
+    /// Mark an inbound handler finished so its `request_id` is no longer
+    /// in-flight. Sent after the handler wrote a response **or** chose to stay
+    /// silent (`sdk.mjs` `handleControlRequest`'s `finally` deletes the
+    /// cancel controller on both paths).
+    Finished(String),
+    /// Stop answering inbound requests (`sdk.mjs` `cleanupPerformed`): frames
+    /// that still arrive are skipped, never answered. Outbound frames keep
+    /// flowing until the handle is dropped.
+    Close,
 }
 
 /// A handle to the control channel. Cloneable: the session actor and any
@@ -262,6 +292,15 @@ impl Control {
             .map_err(|_| ControlError::Closed)
     }
 
+    /// Stop answering inbound `control_request`s (`sdk.mjs`
+    /// `cleanupPerformed`). Queued inbound frames are drained without a
+    /// response; outbound frames (the teardown `interrupt`) still flow.
+    pub fn close(&self) -> Result<(), ControlError> {
+        self.tx
+            .send(Outbound::Close)
+            .map_err(|_| ControlError::Closed)
+    }
+
     /// Perform the `initialize` handshake (4.4): send the `initialize`
     /// control_request built from `opts` and parse the correlated response.
     pub async fn initialize(
@@ -355,21 +394,57 @@ fn request_id() -> String {
 }
 
 /// Build a `control_response` frame echoing an inbound request's `request_id`
-/// with the given `subtype` (4.6).
-fn build_control_response(request_id: &str, subtype: &str) -> Value {
+/// with a success payload (`sdk.mjs` `handleControlRequest`).
+fn build_success_response(request_id: &str, payload: Value) -> Value {
     json!({
         "type": "control_response",
         "response": {
-            "subtype": subtype,
+            "subtype": "success",
             "request_id": request_id,
+            "response": payload,
         }
     })
 }
 
-/// The default response for an inbound `control_request` that has no registered
-/// handler (or an unrecognised subtype): `{subtype:"error"}` (4.6, 4.T9).
-fn respond_error(request_id: &str) -> Value {
-    build_control_response(request_id, "error")
+/// Build an `error` `control_response` carrying the `error` string the SDK
+/// always writes (`sdk.mjs` `handleControlRequest`'s catch: `error: ot(r)`).
+fn build_error_response(request_id: &str, error: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": error,
+        }
+    })
+}
+
+/// The SDK's own response for an inbound subtype when no adapter callback is
+/// registered (`sdk.mjs` `processControlRequest`). `None` means "write
+/// nothing" (`suppressControlResponse`).
+fn sdk_default_response(subtype: &str, request_id: &str) -> Option<Value> {
+    match subtype {
+        // No `onUserDialog` handler: log and stay silent, so a capable client
+        // (or the worker's park deadline) settles it.
+        "request_user_dialog" => None,
+        // No `onElicitation` handler: a real success verdict.
+        "elicitation" => Some(build_success_response(
+            request_id,
+            json!({"action": "decline"}),
+        )),
+        "can_use_tool" => Some(build_error_response(
+            request_id,
+            "canUseTool callback is not provided.",
+        )),
+        "hook_callback" => Some(build_error_response(
+            request_id,
+            "hookCallback callback is not provided.",
+        )),
+        other => Some(build_error_response(
+            request_id,
+            &format!("Unsupported control request subtype: {other}"),
+        )),
+    }
 }
 
 /// Serialise a frame into a newline-terminated line and write it to stdin.
@@ -394,6 +469,9 @@ async fn control_task(
 ) {
     let mut pending: HashMap<String, oneshot::Sender<Result<Value, ControlError>>> = HashMap::new();
     let mut inflight: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // `sdk.mjs` `cleanupPerformed`: once the session is closing, inbound
+    // requests that still arrive are skipped rather than answered.
+    let mut closed = false;
 
     loop {
         tokio::select! {
@@ -439,6 +517,12 @@ async fn control_task(
                     Outbound::Replay(frame) => {
                         spawn_inbound_handler(frame, &mut inflight, &outbound_tx, &opts);
                     }
+                    Outbound::Finished(id) => {
+                        inflight.remove(&id);
+                    }
+                    Outbound::Close => {
+                        closed = true;
+                    }
                 }
             }
             maybe = inbound.recv() => {
@@ -447,7 +531,7 @@ async fn control_task(
                     // child is gone; stop.
                     break;
                 };
-                route_inbound(frame, &mut pending, &mut inflight, &outbound_tx, &opts);
+                route_inbound(frame, &mut pending, &mut inflight, &outbound_tx, &opts, closed);
             }
         }
     }
@@ -460,6 +544,7 @@ fn route_inbound(
     inflight: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     outbound: &mpsc::UnboundedSender<Outbound>,
     opts: &ControlOptions,
+    closed: bool,
 ) {
     let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
     match frame_type {
@@ -471,13 +556,32 @@ fn route_inbound(
                 .and_then(Value::as_str)
             {
                 if let Some(reply) = pending.remove(id) {
-                    let _ = reply.send(Ok(frame.clone()));
+                    // `sdk.mjs` `request()`: a non-success verdict rejects with
+                    // `Error(response.error)`; only success resolves.
+                    let subtype = frame
+                        .pointer("/response/subtype")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if subtype == "success" {
+                        let _ = reply.send(Ok(frame));
+                    } else {
+                        let error = frame
+                            .pointer("/response/error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = reply.send(Err(ControlError::Remote(error)));
+                    }
                 }
                 // Unknown request_id (INV-9 / 4.T3): dropped, no panic.
             }
         }
         "control_request" => {
-            spawn_inbound_handler(frame, inflight, outbound, opts);
+            // `cleanupPerformed`: a request that arrives after close is
+            // skipped, never answered.
+            if !closed {
+                spawn_inbound_handler(frame, inflight, outbound, opts);
+            }
         }
         "control_cancel_request" => {
             if let Some(id) = frame.get("request_id").and_then(Value::as_str) {
@@ -493,27 +597,48 @@ fn route_inbound(
 }
 
 /// Spawn a task to handle an inbound `control_request` (D14) and track it in
-/// `inflight` so a `control_cancel_request` can abort it (INV-10).
+/// `inflight` so a `control_cancel_request` can abort it (INV-10) and a
+/// duplicate delivery of the same `request_id` can be skipped while it is
+/// in-flight (`sdk.mjs` `cancelControllers.has`).
 fn spawn_inbound_handler(
     frame: Value,
     inflight: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     outbound: &mpsc::UnboundedSender<Outbound>,
     opts: &ControlOptions,
 ) {
+    let subtype = frame
+        .pointer("/request/subtype")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // `Z4`: for the machine serving this session's tools — never answered,
+    // even when a handler exists.
+    if SUPPRESSED_SUBTYPES.contains(&subtype.as_str()) {
+        return;
+    }
     let request_id = frame
         .get("request_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // A duplicate delivery of an in-flight request is skipped outright.
+    if !request_id.is_empty() && inflight.contains_key(&request_id) {
+        return;
+    }
     let respond_id = request_id.clone();
     let tx = outbound.clone();
     let handler = opts.on_request.clone();
     let task = tokio::spawn(async move {
         let response = match handler {
             Some(handler) => handler(frame).await,
-            None => respond_error(&respond_id),
+            None => sdk_default_response(&subtype, &respond_id),
         };
-        let _ = tx.send(Outbound::Response(response));
+        if let Some(response) = response {
+            let _ = tx.send(Outbound::Response(response));
+        }
+        // Both the response path and the silent path release the in-flight id
+        // (the SDK's `finally` deletes the cancel controller either way).
+        let _ = tx.send(Outbound::Finished(respond_id));
     });
     inflight.insert(request_id, task);
 }
@@ -521,6 +646,7 @@ fn spawn_inbound_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::io::AsyncBufReadExt;
     use tokio::sync::mpsc;
@@ -726,7 +852,9 @@ mod tests {
             Box::pin(async move {
                 let _ = started_tx.send(());
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                json!({"type":"control_response","response":{"subtype":"success","request_id":"x"}})
+                Some(
+                    json!({"type":"control_response","response":{"subtype":"success","request_id":"x"}}),
+                )
             })
         }));
         let (control, mut lines, inbound) = harness(ControlOptions {
@@ -806,7 +934,9 @@ mod tests {
             let seen_tx = seen_tx.clone();
             Box::pin(async move {
                 let _ = seen_tx.send(frame);
-                json!({"type":"control_response","response":{"subtype":"success","request_id":"x"}})
+                Some(
+                    json!({"type":"control_response","response":{"subtype":"success","request_id":"x"}}),
+                )
             })
         }));
         let (control, _lines, _inbound) = harness(ControlOptions {
@@ -860,6 +990,11 @@ mod tests {
         assert_eq!(frame["type"], "control_response");
         assert_eq!(frame["response"]["subtype"], "error");
         assert_eq!(frame["response"]["request_id"], "req-9");
+        // R-07: the SDK's error response always carries the thrown message.
+        assert_eq!(
+            frame["response"]["error"],
+            "Unsupported control request subtype: bogus_subtype"
+        );
     }
 
     /// 4.T7 — a slow outbound control_request does not block inbound stream
@@ -894,6 +1029,294 @@ mod tests {
         let response = next_line(&mut lines).await;
         assert_eq!(response["type"], "control_response");
         assert_eq!(response["response"]["subtype"], "error");
+    }
+
+    /// A-44 — an outbound `control_request` rejects on an `error`
+    /// `control_response` (`sdk.mjs` `request()` rejects with
+    /// `Error(response.error)`), and resolves on a `success` one.
+    #[tokio::test]
+    async fn outbound_error_response_rejects() {
+        let (control, mut lines, inbound) = harness(ControlOptions::default());
+
+        let control2 = control.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = reply_tx.send(
+                control2
+                    .send_request(json!({"subtype":"set_model","model":"x"}))
+                    .await,
+            );
+        });
+        let frame = next_line(&mut lines).await;
+        assert_eq!(frame["type"], "control_request");
+        let id = frame["request_id"]
+            .as_str()
+            .expect("request_id")
+            .to_string();
+
+        inbound
+            .send(json!({"type":"control_response","response":{
+                "subtype":"error","request_id":id,"error":"model not found"}}))
+            .unwrap();
+
+        let result = timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("reply arrives")
+            .expect("reply channel open");
+        match result {
+            Err(ControlError::Remote(message)) => assert_eq!(message, "model not found"),
+            other => panic!("an error verdict must reject, got {other:?}"),
+        }
+
+        // A success verdict still resolves with the full frame.
+        let control3 = control.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = reply_tx.send(
+                control3
+                    .send_request(json!({"subtype":"set_model","model":"y"}))
+                    .await,
+            );
+        });
+        let frame = next_line(&mut lines).await;
+        let id = frame["request_id"]
+            .as_str()
+            .expect("request_id")
+            .to_string();
+        inbound
+            .send(json!({"type":"control_response","response":{
+                "subtype":"success","request_id":id,"response":{}}}))
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("reply arrives")
+            .expect("reply channel open");
+        assert!(result.is_ok(), "a success verdict must resolve: {result:?}");
+    }
+
+    /// F3a (a) — the `Z4` machine-only subtypes are never answered, even with a
+    /// handler that would return a response (`sdk.mjs` `processControlRequest`).
+    #[tokio::test]
+    async fn sdkctl_z4_subtypes_are_never_answered() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<RequestHandler> = {
+            let calls = calls.clone();
+            Arc::new(Box::new(move |_frame| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(json!({"type":"control_response","response":{
+                        "subtype":"success","request_id":"x","response":{}}}))
+                })
+            }))
+        };
+        let (control, mut lines, inbound) = harness(ControlOptions {
+            on_request: Some(handler),
+        });
+        let _ = control;
+
+        for subtype in SUPPRESSED_SUBTYPES {
+            inbound
+                .send(
+                    json!({"type":"control_request","request_id":format!("z4-{subtype}"),
+                    "request":{"subtype":subtype}}),
+                )
+                .unwrap();
+        }
+        assert_no_line(&mut lines, Duration::from_millis(300)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the Z4 subtypes must be suppressed before any handler runs"
+        );
+    }
+
+    /// F3a (a) — `request_user_dialog` with no handler stays silent so a
+    /// capable client (or the worker's park deadline) settles it.
+    #[tokio::test]
+    async fn sdkctl_dialog_without_handler_stays_silent() {
+        let (control, mut lines, inbound) = harness(ControlOptions::default());
+        let _ = control;
+
+        inbound
+            .send(json!({"type":"control_request","request_id":"dialog-1",
+                "request":{"subtype":"request_user_dialog","dialog_kind":"refusal_fallback",
+                    "payload":{"message":"continue?"}}}))
+            .unwrap();
+        assert_no_line(&mut lines, Duration::from_millis(300)).await;
+    }
+
+    /// F3a (a) — the general handler contract: `None` means write nothing.
+    #[tokio::test]
+    async fn handler_returning_none_writes_nothing() {
+        let handler: Arc<RequestHandler> =
+            Arc::new(Box::new(|_frame| Box::pin(async move { None })));
+        let (control, mut lines, inbound) = harness(ControlOptions {
+            on_request: Some(handler),
+        });
+        let _ = control;
+
+        inbound
+            .send(json!({"type":"control_request","request_id":"silent-1",
+                "request":{"subtype":"can_use_tool","tool_name":"Bash"}}))
+            .unwrap();
+        assert_no_line(&mut lines, Duration::from_millis(300)).await;
+    }
+
+    /// F3a (b) — an `elicitation` with no handler gets a success
+    /// `{action:"decline"}` (not an error verdict).
+    #[tokio::test]
+    async fn sdkctl_elicitation_without_handler_declines() {
+        let (control, mut lines, inbound) = harness(ControlOptions::default());
+        let _ = control;
+
+        inbound
+            .send(json!({"type":"control_request","request_id":"elic-1",
+                "request":{"subtype":"elicitation","mcp_server_name":"mcp",
+                    "message":"pick one"}}))
+            .unwrap();
+
+        let frame = next_line(&mut lines).await;
+        assert_eq!(frame["type"], "control_response");
+        assert_eq!(frame["response"]["subtype"], "success");
+        assert_eq!(frame["response"]["request_id"], "elic-1");
+        assert_eq!(frame["response"]["response"], json!({"action":"decline"}));
+    }
+
+    /// F3a (c) — every error response carries the `error` string, even when no
+    /// handler is registered (`sdk.mjs` `handleControlRequest`'s catch).
+    #[tokio::test]
+    async fn sdkctl_unknown_subtype_error_string_without_handler() {
+        let (control, mut lines, inbound) = harness(ControlOptions::default());
+        let _ = control;
+
+        inbound
+            .send(json!({"type":"control_request","request_id":"unknown-1",
+                "request":{"subtype":"oauth_token_refresh"}}))
+            .unwrap();
+
+        let frame = next_line(&mut lines).await;
+        assert_eq!(frame["type"], "control_response");
+        assert_eq!(frame["response"]["subtype"], "error");
+        assert_eq!(frame["response"]["request_id"], "unknown-1");
+        assert_eq!(
+            frame["response"]["error"],
+            "Unsupported control request subtype: oauth_token_refresh"
+        );
+    }
+
+    /// F3a (d) — a duplicate delivery of an in-flight `request_id` is skipped
+    /// (`sdk.mjs` `cancelControllers.has`): the handler runs once and exactly
+    /// one response is written.
+    #[tokio::test]
+    async fn sdkctl_duplicate_request_is_skipped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let handler: Arc<RequestHandler> = {
+            let calls = calls.clone();
+            let gate = gate.clone();
+            Arc::new(Box::new(move |frame| {
+                let calls = calls.clone();
+                let gate = gate.clone();
+                let id = frame
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    gate.notified().await;
+                    Some(json!({"type":"control_response","response":{
+                        "subtype":"success","request_id":id,
+                        "response":{"behavior":"allow"}}}))
+                })
+            }))
+        };
+        let (control, mut lines, inbound) = harness(ControlOptions {
+            on_request: Some(handler),
+        });
+        let _ = control;
+
+        let request = json!({"type":"control_request","request_id":"dup-1",
+            "request":{"subtype":"can_use_tool","tool_name":"Bash"}});
+        inbound.send(request.clone()).unwrap();
+        // Wait until the first handler is running (it is now in flight).
+        timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first handler starts");
+
+        inbound.send(request).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the duplicate delivery must not start a second handler"
+        );
+
+        gate.notify_one();
+        let frame = next_line(&mut lines).await;
+        assert_eq!(frame["response"]["request_id"], "dup-1");
+        assert_eq!(frame["response"]["response"]["behavior"], "allow");
+        assert_no_line(&mut lines, Duration::from_millis(200)).await;
+    }
+
+    /// F3a (e) — a request that arrives after close is skipped
+    /// (`sdk.mjs` `cleanupPerformed`).
+    #[tokio::test]
+    async fn sdkctl_request_after_close_is_skipped() {
+        let handler: Arc<RequestHandler> = Arc::new(Box::new(|frame| {
+            let id = frame
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Box::pin(async move {
+                Some(json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":id,"response":{}}}))
+            })
+        }));
+        let (control, mut lines, inbound) = harness(ControlOptions {
+            on_request: Some(handler),
+        });
+
+        inbound
+            .send(json!({"type":"control_request","request_id":"before-close",
+                "request":{"subtype":"can_use_tool","tool_name":"Bash"}}))
+            .unwrap();
+        let frame = next_line(&mut lines).await;
+        assert_eq!(frame["response"]["request_id"], "before-close");
+
+        control.close().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        inbound
+            .send(json!({"type":"control_request","request_id":"after-close",
+                "request":{"subtype":"can_use_tool","tool_name":"Bash"}}))
+            .unwrap();
+        assert_no_line(&mut lines, Duration::from_millis(300)).await;
+    }
+
+    /// F3a (c) — a `can_use_tool` with no handler errors with the SDK's
+    /// callback-not-provided message.
+    #[tokio::test]
+    async fn can_use_tool_without_handler_errors() {
+        let (control, mut lines, inbound) = harness(ControlOptions::default());
+        let _ = control;
+
+        inbound
+            .send(json!({"type":"control_request","request_id":"perm-1",
+                "request":{"subtype":"can_use_tool","tool_name":"Bash"}}))
+            .unwrap();
+        let frame = next_line(&mut lines).await;
+        assert_eq!(frame["response"]["subtype"], "error");
+        assert_eq!(
+            frame["response"]["error"],
+            "canUseTool callback is not provided."
+        );
     }
 
     /// Normalise a frame the way `capture.sh`'s `normalize_object` does for the

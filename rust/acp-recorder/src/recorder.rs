@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, InitializeRequest, LoadSessionRequest,
+    CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
+    CreateElicitationResponse, ElicitationAction, InitializeRequest, LoadSessionRequest,
     NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, TextContent,
@@ -21,7 +22,7 @@ use agent_client_protocol::{
 };
 use serde_json::json;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::frames::{Direction, Frame};
 use crate::placeholders::Placeholders;
@@ -38,6 +39,13 @@ const UPDATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// captured frame order non-deterministic. Pause long enough for that timer to
 /// fire before the next step so the order is stable across captures (2.T1).
 const POST_CREATE_SETTLE: Duration = Duration::from_millis(75);
+
+/// A queued agent->client `elicitation/create` request and the one-shot the
+/// script's `elicit_reply` step answers it through (F1).
+type PendingElicitation = (
+    CreateElicitationRequest,
+    oneshot::Sender<CreateElicitationResponse>,
+);
 
 /// Errors produced by the recorder.
 #[derive(Debug, Error)]
@@ -84,6 +92,9 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
     // "cancel after N updates" prompt option.
     let update_count = Arc::new(AtomicUsize::new(0));
     let permission = script.permission.clone();
+    // Agent->client `elicitation/create` requests are queued here; the handler
+    // awaits the one-shot reply that a later `elicit_reply` step sends.
+    let (elicit_tx, elicit_rx) = mpsc::unbounded_channel::<PendingElicitation>();
 
     let outcome = Client
         .builder()
@@ -106,11 +117,33 @@ pub async fn record(agent_cmd: &str, script: &Script) -> Result<Vec<Frame>, Erro
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                let elicit_tx = elicit_tx.clone();
+                async move |request: CreateElicitationRequest, responder, _connection| {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if elicit_tx.send((request, reply_tx)).is_err() {
+                        // No script is listening (recorder already finished):
+                        // answer the safe default rather than hang the agent.
+                        return responder
+                            .respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+                    }
+                    match reply_rx.await {
+                        Ok(response) => responder.respond(response),
+                        Err(_) => responder
+                            .respond(CreateElicitationResponse::new(ElicitationAction::Cancel)),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(agent, {
             let update_count = update_count.clone();
             move |connection: ConnectionTo<agent_client_protocol::Agent>| {
                 let update_count = update_count.clone();
-                async move { run_script(connection, script, update_count, line_rx).await }
+                async move {
+                    run_script(connection, script, update_count, line_rx, elicit_rx).await
+                }
             }
         })
         .await;
@@ -223,6 +256,7 @@ async fn run_script(
     script: &Script,
     update_count: Arc<AtomicUsize>,
     mut line_rx: mpsc::UnboundedReceiver<String>,
+    mut elicit_rx: mpsc::UnboundedReceiver<PendingElicitation>,
 ) -> Result<(), agent_client_protocol::Error> {
     // Every agent line seen so far (drained lazily from `line_rx`).
     let mut recv_lines: Vec<String> = Vec::new();
@@ -239,12 +273,30 @@ async fn run_script(
         match step {
             Step::Initialize {
                 client_capabilities_meta,
+                client_capabilities,
             } => {
-                let mut request = InitializeRequest::new(ProtocolVersion::V1);
+                // F1: carry the whole capability object. A malformed object is
+                // a script error (the recorder is a test client, not a lenient
+                // one); the meta-only form stays the additive default.
+                let mut capabilities = match client_capabilities {
+                    Some(value) if !value.is_null() => {
+                        serde_json::from_value::<ClientCapabilities>(value.clone()).map_err(
+                            |error| {
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(format!("invalid client_capabilities: {error}"))
+                            },
+                        )?
+                    }
+                    _ => ClientCapabilities::new(),
+                };
                 if let Some(meta) = client_capabilities_meta {
                     let meta_map = meta.as_object().cloned().unwrap_or_default();
-                    request = request.client_capabilities(ClientCapabilities::new().meta(meta_map));
+                    let mut merged = capabilities.meta.clone().unwrap_or_default();
+                    merged.extend(meta_map);
+                    capabilities = capabilities.meta(merged);
                 }
+                let request =
+                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities);
                 let _response = connection.send_request(request).block_task().await?;
             }
             Step::NewSession { cwd } => {
@@ -347,6 +399,31 @@ async fn run_script(
                 for sent in pending.drain(..) {
                     let _response = sent.block_task().await?;
                 }
+            }
+            Step::ElicitReply { response } => {
+                // F1: answer the next agent->client `elicitation/create` that a
+                // (usually `no_wait`) prompt produced. The client handler has
+                // already queued it and is awaiting this one-shot.
+                let response: CreateElicitationResponse = serde_json::from_value(response.clone())
+                    .map_err(|error| {
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("invalid elicit_reply response: {error}"))
+                    })?;
+                let pending = tokio::time::timeout(UPDATE_WAIT_TIMEOUT, elicit_rx.recv())
+                    .await
+                    .map_err(|_| {
+                        agent_client_protocol::Error::internal_error().data(
+                            "timed out waiting for an elicitation request before elicit_reply",
+                        )
+                    })?;
+                let Some((_request, reply_tx)) = pending else {
+                    return Err(agent_client_protocol::Error::internal_error()
+                        .data("elicitation request channel closed before elicit_reply"));
+                };
+                reply_tx.send(response).map_err(|_| {
+                    agent_client_protocol::Error::internal_error()
+                        .data("elicitation reply receiver was dropped")
+                })?;
             }
             Step::Sleep { ms } => {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;

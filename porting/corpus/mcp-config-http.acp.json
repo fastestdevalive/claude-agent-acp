@@ -1,0 +1,15 @@
+{
+  "permission": "allow",
+  "steps": [
+    {"call": "initialize"},
+    {"call": "request", "method": "session/new", "capture_session_id": true,
+     "params": {"cwd": "$CWD",
+                "mcpServers": [
+                  {"type": "http", "name": "remote", "url": "https://mcp.example.test/v1",
+                   "headers": [{"name": "Authorization", "value": "Bearer fixture"}]},
+                  {"type": "sse", "name": "events", "url": "https://sse.example.test/stream",
+                   "headers": []}
+                ]}},
+    {"call": "session/prompt", "text": "hello"}
+  ]
+}
